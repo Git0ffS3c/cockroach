@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/datadriven"
@@ -34,38 +35,39 @@ import (
 
 func TestMemo(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
-		memo.ExprFmtHideStats
-	runDataDrivenTest(t, testutils.TestDataPath(t, "memo"), flags)
+		memo.ExprFmtHideStats | memo.ExprFmtHideNotVisibleIndexInfo
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "memo"), flags)
 }
 
 func TestFormat(t *testing.T) {
-	runDataDrivenTest(t, testutils.TestDataPath(t, "format"), memo.ExprFmtShowAll)
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "format"), memo.ExprFmtShowAll)
 }
 
 func TestLogicalProps(t *testing.T) {
-	flags := memo.ExprFmtHideCost | memo.ExprFmtHideQualifications | memo.ExprFmtHideStats
-	runDataDrivenTest(t, testutils.TestDataPath(t, "logprops"), flags)
+	flags := memo.ExprFmtHideCost | memo.ExprFmtHideQualifications | memo.ExprFmtHideStats |
+		memo.ExprFmtHideNotVisibleIndexInfo
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "logprops"), flags)
 }
 
 func TestStats(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
-		memo.ExprFmtHideScalars
-	runDataDrivenTest(t, testutils.TestDataPath(t, "stats"), flags)
+		memo.ExprFmtHideScalars | memo.ExprFmtHideNotVisibleIndexInfo
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "stats"), flags)
 }
 
 func TestStatsQuality(t *testing.T) {
 	flags := memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps | memo.ExprFmtHideQualifications |
-		memo.ExprFmtHideScalars
-	runDataDrivenTest(t, testutils.TestDataPath(t, "stats_quality"), flags)
+		memo.ExprFmtHideScalars | memo.ExprFmtHideNotVisibleIndexInfo
+	runDataDrivenTest(t, datapathutils.TestDataPath(t, "stats_quality"), flags)
 }
 
 func TestCompositeSensitive(t *testing.T) {
-	datadriven.RunTest(t, testutils.TestDataPath(t, "composite_sensitive"), func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "composite_sensitive"), func(t *testing.T, d *datadriven.TestData) string {
 		semaCtx := tree.MakeSemaContext()
 		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		var f norm.Factory
-		f.Init(&evalCtx, nil /* catalog */)
+		f.Init(context.Background(), &evalCtx, nil /* catalog */)
 		md := f.Metadata()
 
 		if d.Cmd != "composite-sensitive" {
@@ -112,7 +114,7 @@ func TestMemoInit(t *testing.T) {
 	var o xform.Optimizer
 	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE $1=10")
 
-	o.Init(&evalCtx, catalog)
+	o.Init(context.Background(), &evalCtx, catalog)
 	if !o.Memo().IsEmpty() {
 		t.Fatal("memo should be empty")
 	}
@@ -145,6 +147,13 @@ func TestMemoIsStale(t *testing.T) {
 	// Initialize context with starting values.
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	evalCtx.SessionData().Database = "t"
+	// MakeTestingEvalContext created a fake planner that can only provide the
+	// memory monitor and will encounter a nil-pointer error when other methods
+	// are accessed. In this test, GetDatabaseSurvivalGoal method will be called
+	// which can handle a case of nil planner but cannot a case when the
+	// planner's GetMultiregionConfig is nil, so we nil out the planner.
+	evalCtx.Planner = nil
+	evalCtx.StreamManagerFactory = nil
 
 	var o xform.Optimizer
 	opttestutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT a, b+1 FROM abcview WHERE c='foo'")
@@ -195,6 +204,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().ZigzagJoinEnabled = false
 	notStale()
 
+	// Stale optimizer forecast usage enable.
+	evalCtx.SessionData().OptimizerUseForecasts = true
+	stale()
+	evalCtx.SessionData().OptimizerUseForecasts = false
+	notStale()
+
 	// Stale optimizer histogram usage enable.
 	evalCtx.SessionData().OptimizerUseHistograms = true
 	stale()
@@ -207,6 +222,12 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptimizerUseMultiColStats = false
 	notStale()
 
+	// Stale optimizer not visible indexes usage enable.
+	evalCtx.SessionData().OptimizerUseNotVisibleIndexes = true
+	stale()
+	evalCtx.SessionData().OptimizerUseNotVisibleIndexes = false
+	notStale()
+
 	// Stale locality optimized search enable.
 	evalCtx.SessionData().LocalityOptimizedSearch = true
 	stale()
@@ -217,18 +238,6 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().SafeUpdates = true
 	stale()
 	evalCtx.SessionData().SafeUpdates = false
-	notStale()
-
-	// Stale intervalStyleEnabled.
-	evalCtx.SessionData().IntervalStyleEnabled = true
-	stale()
-	evalCtx.SessionData().IntervalStyleEnabled = false
-	notStale()
-
-	// Stale dateStyleEnabled.
-	evalCtx.SessionData().DateStyleEnabled = true
-	stale()
-	evalCtx.SessionData().DateStyleEnabled = false
 	notStale()
 
 	// Stale DateStyle.
@@ -277,6 +286,72 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().CostScansWithDefaultColSize = true
 	stale()
 	evalCtx.SessionData().CostScansWithDefaultColSize = false
+	notStale()
+
+	// Stale unconstrained non-covering index scan enabled.
+	evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled = true
+	stale()
+	evalCtx.SessionData().UnconstrainedNonCoveringIndexScanEnabled = false
+	notStale()
+
+	// Stale enforce home region.
+	evalCtx.SessionData().EnforceHomeRegion = true
+	stale()
+	evalCtx.SessionData().EnforceHomeRegion = false
+	notStale()
+
+	// Stale inequality lookup joins enabled.
+	evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
+	stale()
+	evalCtx.SessionData().VariableInequalityLookupJoinEnabled = false
+	notStale()
+
+	// Stale use limit ordering for streaming group by.
+	evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
+	stale()
+	evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = false
+	notStale()
+
+	// Stale use improved split disjunction for joins.
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = false
+	notStale()
+
+	// Stale testing_optimizer_random_seed.
+	evalCtx.SessionData().TestingOptimizerRandomSeed = 100
+	stale()
+	evalCtx.SessionData().TestingOptimizerRandomSeed = 0
+	notStale()
+
+	// Stale testing_optimizer_cost_perturbation.
+	evalCtx.SessionData().TestingOptimizerCostPerturbation = 1
+	stale()
+	evalCtx.SessionData().TestingOptimizerCostPerturbation = 0
+	notStale()
+
+	// Stale testing_optimizer_disable_rule_probability.
+	evalCtx.SessionData().TestingOptimizerDisableRuleProbability = 1
+	stale()
+	evalCtx.SessionData().TestingOptimizerDisableRuleProbability = 0
+	notStale()
+
+	// Stale allow_ordinal_column_references.
+	evalCtx.SessionData().AllowOrdinalColumnReferences = true
+	stale()
+	evalCtx.SessionData().AllowOrdinalColumnReferences = false
+	notStale()
+
+	// Stale optimizer_use_improve_disjunction_stats.
+	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = false
+	notStale()
+
+	// Stale optimizer_always_use_histograms.
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = true
+	stale()
+	evalCtx.SessionData().OptimizerAlwaysUseHistograms = false
 	notStale()
 
 	// Stale data sources and schema. Create new catalog so that data sources are
@@ -331,7 +406,7 @@ func TestStatsAvailable(t *testing.T) {
 
 	testNotAvailable := func(expr memo.RelExpr) {
 		traverseExpr(expr, func(e memo.RelExpr) {
-			if e.Relational().Stats.Available {
+			if e.Relational().Statistics().Available {
 				t.Fatal("stats should not be available")
 			}
 		})
@@ -369,7 +444,7 @@ func TestStatsAvailable(t *testing.T) {
 
 	testAvailable := func(expr memo.RelExpr) {
 		traverseExpr(expr, func(e memo.RelExpr) {
-			if !e.Relational().Stats.Available {
+			if !e.Relational().Statistics().Available {
 				t.Fatal("stats should be available")
 			}
 		})
@@ -401,10 +476,11 @@ func traverseExpr(expr memo.RelExpr, f func(memo.RelExpr)) {
 }
 
 // runDataDrivenTest runs data-driven testcases of the form
-//   <command>
-//   <SQL statement>
-//   ----
-//   <expected results>
+//
+//	<command>
+//	<SQL statement>
+//	----
+//	<expected results>
 //
 // See OptTester.Handle for supported commands.
 func runDataDrivenTest(t *testing.T, path string, fmtFlags memo.ExprFmtFlags) {

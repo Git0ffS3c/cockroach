@@ -167,6 +167,7 @@ func TestAndOrOps(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -228,6 +229,7 @@ func benchmarkLogicalProjOp(
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -245,10 +247,10 @@ func benchmarkLogicalProjOp(
 		nulls1 := batch.ColVec(0).Nulls()
 		nulls2 := batch.ColVec(0).Nulls()
 		for i := 0; i < coldata.BatchSize(); i++ {
-			if rng.Float64() < nullProbability {
+			if rng.Float64() < 0.1 {
 				nulls1.SetNull(i)
 			}
-			if rng.Float64() < nullProbability {
+			if rng.Float64() < 0.1 {
 				nulls2.SetNull(i)
 			}
 		}

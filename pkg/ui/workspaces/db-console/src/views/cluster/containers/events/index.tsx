@@ -14,23 +14,26 @@ import React from "react";
 import { Helmet } from "react-helmet";
 import { Link, RouteComponentProps, withRouter } from "react-router-dom";
 import { connect } from "react-redux";
-import * as protos from "src/js/protos";
 import { refreshEvents } from "src/redux/apiReducers";
 import {
   eventsLastErrorSelector,
   eventsSelector,
   eventsValidSelector,
+  eventsMaxApiReached,
 } from "src/redux/events";
 import { LocalSetting } from "src/redux/localsettings";
 import { AdminUIState } from "src/redux/state";
-import { util } from "@cockroachlabs/cluster-ui";
 import { getEventDescription } from "src/util/events";
-import { DATE_FORMAT_24_UTC } from "src/util/format";
 import { ToolTipWrapper } from "src/views/shared/components/toolTip";
-import { Loading, SortSetting, SortedTable } from "@cockroachlabs/cluster-ui";
+import {
+  Loading,
+  SortSetting,
+  SortedTable,
+  util,
+  api as clusterUiApi,
+} from "@cockroachlabs/cluster-ui";
+import { InlineAlert } from "@cockroachlabs/ui-components";
 import "./events.styl";
-
-type Event$Properties = protos.cockroach.server.serverpb.EventsResponse.IEvent;
 
 // Number of events to show in the sidebar.
 const EVENT_BOX_NUM_EVENTS = 5;
@@ -50,18 +53,17 @@ export interface SimplifiedEvent {
 class EventSortedTable extends SortedTable<SimplifiedEvent> {}
 
 export interface EventRowProps {
-  event: Event$Properties;
+  event: clusterUiApi.EventColumns;
 }
 
-export function getEventInfo(e: Event$Properties): SimplifiedEvent {
+export function getEventInfo(e: clusterUiApi.EventColumns): SimplifiedEvent {
   return {
-    fromNowString: util
-      .TimestampToMoment(e.timestamp)
-      .format(DATE_FORMAT_24_UTC)
+    fromNowString: moment(e.timestamp)
+      .format(util.DATE_FORMAT_24_UTC)
       .replace("second", "sec")
       .replace("minute", "min"),
     content: <span>{getEventDescription(e)}</span>,
-    sortableTimestamp: util.TimestampToMoment(e.timestamp),
+    sortableTimestamp: moment(e.timestamp),
   };
 }
 
@@ -83,7 +85,7 @@ export class EventRow extends React.Component<EventRowProps, {}> {
 }
 
 export interface EventBoxProps {
-  events: Event$Properties[];
+  events: clusterUiApi.EventsResponse;
   // eventsValid is needed so that this component will re-render when the events
   // data becomes invalid, and thus trigger a refresh.
   eventsValid: boolean;
@@ -109,7 +111,7 @@ export class EventBoxUnconnected extends React.Component<EventBoxProps, {}> {
           <tbody>
             {_.map(
               _.take(events, EVENT_BOX_NUM_EVENTS),
-              (e: Event$Properties, i: number) => {
+              (e: clusterUiApi.EventColumns, i: number) => {
                 return <EventRow event={e} key={i} />;
               },
             )}
@@ -126,7 +128,7 @@ export class EventBoxUnconnected extends React.Component<EventBoxProps, {}> {
 }
 
 export interface EventPageProps {
-  events: Event$Properties[];
+  events: clusterUiApi.EventsResponse;
   // eventsValid is needed so that this component will re-render when the events
   // data becomes invalid, and thus trigger a refresh.
   eventsValid: boolean;
@@ -134,6 +136,7 @@ export interface EventPageProps {
   sortSetting: SortSetting;
   setSort: typeof eventsSortSetting.set;
   lastError: Error;
+  maxSizeApiReached: boolean;
 }
 
 export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
@@ -148,30 +151,43 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
   }
 
   renderContent() {
-    const { events, sortSetting } = this.props;
+    const { events, sortSetting, maxSizeApiReached } = this.props;
     const simplifiedEvents = _.map(events, getEventInfo);
 
     return (
-      <div className="l-columns__left events-table">
-        <EventSortedTable
-          data={simplifiedEvents}
-          sortSetting={sortSetting}
-          onChangeSortSetting={setting => this.props.setSort(setting)}
-          columns={[
-            {
-              title: "Event",
-              name: "event",
-              cell: e => e.content,
-            },
-            {
-              title: "Timestamp",
-              name: "timestamp",
-              cell: e => e.fromNowString,
-              sort: e => e.sortableTimestamp,
-            },
-          ]}
-        />
-      </div>
+      <>
+        <div className="l-columns__left events-table">
+          <EventSortedTable
+            data={simplifiedEvents}
+            sortSetting={sortSetting}
+            onChangeSortSetting={setting => this.props.setSort(setting)}
+            columns={[
+              {
+                title: "Event",
+                name: "event",
+                cell: e => e.content,
+              },
+              {
+                title: "Timestamp",
+                name: "timestamp",
+                cell: e => e.fromNowString,
+                sort: e => e.sortableTimestamp,
+              },
+            ]}
+          />
+        </div>
+        {maxSizeApiReached && (
+          <InlineAlert
+            intent="info"
+            title={
+              <>
+                Not all events are displayed because the maximum number of
+                events was reached in the console.&nbsp;
+              </>
+            }
+          />
+        )}
+      </>
     );
   }
 
@@ -183,7 +199,7 @@ export class EventPageUnconnected extends React.Component<EventPageProps, {}> {
         <section className="section section--heading">
           <h1 className="base-heading">Events</h1>
         </section>
-        <section className="section l-columns">
+        <section className="section">
           <Loading
             loading={!events}
             page={"events"}
@@ -220,6 +236,7 @@ const eventPageConnected = withRouter(
         eventsValid: eventsValidSelector(state),
         sortSetting: eventsSortSetting.selector(state),
         lastError: eventsLastErrorSelector(state),
+        maxSizeApiReached: eventsMaxApiReached(state),
       };
     },
     {

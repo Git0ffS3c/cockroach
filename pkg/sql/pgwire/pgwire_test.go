@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -33,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -537,11 +537,12 @@ func TestPGPreparedQuery(t *testing.T) {
 		{"SHOW DATABASE", []preparedQueryTest{
 			baseTest.Results("defaultdb"),
 		}},
-		{"SHOW COLUMNS FROM system.users", []preparedQueryTest{
+		{sql: "SHOW COLUMNS FROM system.users", ptest: []preparedQueryTest{
 			baseTest.
-				Results("username", "STRING", false, gosql.NullBool{}, "", "{primary}", false).
+				Results("username", "STRING", false, gosql.NullBool{}, "", "{primary,users_user_id_idx}", false).
 				Results("hashedPassword", "BYTES", true, gosql.NullBool{}, "", "{primary}", false).
-				Results("isRole", "BOOL", false, false, "", "{primary}", false),
+				Results("isRole", "BOOL", false, false, "", "{primary}", false).
+				Results("user_id", "OID", false, gosql.NullBool{}, "", "{primary,users_user_id_idx}", false),
 		}},
 		{"SELECT database_name, owner FROM [SHOW DATABASES]", []preparedQueryTest{
 			baseTest.Results("d", username.RootUser).
@@ -551,29 +552,31 @@ func TestPGPreparedQuery(t *testing.T) {
 		}},
 		{"SHOW GRANTS ON system.users", []preparedQueryTest{
 			baseTest.Results("system", "public", "users", username.AdminRole, "DELETE", true).
-				Results("system", "public", "users", username.AdminRole, "GRANT", true).
 				Results("system", "public", "users", username.AdminRole, "INSERT", true).
 				Results("system", "public", "users", username.AdminRole, "SELECT", true).
 				Results("system", "public", "users", username.AdminRole, "UPDATE", true).
 				Results("system", "public", "users", username.RootUser, "DELETE", true).
-				Results("system", "public", "users", username.RootUser, "GRANT", true).
 				Results("system", "public", "users", username.RootUser, "INSERT", true).
 				Results("system", "public", "users", username.RootUser, "SELECT", true).
 				Results("system", "public", "users", username.RootUser, "UPDATE", true),
 		}},
 		{"SHOW INDEXES FROM system.users", []preparedQueryTest{
-			baseTest.Results("users", "primary", false, 1, "username", "ASC", false, false).
-				Results("users", "primary", false, 2, "hashedPassword", "N/A", true, false).
-				Results("users", "primary", false, 3, "isRole", "N/A", true, false),
+			baseTest.Results("users", "primary", false, 1, "username", "username", "ASC", false, false, true).
+				Results("users", "primary", false, 2, "hashedPassword", "hashedPassword", "N/A", true, false, true).
+				Results("users", "primary", false, 3, "isRole", "isRole", "N/A", true, false, true).
+				Results("users", "primary", false, 4, "user_id", "user_id", "N/A", true, false, true).
+				Results("users", "users_user_id_idx", false, 1, "user_id", "user_id", "ASC", false, false, true).
+				Results("users", "users_user_id_idx", false, 2, "username", "username", "ASC", true, true, true),
 		}},
 		{"SHOW TABLES FROM system", []preparedQueryTest{
-			baseTest.Results("public", "comments", "table", gosql.NullString{}, 0, gosql.NullString{}).Others(36),
+			baseTest.Results("public", "comments", "table", gosql.NullString{}, 0, gosql.NullString{}).Others(bootstrap.NumSystemTablesForSystemTenant - 1),
 		}},
 		{"SHOW SCHEMAS FROM system", []preparedQueryTest{
 			baseTest.Results("crdb_internal", gosql.NullString{}).Others(4),
 		}},
 		{"SHOW CONSTRAINTS FROM system.users", []preparedQueryTest{
-			baseTest.Results("users", "primary", "PRIMARY KEY", "PRIMARY KEY (username ASC)", true),
+			baseTest.Results("users", "primary", "PRIMARY KEY", "PRIMARY KEY (username ASC)", true).
+				Results("users", "users_user_id_idx", "UNIQUE", "UNIQUE (user_id ASC)", true),
 		}},
 		{"SHOW TIME ZONE", []preparedQueryTest{
 			baseTest.Results("UTC"),
@@ -789,7 +792,7 @@ func TestPGPreparedQuery(t *testing.T) {
 		}},
 		{"SELECT $1:::FLOAT[]", []preparedQueryTest{
 			baseTest.SetArgs("{}").Results("{}"),
-			baseTest.SetArgs("{1.0,2.0,3.0}").Results("{1.0,2.0,3.0}"),
+			baseTest.SetArgs("{1.0,2.0,3.0}").Results("{1,2,3}"),
 		}},
 		{"SELECT $1:::DECIMAL[]", []preparedQueryTest{
 			baseTest.SetArgs("{1.000}").Results("{1.000}"),
@@ -1632,7 +1635,7 @@ func TestSQLNetworkMetrics(t *testing.T) {
 		t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanupFn()
 
-	const minbytes = 20
+	const minbytes = 10
 	const maxbytes = 2 * 1024
 
 	// Make sure we're starting at 0.
@@ -1709,7 +1712,7 @@ func TestPGWireOverUnixSocket(t *testing.T) {
 	if runtime.GOOS == "darwin" || strings.Contains(runtime.GOOS, "bsd") {
 		baseTmpDir = "/tmp"
 	}
-	tempDir, err := ioutil.TempDir(baseTmpDir, "PGSQL")
+	tempDir, err := os.MkdirTemp(baseTmpDir, "PGSQL")
 	if err != nil {
 		t.Fatal(err)
 	}

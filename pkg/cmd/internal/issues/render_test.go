@@ -11,11 +11,11 @@
 package issues
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/datadriven"
 )
 
@@ -53,7 +53,7 @@ as well as
 		},
 	}
 
-	dir := testutils.TestDataPath(t, "render")
+	dir := datapathutils.TestDataPath(t, "render")
 	datadriven.Walk(t, dir, func(t *testing.T, path string) {
 		datadriven.RunTest(t, path, func(t *testing.T, td *datadriven.TestData) string {
 			if td.Cmd != "render" {
@@ -78,7 +78,7 @@ as well as
 		t.Errorf("testdata file missing: %s", path)
 		const create = true
 		if create {
-			_ = ioutil.WriteFile(path, []byte(`render
+			_ = os.WriteFile(path, []byte(`render
 ----
 `), 0644)
 		}

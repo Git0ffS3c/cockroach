@@ -15,6 +15,7 @@ import {
   BytesFitScale,
   ComputeByteScale,
   ComputeDurationScale,
+  DATE_WITH_SECONDS_FORMAT_24_UTC,
   DurationFitScale,
 } from "src/util/format";
 
@@ -97,18 +98,7 @@ export class AxisDomain {
 }
 
 const countIncrementTable = [
-  0.1,
-  0.2,
-  0.25,
-  0.3,
-  0.4,
-  0.5,
-  0.6,
-  0.7,
-  0.75,
-  0.8,
-  0.9,
-  1.0,
+  0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0,
 ];
 
 // converts a number from raw format to abbreviation k,m,b,t
@@ -145,7 +135,7 @@ const abbreviateNumber = (num: number, fixedDecimals: number) => {
 };
 
 const formatPercentage = (n: number, fractionDigits: number) => {
-  return `${(n * 100).toFixed(fractionDigits)}%`;
+  return n?.toFixed ? `${(n * 100).toFixed(fractionDigits)}%` : "0%";
 };
 
 // computeNormalizedIncrement computes a human-friendly increment between tick
@@ -190,7 +180,7 @@ function computeAxisDomain(extent: Extent, factor = 1): AxisDomain {
   // but with a metric prefix for large numbers (i.e. 1000 will display as "1k")
   let unitFormat: (v: number) => string;
   if (Math.floor(increment) !== increment) {
-    unitFormat = (n: number) => n.toFixed(1);
+    unitFormat = (n: number) => n?.toFixed(1) || "0";
   } else {
     unitFormat = (n: number) => abbreviateNumber(n, 4);
   }
@@ -208,7 +198,7 @@ function ComputeCountAxisDomain(extent: Extent): AxisDomain {
   // fractional metric prefix; this is because the use of fractional metric
   // prefixes (i.e. milli, micro, nano) have proved confusing to users.
   const metricFormat = (n: number) => abbreviateNumber(n, 4);
-  const decimalFormat = (n: number) => n.toFixed(4);
+  const decimalFormat = (n: number) => n?.toFixed(4) || "0";
   axisDomain.guideFormat = (n: number) => {
     if (n < 1) {
       return decimalFormat(n);
@@ -275,7 +265,7 @@ const timeIncrements: number[] = timeIncrementDurations.map(inc =>
 );
 
 export function formatTimeStamp(timeMillis: number): string {
-  return moment.utc(timeMillis).format("HH:mm:ss on MMM Do, YYYY");
+  return moment.utc(timeMillis).format(DATE_WITH_SECONDS_FORMAT_24_UTC);
 }
 
 function ComputeTimeAxisDomain(extent: Extent): AxisDomain {

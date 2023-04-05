@@ -21,7 +21,8 @@ import Long from "long";
 
 export type StatementStatistics = protos.cockroach.sql.IStatementStatistics;
 export type ExecStats = protos.cockroach.sql.IExecStats;
-export type CollectedStatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+export type CollectedStatementStatistics =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 
 export interface NumericStat {
   mean?: number;
@@ -60,10 +61,45 @@ export function aggregateNumericStats(
   };
 }
 
+export function aggregateLatencyInfo(
+  a: StatementStatistics,
+  b: StatementStatistics,
+): protos.cockroach.sql.ILatencyInfo {
+  const min =
+    a.latency_info?.min == 0 || a.latency_info?.min > b.latency_info?.min
+      ? b.latency_info?.min
+      : a.latency_info?.min;
+  const max =
+    a.latency_info?.max > b.latency_info?.max
+      ? a.latency_info?.max
+      : b.latency_info?.max;
+
+  let p50 = b.latency_info?.p50;
+  let p90 = b.latency_info?.p90;
+  let p99 = b.latency_info?.p99;
+  // Use the latest value we have that is not zero.
+  if (
+    b.last_exec_timestamp < a.last_exec_timestamp &&
+    b.latency_info?.p50 != 0
+  ) {
+    p50 = a.latency_info?.p50;
+    p90 = a.latency_info?.p90;
+    p99 = a.latency_info?.p99;
+  }
+
+  return {
+    min,
+    max,
+    p50,
+    p90,
+    p99,
+  };
+}
+
 export function coalesceSensitiveInfo(
   a: protos.cockroach.sql.ISensitiveInfo,
   b: protos.cockroach.sql.ISensitiveInfo,
-) {
+): protos.cockroach.sql.ISensitiveInfo {
   return {
     last_err: a.last_err || b.last_err,
     most_recent_plan_description:
@@ -80,7 +116,7 @@ export function addMaybeUnsetNumericStat(
   return a && b ? aggregateNumericStats(a, b, countA, countB) : null;
 }
 
-export function addExecStats(a: ExecStats, b: ExecStats): Required<ExecStats> {
+export function addExecStats(a: ExecStats, b: ExecStats): ExecStats {
   let countA = FixLong(a.count).toInt();
   const countB = FixLong(b.count).toInt();
   if (countA === 0 && countB === 0) {
@@ -120,6 +156,12 @@ export function addExecStats(a: ExecStats, b: ExecStats): Required<ExecStats> {
       countA,
       countB,
     ),
+    cpu_sql_nanos: addMaybeUnsetNumericStat(
+      a.cpu_sql_nanos,
+      b.cpu_sql_nanos,
+      countA,
+      countB,
+    ),
   };
 }
 
@@ -129,6 +171,16 @@ export function addStatementStats(
 ): Required<StatementStatistics> {
   const countA = FixLong(a.count).toInt();
   const countB = FixLong(b.count).toInt();
+
+  let regions: string[] = [];
+  if (a.regions && b.regions) {
+    regions = unique(a.regions.concat(b.regions));
+  } else if (a.regions) {
+    regions = a.regions;
+  } else if (b.regions) {
+    regions = b.regions;
+  }
+
   let planGists: string[] = [];
   if (a.plan_gists && b.plan_gists) {
     planGists = unique(a.plan_gists.concat(b.plan_gists));
@@ -138,6 +190,24 @@ export function addStatementStats(
     planGists = b.plan_gists;
   }
 
+  let indexRec: string[] = [];
+  if (a.index_recommendations && b.index_recommendations) {
+    indexRec = unique(a.index_recommendations.concat(b.index_recommendations));
+  } else if (a.index_recommendations) {
+    indexRec = a.index_recommendations;
+  } else if (b.index_recommendations) {
+    indexRec = b.index_recommendations;
+  }
+
+  let indexes: string[] = [];
+  if (a.indexes && b.indexes) {
+    indexes = unique(a.indexes.concat(b.indexes));
+  } else if (a.indexes) {
+    indexes = a.indexes;
+  } else if (b.indexes) {
+    indexes = b.indexes;
+  }
+
   return {
     count: a.count.add(b.count),
     first_attempt_count: a.first_attempt_count.add(b.first_attempt_count),
@@ -145,6 +215,7 @@ export function addStatementStats(
       ? a.max_retries
       : b.max_retries,
     num_rows: aggregateNumericStats(a.num_rows, b.num_rows, countA, countB),
+    idle_lat: aggregateNumericStats(a.idle_lat, b.idle_lat, countA, countB),
     parse_lat: aggregateNumericStats(a.parse_lat, b.parse_lat, countA, countB),
     plan_lat: aggregateNumericStats(a.plan_lat, b.plan_lat, countA, countB),
     run_lat: aggregateNumericStats(a.run_lat, b.run_lat, countA, countB),
@@ -185,7 +256,12 @@ export function addStatementStats(
         ? a.last_exec_timestamp
         : b.last_exec_timestamp,
     nodes: uniqueLong([...a.nodes, ...b.nodes]),
+    regions: regions,
     plan_gists: planGists,
+    index_recommendations: indexRec,
+    indexes: indexes,
+    latency_info: aggregateLatencyInfo(a, b),
+    last_error_code: "",
   };
 }
 
@@ -301,9 +377,7 @@ export const generateStmtDetailsToID = (
         apps[i] = "";
       }
     }
-    appNames = unique(apps)
-      .sort()
-      .toString();
+    appNames = unique(apps).sort().toString();
   }
   let generatedID = fingerprintID;
   if (appNames) {
@@ -316,4 +390,8 @@ export const generateStmtDetailsToID = (
     generatedID += `/${end}`;
   }
   return generatedID;
+};
+
+export const generateTableID = (db: string, table: string): string => {
+  return `${encodeURIComponent(db)}/${encodeURIComponent(table)}`;
 };

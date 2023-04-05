@@ -29,16 +29,37 @@ import (
 // compatible dataset exists (compatible is defined as a tpch dataset with a
 // scale factor at least as large as the provided scale factor), performing an
 // expensive dataset restore only if it doesn't.
+//
+// The function disables auto stats collection and ensures that table statistics
+// are present for all TPCH tables.
 func loadTPCHDataset(
 	ctx context.Context,
 	t test.Test,
 	c cluster.Cluster,
+	db *gosql.DB,
 	sf int,
 	m cluster.Monitor,
 	roachNodes option.NodeListOption,
-) error {
-	db := c.Conn(ctx, t.L(), roachNodes[0])
-	defer db.Close()
+	disableMergeQueue bool,
+) (retErr error) {
+	_, err := db.Exec("SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;")
+	if retErr != nil {
+		return err
+	}
+	defer func() {
+		if retErr == nil {
+			if _, err = db.Exec("USE tpch"); err != nil {
+				retErr = err
+			} else {
+				createStatsFromTables(t, db, tpchTables)
+			}
+		}
+	}()
+	if disableMergeQueue {
+		if _, err := db.Exec("SET CLUSTER SETTING kv.range_merge.queue_enabled = false;"); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if _, err := db.ExecContext(ctx, `USE tpch`); err == nil {
 		t.L().Printf("found existing tpch dataset, verifying scale factor\n")
@@ -76,12 +97,18 @@ func loadTPCHDataset(
 	}
 
 	t.L().Printf("restoring tpch scale factor %d\n", sf)
+	// Lower the target size for the restore spans so that we get more ranges.
+	// This is useful to exercise the parallelism across ranges within a single
+	// query.
+	if _, err := db.ExecContext(ctx, "SET CLUSTER SETTING backup.restore_span.target_size = '64MiB';"); err != nil {
+		return err
+	}
 	tpchURL := fmt.Sprintf("gs://cockroach-fixtures/workload/tpch/scalefactor=%d/backup?AUTH=implicit", sf)
 	if _, err := db.ExecContext(ctx, `CREATE DATABASE IF NOT EXISTS tpch;`); err != nil {
 		return err
 	}
-	query := fmt.Sprintf(`RESTORE tpch.* FROM '%s' WITH into_db = 'tpch';`, tpchURL)
-	_, err := db.ExecContext(ctx, query)
+	query := fmt.Sprintf(`RESTORE tpch.* FROM '%s' WITH into_db = 'tpch', unsafe_restore_incompatible_version;`, tpchURL)
+	_, err = db.ExecContext(ctx, query)
 	return err
 }
 
@@ -98,25 +125,15 @@ func scatterTables(t test.Test, conn *gosql.DB, tableNames []string) {
 	}
 }
 
-// disableAutoStats disables automatic collection of statistics on the cluster.
-func disableAutoStats(t test.Test, conn *gosql.DB) {
-	t.Status("disabling automatic collection of stats")
-	if _, err := conn.Exec(
-		`SET CLUSTER SETTING sql.stats.automatic_collection.enabled=false;`,
-	); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// createStatsFromTables runs "CREATE STATISTICS" statement for every table in
-// tableNames. It assumes that conn is already using the target database. If an
-// error is encountered, the test is failed.
+// createStatsFromTables runs ANALYZE statement for every table in tableNames.
+// It assumes that conn is already using the target database. If an error is
+// encountered, the test is failed.
 func createStatsFromTables(t test.Test, conn *gosql.DB, tableNames []string) {
 	t.Status("collecting stats")
 	for _, tableName := range tableNames {
 		t.Status(fmt.Sprintf("creating statistics from table %q", tableName))
 		if _, err := conn.Exec(
-			fmt.Sprintf(`CREATE STATISTICS %s FROM %s;`, tableName, tableName),
+			fmt.Sprintf(`ANALYZE %s;`, tableName),
 		); err != nil {
 			t.Fatal(err)
 		}

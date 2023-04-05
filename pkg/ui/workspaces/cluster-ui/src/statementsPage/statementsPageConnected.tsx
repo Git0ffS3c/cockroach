@@ -15,8 +15,14 @@ import { Dispatch } from "redux";
 import { AppState, uiConfigActions } from "src/store";
 import { actions as statementDiagnosticsActions } from "src/store/statementDiagnostics";
 import { actions as analyticsActions } from "src/store/analytics";
-import { actions as localStorageActions } from "src/store/localStorage";
+import {
+  actions as localStorageActions,
+  updateStmtsPageLimitAction,
+  updateStmsPageReqSortAction,
+} from "src/store/localStorage";
 import { actions as sqlStatsActions } from "src/store/sqlStats";
+import { actions as databasesListActions } from "src/store/databasesList";
+import { actions as nodesActions } from "../store/nodes";
 import {
   StatementsPageDispatchProps,
   StatementsPageStateProps,
@@ -26,52 +32,55 @@ import {
   selectDatabases,
   selectLastReset,
   selectStatements,
+  selectStatementsDataValid,
+  selectStatementsDataInFlight,
   selectStatementsLastError,
   selectTotalFingerprints,
   selectColumns,
-  selectTimeScale,
   selectSortSetting,
   selectFilters,
   selectSearch,
+  selectStatementsLastUpdated,
 } from "./statementsPage.selectors";
+import {
+  selectTimeScale,
+  selectStmtsPageLimit,
+  selectStmtsPageReqSort,
+} from "../store/utils/selectors";
 import {
   selectIsTenant,
   selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
 } from "../store/uiConfig";
 import { nodeRegionsByIDSelector } from "../store/nodes";
 import { StatementsRequest } from "src/api/statementsApi";
 import { TimeScale } from "../timeScaleDropdown";
-import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
 import {
   StatementsPageRoot,
   StatementsPageRootProps,
 } from "./statementsPageRoot";
 import {
-  ActiveStatementsViewDispatchProps,
-  ActiveStatementsViewStateProps,
-} from "./activeStatementsView";
+  RecentStatementsViewDispatchProps,
+  RecentStatementsViewStateProps,
+} from "./recentStatementsView";
 import {
-  mapDispatchToActiveStatementsPageProps,
-  mapStateToActiveStatementsPageProps,
-} from "./activeStatementsPage.selectors";
-
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
-type IDuration = google.protobuf.IDuration;
-
-const CreateStatementDiagnosticsReportRequest =
-  cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
-
-const CancelStatementDiagnosticsReportRequest =
-  cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest;
+  mapDispatchToRecentStatementsPageProps,
+  mapStateToRecentStatementsPageProps,
+} from "./recentStatementsPage.selectors";
+import {
+  InsertStmtDiagnosticRequest,
+  StatementDiagnosticsReport,
+  SqlStatsSortType,
+} from "../api";
 
 type StateProps = {
   fingerprintsPageProps: StatementsPageStateProps & RouteComponentProps;
-  activePageProps: ActiveStatementsViewStateProps;
+  activePageProps: RecentStatementsViewStateProps;
 };
 
 type DispatchProps = {
   fingerprintsPageProps: StatementsPageDispatchProps;
-  activePageProps: ActiveStatementsViewDispatchProps;
+  activePageProps: RecentStatementsViewDispatchProps;
 };
 
 export const ConnectedStatementsPage = withRouter(
@@ -91,20 +100,27 @@ export const ConnectedStatementsPage = withRouter(
         filters: selectFilters(state),
         isTenant: selectIsTenant(state),
         hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+        hasAdminRole: selectHasAdminRole(state),
         lastReset: selectLastReset(state),
-        nodeRegions: selectIsTenant(state)
-          ? {}
-          : nodeRegionsByIDSelector(state),
+        nodeRegions: nodeRegionsByIDSelector(state),
         search: selectSearch(state),
         sortSetting: selectSortSetting(state),
         statements: selectStatements(state, props),
+        isDataValid: selectStatementsDataValid(state),
+        isReqInFlight: selectStatementsDataInFlight(state),
+        lastUpdated: selectStatementsLastUpdated(state),
         statementsError: selectStatementsLastError(state),
         totalFingerprints: selectTotalFingerprints(state),
+        limit: selectStmtsPageLimit(state),
+        reqSortSetting: selectStmtsPageReqSort(state),
+        stmtsTotalRuntimeSecs:
+          state.adminUI?.statements?.data?.stmts_total_runtime_secs ?? 0,
       },
-      activePageProps: mapStateToActiveStatementsPageProps(state),
+      activePageProps: mapStateToRecentStatementsPageProps(state),
     }),
     (dispatch: Dispatch) => ({
       fingerprintsPageProps: {
+        refreshDatabases: () => dispatch(databasesListActions.refresh()),
         refreshStatements: (req: StatementsRequest) =>
           dispatch(sqlStatsActions.refresh(req)),
         onTimeScaleChange: (ts: TimeScale) => {
@@ -116,10 +132,10 @@ export const ConnectedStatementsPage = withRouter(
         },
         refreshStatementDiagnosticsRequests: () =>
           dispatch(statementDiagnosticsActions.refresh()),
+        refreshNodes: () => dispatch(nodesActions.refresh()),
         refreshUserSQLRoles: () =>
           dispatch(uiConfigActions.refreshUserSQLRoles()),
-        resetSQLStats: (req: StatementsRequest) =>
-          dispatch(sqlStatsActions.reset(req)),
+        resetSQLStats: () => dispatch(sqlStatsActions.reset()),
         dismissAlertMessage: () =>
           dispatch(
             localStorageActions.update({
@@ -128,17 +144,11 @@ export const ConnectedStatementsPage = withRouter(
             }),
           ),
         onActivateStatementDiagnostics: (
-          statementFingerprint: string,
-          minExecLatency: IDuration,
-          expiresAfter: IDuration,
+          insertStmtDiagnosticsRequest: InsertStmtDiagnosticRequest,
         ) => {
           dispatch(
             statementDiagnosticsActions.createReport(
-              new CreateStatementDiagnosticsReportRequest({
-                statement_fingerprint: statementFingerprint,
-                min_execution_latency: minExecLatency,
-                expires_after: expiresAfter,
-              }),
+              insertStmtDiagnosticsRequest,
             ),
           );
           dispatch(
@@ -150,7 +160,7 @@ export const ConnectedStatementsPage = withRouter(
           );
         },
         onSelectDiagnosticsReportDropdownOption: (
-          report: IStatementDiagnosticsReport,
+          report: StatementDiagnosticsReport,
         ) => {
           if (report.completed) {
             dispatch(
@@ -162,11 +172,9 @@ export const ConnectedStatementsPage = withRouter(
             );
           } else {
             dispatch(
-              statementDiagnosticsActions.cancelReport(
-                new CancelStatementDiagnosticsReportRequest({
-                  request_id: report.id,
-                }),
-              ),
+              statementDiagnosticsActions.cancelReport({
+                requestId: report.id,
+              }),
             );
             dispatch(
               analyticsActions.track({
@@ -196,7 +204,7 @@ export const ConnectedStatementsPage = withRouter(
             analyticsActions.track({
               name: "Filter Clicked",
               page: "Statements",
-              filterName: "app",
+              filterName: "filters",
               value: value.toString(),
             }),
           );
@@ -246,8 +254,22 @@ export const ConnectedStatementsPage = withRouter(
                 selectedColumns.length === 0 ? " " : selectedColumns.join(","),
             }),
           ),
+        onChangeLimit: (limit: number) =>
+          dispatch(updateStmtsPageLimitAction(limit)),
+        onChangeReqSort: (sort: SqlStatsSortType) =>
+          dispatch(updateStmsPageReqSortAction(sort)),
+        onApplySearchCriteria: (ts: TimeScale, limit: number, sort: string) =>
+          dispatch(
+            analyticsActions.track({
+              name: "Apply Search Criteria",
+              page: "Statements",
+              tsValue: ts.key,
+              limitValue: limit,
+              sortValue: sort,
+            }),
+          ),
       },
-      activePageProps: mapDispatchToActiveStatementsPageProps(dispatch),
+      activePageProps: mapDispatchToRecentStatementsPageProps(dispatch),
     }),
     (stateProps, dispatchProps) => ({
       fingerprintsPageProps: {

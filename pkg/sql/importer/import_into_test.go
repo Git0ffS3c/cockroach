@@ -57,7 +57,12 @@ func TestProtectedTimestampsDuringImportInto(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	args := base.TestClusterArgs{}
+	args := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			//  Test hangs within a test tenant. More investigation is required.
+			DefaultTestTenant: base.TestTenantDisabled,
+		},
+	}
 	tc := testcluster.StartTestCluster(t, 1, args)
 	defer tc.Stopper().Stop(ctx)
 
@@ -115,11 +120,12 @@ func TestProtectedTimestampsDuringImportInto(t *testing.T) {
 
 	time.Sleep(3 * time.Second) // Wait for the data to definitely be expired and GC to run.
 	gcTable := func(skipShouldQueue bool) (traceStr string) {
-		rows := runner.Query(t, "SELECT start_key"+
-			" FROM crdb_internal.ranges_no_leases"+
-			" WHERE table_name = $1"+
-			" AND database_name = current_database()"+
-			" ORDER BY start_key ASC", "foo")
+		// Note: we cannot use SHOW RANGES FROM TABLE here because 'foo'
+		// is being imported and is not ready yet.
+		rows := runner.Query(t, `
+SELECT raw_start_key
+FROM [SHOW RANGES FROM TABLE foo WITH KEYS]
+ORDER BY raw_start_key ASC`)
 		var traceBuf strings.Builder
 		for rows.Next() {
 			var startKey roachpb.Key
@@ -129,7 +135,7 @@ func TestProtectedTimestampsDuringImportInto(t *testing.T) {
 			require.NoError(t, err)
 			lhServer := tc.Server(int(l.Replica.NodeID) - 1)
 			s, repl := getFirstStoreReplica(t, lhServer, startKey)
-			trace, _, err := s.ManuallyEnqueue(ctx, "mvccGC", repl, skipShouldQueue)
+			trace, _, err := s.Enqueue(ctx, "mvccGC", repl, skipShouldQueue, false /* async */)
 			require.NoError(t, err)
 			fmt.Fprintf(&traceBuf, "%s\n", trace.String())
 		}

@@ -45,16 +45,33 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/trace"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
+
 	// maxRecordedSpansPerTrace limits the number of spans per recording, keeping
 	// recordings from getting too large.
 	maxRecordedSpansPerTrace = 1000
-	// maxRecordedBytesPerSpan limits the size of logs and structured in a span;
-	// use a comfortable limit.
-	maxLogBytesPerSpan        = 256 * (1 << 10) // 256 KiB
-	maxStructuredBytesPerSpan = 10 * (1 << 10)  // 10 KiB
+	// maxRecordedBytesPerSpan limits the size of unstructured logs in a span.
+	maxLogBytesPerSpan = 256 * (1 << 10) // 256 KiB
+	// maxStructuredBytesPerSpan limits the size of structured logs in a span.
+	// This limit applies to records directly logged into the span; it does not
+	// apply to records in child span (including structured records copied from
+	// the child into the parent when the child is dropped because of the number
+	// of spans limit).
+	// See also maxStructuredBytesPerTrace.
+	maxStructuredBytesPerSpan = 10 * (1 << 10) // 10 KiB
+	// maxStructuredBytesPerTrace limits the total size of structured logs in a
+	// trace recording, across all spans. This limit is enforced at the time when
+	// a span is finished and its recording is copied to the parent, and at the
+	// time when an open span's recording is collected - which calls into all its
+	// open children. Thus, if there are multiple open spans that are part of the
+	// same trace, each one of them can temporarily have up to
+	// maxStructuredBytesPerTrace worth of messages under it. Each open span is
+	// also subject to the maxStructuredBytesPerSpan limit.
+	maxStructuredBytesPerTrace = 1 << 20 // 1 MiB
+
 	// maxSpanRegistrySize limits the number of local root spans tracked in
 	// a Tracer's registry.
 	maxSpanRegistrySize = 5000
@@ -63,7 +80,8 @@ const (
 	maxLogsPerSpanExternal = 1000
 	// maxSnapshots limits the number of snapshots that a Tracer will hold in
 	// memory. Beyond this limit, each new snapshot evicts the oldest one.
-	maxSnapshots = 10
+	maxSnapshots          = 10
+	maxAutomaticSnapshots = 20 // TODO(dt): make this a setting
 )
 
 // These constants are used to form keys to represent tracing context
@@ -81,16 +99,7 @@ const (
 	fieldNameOtelTraceID = prefixTracerState + "otel_traceid"
 	fieldNameOtelSpanID  = prefixTracerState + "otel_spanid"
 
-	// fieldNameDeprecatedVerboseTracing is the carrier key indicating that the trace
-	// has verbose recording enabled. It means that a) spans derived from this one
-	// will not be no-op spans and b) they will start recording.
-	//
-	// The key is named the way it is for backwards compatibility reasons.
-	// TODO(andrei): remove in 22.2, once we no longer need to set this key for
-	// compatibility with 21.2.
-	fieldNameDeprecatedVerboseTracing = "crdb-baggage-sb"
-
-	spanKindTagKey = "span.kind"
+	SpanKindTagKey = "span.kind"
 )
 
 // TODO(davidh): Once performance issues around redaction are
@@ -172,6 +181,14 @@ var EnableActiveSpansRegistry = settings.RegisterBoolSetting(
 	"trace.span_registry.enabled",
 	"if set, ongoing traces can be seen at https://<ui>/#/debug/tracez",
 	envutil.EnvOrDefaultBool("COCKROACH_REAL_SPANS", true),
+).WithPublic()
+
+var periodicSnapshotInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"trace.snapshot.rate",
+	"if non-zero, interval at which background trace snapshots are captured",
+	0,
+	settings.NonNegativeDuration,
 ).WithPublic()
 
 // panicOnUseAfterFinish, if set, causes use of a span after Finish() to panic
@@ -256,12 +273,12 @@ var spanReusePercent = util.ConstantWithMetamorphicTestRange(
 
 // Tracer implements tracing requests. It supports:
 //
-//  - forwarding events to x/net/trace instances
+//   - forwarding events to x/net/trace instances
 //
-//  - recording traces. Recorded events can be retrieved at any time.
+//   - recording traces. Recorded events can be retrieved at any time.
 //
-//  - OpenTelemetry tracing. This is implemented by maintaining a "shadow"
-//    OpenTelemetry Span inside each of our spans.
+//   - OpenTelemetry tracing. This is implemented by maintaining a "shadow"
+//     OpenTelemetry Span inside each of our spans.
 //
 // Even when tracing is disabled, we still use this Tracer (with x/net/trace and
 // lightstep disabled) because of its recording capability (verbose tracing needs
@@ -275,12 +292,6 @@ type Tracer struct {
 	// x/net/trace or OpenTelemetry and we are not recording.
 	noopSpan        *Span
 	sterileNoopSpan *Span
-
-	// backardsCompatibilityWith211, if set, makes the Tracer
-	// work with 21.1 remote nodes.
-	//
-	// Accessed atomically.
-	backwardsCompatibilityWith211 int64
 
 	// True if tracing to the debug/requests endpoint. Accessed via t.useNetTrace().
 	_useNetTrace int32 // updated atomically
@@ -311,7 +322,8 @@ type Tracer struct {
 		// snapshots stores the activeSpansRegistry snapshots taken during the
 		// Tracer's lifetime. The ring buffer will contain snapshots with contiguous
 		// IDs, from the oldest one to <oldest id> + maxSnapshots - 1.
-		snapshots ring.Buffer // snapshotWithID
+		snapshots     ring.Buffer[snapshotWithID]
+		autoSnapshots ring.Buffer[snapshotWithID]
 	}
 
 	testingMu               syncutil.Mutex // protects testingRecordAsyncSpans
@@ -380,6 +392,13 @@ type Tracer struct {
 type SpanRegistry struct {
 	mu struct {
 		syncutil.Mutex
+		// m stores all the currently open spans. Note that a span being present
+		// here proves that the corresponding Span.Finish() call has not yet
+		// completed (but crdbSpan.Finish() might have finished), therefor the span
+		// cannot be reused while present in the registry. At the same time, note
+		// that Span.Finish() can be called on these spans so, when using one of
+		// these spans, we need to be prepared for that use to be concurrent with
+		// the Finish() call.
 		m map[tracingpb.SpanID]*crdbSpan
 	}
 }
@@ -449,20 +468,17 @@ func (r *SpanRegistry) VisitRoots(visitor func(span RegistrySpan) error) error {
 
 	for _, sp := range spans {
 		if err := visitor(sp.Span.i.crdb); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil
 }
 
-// visitTrace recursively calls the visitor on sp and all its descedents.
-func visitTrace(sp *Span, visitor func(sp RegistrySpan)) {
-	visitor(sp.i.crdb)
-	sp.visitOpenChildren(func(sp *Span) {
-		visitTrace(sp, visitor)
+// visitTrace recursively calls the visitor on sp and all its descendants.
+func visitTrace(sp *crdbSpan, visitor func(sp RegistrySpan)) {
+	visitor(sp)
+	sp.visitOpenChildren(func(child *crdbSpan) {
+		visitTrace(child, visitor)
 	})
 }
 
@@ -487,7 +503,7 @@ func (r *SpanRegistry) VisitSpans(visitor func(span RegistrySpan)) {
 	}()
 
 	for _, sp := range spans {
-		visitTrace(sp.Span, visitor)
+		visitTrace(sp.Span.i.crdb, visitor)
 	}
 }
 
@@ -616,6 +632,7 @@ func NewTracer() *Tracer {
 				sp:     sp,
 			}
 			sp.i.crdb = c
+			h.childrenMetadataAlloc = make(map[string]tracingpb.OperationMetadata)
 			return h
 		},
 	}
@@ -960,12 +977,13 @@ type spanAllocHelper struct {
 	// Pre-allocated buffers for the span.
 	tagsAlloc             [3]attribute.KeyValue
 	childrenAlloc         [4]childRef
-	structuredEventsAlloc [3]interface{}
+	structuredEventsAlloc [3]*tracingpb.StructuredRecord
+	childrenMetadataAlloc map[string]tracingpb.OperationMetadata
 }
 
 // newSpan allocates a span using the Tracer's sync.Pool. A span that was
 // previously Finish()ed be returned if the Tracer is configured for Span reuse.
-//+(...) must be called on the returned span before further use.
+// +(...) must be called on the returned span before further use.
 func (t *Tracer) newSpan(
 	traceID tracingpb.TraceID,
 	spanID tracingpb.SpanID,
@@ -973,6 +991,7 @@ func (t *Tracer) newSpan(
 	goroutineID uint64,
 	startTime time.Time,
 	logTags *logtags.Buffer,
+	eventListeners []EventListener,
 	kind oteltrace.SpanKind,
 	otelSpan oteltrace.Span,
 	netTr trace.Trace,
@@ -984,7 +1003,7 @@ func (t *Tracer) newSpan(
 	h := t.spanPool.Get().(*spanAllocHelper)
 	h.span.reset(
 		traceID, spanID, operation, goroutineID,
-		startTime, logTags, kind,
+		startTime, logTags, eventListeners, kind,
 		otelSpan, netTr, sterile)
 	return &h.span
 }
@@ -1012,13 +1031,15 @@ func (t *Tracer) releaseSpanToPool(sp *Span) {
 	// We'll zero-out the spanAllocHelper, though, to make all the elements
 	// available for GC.
 	c := sp.i.crdb
+	c.eventListeners = nil
 	// Nobody is supposed to have a reference to the span at this point, but let's
 	// take the lock anyway to protect against buggy clients accessing the span
 	// after Finish().
 	c.mu.Lock()
 	c.mu.openChildren = nil
-	c.mu.recording.finishedChildren = nil
+	c.mu.recording.finishedChildren = Trace{}
 	c.mu.tags = nil
+	c.mu.lazyTags = nil
 	c.mu.recording.logs.Discard()
 	c.mu.recording.structured.Discard()
 	c.mu.Unlock()
@@ -1028,7 +1049,10 @@ func (t *Tracer) releaseSpanToPool(sp *Span) {
 	h := sp.helper
 	h.tagsAlloc = [3]attribute.KeyValue{}
 	h.childrenAlloc = [4]childRef{}
-	h.structuredEventsAlloc = [3]interface{}{}
+	h.structuredEventsAlloc = [3]*tracingpb.StructuredRecord{}
+	for op := range h.childrenMetadataAlloc {
+		delete(h.childrenMetadataAlloc, op)
+	}
 
 	release := true
 	if fn := t.testing.ReleaseSpanToPool; fn != nil {
@@ -1082,14 +1106,17 @@ func (t *Tracer) startSpanGeneric(
 	}
 
 	if !opts.Parent.empty() {
-		// If we don't panic, opts.Parent will be moved into the child, and this
-		// release() will be a no-op.
-		defer opts.Parent.release()
+		if !opts.Parent.IsNoop() {
+			// If we don't panic, opts.Parent will be moved into the child, and this
+			// release() will be a no-op.
+			// Note that we can't call release() on a no-op span.
+			defer opts.Parent.release()
+		}
 
 		if !opts.RemoteParent.Empty() {
 			panic("can't specify both Parent and RemoteParent")
 		}
-		if opts.Parent.IsSterile() {
+		if opts.Parent.i.sterile {
 			// A sterile parent should have been optimized away by
 			// WithParent.
 			panic("invalid sterile parent")
@@ -1112,7 +1139,6 @@ child operation: %s, tracer created at:
 		}
 		if opts.Parent.IsNoop() {
 			// If the parent is a no-op, we'll create a root span.
-			opts.Parent.decRef()
 			opts.Parent = spanRef{}
 		}
 	}
@@ -1120,7 +1146,7 @@ child operation: %s, tracer created at:
 	// Are we tracing everything, or have a parent, or want a real span, or were
 	// asked for a recording? Then we create a real trace span. In all other
 	// cases, a noop span will do.
-	if !(t.AlwaysTrace() || opts.parentTraceID() != 0 || opts.ForceRealSpan || opts.recordingType() != RecordingOff) {
+	if !(t.AlwaysTrace() || opts.parentTraceID() != 0 || opts.ForceRealSpan || opts.recordingType() != tracingpb.RecordingOff) {
 		if !opts.Sterile {
 			return maybeWrapCtx(ctx, t.noopSpan)
 		}
@@ -1139,7 +1165,7 @@ child operation: %s, tracer created at:
 		opts.LogTags = opts.Parent.i.crdb.logTags
 	}
 
-	startTime := time.Now()
+	startTime := timeutil.Now()
 
 	// First, create any external spans that we may need (OpenTelemetry, net/trace).
 	// We do this early so that they are available when we construct the main Span,
@@ -1182,11 +1208,10 @@ child operation: %s, tracer created at:
 
 	s := t.newSpan(
 		traceID, spanID, opName, uint64(goid.Get()),
-		startTime, opts.LogTags, opts.SpanKind,
+		startTime, opts.LogTags, opts.EventListeners, opts.SpanKind,
 		otelSpan, netTr, opts.Sterile)
 
-	s.i.crdb.enableRecording(opts.recordingType())
-
+	s.i.crdb.SetRecordingType(opts.recordingType())
 	s.i.crdb.parentSpanID = opts.parentSpanID()
 
 	var localRoot bool
@@ -1196,7 +1221,7 @@ child operation: %s, tracer created at:
 		// activeSpansRegistry indirectly through this link. If the parent is
 		// recording, it will also use this link to collect the child's recording.
 		//
-		// NB: (!opts.Parent.empty() && opts.Parent.i.crdb == nil) is not possible at
+		// NB: (!opts.Parent.Empty() && opts.Parent.i.crdb == nil) is not possible at
 		// the moment, but let's not rely on that.
 		if !opts.Parent.empty() && opts.Parent.i.crdb != nil {
 
@@ -1221,6 +1246,7 @@ child operation: %s, tracer created at:
 					// parent of the child finish). Note that some methods on opts cannot
 					// be used from this moment on.
 					s.i.crdb.mu.parent = opts.Parent.move()
+					s.i.crdb.mu.recording.notifyParentOnStructuredEvent = parent.wantEventNotificationsLocked()
 				} else {
 					// The parent has already finished, so make this "child" a root.
 					localRoot = true
@@ -1275,7 +1301,7 @@ func (c MapCarrier) ForEach(fn func(key, val string) error) error {
 func (t *Tracer) InjectMetaInto(sm SpanMeta, carrier Carrier) {
 	if sm.Empty() {
 		// Fast path when tracing is disabled. ExtractMetaFrom will accept an
-		// empty map as a noop context.
+		// Empty map as a noop context.
 		return
 	}
 	// If the span has been marked as not wanting children, we don't propagate any
@@ -1290,23 +1316,9 @@ func (t *Tracer) InjectMetaInto(sm SpanMeta, carrier Carrier) {
 		carrier.Set(fieldNameOtelSpanID, sm.otelCtx.SpanID().String())
 	}
 
-	compatMode := atomic.LoadInt64(&t.backwardsCompatibilityWith211) == 1
-
-	// For compatibility with 21.1, we don't want to propagate the traceID when
-	// we're not recording. A 21.1 node interprets a traceID as wanting structured
-	// recording (or verbose recording if fieldNameDeprecatedVerboseTracing is also
-	// set).
-	if compatMode && sm.recordingType == RecordingOff {
-		return
-	}
-
 	carrier.Set(fieldNameTraceID, strconv.FormatUint(uint64(sm.traceID), 16))
 	carrier.Set(fieldNameSpanID, strconv.FormatUint(uint64(sm.spanID), 16))
 	carrier.Set(fieldNameRecordingType, sm.recordingType.ToCarrierValue())
-
-	if compatMode && sm.recordingType == RecordingVerbose {
-		carrier.Set(fieldNameDeprecatedVerboseTracing, "1")
-	}
 }
 
 var noopSpanMeta = SpanMeta{}
@@ -1320,7 +1332,7 @@ func (t *Tracer) ExtractMetaFrom(carrier Carrier) (SpanMeta, error) {
 	var otelTraceID oteltrace.TraceID
 	var otelSpanID oteltrace.SpanID
 	var recordingTypeExplicit bool
-	var recordingType RecordingType
+	var recordingType tracingpb.RecordingType
 
 	iterFn := func(k, v string) error {
 		switch k = strings.ToLower(k); k {
@@ -1352,12 +1364,7 @@ func (t *Tracer) ExtractMetaFrom(carrier Carrier) (SpanMeta, error) {
 			}
 		case fieldNameRecordingType:
 			recordingTypeExplicit = true
-			recordingType = RecordingTypeFromCarrierValue(v)
-		case fieldNameDeprecatedVerboseTracing:
-			// Compatibility with 21.2.
-			if !recordingTypeExplicit {
-				recordingType = RecordingVerbose
-			}
+			recordingType = tracingpb.RecordingTypeFromCarrierValue(v)
 		}
 		return nil
 	}
@@ -1369,7 +1376,7 @@ func (t *Tracer) ExtractMetaFrom(carrier Carrier) (SpanMeta, error) {
 		if err := c.ForEach(iterFn); err != nil {
 			return noopSpanMeta, err
 		}
-	case metadataCarrier:
+	case MetadataCarrier:
 		if err := c.ForEach(iterFn); err != nil {
 			return noopSpanMeta, err
 		}
@@ -1381,11 +1388,11 @@ func (t *Tracer) ExtractMetaFrom(carrier Carrier) (SpanMeta, error) {
 		return noopSpanMeta, nil
 	}
 
-	if !recordingTypeExplicit && recordingType == RecordingOff {
+	if !recordingTypeExplicit && recordingType == tracingpb.RecordingOff {
 		// A 21.1 node (or a 21.2 mode running in backwards-compatibility mode)
 		// that passed a TraceID but not fieldNameDeprecatedVerboseTracing wants the
 		// structured events.
-		recordingType = RecordingStructured
+		recordingType = tracingpb.RecordingStructured
 	}
 
 	var otelCtx oteltrace.SpanContext
@@ -1406,6 +1413,9 @@ func (t *Tracer) ExtractMetaFrom(carrier Carrier) (SpanMeta, error) {
 }
 
 // RegistrySpan is the interface used by clients of the active span registry.
+//
+// Note that RegistrySpans can be Finish()ed concurrently with their use, so all
+// methods must work with concurrent Finish() calls.
 type RegistrySpan interface {
 	// TraceID returns the id of the trace that this span is part of.
 	TraceID() tracingpb.TraceID
@@ -1419,15 +1429,15 @@ type RegistrySpan interface {
 	// WithDetachedRecording option. In other situations, the recording of such
 	// children is not included in the parent's recording but, in the case of the
 	// span registry, we want as much information as possible to be included.
-	GetFullRecording(recType RecordingType) Recording
+	GetFullRecording(recType tracingpb.RecordingType) Trace
 
 	// SetRecordingType sets the recording mode of the span and its children,
 	// recursively. Setting it to RecordingOff disables further recording.
 	// Everything recorded so far remains in memory.
-	SetRecordingType(to RecordingType)
+	SetRecordingType(to tracingpb.RecordingType)
 
 	// RecordingType returns the span's current recording type.
-	RecordingType() RecordingType
+	RecordingType() tracingpb.RecordingType
 }
 
 var _ RegistrySpan = &crdbSpan{}
@@ -1472,15 +1482,6 @@ func (t *Tracer) ShouldRecordAsyncSpans() bool {
 	return t.testingRecordAsyncSpans
 }
 
-// SetBackwardsCompatibilityWith211 toggles the compatibility mode.
-func (t *Tracer) SetBackwardsCompatibilityWith211(to bool) {
-	if to {
-		atomic.StoreInt64(&t.backwardsCompatibilityWith211, 1)
-	} else {
-		atomic.StoreInt64(&t.backwardsCompatibilityWith211, 0)
-	}
-}
-
 // PanicOnUseAfterFinish returns true if the Tracer is configured to crash when
 // a Span is used after it was previously Finish()ed. Crashing is supposed to be
 // best-effort as, in the future, reliably detecting use-after-Finish might not
@@ -1510,6 +1511,13 @@ func (t *Tracer) TestingGetStatsAndReset() (int, int) {
 	return int(created), int(allocs)
 }
 
+func (t *Tracer) now() time.Time {
+	if clock := t.testing.Clock; clock != nil {
+		return clock.Now()
+	}
+	return timeutil.Now()
+}
+
 // ForkSpan forks the current span, if any[1]. Forked spans "follow from" the
 // original, and are typically used to trace operations that may outlive the
 // parent (think async tasks). See the package-level documentation for more
@@ -1524,7 +1532,8 @@ func (t *Tracer) TestingGetStatsAndReset() (int, int) {
 //
 // [1]: Looking towards the provided context to see if one exists.
 // [2]: Unless configured differently by tests, see
-//      TestingRecordAsyncSpans.
+//
+//	TestingRecordAsyncSpans.
 func ForkSpan(ctx context.Context, opName string) (context.Context, *Span) {
 	sp := SpanFromContext(ctx)
 	if sp == nil {
@@ -1603,11 +1612,11 @@ func EnsureChildSpan(
 // Recording.String(). Tests can also use FindMsgInRecording().
 func ContextWithRecordingSpan(
 	ctx context.Context, tr *Tracer, opName string,
-) (_ context.Context, finishAndGetRecording func() Recording) {
-	ctx, sp := tr.StartSpanCtx(ctx, opName, WithRecording(RecordingVerbose))
-	var rec Recording
+) (_ context.Context, finishAndGetRecording func() tracingpb.Recording) {
+	ctx, sp := tr.StartSpanCtx(ctx, opName, WithRecording(tracingpb.RecordingVerbose))
+	var rec tracingpb.Recording
 	return ctx,
-		func() Recording {
+		func() tracingpb.Recording {
 			if rec != nil {
 				return rec
 			}
@@ -1617,7 +1626,7 @@ func ContextWithRecordingSpan(
 }
 
 // makeOtelSpan creates an OpenTelemetry span. If either of localParent or
-// remoteParent are not empty, the returned span will be a child of that parent.
+// remoteParent are not Empty, the returned span will be a child of that parent.
 //
 // End() needs to be called on the returned span once the span is complete.
 func makeOtelSpan(
@@ -1658,4 +1667,57 @@ func makeOtelSpan(
 
 	_ /* ctx */, sp := otelTr.Start(ctx, opName, opts...)
 	return sp
+}
+
+// MetadataCarrier is an implementation of the Carrier interface for gRPC
+// metadata.
+type MetadataCarrier struct {
+	metadata.MD
+}
+
+// Set implements the Carrier interface.
+func (w MetadataCarrier) Set(key, val string) {
+	// The GRPC HPACK implementation rejects any uppercase keys here.
+	//
+	// As such, since the HTTP_HEADERS format is case-insensitive anyway, we
+	// blindly lowercase the key.
+	key = strings.ToLower(key)
+	w.MD[key] = append(w.MD[key], val)
+}
+
+// ForEach implements the Carrier interface.
+func (w MetadataCarrier) ForEach(fn func(key, val string) error) error {
+	for k, vals := range w.MD {
+		for _, v := range vals {
+			if err := fn(k, v); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// SpanInclusionFuncForClient is used as a SpanInclusionFunc for the client-side
+// of RPCs, deciding for which operations the gRPC tracing interceptor should
+// create a span.
+//
+// We use this to circumvent the interceptor's work when tracing is
+// disabled. Otherwise, the interceptor causes an increase in the
+// number of packets (even with an Empty context!).
+//
+// See #17177.
+func SpanInclusionFuncForClient(parent *Span) bool {
+	return parent != nil && !parent.IsNoop()
+}
+
+// SpanInclusionFuncForServer is used as a SpanInclusionFunc for the server-side
+// of RPCs, deciding for which operations the gRPC tracing interceptor should
+// create a span.
+func SpanInclusionFuncForServer(t *Tracer, spanMeta SpanMeta) bool {
+	// If there is an incoming trace on the RPC (spanMeta) or the tracer is
+	// configured to always trace, return true. The second part is particularly
+	// useful for calls coming through the HTTP->RPC gateway (i.e. the AdminUI),
+	// where client is never tracing.
+	return !spanMeta.Empty() || t.AlwaysTrace()
 }

@@ -15,16 +15,17 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/scmutationexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
 // Dependencies contains all the dependencies required by the executor.
@@ -33,16 +34,20 @@ type Dependencies interface {
 	Clock() scmutationexec.Clock
 	TransactionalJobRegistry() TransactionalJobRegistry
 	IndexBackfiller() Backfiller
-	BackfillProgressTracker() BackfillTracker
+	IndexMerger() Merger
+	BackfillProgressTracker() BackfillerTracker
 	PeriodicProgressFlusher() PeriodicProgressFlusher
-	IndexValidator() IndexValidator
+	Validator() Validator
 	IndexSpanSplitter() IndexSpanSplitter
-	EventLogger() EventLogger
 	DescriptorMetadataUpdater(ctx context.Context) DescriptorMetadataUpdater
+	StatsRefresher() StatsRefreshQueue
+	GetTestingKnobs() *TestingKnobs
+	Telemetry() Telemetry
 
 	// Statements returns the statements behind this schema change.
 	Statements() []string
 	User() username.SQLUsername
+	ClusterSettings() *cluster.Settings
 }
 
 // Catalog encapsulates the catalog-related dependencies for the executor.
@@ -50,34 +55,7 @@ type Dependencies interface {
 // changes.
 type Catalog interface {
 	scmutationexec.NameResolver
-	scmutationexec.SyntheticDescriptors
-
-	// MustReadImmutableDescriptors reads descriptors from the catalog by ID.
-	MustReadImmutableDescriptors(ctx context.Context, ids ...descpb.ID) ([]catalog.Descriptor, error)
-
-	// MustReadMutableDescriptor the mutable equivalent to
-	// MustReadImmutableDescriptors.
-	MustReadMutableDescriptor(ctx context.Context, id descpb.ID) (catalog.MutableDescriptor, error)
-
-	// NewCatalogChangeBatcher is equivalent to creating a new kv.Batch for the
-	// current kv.Txn.
-	NewCatalogChangeBatcher() CatalogChangeBatcher
-}
-
-// EventLogger encapsulates the operations for emitting event log entries.
-type EventLogger interface {
-	// LogEvent writes to the eventlog.
-	LogEvent(
-		ctx context.Context,
-		descID descpb.ID,
-		details eventpb.CommonSQLEventDetails,
-		event eventpb.EventPayload,
-	) error
-}
-
-// CatalogChangeBatcher encapsulates batched updates to the catalog: descriptor
-// updates, namespace operations, etc.
-type CatalogChangeBatcher interface {
+	scmutationexec.DescriptorReader
 
 	// CreateOrUpdateDescriptor upserts a descriptor.
 	CreateOrUpdateDescriptor(ctx context.Context, desc catalog.MutableDescriptor) error
@@ -88,11 +66,38 @@ type CatalogChangeBatcher interface {
 	// DeleteDescriptor deletes a descriptor entry.
 	DeleteDescriptor(ctx context.Context, id descpb.ID) error
 
-	// ValidateAndRun executes the updates after validating the catalog changes.
-	ValidateAndRun(ctx context.Context) error
-
 	// DeleteZoneConfig deletes the zone config for a descriptor.
 	DeleteZoneConfig(ctx context.Context, id descpb.ID) error
+
+	// UpdateComment upserts a comment for the (objID, subID, cmtType) key.
+	UpdateComment(
+		ctx context.Context, key catalogkeys.CommentKey, cmt string,
+	) error
+
+	// DeleteComment deletes a comment with (objID, subID, cmtType) key.
+	DeleteComment(
+		ctx context.Context, key catalogkeys.CommentKey,
+	) error
+
+	// Validate validates all the uncommitted catalog changes performed
+	// in this transaction so far.
+	Validate(ctx context.Context) error
+
+	// Run persists all the uncommitted catalog changes performed in this
+	// transaction so far. Reset cannot be called after this method.
+	Run(ctx context.Context) error
+
+	// Reset undoes all the uncommitted catalog changes performed in this
+	// transaction so far, assuming that they haven't been persisted yet
+	// by calling Run.
+	Reset(ctx context.Context) error
+}
+
+// Telemetry encapsulates metrics gather for the declarative schema changer.
+type Telemetry interface {
+	// IncrementSchemaChangeErrorType increments the number of errors of a given
+	// type observed by the schema changer.
+	IncrementSchemaChangeErrorType(typ string)
 }
 
 // TransactionalJobRegistry creates and updates jobs in the current transaction.
@@ -109,6 +114,10 @@ type TransactionalJobRegistry interface {
 	// doesn't yet exist.
 	SchemaChangerJobID() jobspb.JobID
 
+	// CurrentJob returns the schema changer job that is currently, running,
+	// if we are executing within a job.
+	CurrentJob() *jobs.Job
+
 	// CreateJob creates a job in the current transaction and returns the
 	// id which was assigned to that job, or an error otherwise.
 	CreateJob(ctx context.Context, record jobs.Record) error
@@ -123,6 +132,10 @@ type TransactionalJobRegistry interface {
 	// See (*jobs.Registry).CheckPausepoint
 	CheckPausepoint(name string) error
 
+	// UseLegacyGCJob indicate whether the legacy GC job should be used.
+	// This only matters for setting the initial RunningStatus.
+	UseLegacyGCJob(ctx context.Context) bool
+
 	// TODO(ajwerner): Deal with setting the running status to indicate
 	// validating, backfilling, or generally performing metadata changes
 	// and waiting for lease draining.
@@ -132,7 +145,7 @@ type TransactionalJobRegistry interface {
 type JobUpdateCallback = func(
 	md jobs.JobMetadata,
 	updateProgress func(*jobspb.Progress),
-	setNonCancelable func(),
+	updatePayload func(*jobspb.Payload),
 ) error
 
 // Backfiller is an abstract index backfiller that performs index backfills
@@ -148,23 +161,39 @@ type Backfiller interface {
 		context.Context, BackfillProgress, catalog.TableDescriptor,
 	) (BackfillProgress, error)
 
-	// BackfillIndex will backfill the specified indexes on in the table with
+	// BackfillIndexes will backfill the specified indexes in the table with
 	// the specified source and destination indexes. Note that the
 	// MinimumWriteTimestamp on the progress must be non-zero. Use
 	// MaybePrepareDestIndexesForBackfill to construct a properly initialized
 	// progress.
-	BackfillIndex(
+	BackfillIndexes(
 		context.Context,
 		BackfillProgress,
-		BackfillProgressWriter,
+		BackfillerProgressWriter,
 		catalog.TableDescriptor,
 	) error
 }
 
-// IndexValidator provides interfaces that allow indexes to be validated.
-type IndexValidator interface {
+// Merger is an abstract index merger that performs index merges
+// when provided with a specification of tables and indexes and a way to track
+// job progress.
+type Merger interface {
+
+	// MergeIndexes will merge the specified indexes in the table, from each
+	// temporary index into each adding index.
+	MergeIndexes(
+		context.Context,
+		MergeProgress,
+		BackfillerProgressWriter,
+		catalog.TableDescriptor,
+	) error
+}
+
+// Validator provides interfaces that allow indexes and check constraints to be validated.
+type Validator interface {
 	ValidateForwardIndexes(
 		ctx context.Context,
+		job *jobs.Job,
 		tbl catalog.TableDescriptor,
 		indexes []catalog.Index,
 		override sessiondata.InternalExecutorOverride,
@@ -172,8 +201,17 @@ type IndexValidator interface {
 
 	ValidateInvertedIndexes(
 		ctx context.Context,
+		job *jobs.Job,
 		tbl catalog.TableDescriptor,
 		indexes []catalog.Index,
+		override sessiondata.InternalExecutorOverride,
+	) error
+
+	ValidateConstraint(
+		ctx context.Context,
+		tbl catalog.TableDescriptor,
+		constraint catalog.Constraint,
+		indexIDForValidation descpb.IndexID,
 		override sessiondata.InternalExecutorOverride,
 	) error
 }
@@ -182,8 +220,13 @@ type IndexValidator interface {
 // prior to backfilling.
 type IndexSpanSplitter interface {
 
-	// MaybeSplitIndexSpans will attempt to split the backfilled index span.
+	// MaybeSplitIndexSpans will attempt to split the backfilled index span, if
+	// the index is in the system tenant or is partitioned.
 	MaybeSplitIndexSpans(ctx context.Context, table catalog.TableDescriptor, indexToBackfill catalog.Index) error
+
+	// MaybeSplitIndexSpansForPartitioning will split backfilled index spans
+	// across hash-sharded index boundaries if applicable.
+	MaybeSplitIndexSpansForPartitioning(ctx context.Context, table catalog.TableDescriptor, indexToBackfill catalog.Index) error
 }
 
 // BackfillProgress tracks the progress for a Backfill.
@@ -211,47 +254,84 @@ type Backfill struct {
 	DestIndexIDs  []descpb.IndexID
 }
 
-// BackfillTracker abstracts the infrastructure to read and write backfill
-// progress to job state. Implementations should support multiple concurrent
-// writers.
-type BackfillTracker interface {
-	BackfillProgressReader
-	BackfillProgressWriter
-	BackfillProgressFlusher
+// MergeProgress tracks the progress for a Merge.
+type MergeProgress struct {
+	Merge
+
+	// CompletedSpans contains the spans of the source indexes which have been
+	// merged into the destination indexes. The spans are expected to
+	// contain any tenant prefix. The outer slice is parallel to the
+	// SourceIndexIDs slice in the embedded Merge struct.
+	CompletedSpans [][]roachpb.Span
+}
+
+// MakeMergeProgress constructs a new MergeProgress for a merge with an empty
+// set of CompletedSpans.
+func MakeMergeProgress(m Merge) MergeProgress {
+	return MergeProgress{
+		Merge:          m,
+		CompletedSpans: make([][]roachpb.Span, len(m.SourceIndexIDs)),
+	}
+}
+
+// Merge corresponds to a definition of a merge from multiple temporary indexes
+// into adding indexes.
+type Merge struct {
+	TableID        descpb.ID
+	SourceIndexIDs []descpb.IndexID
+	DestIndexIDs   []descpb.IndexID
+}
+
+// BackfillerTracker abstracts the infrastructure to read and write backfill
+// and merge progress to job state. Implementations should support multiple
+// concurrent writers.
+type BackfillerTracker interface {
+	BackfillerProgressReader
+	BackfillerProgressWriter
+	BackfillerProgressFlusher
 }
 
 // PeriodicProgressFlusher is used to write updates to backfill progress
 // periodically.
 type PeriodicProgressFlusher interface {
-	StartPeriodicUpdates(ctx context.Context, tracker BackfillProgressFlusher) (stop func() error)
+	StartPeriodicUpdates(ctx context.Context, tracker BackfillerProgressFlusher) (stop func() error)
 }
 
-// BackfillProgressReader is used by the backfill execution layer to read
-// backfill progress.
-type BackfillProgressReader interface {
+// BackfillerProgressReader is used by the backfill execution layer to read
+// backfill and merge progress.
+type BackfillerProgressReader interface {
 	// GetBackfillProgress reads the backfill progress for the specified backfill.
 	// If no such backfill has been stored previously, this call will return a
 	// new BackfillProgress without the CompletedSpans or MinimumWriteTimestamp
 	// populated.
 	GetBackfillProgress(ctx context.Context, b Backfill) (BackfillProgress, error)
+	// GetMergeProgress reads the merge progress for the specified merge.
+	// If no such merge has been stored previously, this call will return a
+	// new MergeProgress without the CompletedSpans populated
+	GetMergeProgress(ctx context.Context, b Merge) (MergeProgress, error)
 }
 
-// BackfillProgressWriter is used by the backfiller to write out progress
+// BackfillerProgressWriter is used by the backfiller to write out progress
 // updates.
-type BackfillProgressWriter interface {
+type BackfillerProgressWriter interface {
 	// SetBackfillProgress updates the progress for a single backfill. Multiple
 	// backfills may be concurrently tracked. Setting the progress may not make
 	// that progress durable; the concrete implementation of the backfill tracker
 	// may defer writing until later.
 	SetBackfillProgress(ctx context.Context, progress BackfillProgress) error
+	// SetMergeProgress updates the progress for a single merge. Multiple
+	// merges may be concurrently tracked. Setting the progress may not make
+	// that progress durable; the concrete implementation of the merge tracker
+	// may defer writing until later.
+	SetMergeProgress(ctx context.Context, progress MergeProgress) error
 }
 
-// BackfillProgressFlusher is used to flush backfill progress state to
-// the underlying store.
-type BackfillProgressFlusher interface {
+// BackfillerProgressFlusher is used to flush backfill and merge progress state
+// to the underlying store.
+type BackfillerProgressFlusher interface {
 
 	// FlushCheckpoint writes out a checkpoint containing any data which has
-	// been previously set via SetBackfillProgress.
+	// been previously set via SetBackfillProgress or SetMergeProgress.
 	FlushCheckpoint(ctx context.Context) error
 
 	// FlushFractionCompleted writes out the fraction completed.
@@ -261,37 +341,54 @@ type BackfillProgressFlusher interface {
 // DescriptorMetadataUpdater is used to update metadata associated with schema objects,
 // for example comments associated with a schema.
 type DescriptorMetadataUpdater interface {
-	// UpsertDescriptorComment updates a comment associated with a schema object.
-	UpsertDescriptorComment(id int64, subID int64, commentType keys.CommentType, comment string) error
-
-	// DeleteDescriptorComment deletes a comment for schema object.
-	DeleteDescriptorComment(id int64, subID int64, commentType keys.CommentType) error
-
-	//UpsertConstraintComment upserts a comment associated with a constraint.
-	UpsertConstraintComment(tableID descpb.ID, constraintID descpb.ConstraintID, comment string) error
-
-	//DeleteConstraintComment deletes a comment associated with a constraint.
-	DeleteConstraintComment(tableID descpb.ID, constraintID descpb.ConstraintID) error
-
 	// DeleteDatabaseRoleSettings deletes role settings associated with a database.
 	DeleteDatabaseRoleSettings(ctx context.Context, dbID descpb.ID) error
-
-	// SwapDescriptorSubComment moves a comment from one sub ID to another.
-	SwapDescriptorSubComment(id int64, oldSubID int64, newSubID int64, commentType keys.CommentType) error
-
-	// DeleteAllCommentsForTables deletes all table-bound comments for the tables
-	// with the specified IDs.
-	DeleteAllCommentsForTables(ids catalog.DescriptorIDSet) error
 
 	// DeleteSchedule deletes the given schedule.
 	DeleteSchedule(ctx context.Context, id int64) error
 }
 
-// DescriptorMetadataUpdaterFactory is used to construct a DescriptorMetadataUpdater for a given
-// transaction and context.
-type DescriptorMetadataUpdaterFactory interface {
-	// NewMetadataUpdater creates a new DescriptorMetadataUpdater.
-	NewMetadataUpdater(
-		ctx context.Context, txn *kv.Txn, sessionData *sessiondata.SessionData,
-	) DescriptorMetadataUpdater
+// StatsRefreshQueue queues table for stats refreshes.
+type StatsRefreshQueue interface {
+	// AddTableForStatsRefresh adds a table for a stats refresh.
+	AddTableForStatsRefresh(id descpb.ID)
+}
+
+// StatsRefresher responsible for refreshing table stats.
+type StatsRefresher interface {
+	// NotifyMutation notifies the stats refresher that a table needs its
+	// statistics updated.
+	NotifyMutation(table catalog.TableDescriptor, rowsAffected int)
+}
+
+// ProtectedTimestampManager used to install a protected timestamp before
+// the GC interval is encountered.
+type ProtectedTimestampManager interface {
+	// TryToProtectBeforeGC adds a protected timestamp record for a historical
+	// transaction for a specific table, once a certain percentage of the GC time
+	// has elapsed. This is done on a best effort bases using a timer relative to
+	// the GC TTL, and should be done fairy early in the transaction. Note, the
+	// function assumes the in-memory job is up to date with the persisted job
+	// record.
+	TryToProtectBeforeGC(
+		ctx context.Context, job *jobs.Job, tableDesc catalog.TableDescriptor, readAsOf hlc.Timestamp,
+	) jobsprotectedts.Cleaner
+
+	// Protect adds a protected timestamp record for a historical transaction for
+	// a specific target immediately. If an existing record is found, it will be
+	// updated with a new timestamp. Returns a Cleaner function to remove the
+	// protected timestamp, if one was installed. Note, the function assumes the
+	// in-memory job is up to date with the persisted job record.
+	Protect(
+		ctx context.Context,
+		job *jobs.Job,
+		target *ptpb.Target,
+		readAsOf hlc.Timestamp,
+	) (jobsprotectedts.Cleaner, error)
+
+	// Unprotect unprotects the spans associated with the job, mainly for last
+	// resort cleanup. The function assumes the in-memory job is up to date with
+	// the persisted job record. Note: This should only be used for job cleanup if
+	// its not currently, executing.
+	Unprotect(ctx context.Context, job *jobs.Job) error
 }

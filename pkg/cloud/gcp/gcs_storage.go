@@ -13,16 +13,17 @@ package gcp
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
 	gcs "cloud.google.com/go/storage"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -30,8 +31,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/gogo/protobuf/types"
-	"golang.org/x/oauth2/google"
+	"go.opentelemetry.io/otel/attribute"
+	"golang.org/x/net/http2"
+	"golang.org/x/oauth2"
+	"google.golang.org/api/impersonate"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
@@ -43,6 +46,16 @@ const (
 	// CredentialsParam is the query parameter for the base64-encoded contents of
 	// the Google Application Credentials JSON file.
 	CredentialsParam = "CREDENTIALS"
+	// AssumeRoleParam is the query parameter for the chain of service account
+	// email addresses to assume.
+	AssumeRoleParam = "ASSUME_ROLE"
+
+	// BearerTokenParam is the query parameter for a temporary bearer token. There
+	// is no refresh mechanism associated with this token, so it is up to the user
+	// to ensure that its TTL is longer than the duration of the job or query that
+	// is using the token. The job or query may irrecoverably fail if one of its
+	// tokens expire before completion.
+	BearerTokenParam = "BEARER_TOKEN"
 )
 
 // gcsChunkingEnabled is used to enable and disable chunking of file upload to
@@ -54,24 +67,45 @@ var gcsChunkingEnabled = settings.RegisterBoolSetting(
 	true, /* default */
 )
 
-func parseGSURL(_ cloud.ExternalStorageURIContext, uri *url.URL) (roachpb.ExternalStorage, error) {
-	conf := roachpb.ExternalStorage{}
-	conf.Provider = roachpb.ExternalStorageProvider_gs
-	conf.GoogleCloudConfig = &roachpb.ExternalStorage_GCS{
-		Bucket:         uri.Host,
-		Prefix:         uri.Path,
-		Auth:           uri.Query().Get(cloud.AuthParam),
-		BillingProject: uri.Query().Get(GoogleBillingProjectParam),
-		Credentials:    uri.Query().Get(CredentialsParam),
+// gcsChunkRetryTimeout is used to configure the per-chunk retry deadline when
+// uploading chunks to Google Cloud Storage.
+var gcsChunkRetryTimeout = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"cloudstorage.gs.chunking.retry_timeout",
+	"per-chunk retry deadline when chunking of file upload to Google Cloud Storage",
+	60*time.Second,
+)
+
+func parseGSURL(_ cloud.ExternalStorageURIContext, uri *url.URL) (cloudpb.ExternalStorage, error) {
+	gsURL := cloud.ConsumeURL{URL: uri}
+	conf := cloudpb.ExternalStorage{}
+	conf.Provider = cloudpb.ExternalStorageProvider_gs
+	assumeRole, delegateRoles := cloud.ParseRoleString(gsURL.ConsumeParam(AssumeRoleParam))
+	conf.GoogleCloudConfig = &cloudpb.ExternalStorage_GCS{
+		Bucket:              uri.Host,
+		Prefix:              uri.Path,
+		Auth:                gsURL.ConsumeParam(cloud.AuthParam),
+		BillingProject:      gsURL.ConsumeParam(GoogleBillingProjectParam),
+		Credentials:         gsURL.ConsumeParam(CredentialsParam),
+		AssumeRole:          assumeRole,
+		AssumeRoleDelegates: delegateRoles,
+		BearerToken:         gsURL.ConsumeParam(BearerTokenParam),
 	}
 	conf.GoogleCloudConfig.Prefix = strings.TrimLeft(conf.GoogleCloudConfig.Prefix, "/")
+
+	// Validate that all the passed in parameters are supported.
+	if unknownParams := gsURL.RemainingQueryParams(); len(unknownParams) > 0 {
+		return cloudpb.ExternalStorage{}, errors.Errorf(
+			`unknown GS query parameters: %s`, strings.Join(unknownParams, ", "))
+	}
+
 	return conf, nil
 }
 
 type gcsStorage struct {
 	bucket   *gcs.BucketHandle
 	client   *gcs.Client
-	conf     *roachpb.ExternalStorage_GCS
+	conf     *cloudpb.ExternalStorage_GCS
 	ioConf   base.ExternalIODirConfig
 	prefix   string
 	settings *cluster.Settings
@@ -79,9 +113,9 @@ type gcsStorage struct {
 
 var _ cloud.ExternalStorage = &gcsStorage{}
 
-func (g *gcsStorage) Conf() roachpb.ExternalStorage {
-	return roachpb.ExternalStorage{
-		Provider:          roachpb.ExternalStorageProvider_gs,
+func (g *gcsStorage) Conf() cloudpb.ExternalStorage {
+	return cloudpb.ExternalStorage{
+		Provider:          cloudpb.ExternalStorageProvider_gs,
 		GoogleCloudConfig: g.conf,
 	}
 }
@@ -90,12 +124,14 @@ func (g *gcsStorage) ExternalIOConf() base.ExternalIODirConfig {
 	return g.ioConf
 }
 
+func (g *gcsStorage) RequiresExternalIOAccounting() bool { return true }
+
 func (g *gcsStorage) Settings() *cluster.Settings {
 	return g.settings
 }
 
 func makeGCSStorage(
-	ctx context.Context, args cloud.ExternalStorageContext, dest roachpb.ExternalStorage,
+	ctx context.Context, args cloud.ExternalStorageContext, dest cloudpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.google_cloud")
 	conf := dest.GoogleCloudConfig
@@ -103,7 +139,6 @@ func makeGCSStorage(
 		return nil, errors.Errorf("google cloud storage upload requested but info missing")
 	}
 	const scope = gcs.ScopeReadWrite
-	opts := []option.ClientOption{option.WithScopes(scope)}
 
 	// "default": only use the key in the settings; error if not present.
 	// "specified": the JSON object for authentication is given by the CREDENTIALS param.
@@ -114,33 +149,56 @@ func makeGCSStorage(
 			"implicit credentials disallowed for gs due to --external-io-disable-implicit-credentials flag")
 	}
 
+	var credentialsOpt []option.ClientOption
 	switch conf.Auth {
 	case cloud.AuthParamImplicit:
 		// Do nothing; use implicit params:
 		// https://godoc.org/golang.org/x/oauth2/google#FindDefaultCredentials
 	default:
-		if conf.Credentials == "" {
+		if conf.Credentials != "" {
+			authOption, err := createAuthOptionFromServiceAccountKey(conf.Credentials)
+			if err != nil {
+				return nil, errors.Wrapf(err, "error getting credentials from %s", CredentialsParam)
+			}
+			credentialsOpt = append(credentialsOpt, authOption)
+		} else if conf.BearerToken != "" {
+			credentialsOpt = append(credentialsOpt, createAuthOptionFromBearerToken(conf.BearerToken))
+		} else {
 			return nil, errors.Errorf(
-				"%s must be set unless %q is %q",
+				"%s or %s must be set if %q is %q",
 				CredentialsParam,
+				BearerTokenParam,
 				cloud.AuthParam,
-				cloud.AuthParamImplicit,
+				cloud.AuthParamSpecified,
 			)
 		}
-		decodedKey, err := base64.StdEncoding.DecodeString(conf.Credentials)
-		if err != nil {
-			return nil, errors.Wrapf(err, "decoding value of %s", CredentialsParam)
-		}
-		source, err := google.JWTConfigFromJSON(decodedKey, scope)
-		if err != nil {
-			return nil, errors.Wrap(err, "creating GCS oauth token source from specified credentials")
-		}
-		opts = append(opts, option.WithTokenSource(source.TokenSource(ctx)))
 	}
+
+	opts := []option.ClientOption{option.WithScopes(scope)}
+	// Once credentials have been obtained via implicit or specified params, we
+	// then check if we should use the credentials directly or whether they should
+	// be used to assume another role.
+	if conf.AssumeRole == "" {
+		opts = append(opts, credentialsOpt...)
+	} else {
+		if !args.Settings.Version.IsActive(ctx, clusterversion.TODODelete_V22_2SupportAssumeRoleAuth) {
+			return nil, errors.New("cannot authenticate to cloud storage via assume role until cluster has fully upgraded to 22.2")
+		}
+
+		assumeOpt, err := createImpersonateCredentials(ctx, conf.AssumeRole, conf.AssumeRoleDelegates, []string{scope}, credentialsOpt...)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to assume role")
+		}
+
+		opts = append(opts, assumeOpt)
+	}
+
 	g, err := gcs.NewClient(ctx, opts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create google cloud client")
 	}
+	g.SetRetry(gcs.WithErrorFunc(shouldRetry))
+	g.SetRetry(gcs.WithPolicy(gcs.RetryAlways))
 	bucket := g.Bucket(conf.Bucket)
 	if conf.BillingProject != `` {
 		bucket = bucket.UserProject(conf.BillingProject)
@@ -155,17 +213,61 @@ func makeGCSStorage(
 	}, nil
 }
 
+// createAuthOptionFromServiceAccountKey creates an option.ClientOption for
+// authentication with the given Service Account key.
+func createAuthOptionFromServiceAccountKey(encodedKey string) (option.ClientOption, error) {
+	// Service Account keys are passed in base64 encoded, so decode it first.
+	credentialsJSON, err := base64.StdEncoding.DecodeString(encodedKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return option.WithCredentialsJSON(credentialsJSON), nil
+}
+
+// createAuthOptionFromBearerToken creates an option.ClientOption for
+// authentication with the given bearer token.
+func createAuthOptionFromBearerToken(bearerToken string) option.ClientOption {
+	token := &oauth2.Token{AccessToken: bearerToken}
+	return option.WithTokenSource(oauth2.StaticTokenSource(token))
+}
+
+// createImpersonateCredentials creates an option.ClientOption for
+// authentication for the specified scopes by impersonating the target,
+// potentially with authentication options from authOpts.
+func createImpersonateCredentials(
+	ctx context.Context,
+	impersonateTarget string,
+	impersonateDelegates []string,
+	scopes []string,
+	authOpts ...option.ClientOption,
+) (option.ClientOption, error) {
+
+	cfg := impersonate.CredentialsConfig{
+		TargetPrincipal: impersonateTarget,
+		Scopes:          scopes,
+		Delegates:       impersonateDelegates,
+	}
+
+	source, err := impersonate.CredentialsTokenSource(ctx, cfg, authOpts...)
+	if err != nil {
+		return nil, errors.Wrap(err, "impersonate credentials")
+	}
+
+	return option.WithTokenSource(source), nil
+}
+
 func (g *gcsStorage) Writer(ctx context.Context, basename string) (io.WriteCloser, error) {
 	_, sp := tracing.ChildSpan(ctx, "gcs.Writer")
 	defer sp.Finish()
-	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.Writer: %s",
-		path.Join(g.prefix, basename))})
+	sp.SetTag("path", attribute.StringValue(path.Join(g.prefix, basename)))
 
 	w := g.bucket.Object(path.Join(g.prefix, basename)).NewWriter(ctx)
 	w.ChunkSize = int(cloud.WriteChunkSize.Get(&g.settings.SV))
 	if !gcsChunkingEnabled.Get(&g.settings.SV) {
 		w.ChunkSize = 0
 	}
+	w.ChunkRetryDeadline = gcsChunkRetryTimeout.Get(&g.settings.SV)
 	return w, nil
 }
 
@@ -182,8 +284,7 @@ func (g *gcsStorage) ReadFileAt(
 
 	ctx, sp := tracing.ChildSpan(ctx, "gcs.ReadFileAt")
 	defer sp.Finish()
-	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.ReadFileAt: %s",
-		path.Join(g.prefix, basename))})
+	sp.SetTag("path", attribute.StringValue(path.Join(g.prefix, basename)))
 
 	r := cloud.NewResumingReader(ctx,
 		func(ctx context.Context, pos int64) (io.ReadCloser, error) {
@@ -203,7 +304,7 @@ func (g *gcsStorage) ReadFileAt(
 			// return our internal ErrFileDoesNotExist.
 			// nolint:errwrap
 			err = errors.Wrapf(
-				errors.Wrap(cloud.ErrFileDoesNotExist, "gcs object does not exist"),
+				errors.Wrapf(cloud.ErrFileDoesNotExist, "gcs object %q does not exist", object),
 				"%v",
 				err.Error(),
 			)
@@ -217,7 +318,7 @@ func (g *gcsStorage) List(ctx context.Context, prefix, delim string, fn cloud.Li
 	dest := cloud.JoinPathPreservingTrailingSlash(g.prefix, prefix)
 	ctx, sp := tracing.ChildSpan(ctx, "gcs.List")
 	defer sp.Finish()
-	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("gcs.List: %s", dest)})
+	sp.SetTag("path", attribute.StringValue(dest))
 
 	it := g.bucket.Objects(ctx, &gcs.Query{Prefix: dest, Delimiter: delim})
 	for {
@@ -266,7 +367,35 @@ func (g *gcsStorage) Close() error {
 	return g.client.Close()
 }
 
+// shouldRetry is the predicate that determines whether a GCS client error
+// should be retried. The predicate combines google-cloud-go's default retry
+// predicate and some additional predicates when determining whether the error
+// is retried. The additional predicates are:
+//
+// - http2.StreamError error with code http2.ErrCodeInternal: this error has
+// been recommended to be retried in several issues in the google-cloud-go repo:
+// https://github.com/googleapis/google-cloud-go/issues/3735
+// https://github.com/googleapis/google-cloud-go/issues/784
+// Remove if this error ever becomes part of the default retry predicate.
+func shouldRetry(err error) bool {
+	if defaultShouldRetry(err) {
+		return true
+	}
+
+	if e := (http2.StreamError{}); errors.As(err, &e) {
+		if e.Code == http2.ErrCodeInternal {
+			return true
+		}
+	}
+
+	if e := (errors.Wrapper)(nil); errors.As(err, &e) {
+		return shouldRetry(e.Unwrap())
+	}
+
+	return false
+}
+
 func init() {
-	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_gs,
-		parseGSURL, makeGCSStorage, cloud.RedactedParams(CredentialsParam), "gs")
+	cloud.RegisterExternalStorageProvider(cloudpb.ExternalStorageProvider_gs,
+		parseGSURL, makeGCSStorage, cloud.RedactedParams(CredentialsParam, BearerTokenParam), gcsScheme)
 }

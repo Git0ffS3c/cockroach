@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -27,11 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scstage"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/scviz"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/emicklei/dot"
-	"github.com/gogo/protobuf/jsonpb"
 )
 
 // StagesURL returns a URL to a rendering of the stages of the Plan.
@@ -119,14 +117,14 @@ func drawStages(
 		targetNodes[idx] = tn
 	}
 
-	// Want to draw an edge to the initial target statuses with some dots
-	// or something.
-	curNodes := make([]dot.Node, len(cs.Current))
-	cur := cs.Current
+	// Want to draw an edge to the initial target statuses
+	// with some dots or something.
+	curNodes := make([]dot.Node, len(cs.Initial))
+	cur := cs.Initial
 	curDummy := targetsSubgraph.Node("dummy")
 	curDummy.Attr("shape", "point")
 	curDummy.Attr("style", "invis")
-	for i, status := range cs.Current {
+	for i, status := range cs.Initial {
 		label := targetStatusID(i, status)
 		tsn := stagesSubgraph.Node(fmt.Sprintf("initial %d", i))
 		tsn.Attr("label", label)
@@ -183,7 +181,7 @@ func drawDeps(cs scpb.CurrentState, g *scgraph.Graph) (*dot.Graph, error) {
 	depsSubgraph := dg.Subgraph("deps", dot.ClusterOption{})
 	targetsSubgraph := depsSubgraph.Subgraph("targets", dot.ClusterOption{})
 	statementsSubgraph := depsSubgraph.Subgraph("statements", dot.ClusterOption{})
-	targetNodes := make([]dot.Node, len(cs.Current))
+	targetNodes := make([]dot.Node, len(cs.Initial))
 	targetIdxMap := make(map[*scpb.Target]int)
 	// Add all the statements in their own section.
 	// Note: Explains can only have one statement, so we aren't
@@ -194,10 +192,10 @@ func drawDeps(cs scpb.CurrentState, g *scgraph.Graph) (*dot.Graph, error) {
 		stmtNode.Attr("fontsize", "9")
 		stmtNode.Attr("shape", "none")
 	}
-	targetStatusNodes := make([]map[scpb.Status]dot.Node, len(cs.Current))
-	for idx, status := range cs.Current {
+	targetStatusNodes := make([]map[scpb.Status]dot.Node, len(cs.Initial))
+	for idx, status := range cs.Initial {
 		t := &cs.TargetState.Targets[idx]
-		tn := targetsSubgraph.Node(itoa(idx, len(cs.Current)))
+		tn := targetsSubgraph.Node(itoa(idx, len(cs.Initial)))
 		tn.Attr("label", htmlLabel(t.Element()))
 		tn.Attr("fontsize", "9")
 		tn.Attr("shape", "none")
@@ -210,7 +208,7 @@ func drawDeps(cs scpb.CurrentState, g *scgraph.Graph) (*dot.Graph, error) {
 		targetStatusNodes[targetIdxMap[n.Target]][n.CurrentStatus] = tn
 		return nil
 	})
-	for idx, status := range cs.Current {
+	for idx, status := range cs.Initial {
 		nn := targetStatusNodes[idx][status]
 		tn := targetNodes[idx]
 		e := tn.Edge(nn)
@@ -228,8 +226,11 @@ func drawDeps(cs scpb.CurrentState, g *scgraph.Graph) (*dot.Graph, error) {
 			ge.Attr("fontsize", "9")
 		case *scgraph.DepEdge:
 			ge.Attr("color", "red")
-			ge.Attr("label", e.Name())
-			if e.Kind() == scgraph.SameStagePrecedence {
+			ge.Attr("label", e.RuleNames())
+			switch e.Kind() {
+			case scgraph.PreviousStagePrecedence:
+				ge.Attr("arrowhead", "inv")
+			case scgraph.SameStagePrecedence:
 				ge.Attr("arrowhead", "diamond")
 			}
 		}
@@ -254,51 +255,22 @@ func itoa(i, ub int) string {
 	return fmt.Sprintf(fmt.Sprintf("%%0%dd", len(strconv.Itoa(ub))), i)
 }
 
-// ToMap converts a struct to a map, field by field. If at any point a protobuf
-// message is encountered, it is converted to a map using jsonpb to marshal it
-// to json and then marshaling it back to a map. This approach allows zero
-// values to be effectively omitted.
+// ToMap is a thin wrapper around scviz.ToMap which comes with some default
+// behavior for planned data structures.
 func ToMap(v interface{}) (interface{}, error) {
-	if v == nil {
-		return nil, nil
+	// The SetJobStateOnDescriptor is very large and graphviz fails to render it.
+	// Clear the DescriptorState field so that the relevant information (the
+	// existence of the Op and the descriptor ID) make it into the graph.
+	if sjs, ok := v.(*scop.SetJobStateOnDescriptor); ok {
+		clone := *sjs
+		clone.State = scpb.DescriptorState{}
+		v = &clone
 	}
-	if msg, ok := v.(protoutil.Message); ok {
-		var buf bytes.Buffer
-		jsonEncoder := jsonpb.Marshaler{EmitDefaults: false}
-		if err := jsonEncoder.Marshal(&buf, msg); err != nil {
-			return nil, errors.Wrapf(err, "%T %v", v, v)
-		}
-		var m map[string]interface{}
-		if err := json.NewDecoder(&buf).Decode(&m); err != nil {
-			return nil, err
-		}
-		return m, nil
+	m, err := scviz.ToMap(v, false /* emitDefaults */)
+	if err != nil {
+		return nil, err
 	}
-	vv := reflect.ValueOf(v)
-	vt := vv.Type()
-	switch vt.Kind() {
-	case reflect.Struct:
-	case reflect.Ptr:
-		if vt.Elem().Kind() != reflect.Struct {
-			return v, nil
-		}
-		vv = vv.Elem()
-		vt = vt.Elem()
-	default:
-		return v, nil
-	}
-
-	m := make(map[string]interface{}, vt.NumField())
-	for i := 0; i < vt.NumField(); i++ {
-		vvf := vv.Field(i)
-		if !vvf.CanInterface() || vvf.IsZero() {
-			continue
-		}
-		var err error
-		if m[vt.Field(i).Name], err = ToMap(vvf.Interface()); err != nil {
-			return nil, err
-		}
-	}
+	scviz.WalkMap(m, scviz.RewriteEmbeddedIntoParent)
 	return m, nil
 }
 

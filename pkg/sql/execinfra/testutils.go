@@ -16,7 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -95,7 +95,7 @@ func NewTestMemMonitor(ctx context.Context, st *cluster.Settings) *mon.BytesMoni
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	memMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	memMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	return memMonitor
 }
 
@@ -111,7 +111,7 @@ func NewTestDiskMonitor(ctx context.Context, st *cluster.Settings) *mon.BytesMon
 		math.MaxInt64,
 		st,
 	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	return diskMonitor
 }
 
@@ -124,7 +124,7 @@ func GenerateValuesSpec(
 	spec.Columns = make([]execinfrapb.DatumInfo, len(colTypes))
 	for i := range spec.Columns {
 		spec.Columns[i].Type = colTypes[i]
-		spec.Columns[i].Encoding = descpb.DatumEncoding_VALUE
+		spec.Columns[i].Encoding = catenumpb.DatumEncoding_VALUE
 	}
 
 	spec.NumRows = uint64(len(rows))

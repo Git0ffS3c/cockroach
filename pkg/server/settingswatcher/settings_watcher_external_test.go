@@ -22,11 +22,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/deprecatedshowranges"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -60,7 +64,7 @@ func TestSettingWatcherOnTenant(t *testing.T) {
 		// value (which would cause a panic in test builds).
 		systemOnlySetting: {2 << 20, 4 << 20},
 	}
-	fakeTenant := roachpb.MakeTenantID(2)
+	fakeTenant := roachpb.MustMakeTenantID(2)
 	systemTable := keys.SystemSQLCodec.TablePrefix(keys.SettingsTableID)
 	fakeCodec := keys.MakeSQLCodec(fakeTenant)
 	fakeTenantPrefix := keys.MakeTenantPrefix(fakeTenant)
@@ -132,6 +136,14 @@ func TestSettingWatcherOnTenant(t *testing.T) {
 	s0 := tc.Server(0)
 	tenantSettings := cluster.MakeTestingClusterSettings()
 	tenantSettings.SV.SetNonSystemTenant()
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	deprecatedshowranges.ShowRangesDeprecatedBehaviorSetting.Override(
+		ctx, &tenantSettings.SV,
+		// In unit tests, we exercise the new behavior.
+		false)
+
 	storage := &fakeStorage{}
 	sw := settingswatcher.New(s0.Clock(), fakeCodec, tenantSettings,
 		s0.ExecutorConfig().(sql.ExecutorConfig).RangeFeedFactory,
@@ -233,14 +245,14 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 
 	expect := func(setting, value string) {
 		t.Helper()
-		s, ok := settings.Lookup(setting, settings.LookupForLocalAccess, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		require.Equal(t, value, s.String(&st.SV))
 	}
 
 	expectSoon := func(setting, value string) {
 		t.Helper()
-		s, ok := settings.Lookup(setting, settings.LookupForLocalAccess, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		testutils.SucceedsSoon(t, func() error {
 			if actual := s.String(&st.SV); actual != value {
@@ -289,7 +301,7 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 	expectSoon("i1", "10")
 
 	// Verify that version cannot be overridden.
-	version, ok := settings.Lookup("version", settings.LookupForLocalAccess, settings.ForSystemTenant)
+	version, ok := settings.LookupForLocalAccess("version", settings.ForSystemTenant)
 	require.True(t, ok)
 	versionValue := version.String(&st.SV)
 
@@ -370,6 +382,14 @@ func TestOverflowRestart(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	sideSettings := cluster.MakeTestingClusterSettings()
+
+	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
+	// Remove in v23.2.
+	deprecatedshowranges.ShowRangesDeprecatedBehaviorSetting.Override(
+		ctx, &sideSettings.SV,
+		// In unit tests, we exercise the new behavior.
+		false)
+
 	w := settingswatcher.New(
 		s.Clock(),
 		s.ExecutorConfig().(sql.ExecutorConfig).Codec,
@@ -420,7 +440,7 @@ func TestOverflowRestart(t *testing.T) {
 // two settings do not match. It generally gets used with SucceeedsSoon.
 func CheckSettingsValuesMatch(t *testing.T, a, b *cluster.Settings) error {
 	for _, k := range settings.Keys(false /* forSystemTenant */) {
-		s, ok := settings.Lookup(k, settings.LookupForLocalAccess, false /* forSystemTenant */)
+		s, ok := settings.LookupForLocalAccess(k, false /* forSystemTenant */)
 		require.True(t, ok)
 		if s.Class() == settings.SystemOnly {
 			continue
@@ -430,4 +450,144 @@ func CheckSettingsValuesMatch(t *testing.T, a, b *cluster.Settings) error {
 		}
 	}
 	return nil
+}
+
+// Test that when the rangefeed sends a prefix of events (as it is allowed to
+// do), that the setting value that clients read does not regress.
+func TestStaleRowsDoNotCauseSettingsToRegress(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+
+	// Make a bogus tenant ID and codec we'll use to prefix the events
+	// we want to observe. Below, inject a testing knob to plumb the stream
+	// into the test logic to make injecting rangefeed events straightforward.
+	bogusTenantID := roachpb.MustMakeTenantID(42)
+	bogusCodec := keys.MakeSQLCodec(bogusTenantID)
+	settingsStart := bogusCodec.TablePrefix(keys.SettingsTableID)
+	interceptedStreamCh := make(chan kvpb.RangeFeedEventSink)
+	cancelCtx, cancel := context.WithCancel(ctx)
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingRangefeedFilter: func(args *kvpb.RangeFeedRequest, stream kvpb.RangeFeedEventSink) *kvpb.Error {
+					if !args.Span.ContainsKey(settingsStart) {
+						return nil
+					}
+					select {
+					case interceptedStreamCh <- stream:
+					case <-cancelCtx.Done():
+					}
+					<-cancelCtx.Done()
+					return nil
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+	defer cancel()
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+
+	const (
+		defaultFakeSettingValue = "foo"
+		fakeSettingName         = "test_setting"
+	)
+
+	fakeSetting := settings.RegisterStringSetting(
+		settings.TenantWritable, fakeSettingName, "for testing", defaultFakeSettingValue,
+	)
+
+	// Set a cluster setting in the real cluster and read its raw KV.
+	// This will form the basis for events we inject into the fake watcher.
+	// The tenant prefix, if one exists, will have been stripped from the
+	// key.
+	getSettingKVForFakeSetting := func(t *testing.T) roachpb.KeyValue {
+		codec := s.ExecutorConfig().(sql.ExecutorConfig).Codec
+		k := codec.TablePrefix(keys.SettingsTableID)
+		rows, err := s.DB().Scan(ctx, k, k.PrefixEnd(), 0 /* maxRows */)
+		require.NoError(t, err)
+		dec := settingswatcher.MakeRowDecoder(codec)
+		var alloc tree.DatumAlloc
+		for _, r := range rows {
+			rkv := roachpb.KeyValue{Key: r.Key}
+			if r.Value != nil {
+				rkv.Value = *r.Value
+			}
+			name, _, _, err := dec.DecodeRow(rkv, &alloc)
+			require.NoError(t, err)
+			if name == fakeSettingName {
+				rkv.Key, err = codec.StripTenantPrefix(rkv.Key)
+				require.NoError(t, err)
+				rkv.Value.ClearChecksum()
+				rkv.Value.InitChecksum(rkv.Key)
+				return rkv
+			}
+		}
+		t.Fatalf("failed to find setting %v", fakeSettingName)
+		return roachpb.KeyValue{} // unreachable
+	}
+
+	// newRangeFeedEvent creates a RangeFeedEvent for the bogus tenant using a KV
+	// which has a stripped prefix. It also sets the timestamp.
+	newRangeFeedEvent := func(kv roachpb.KeyValue, ts hlc.Timestamp) *kvpb.RangeFeedEvent {
+		kv.Key = append(bogusCodec.TenantPrefix(), kv.Key...)
+		kv.Value.Timestamp = ts
+		kv.Value.ClearChecksum()
+		kv.Value.InitChecksum(kv.Key)
+		return &kvpb.RangeFeedEvent{
+			Val: &kvpb.RangeFeedValue{Key: kv.Key, Value: kv.Value},
+		}
+	}
+	sideSettings := cluster.MakeTestingClusterSettings()
+	settingIsSoon := func(t *testing.T, exp string) {
+		testutils.SucceedsSoon(t, func() error {
+			if got := fakeSetting.Get(&sideSettings.SV); got != exp {
+				return errors.Errorf("expected %v, got %v", exp, got)
+			}
+			return nil
+		})
+	}
+	settingStillHasValueAfterAShortWhile := func(t *testing.T, exp string) {
+		const aShortWhile = 10 * time.Millisecond
+		require.Equal(t, exp, fakeSetting.Get(&sideSettings.SV))
+		time.Sleep(aShortWhile)
+		require.Equal(t, exp, fakeSetting.Get(&sideSettings.SV))
+	}
+	w := settingswatcher.New(
+		s.Clock(),
+		bogusCodec,
+		sideSettings,
+		s.RangeFeedFactory().(*rangefeed.Factory),
+		s.Stopper(),
+		nil,
+	)
+	// Start the watcher, make sure the value is the default, and intercept
+	// the rangefeed.
+	require.NoError(t, w.Start(ctx))
+	require.Equal(t, defaultFakeSettingValue, fakeSetting.Get(&sideSettings.SV))
+	stream := <-interceptedStreamCh
+	require.Equal(t, defaultFakeSettingValue, fakeSetting.Get(&sideSettings.SV))
+
+	// Synthesize a proper KV value by writing the setting into the real settings
+	// table and then use that to inject a properly prefixed value into the stream.
+	const newSettingValue = "bar"
+	tdb.Exec(t, "SET CLUSTER SETTING "+fakeSettingName+" = $1", newSettingValue)
+	setting1KV := getSettingKVForFakeSetting(t)
+
+	ts0 := s.Clock().Now()
+	ts1 := ts0.Next()
+	ts2 := ts1.Next()
+	tombstone := setting1KV
+	tombstone.Value.RawBytes = nil
+
+	require.NoError(t, stream.Send(newRangeFeedEvent(setting1KV, ts1)))
+	settingIsSoon(t, newSettingValue)
+
+	require.NoError(t, stream.Send(newRangeFeedEvent(tombstone, ts0)))
+	settingStillHasValueAfterAShortWhile(t, newSettingValue)
+
+	require.NoError(t, stream.Send(newRangeFeedEvent(tombstone, ts2)))
+	settingIsSoon(t, defaultFakeSettingValue)
+	require.NoError(t, stream.Send(newRangeFeedEvent(setting1KV, ts1)))
+	settingStillHasValueAfterAShortWhile(t, defaultFakeSettingValue)
 }

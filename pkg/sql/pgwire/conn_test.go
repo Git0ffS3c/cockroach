@@ -17,7 +17,6 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"strconv"
@@ -31,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -39,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -52,8 +51,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgconn"
-	"github.com/jackc/pgproto3/v2"
-	"github.com/jackc/pgx/v4"
+	pgproto3 "github.com/jackc/pgproto3/v2"
+	pgx "github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -116,7 +115,7 @@ func TestConn(t *testing.T) {
 			func() bool { return false }, /* draining */
 			// sqlServer - nil means don't create a command processor and a write side of the conn
 			nil,
-			mon.BoundAccount{}, /* reserved */
+			&mon.BoundAccount{}, /* reserved */
 			authOptions{testingSkipAuth: true, connType: hba.ConnHostAny},
 		)
 		return nil
@@ -160,6 +159,9 @@ func TestConn(t *testing.T) {
 	if err := finishQuery(generateError, conn); err != nil {
 		t.Fatal(err)
 	}
+	expectExecStmt(ctx, t, "DECLARE \"a b\" CURSOR FOR SELECT 10", &rd, conn, queryStringComplete)
+	expectExecStmt(ctx, t, "FETCH 1 \"a b\"", &rd, conn, queryStringComplete)
+	expectExecStmt(ctx, t, "CLOSE \"a b\"", &rd, conn, queryStringComplete)
 	// We got to the COMMIT at the end of the batch.
 	expectExecStmt(ctx, t, "COMMIT TRANSACTION", &rd, conn, queryStringComplete)
 	expectSync(ctx, t, &rd)
@@ -434,7 +436,7 @@ func processPgxStartup(ctx context.Context, s serverutils.TestServerInterface, c
 func execQuery(
 	ctx context.Context, query string, s serverutils.TestServerInterface, c *conn,
 ) error {
-	it, err := s.InternalExecutor().(sqlutil.InternalExecutor).QueryIteratorEx(
+	it, err := s.InternalExecutor().(isql.Executor).QueryIteratorEx(
 		ctx, "test", nil, /* txn */
 		sessiondata.InternalExecutorOverride{User: username.RootUserName(), Database: "system"},
 		query,
@@ -506,6 +508,9 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 	batch.Queue("BEGIN")
 	batch.Queue("select 7")
 	batch.Queue("select 8")
+	batch.Queue("declare \"a b\" cursor for select 10")
+	batch.Queue("fetch 1 \"a b\"")
+	batch.Queue("close \"a b\"")
 	batch.Queue("COMMIT")
 
 	batchResults := conn.SendBatch(ctx, batch)
@@ -531,46 +536,60 @@ func client(ctx context.Context, serverAddr net.Addr, wg *sync.WaitGroup) error 
 // waitForClientConn blocks until a client connects and performs the pgwire
 // handshake. This emulates what pgwire.Server does.
 func waitForClientConn(ln net.Listener) (*conn, error) {
-	conn, _, err := getSessionArgs(ln, false /* trustRemoteAddr */)
+	conn, _, err := getSessionArgs(ln, false)
 	if err != nil {
 		return nil, err
 	}
 
-	metrics := makeServerMetrics(sql.MemoryMetrics{} /* sqlMemMetrics */, metric.TestSampleInterval)
+	metrics := makeTenantSpecificMetrics(sql.MemoryMetrics{} /* sqlMemMetrics */, metric.TestSampleInterval)
 	pgwireConn := newConn(conn, sql.SessionArgs{ConnResultsBufferSize: 16 << 10}, &metrics, timeutil.Now(), nil)
 	return pgwireConn, nil
 }
 
 // getSessionArgs blocks until a client connects and returns the connection
 // together with session arguments or an error.
-func getSessionArgs(ln net.Listener, trustRemoteAddr bool) (net.Conn, sql.SessionArgs, error) {
-	conn, err := ln.Accept()
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
+func getSessionArgs(
+	ln net.Listener, trustRemoteAddr bool,
+) (conn net.Conn, _ sql.SessionArgs, err error) {
+	for {
+		conn, err = ln.Accept()
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
 
-	buf := pgwirebase.MakeReadBuffer()
-	_, err = buf.ReadUntypedMsg(conn)
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
-	version, err := buf.GetUint32()
-	if err != nil {
-		return nil, sql.SessionArgs{}, err
-	}
-	if version != version30 {
-		return nil, sql.SessionArgs{}, errors.Errorf("unexpected protocol version: %d", version)
-	}
+		buf := pgwirebase.MakeReadBuffer()
+		_, err = buf.ReadUntypedMsg(conn)
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
+		version, err := buf.GetUint32()
+		if err != nil {
+			return nil, sql.SessionArgs{}, err
+		}
+		if version == versionCancel {
+			// The pgx driver can send a cancel message asynchronously if the
+			// context expired, but these test should ignore it.
+			continue
+		}
+		if version != version30 {
+			return nil, sql.SessionArgs{}, errors.Errorf("unexpected protocol version: %d", version)
+		}
 
-	args, err := parseClientProvidedSessionParameters(
-		context.Background(), nil, &buf, conn.RemoteAddr(), trustRemoteAddr,
-	)
-	return conn, args, err
+		ctx := context.Background()
+		cp, err := parseClientProvidedSessionParameters(ctx, &buf, conn.RemoteAddr(), trustRemoteAddr,
+			false /* acceptTenantName */, false /* acceptSystemIdentityOption */)
+		if err != nil {
+			return conn, sql.SessionArgs{}, err
+		}
+		args, err := finalizeClientParameters(ctx, cp, nil)
+		return conn, args, err
+	}
 }
 
 func makeTestingConvCfg() (sessiondatapb.DataConversionConfig, *time.Location) {
 	return sessiondatapb.DataConversionConfig{
 		BytesEncodeFormat: lex.BytesEncodeHex,
+		ExtraFloatDigits:  1,
 	}, time.UTC
 }
 
@@ -676,7 +695,7 @@ func expectPrepareStmt(
 func expectDescribeStmt(
 	ctx context.Context,
 	t *testing.T,
-	expName string,
+	expName tree.Name,
 	expType pgwirebase.PrepareType,
 	rd *sql.StmtBufReader,
 	c *conn,
@@ -1044,13 +1063,13 @@ func TestMaliciousInputs(t *testing.T) {
 				// The reason this works is that ioutil.devNull implements ReadFrom
 				// as an infinite loop, so it will Read continuously until it hits an
 				// error (on w.Close()).
-				_, _ = io.Copy(ioutil.Discard, w)
+				_, _ = io.Copy(io.Discard, w)
 			}()
 
 			errChan := make(chan error, 1)
-			go func() {
+			go func(data []byte) {
 				// Write the malicious data.
-				if _, err := w.Write(tc); err != nil {
+				if _, err := w.Write(data); err != nil {
 					errChan <- err
 					return
 				}
@@ -1061,10 +1080,10 @@ func TestMaliciousInputs(t *testing.T) {
 				_, _ = w.Write([]byte{byte(pgwirebase.ClientMsgSync), 0x00, 0x00, 0x00, 0x04})
 				_, _ = w.Write([]byte{byte(pgwirebase.ClientMsgTerminate), 0x00, 0x00, 0x00, 0x04})
 				close(errChan)
-			}()
+			}(tc)
 
 			sqlMetrics := sql.MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
-			metrics := makeServerMetrics(sqlMetrics, time.Second /* histogramWindow */)
+			metrics := makeTenantSpecificMetrics(sqlMetrics, time.Second /* histogramWindow */)
 
 			conn := newConn(
 				r,
@@ -1081,7 +1100,7 @@ func TestMaliciousInputs(t *testing.T) {
 				ctx,
 				func() bool { return false }, /* draining */
 				nil,                          /* sqlServer */
-				mon.BoundAccount{},           /* reserved */
+				&mon.BoundAccount{},          /* reserved */
 				authOptions{testingSkipAuth: true, connType: hba.ConnHostAny},
 			)
 			if err := <-errChan; err != nil {
@@ -1338,6 +1357,7 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = ln.Close() }()
 	serverAddr := ln.Addr()
 	log.Infof(context.Background(), "started listener on %s", serverAddr)
 	testCases := []struct {
@@ -1463,6 +1483,46 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 			},
 		},
 		{
+			desc:  "success parsing crdb:jwt_auth_enabled from true option",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=1",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.True(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "success parsing crdb:jwt_auth_enabled from false option",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=false",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "success parsing crdb:jwt_auth_enabled when there is some capitalization",
+			query: "user=root&options=-c CrDb:JwT_AUth_eNaBLEd=False",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "default crdb:jwt_auth_enabled value is false if not provided",
+			query: "user=root",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.False(t, args.JWTAuthEnabled)
+			},
+		},
+		{
+			desc:  "crdb:jwt_auth_enabled must be a boolean if provided",
+			query: "user=root&options=-c crdb:jwt_auth_enabled=notaboolean",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.Error(t, err)
+				require.Regexp(t, "crdb:jwt_auth_enabled: strconv.ParseBool: parsing \"notaboolean\": invalid syntax", err)
+			},
+		},
+		{
 			desc:  "remote_addr missing port",
 			query: "user=root&crdb:remote_addr=5.4.3.2",
 			assert: func(t *testing.T, args sql.SessionArgs, err error) {
@@ -1510,6 +1570,15 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				require.Equal(t, "ISO,YMD", args.SessionDefaults["datestyle"])
 			},
 		},
+		{
+			// Regression test for issue #98301.
+			desc:  "special characters that look like urlencoded must not be decoded during option parsing",
+			query: "options=-c application_name=%2566%256f%256f",
+			assert: func(t *testing.T, args sql.SessionArgs, err error) {
+				require.NoError(t, err)
+				require.Equal(t, "%66%6f%6f", args.SessionDefaults["application_name"])
+			},
+		},
 	}
 
 	baseURL := fmt.Sprintf("postgres://%s/system?sslmode=disable", serverAddr)
@@ -1517,13 +1586,14 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 
-			var connErr error
-			go func() {
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			go func(query string) {
+				defer wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 				defer cancel()
-				url := fmt.Sprintf("%s&%s", baseURL, tc.query)
-				var c *pgx.Conn
-				c, connErr = pgx.Connect(ctx, url)
+				url := fmt.Sprintf("%s&%s", baseURL, query)
+				c, connErr := pgx.Connect(ctx, url)
 				if connErr != nil {
 					return
 				}
@@ -1532,9 +1602,18 @@ func TestParseClientProvidedSessionParameters(t *testing.T) {
 				_ = c.Ping(ctx)
 				// closing connection immediately, since getSessionArgs is blocking
 				_ = c.Close(ctx)
-			}()
+
+				select {
+				case <-c.PgConn().CleanupDone():
+				case <-time.After(20 * time.Second):
+					// 20 seconds was picked because pgconn has an internal deadline of
+					// 15 seconds when performing the async close request.
+					t.Error("pgconn asyncClose did not clean up on time")
+				}
+			}(tc.query)
 			// Wait for the client to connect and perform the handshake.
 			_, args, err := getSessionArgs(ln, true /* trustRemoteAddr */)
+			wg.Wait()
 			tc.assert(t, args, err)
 		})
 	}
@@ -1548,24 +1627,17 @@ func TestSetSessionArguments(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	defer db.Close()
 
-	_, err := db.Exec("SET CLUSTER SETTING sql.defaults.datestyle.enabled = true")
-	require.NoError(t, err)
-	_, err = db.Exec("SET CLUSTER SETTING sql.defaults.intervalstyle.enabled = true")
-	require.NoError(t, err)
-
 	pgURL, cleanupFunc := sqlutils.PGUrl(
 		t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(username.RootUser),
 	)
 	defer cleanupFunc()
 
-	q := pgURL.Query()
-	q.Add("options", "  --user=test -c    search_path=public,testsp %20 "+
-		"--default-transaction-isolation=read\\ uncommitted   "+
-		"-capplication_name=test  "+
-		"--DateStyle=ymd\\ ,\\ iso\\  "+
-		"-c intervalstyle%3DISO_8601 "+
-		"-ccustom_option.custom_option=test2")
-	pgURL.RawQuery = q.Encode()
+	pgURL.RawQuery += `&options=` + "  --user=test -c    search_path=public,testsp %20 " +
+		"--default-transaction-isolation=read\\ uncommitted   " +
+		"-capplication_name=test  " +
+		"--DateStyle=ymd\\ ,\\ iso\\  " +
+		"-c intervalstyle%3DISO_8601 " +
+		"-ccustom_option.custom_option=test2"
 	noBufferDB, err := gosql.Open("postgres", pgURL.String())
 
 	if err != nil {
@@ -1940,4 +2012,34 @@ func TestPGWireRejectsNewConnIfTooManyConns(t *testing.T) {
 		nonAdminCleanup2()
 		requireConnectionCount(t, 0)
 	})
+}
+
+func TestConnCloseReleasesReservedMem(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+
+	before := s.PGServer().(*Server).tenantSpecificConnMonitor.AllocBytes()
+
+	pgURL, cleanupFunc := sqlutils.PGUrl(
+		t, s.ServingSQLAddr(), "testConnClose" /* prefix */, url.User(username.RootUser),
+	)
+	values := pgURL.Query()
+	values.Add("options", "c sadsad=") // invalid client-provided session param
+	pgURL.RawQuery = values.Encode()
+
+	defer cleanupFunc()
+	db, err := gosql.Open("postgres", pgURL.String())
+	require.NoError(t, err)
+	defer db.Close()
+
+	err = db.Ping()
+	require.Error(t, err)
+	require.Regexp(t, "pq: option .* is invalid", err.Error())
+
+	// Check that no accounted-for memory is leaked, after the connection attempt fails.
+	after := s.PGServer().(*Server).tenantSpecificConnMonitor.AllocBytes()
+	require.Equal(t, before, after)
 }

@@ -11,38 +11,49 @@ package backupccl
 import (
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupinfo"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuptestutils"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/bank"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	"github.com/kr/pretty"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,8 +62,13 @@ const (
 	multiNode                   = 3
 	backupRestoreDefaultRanges  = 10
 	backupRestoreRowPayloadSize = 100
-	localFoo                    = "nodelocal://0/foo"
+	localFoo                    = "nodelocal://1/foo"
 )
+
+// smallEngineBlocks configures Pebble with a block size of 1 byte, to provoke
+// bugs in time-bound iterators. We disable this in race builds, which can
+// be too slow.
+var smallEngineBlocks = !util.RaceEnabled && util.ConstantWithMetamorphicTestBool("small-engine-blocks", false)
 
 func backupRestoreTestSetupWithParams(
 	t testing.TB,
@@ -69,12 +85,26 @@ func backupRestoreTestSetupWithParams(
 	if len(params.ServerArgsPerNode) > 0 {
 		for i := range params.ServerArgsPerNode {
 			param := params.ServerArgsPerNode[i]
-			param.ExternalIODir = dir
+			param.ExternalIODir = dir + param.ExternalIODir
 			param.UseDatabase = "data"
 			params.ServerArgsPerNode[i] = param
 		}
 	}
 
+	if smallEngineBlocks {
+		if params.ServerArgs.Knobs.Store == nil {
+			params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{}
+		}
+		params.ServerArgs.Knobs.Store.(*kvserver.StoreTestingKnobs).SmallEngineBlocks = true
+	}
+
+	params.ServerArgs.Knobs.KeyVisualizer = &keyvisualizer.TestingKnobs{
+		SkipJobBootstrap:        true,
+		SkipZoneConfigBootstrap: true,
+	}
+	params.ServerArgs.Knobs.SQLStatsKnobs = &sqlstats.TestingKnobs{
+		SkipZoneConfigBootstrap: true,
+	}
 	tc = testcluster.StartTestCluster(t, clusterSize, params)
 	init(tc)
 
@@ -87,11 +117,15 @@ func backupRestoreTestSetupWithParams(
 
 	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
 
+	// Lower the initial buffering adder ingest size to allow concurrent import jobs to run without
+	// borking the memory monitor.
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.pk_buffer_size = '16MiB'`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.index_buffer_size = '16MiB'`)
+
 	// Set the max buffer size to something low to prevent backup/restore tests
 	// from hitting OOM errors. If any test cares about this setting in
 	// particular, they will override it inline after setting up the test cluster.
 	sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '16MiB'`)
-
 	sqlDB.Exec(t, `CREATE DATABASE data`)
 	l := workloadsql.InsertsDataLoader{BatchSize: 1000, Concurrency: 4}
 	if _, err := workloadsql.Setup(ctx, sqlDB.DB.(*gosql.DB), bankData, l); err != nil {
@@ -103,6 +137,7 @@ func backupRestoreTestSetupWithParams(
 	}
 
 	cleanupFn := func() {
+		backuptestutils.CheckForInvalidDescriptors(t, tc.Conns[0])
 		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
 		dirCleanupFn()         // cleans up dir, which is the nodelocal:// storage
 	}
@@ -110,16 +145,15 @@ func backupRestoreTestSetupWithParams(
 	return tc, sqlDB, dir, cleanupFn
 }
 
-func backupDestinationTestSetup(
-	t testing.TB, clusterSize int, numAccounts int, init func(*testcluster.TestCluster),
-) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, tempDir string, cleanup func()) {
-	return backupRestoreTestSetupWithParams(t, clusterSize, numAccounts, init, base.TestClusterArgs{})
-}
-
 func backupRestoreTestSetup(
 	t testing.TB, clusterSize int, numAccounts int, init func(*testcluster.TestCluster),
 ) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, tempDir string, cleanup func()) {
-	return backupRestoreTestSetupWithParams(t, clusterSize, numAccounts, init, base.TestClusterArgs{})
+	// TODO (msbutler): The DefaultTestTenant should be disabled by the caller of this function
+	return backupRestoreTestSetupWithParams(t, clusterSize, numAccounts, init,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestTenantDisabled,
+			}})
 }
 
 func backupRestoreTestSetupEmpty(
@@ -129,62 +163,9 @@ func backupRestoreTestSetupEmpty(
 	init func(*testcluster.TestCluster),
 	params base.TestClusterArgs,
 ) (tc *testcluster.TestCluster, sqlDB *sqlutils.SQLRunner, cleanup func()) {
+	// TODO (msbutler): this should be disabled by callers of this function
+	params.ServerArgs.DefaultTestTenant = base.TestTenantDisabled
 	return backupRestoreTestSetupEmptyWithParams(t, clusterSize, tempDir, init, params)
-}
-
-func verifyBackupRestoreStatementResult(
-	t *testing.T, sqlDB *sqlutils.SQLRunner, query string, args ...interface{},
-) error {
-	t.Helper()
-	rows := sqlDB.Query(t, query, args...)
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return err
-	}
-	if e, a := columns, []string{
-		"job_id", "status", "fraction_completed", "rows", "index_entries", "bytes",
-	}; !reflect.DeepEqual(e, a) {
-		return errors.Errorf("unexpected columns:\n%s", strings.Join(pretty.Diff(e, a), "\n"))
-	}
-
-	type job struct {
-		id                int64
-		status            string
-		fractionCompleted float32
-	}
-
-	var expectedJob job
-	var actualJob job
-	var unused int64
-
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		return errors.New("zero rows in result")
-	}
-	if err := rows.Scan(
-		&actualJob.id, &actualJob.status, &actualJob.fractionCompleted, &unused, &unused, &unused,
-	); err != nil {
-		return err
-	}
-	if rows.Next() {
-		return errors.New("more than one row in result")
-	}
-
-	sqlDB.QueryRow(t,
-		`SELECT job_id, status, fraction_completed FROM crdb_internal.jobs WHERE job_id = $1`, actualJob.id,
-	).Scan(
-		&expectedJob.id, &expectedJob.status, &expectedJob.fractionCompleted,
-	)
-
-	if e, a := expectedJob, actualJob; !reflect.DeepEqual(e, a) {
-		return errors.Errorf("result does not match system.jobs:\n%s",
-			strings.Join(pretty.Diff(e, a), "\n"))
-	}
-
-	return nil
 }
 
 func backupRestoreTestSetupEmptyWithParams(
@@ -204,12 +185,21 @@ func backupRestoreTestSetupEmptyWithParams(
 			params.ServerArgsPerNode[i] = param
 		}
 	}
+
+	if smallEngineBlocks {
+		if params.ServerArgs.Knobs.Store == nil {
+			params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{}
+		}
+		params.ServerArgs.Knobs.Store.(*kvserver.StoreTestingKnobs).SmallEngineBlocks = true
+	}
+
 	tc = testcluster.StartTestCluster(t, clusterSize, params)
 	init(tc)
 
 	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
 
 	cleanupFn := func() {
+		backuptestutils.CheckForInvalidDescriptors(t, tc.Conns[0])
 		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
 	}
 
@@ -224,11 +214,15 @@ func createEmptyCluster(
 	dir, dirCleanupFn := testutils.TempDir(t)
 	params := base.TestClusterArgs{}
 	params.ServerArgs.ExternalIODir = dir
+	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
+		SmallEngineBlocks: smallEngineBlocks,
+	}
 	tc := testcluster.StartTestCluster(t, clusterSize, params)
 
 	sqlDB = sqlutils.MakeSQLRunner(tc.Conns[0])
 
 	cleanupFn := func() {
+		backuptestutils.CheckForInvalidDescriptors(t, tc.Conns[0])
 		tc.Stopper().Stop(ctx) // cleans up in memory storage's auxiliary dirs
 		dirCleanupFn()         // cleans up dir, which is the nodelocal:// storage
 	}
@@ -366,10 +360,10 @@ func makeThresholdBlocker(threshold int) thresholdBlocker {
 // getSpansFromManifest returns the spans that describe the data included in a
 // given backup.
 func getSpansFromManifest(ctx context.Context, t *testing.T, backupPath string) roachpb.Spans {
-	backupManifestBytes, err := ioutil.ReadFile(backupPath + "/" + backupManifestName)
+	backupManifestBytes, err := os.ReadFile(backupPath + "/" + backupbase.BackupManifestName)
 	require.NoError(t, err)
-	var backupManifest BackupManifest
-	decompressedBytes, err := decompressData(ctx, nil, backupManifestBytes)
+	var backupManifest backuppb.BackupManifest
+	decompressedBytes, err := backupinfo.DecompressData(ctx, nil, backupManifestBytes)
 	require.NoError(t, err)
 	require.NoError(t, protoutil.Unmarshal(decompressedBytes, &backupManifest))
 	spans := make([]roachpb.Span, 0, len(backupManifest.Files))
@@ -380,9 +374,11 @@ func getSpansFromManifest(ctx context.Context, t *testing.T, backupPath string) 
 	return mergedSpans
 }
 
-func getKVCount(ctx context.Context, kvDB *kv.DB, dbName, tableName string) (int, error) {
-	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, dbName, tableName)
-	tablePrefix := keys.SystemSQLCodec.TablePrefix(uint32(tableDesc.GetID()))
+func getKVCount(
+	ctx context.Context, kvDB *kv.DB, codec keys.SQLCodec, dbName, tableName string,
+) (int, error) {
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, dbName, tableName)
+	tablePrefix := codec.TablePrefix(uint32(tableDesc.GetID()))
 	tableEnd := tablePrefix.PrefixEnd()
 	kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0)
 	return len(kvs), err
@@ -390,7 +386,10 @@ func getKVCount(ctx context.Context, kvDB *kv.DB, dbName, tableName string) (int
 
 // uriFmtStringAndArgs returns format strings like "$1" or "($1, $2, $3)" and
 // an []interface{} of URIs for the BACKUP/RESTORE queries.
-func uriFmtStringAndArgs(uris []string) (string, []interface{}) {
+//
+// Passing startIndex=i will start the fmt strings at $i+1. This can be useful
+// when formatting different blocks of strings/args in the same query.
+func uriFmtStringAndArgs(uris []string, startIndex int) (string, []interface{}) {
 	urisForFormat := make([]interface{}, len(uris))
 	var fmtString strings.Builder
 	if len(uris) > 1 {
@@ -400,7 +399,7 @@ func uriFmtStringAndArgs(uris []string) (string, []interface{}) {
 		if i > 0 {
 			fmtString.WriteString(", ")
 		}
-		fmtString.WriteString(fmt.Sprintf("$%d", i+1))
+		fmtString.WriteString(fmt.Sprintf("$%d", startIndex+i+1))
 		urisForFormat[i] = uri
 	}
 	if len(uris) > 1 {
@@ -417,11 +416,8 @@ func waitForTableSplit(t *testing.T, conn *gosql.DB, tableName, dbName string) {
 	testutils.SucceedsSoon(t, func() error {
 		count := 0
 		if err := conn.QueryRow(
-			"SELECT count(*) "+
-				"FROM crdb_internal.ranges_no_leases "+
-				"WHERE table_name = $1 "+
-				"AND database_name = $2",
-			tableName, dbName).Scan(&count); err != nil {
+			fmt.Sprintf("SELECT count(*) FROM [SHOW RANGES FROM TABLE %s.%s]",
+				tree.NameString(dbName), tree.NameString(tableName))).Scan(&count); err != nil {
 			return err
 		}
 		if count == 0 {
@@ -434,13 +430,8 @@ func waitForTableSplit(t *testing.T, conn *gosql.DB, tableName, dbName string) {
 func getTableStartKey(t *testing.T, conn *gosql.DB, tableName, dbName string) roachpb.Key {
 	t.Helper()
 	row := conn.QueryRow(
-		"SELECT start_key "+
-			"FROM crdb_internal.ranges_no_leases "+
-			"WHERE table_name = $1 "+
-			"AND database_name = $2 "+
-			"ORDER BY start_key ASC "+
-			"LIMIT 1",
-		tableName, dbName)
+		fmt.Sprintf(`SELECT crdb_internal.table_span('%s.%s'::regclass::oid::int)[1]`,
+			tree.NameString(dbName), tree.NameString(tableName)))
 	var startKey roachpb.Key
 	require.NoError(t, row.Scan(&startKey))
 	return startKey
@@ -468,10 +459,22 @@ func getStoreAndReplica(
 ) (*kvserver.Store, *kvserver.Replica) {
 	t.Helper()
 	startKey := getTableStartKey(t, conn, tableName, dbName)
+
 	// Okay great now we have a key and can go find replicas and stores and what not.
 	r := tc.LookupRangeOrFatal(t, startKey)
-	l, _, err := tc.FindRangeLease(r, nil)
-	require.NoError(t, err)
+
+	var l roachpb.Lease
+	testutils.SucceedsSoon(t, func() error {
+		var err error
+		l, _, err = tc.FindRangeLease(r, nil)
+		if err != nil {
+			return err
+		}
+		if l.Replica.NodeID == 0 {
+			return errors.New("range does not have a lease yet")
+		}
+		return nil
+	})
 
 	lhServer := tc.Server(int(l.Replica.NodeID) - 1)
 	return getFirstStoreReplica(t, lhServer, startKey)
@@ -518,7 +521,7 @@ func setAndWaitForTenantReadOnlyClusterSetting(
 	systemTenantRunner.Exec(
 		t,
 		fmt.Sprintf(
-			"ALTER TENANT $1 SET CLUSTER	SETTING %s = '%s'",
+			"ALTER TENANT [$1] SET CLUSTER SETTING %s = '%s'",
 			setting,
 			val,
 		),
@@ -569,7 +572,7 @@ WHERE start_pretty LIKE '%s' ORDER BY start_key ASC`, startPretty)).Scan(&startK
 	lhServer := tc.Server(int(l.Replica.NodeID) - 1)
 	s, repl := getFirstStoreReplica(t, lhServer, startKey)
 	testutils.SucceedsSoon(t, func() error {
-		trace, _, err := s.ManuallyEnqueue(ctx, "mvccGC", repl, skipShouldQueue)
+		trace, _, err := s.Enqueue(ctx, "mvccGC", repl, skipShouldQueue, false /* async */)
 		require.NoError(t, err)
 		return checkGCTrace(trace.String())
 	})
@@ -590,10 +593,10 @@ func runGCAndCheckTraceOnCluster(
 	t.Helper()
 	var startKey roachpb.Key
 	testutils.SucceedsSoon(t, func() error {
-		err := runner.DB.QueryRowContext(ctx, `
-SELECT start_key FROM crdb_internal.ranges_no_leases
-WHERE table_name = $1 AND database_name = $2
-ORDER BY start_key ASC`, tableName, databaseName).Scan(&startKey)
+		err := runner.DB.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT raw_start_key
+FROM [SHOW RANGES FROM TABLE %s.%s WITH KEYS]
+ORDER BY raw_start_key ASC`, tree.NameString(databaseName), tree.NameString(tableName))).Scan(&startKey)
 		if err != nil {
 			return errors.Wrap(err, "failed to query start_key ")
 		}
@@ -631,16 +634,60 @@ func upsertUntilBackpressure(
 	t *testing.T, rRand *rand.Rand, conn *gosql.DB, database, table string,
 ) {
 	t.Helper()
-	testutils.SucceedsSoon(t, func() error {
+	for i := 1; i < 50; i++ {
 		_, err := conn.Exec(fmt.Sprintf("UPSERT INTO %s.%s VALUES (1, $1)", database, table),
-			randutil.RandBytes(rRand, 1<<15))
-		if err == nil {
-			return errors.New("expected `backpressure` error")
+			randutil.RandBytes(rRand, 5<<20))
+		if testutils.IsError(err, "backpressure") {
+			return
+		}
+	}
+	assert.Fail(t, "expected `backpressure` error")
+}
+
+// requireRecoveryEvent fetches all available log entries on disk after
+// startTime, and requires that the first RecoveryEvent of recoveryType matches
+// the expected event. requireRecoveryEvent will fail the test if the first
+// event does not match what's expected or if no RecoveryEvents of recoveryType
+// appear in the logs after a preset timeout.
+func requireRecoveryEvent(
+	t *testing.T,
+	startTime int64,
+	recoveryType eventpb.RecoveryEventType,
+	expected eventpb.RecoveryEvent,
+) {
+	testutils.SucceedsSoon(t, func() error {
+		log.Flush()
+		entries, err := log.FetchEntriesFromFiles(
+			startTime,
+			math.MaxInt64,
+			1000,
+			regexp.MustCompile(fmt.Sprintf(`"EventType":"recovery_event".*"RecoveryType":"%s"`, recoveryType)),
+			log.WithMarkedSensitiveData,
+		)
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		if !testutils.IsError(err, "backpressure") {
-			return errors.NewAssertionErrorWithWrappedErrf(err, "expected `backpressure` error")
+		if len(entries) == 0 {
+			return errors.New("structured entry for recovery event not found in logs")
 		}
+
+		sort.Slice(entries, func(a int, b int) bool {
+			return entries[a].Time < entries[b].Time
+		})
+
+		jsonPayload := []byte(entries[0].Message)
+		var actual eventpb.RecoveryEvent
+		if err := json.Unmarshal(jsonPayload, &actual); err != nil {
+			t.Errorf("unmarshalling %q: %v", entries[0].Message, err)
+		}
+
+		// Exclude Job ID and timestamp from the comparison by clearing those values
+		// on the actual event.
+		actual.Timestamp = 0
+		actual.JobID = 0
+
+		require.Equal(t, expected, actual)
 		return nil
 	})
 }

@@ -15,9 +15,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	"github.com/cockroachdb/cockroach/pkg/ccl/testutilsccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -62,7 +62,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -75,7 +75,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -95,7 +95,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER TABLE t.public.test CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 3,
 	num_voters = 3,
@@ -109,7 +109,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER PARTITION "ajstorm-1" OF INDEX t.public.test@new_primary_key CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 3,
 	num_voters = 3,
@@ -130,7 +130,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -150,7 +150,7 @@ func TestAlterTableLocalityRegionalByRowCorrectZoneConfigBeforeBackfill(t *testi
 					ExpectedSQL: `ALTER DATABASE t CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	num_replicas = 3,
 	num_voters = 3,
 	constraints = '{+region=ajstorm-1: 1}',
@@ -350,6 +350,11 @@ func TestAlterTableLocalityRegionalByRowError(t *testing.T) {
 							params.Locality.Tiers = []roachpb.Tier{
 								{Key: "region", Value: "ajstorm-1"},
 							}
+							// Need to disable the test tenant here because
+							// when running inside a tenant, for some reason
+							// this test doesn't error when expected. More
+							// investigation is required. Tracked with #76378.
+							params.DefaultTestTenant = base.TestTenantDisabled
 							var sqlDB *gosql.DB
 							params.Knobs = base.TestingKnobs{
 								SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
@@ -394,7 +399,12 @@ USE t;
 							if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
 								t.Fatal(err)
 							}
-
+							// Disable declarative schema changer for the add column, since
+							// the backfill callbacks required are not currently used (they
+							// need the MVCC compliant backfiller).
+							if _, err := sqlDB.Exec(`SET use_declarative_schema_changer='off'`); err != nil {
+								t.Fatal(err)
+							}
 							// We add the "cr" column, which can be used for REGIONAL BY ROW AS.
 							if _, err := sqlDB.Exec(`
 		ALTER TABLE t.test ADD COLUMN cr t.crdb_internal_region
@@ -588,7 +598,10 @@ func TestIndexCleanupAfterAlterFromRegionalByRow(t *testing.T) {
 				},
 				// Decrease the adopt loop interval so that retries happen quickly.
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
-				GCJob:            &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { <-blockGC; return nil }},
+				GCJob: &sql.GCJobTestingKnobs{
+					RunBeforeResume:      func(_ jobspb.JobID) error { <-blockGC; return nil },
+					SkipWaitingForMVCCGC: true,
+				},
 			}
 
 			_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
@@ -626,7 +639,7 @@ CREATE TABLE regional_by_row (
 			payload,
 			false
 		) AS job
-		FROM system.jobs
+		FROM "".crdb_internal.system_jobs
 		)
     SELECT count(*)
     FROM jobs
@@ -646,7 +659,7 @@ CREATE TABLE regional_by_row (
 			payload,
 			false
 		) AS job
-		FROM system.jobs
+		FROM "".crdb_internal.system_jobs
 		)
     SELECT status, job->'schemaChangeGC' as details
     FROM jobs
@@ -689,14 +702,6 @@ CREATE TABLE regional_by_row (
 
 			// Unblock GC jobs.
 			close(blockGC)
-			// The GC jobs for the temporary indexes should be cleaned up immediately.
-			testutils.SucceedsSoon(t, queryAndEnsureThatIndexGCJobsSucceeded(expectedGCJobsForTempIndexes))
-			// The GC jobs for the drops should still be waiting out the GC TTL.
-			err = queryIndexGCJobsAndValidateCount(`running`, expectedGCJobsForDrops)
-			require.NoError(t, err)
-
-			// Change gc.ttlseconds to speed up the cleanup.
-			_ = sqlRunner.Exec(t, `ALTER TABLE regional_by_row CONFIGURE ZONE USING gc.ttlseconds = 1`)
 
 			// Validate that indexes are cleaned up.
 			testutils.SucceedsSoon(t, queryAndEnsureThatIndexGCJobsSucceeded(expectedGCJobsForDrops+expectedGCJobsForTempIndexes))
@@ -794,6 +799,7 @@ USE t;
 	for _, rbrChange := range regionalByRowChanges {
 		for _, regionChange := range regionChanges {
 			t.Run(fmt.Sprintf("setup %s executing %s with racing %s", rbrChange.setup, rbrChange.cmd, regionChange.cmd), func(t *testing.T) {
+				defer log.Scope(t).Close(t)
 				interruptStartCh := make(chan struct{})
 				interruptEndCh := make(chan struct{})
 				performInterrupt := false
@@ -821,10 +827,10 @@ USE t;
 				// Perform the alter table command asynchronously; this will be interrupted.
 				rbrErrCh := make(chan error, 1)
 				performInterrupt = true
-				go func() {
-					_, err := sqlDB.Exec(rbrChange.cmd)
+				go func(cmd string) {
+					_, err := sqlDB.Exec(cmd)
 					rbrErrCh <- err
-				}()
+				}(rbrChange.cmd)
 
 				// Wait for the backfill to start.
 				<-interruptStartCh
@@ -849,6 +855,7 @@ USE t;
 	for _, regionChange := range regionChanges {
 		for _, rbrChange := range regionalByRowChanges {
 			t.Run(fmt.Sprintf("setup %s executing %s with racing %s", rbrChange.setup, regionChange.cmd, rbrChange.cmd), func(t *testing.T) {
+				defer log.Scope(t).Close(t)
 				interruptStartCh := make(chan struct{})
 				interruptEndCh := make(chan struct{})
 				performInterrupt := false
@@ -874,10 +881,10 @@ USE t;
 				performInterrupt = true
 
 				regionChangeErr := make(chan error, 1)
-				go func() {
-					_, err := sqlDB.Exec(regionChange.cmd)
+				go func(cmd string) {
+					_, err := sqlDB.Exec(cmd)
 					regionChangeErr <- err
-				}()
+				}(regionChange.cmd)
 
 				// Wait for the enum change to start.
 				<-interruptStartCh
@@ -905,7 +912,7 @@ USE t;
 func TestIndexDescriptorUpdateForImplicitColumns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
 	c, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
 		t, 3 /* numServers */, base.TestingKnobs{},

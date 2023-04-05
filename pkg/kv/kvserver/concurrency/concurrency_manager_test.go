@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -26,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
@@ -36,11 +36,14 @@ import (
 	clustersettings "github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
@@ -53,9 +56,11 @@ import (
 //
 // The input files use the following DSL:
 //
-// new-txn      name=<txn-name> ts=<int>[,<int>] epoch=<int> [uncertainty-limit=<int>[,<int>]]
+// new-txn      name=<txn-name> ts=<int>[,<int>] [epoch=<int>] [priority] [uncertainty-limit=<int>[,<int>]]
 // new-request  name=<req-name> txn=<txn-name>|none ts=<int>[,<int>] [priority] [inconsistent] [wait-policy=<policy>] [lock-timeout] [max-lock-wait-queue-length=<int>] [poison-policy=[err|wait]]
-//   <proto-name> [<field-name>=<field-value>...] (hint: see scanSingleRequest)
+//
+//	<proto-name> [<field-name>=<field-value>...] (hint: see scanSingleRequest)
+//
 // sequence     req=<req-name> [eval-kind=<pess|opt|pess-after-opt]
 // poison       req=<req-name>
 // finish       req=<req-name>
@@ -63,7 +68,8 @@ import (
 // handle-write-intent-error  req=<req-name> txn=<txn-name> key=<key> lease-seq=<seq>
 // handle-txn-push-error      req=<req-name> txn=<txn-name> key=<key>  TODO(nvanbenschoten): implement this
 //
-// check-opt-no-conflicts req=<req-name>
+// check-opt-no-conflicts            req=<req-name>
+// is-key-locked-by-conflicting-txn  req=<req-name> key=<key> strength=<strength>
 //
 // on-lock-acquired  req=<req-name> key=<key> [seq=<seq>] [dur=r|u]
 // on-lock-updated   req=<req-name> txn=<txn-name> key=<key> status=[committed|aborted|pending] [ts=<int>[,<int>]]
@@ -82,12 +88,11 @@ import (
 // debug-set-discovered-locks-threshold-to-consult-finalized-txn-cache n=<count>
 // debug-set-max-locks n=<count>
 // reset
-//
 func TestConcurrencyManagerBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	datadriven.Walk(t, testutils.TestDataPath(t, "concurrency_manager"), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "concurrency_manager"), func(t *testing.T, path string) {
 		c := newCluster()
 		c.enableTxnPushes()
 		m := concurrency.NewManager(c.makeConfig())
@@ -101,8 +106,12 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				d.ScanArgs(t, "name", &txnName)
 				ts := scanTimestamp(t, d)
 
-				var epoch int
-				d.ScanArgs(t, "epoch", &epoch)
+				epoch := 0
+				if d.HasArg("epoch") {
+					d.ScanArgs(t, "epoch", &epoch)
+				}
+
+				priority := scanTxnPriority(t, d)
 
 				uncertaintyLimit := ts
 				if d.HasArg("uncertainty-limit") {
@@ -122,7 +131,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 						Epoch:          enginepb.TxnEpoch(epoch),
 						WriteTimestamp: ts,
 						MinTimestamp:   ts,
-						Priority:       1, // not min or max
+						Priority:       priority,
 					},
 					ReadTimestamp:          ts,
 					GlobalUncertaintyLimit: uncertaintyLimit,
@@ -151,11 +160,12 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					txn.WriteTimestamp = ts
 				}
 
-				readConsistency := roachpb.CONSISTENT
+				readConsistency := kvpb.CONSISTENT
 				if d.HasArg("inconsistent") {
-					readConsistency = roachpb.INCONSISTENT
+					readConsistency = kvpb.INCONSISTENT
 				}
 
+				priority := scanUserPriority(t, d)
 				waitPolicy := scanWaitPolicy(t, d, false /* required */)
 
 				var lockTimeout time.Duration
@@ -174,14 +184,14 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 
 				pp := scanPoisonPolicy(t, d)
 
-				// Each roachpb.Request is provided on an indented line.
+				// Each kvpb.Request is provided on an indented line.
 				reqs, reqUnions := scanRequests(t, d, c)
 				latchSpans, lockSpans := c.collectSpans(t, txn, ts, reqs)
 
 				c.requestsByName[reqName] = concurrency.Request{
-					Txn:       txn,
-					Timestamp: ts,
-					// TODO(nvanbenschoten): test Priority
+					Txn:                    txn,
+					Timestamp:              ts,
+					NonTxnPriority:         priority,
 					ReadConsistency:        readConsistency,
 					WaitPolicy:             waitPolicy,
 					LockTimeout:            lockTimeout,
@@ -318,7 +328,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				opName := fmt.Sprintf("handle write intent error %s", reqName)
 				mon.runAsync(opName, func(ctx context.Context) {
 					seq := roachpb.LeaseSequence(leaseSeq)
-					wiErr := &roachpb.WriteIntentError{Intents: intents}
+					wiErr := &kvpb.WriteIntentError{Intents: intents}
 					guard, err := m.HandleWriterIntentError(ctx, prev, seq, wiErr)
 					if err != nil {
 						log.Eventf(ctx, "handled %v, returned error: %v", wiErr, err)
@@ -344,6 +354,25 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				reqs, _ := scanRequests(t, d, c)
 				latchSpans, lockSpans := c.collectSpans(t, g.Req.Txn, g.Req.Timestamp, reqs)
 				return fmt.Sprintf("no-conflicts: %t", g.CheckOptimisticNoConflicts(latchSpans, lockSpans))
+
+			case "is-key-locked-by-conflicting-txn":
+				var reqName string
+				d.ScanArgs(t, "req", &reqName)
+				g, ok := c.guardsByReqName[reqName]
+				if !ok {
+					d.Fatalf(t, "unknown request: %s", reqName)
+				}
+				var key string
+				d.ScanArgs(t, "key", &key)
+				strength := concurrency.ScanLockStrength(t, d)
+				if ok, txn := g.IsKeyLockedByConflictingTxn(roachpb.Key(key), strength); ok {
+					holder := "<nil>"
+					if txn != nil {
+						holder = txn.ID.String()
+					}
+					return fmt.Sprintf("locked: true, holder: %s", holder)
+				}
+				return "locked: false"
 
 			case "on-lock-acquired":
 				var reqName string
@@ -373,7 +402,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				for _, ru := range guard.Req.Requests {
 					req := ru.GetInner()
 					keySpan := roachpb.Span{Key: roachpb.Key(key)}
-					if roachpb.IsLocking(req) &&
+					if kvpb.IsLocking(req) &&
 						req.Header().Span().Contains(keySpan) &&
 						req.Header().Sequence == seqNum {
 						found = true
@@ -524,17 +553,16 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				var secs int
 				d.ScanArgs(t, "ts", &secs)
 
-				nanos := int64(secs) * time.Second.Nanoseconds()
-				if nanos < c.manual.UnixNano() {
+				if int64(secs) < c.manual.Now().Unix() {
 					d.Fatalf(t, "manual clock must advance")
 				}
-				c.manual.Set(nanos)
+				c.manual.MustAdvanceTo(timeutil.Unix(int64(secs), 0))
 				return ""
 
 			case "debug-advance-clock":
 				var secs int
 				d.ScanArgs(t, "ts", &secs)
-				c.manual.Increment(int64(secs) * time.Second.Nanoseconds())
+				c.manual.Advance(time.Duration(secs) * time.Second)
 				return ""
 
 			case "debug-set-discovered-locks-threshold-to-consult-finalized-txn-cache":
@@ -572,15 +600,15 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 
 func scanRequests(
 	t *testing.T, d *datadriven.TestData, c *cluster,
-) ([]roachpb.Request, []roachpb.RequestUnion) {
-	// Each roachpb.Request is provided on an indented line.
-	var reqs []roachpb.Request
+) ([]kvpb.Request, []kvpb.RequestUnion) {
+	// Each kvpb.Request is provided on an indented line.
+	var reqs []kvpb.Request
 	singleReqLines := strings.Split(d.Input, "\n")
 	for _, line := range singleReqLines {
 		req := scanSingleRequest(t, d, line, c.txnsByName)
 		reqs = append(reqs, req)
 	}
-	reqUnions := make([]roachpb.RequestUnion, len(reqs))
+	reqUnions := make([]kvpb.RequestUnion, len(reqs))
 	for i, req := range reqs {
 		reqUnions[i].MustSetInner(req)
 	}
@@ -596,7 +624,7 @@ type cluster struct {
 	nodeDesc  *roachpb.NodeDescriptor
 	rangeDesc *roachpb.RangeDescriptor
 	st        *clustersettings.Settings
-	manual    *hlc.ManualClock
+	manual    *timeutil.ManualTime
 	clock     *hlc.Clock
 	m         concurrency.Manager
 
@@ -627,13 +655,13 @@ type txnPush struct {
 }
 
 func newCluster() *cluster {
-	manual := hlc.NewManualClock(123 * time.Second.Nanoseconds())
+	manual := timeutil.NewManualTime(timeutil.Unix(123, 0))
 	return &cluster{
 		nodeDesc:  &roachpb.NodeDescriptor{NodeID: 1},
 		rangeDesc: &roachpb.RangeDescriptor{RangeID: 1},
 		st:        clustersettings.MakeTestingClusterSettings(),
 		manual:    manual,
-		clock:     hlc.NewClock(manual.UnixNano, time.Nanosecond),
+		clock:     hlc.NewClockForTesting(manual),
 
 		txnsByName:      make(map[string]*roachpb.Transaction),
 		requestsByName:  make(map[string]concurrency.Request),
@@ -656,46 +684,74 @@ func (c *cluster) makeConfig() concurrency.Config {
 
 // PushTransaction implements the concurrency.IntentResolver interface.
 func (c *cluster) PushTransaction(
-	ctx context.Context, pushee *enginepb.TxnMeta, h roachpb.Header, pushType roachpb.PushTxnType,
-) (*roachpb.Transaction, *roachpb.Error) {
+	ctx context.Context, pushee *enginepb.TxnMeta, h kvpb.Header, pushType kvpb.PushTxnType,
+) (*roachpb.Transaction, *kvpb.Error) {
 	pusheeRecord, err := c.getTxnRecord(pushee.ID)
 	if err != nil {
-		return nil, roachpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
 	var pusherRecord *txnRecord
 	if h.Txn != nil {
 		pusherID := h.Txn.ID
 		pusherRecord, err = c.getTxnRecord(pusherID)
 		if err != nil {
-			return nil, roachpb.NewError(err)
+			return nil, kvpb.NewError(err)
 		}
 
 		push, err := c.registerPush(ctx, pusherID, pushee.ID)
 		if err != nil {
-			return nil, roachpb.NewError(err)
+			return nil, kvpb.NewError(err)
 		}
 		defer c.unregisterPush(push)
 	}
+	var pusherPriority enginepb.TxnPriority
+	if h.Txn != nil {
+		pusherPriority = h.Txn.Priority
+	} else {
+		pusherPriority = roachpb.MakePriority(h.UserPriority)
+	}
+	pushTo := h.Timestamp.Next()
 	for {
 		// Is the pushee pushed?
 		pusheeTxn, pusheeRecordSig := pusheeRecord.asTxn()
-		var pushed bool
-		switch pushType {
-		case roachpb.PUSH_TIMESTAMP:
-			pushed = h.Timestamp.Less(pusheeTxn.WriteTimestamp) || pusheeTxn.Status.IsFinalized()
-		case roachpb.PUSH_ABORT, roachpb.PUSH_TOUCH:
-			pushed = pusheeTxn.Status.IsFinalized()
+		// NOTE: this logic is adapted from cmd_push_txn.go.
+		var pusherWins bool
+		switch {
+		case pusheeTxn.Status.IsFinalized():
+			// Already finalized.
+			return pusheeTxn, nil
+		case pushType == kvpb.PUSH_TIMESTAMP && pushTo.LessEq(pusheeTxn.WriteTimestamp):
+			// Already pushed.
+			return pusheeTxn, nil
+		case pushType == kvpb.PUSH_TOUCH:
+			pusherWins = false
+		case txnwait.CanPushWithPriority(pusherPriority, pusheeTxn.Priority):
+			pusherWins = true
 		default:
-			return nil, roachpb.NewErrorf("unexpected push type: %s", pushType)
+			pusherWins = false
 		}
-		if pushed {
+		if pusherWins {
+			switch pushType {
+			case kvpb.PUSH_ABORT:
+				log.Eventf(ctx, "pusher aborted pushee")
+				err = c.updateTxnRecord(pusheeTxn.ID, roachpb.ABORTED, pusheeTxn.WriteTimestamp)
+			case kvpb.PUSH_TIMESTAMP:
+				log.Eventf(ctx, "pusher pushed pushee to %s", pushTo)
+				err = c.updateTxnRecord(pusheeTxn.ID, pusheeTxn.Status, pushTo)
+			default:
+				err = errors.Errorf("unexpected push type: %s", pushType)
+			}
+			if err != nil {
+				return nil, kvpb.NewError(err)
+			}
+			pusheeTxn, _ = pusheeRecord.asTxn()
 			return pusheeTxn, nil
 		}
 		// If PUSH_TOUCH, return error instead of waiting.
-		if pushType == roachpb.PUSH_TOUCH {
+		if pushType == kvpb.PUSH_TOUCH {
 			log.Eventf(ctx, "pushee not abandoned")
-			err := roachpb.NewTransactionPushError(*pusheeTxn)
-			return nil, roachpb.NewError(err)
+			err := kvpb.NewTransactionPushError(*pusheeTxn)
+			return nil, kvpb.NewError(err)
 		}
 		// Or the pusher aborted?
 		var pusherRecordSig chan struct{}
@@ -704,8 +760,8 @@ func (c *cluster) PushTransaction(
 			pusherTxn, pusherRecordSig = pusherRecord.asTxn()
 			if pusherTxn.Status == roachpb.ABORTED {
 				log.Eventf(ctx, "detected pusher aborted")
-				err := roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_PUSHER_ABORTED)
-				return nil, roachpb.NewError(err)
+				err := kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_PUSHER_ABORTED)
+				return nil, kvpb.NewError(err)
 			}
 		}
 		// Wait until either record is updated.
@@ -713,7 +769,7 @@ func (c *cluster) PushTransaction(
 		case <-pusheeRecordSig:
 		case <-pusherRecordSig:
 		case <-ctx.Done():
-			return nil, roachpb.NewError(ctx.Err())
+			return nil, kvpb.NewError(ctx.Err())
 		}
 	}
 }
@@ -721,8 +777,13 @@ func (c *cluster) PushTransaction(
 // ResolveIntent implements the concurrency.IntentResolver interface.
 func (c *cluster) ResolveIntent(
 	ctx context.Context, intent roachpb.LockUpdate, _ intentresolver.ResolveOptions,
-) *roachpb.Error {
-	log.Eventf(ctx, "resolving intent %s for txn %s with %s status", intent.Key, intent.Txn.ID.Short(), intent.Status)
+) *kvpb.Error {
+	var obsStr string
+	if obs := intent.ClockWhilePending; obs != (roachpb.ObservedTimestamp{}) {
+		obsStr = fmt.Sprintf(" and clock observation {%d %v}", obs.NodeID, obs.Timestamp)
+	}
+	log.Eventf(ctx, "resolving intent %s for txn %s with %s status%s",
+		intent.Key, intent.Txn.ID.Short(), intent.Status, obsStr)
 	c.m.OnLockUpdated(ctx, &intent)
 	return nil
 }
@@ -730,7 +791,7 @@ func (c *cluster) ResolveIntent(
 // ResolveIntents implements the concurrency.IntentResolver interface.
 func (c *cluster) ResolveIntents(
 	ctx context.Context, intents []roachpb.LockUpdate, opts intentresolver.ResolveOptions,
-) *roachpb.Error {
+) *kvpb.Error {
 	log.Eventf(ctx, "resolving a batch of %d intent(s)", len(intents))
 	for _, intent := range intents {
 		if err := c.ResolveIntent(ctx, intent, opts); err != nil {
@@ -936,10 +997,10 @@ func (c *cluster) resetNamespace() {
 // collectSpans collects the declared spans for a set of requests.
 // Its logic mirrors that in Replica.collectSpans.
 func (c *cluster) collectSpans(
-	t *testing.T, txn *roachpb.Transaction, ts hlc.Timestamp, reqs []roachpb.Request,
+	t *testing.T, txn *roachpb.Transaction, ts hlc.Timestamp, reqs []kvpb.Request,
 ) (latchSpans, lockSpans *spanset.SpanSet) {
 	latchSpans, lockSpans = &spanset.SpanSet{}, &spanset.SpanSet{}
-	h := roachpb.Header{Txn: txn, Timestamp: ts}
+	h := kvpb.Header{Txn: txn, Timestamp: ts}
 	for _, req := range reqs {
 		if cmd, ok := batcheval.LookupCommand(req.Method()); ok {
 			cmd.DeclareKeys(c.rangeDesc, &h, req, latchSpans, lockSpans, 0)
@@ -984,7 +1045,7 @@ type monitoredGoroutine struct {
 	finished int32
 
 	ctx        context.Context
-	collect    func() tracing.Recording
+	collect    func() tracingpb.Recording
 	cancel     func()
 	prevEvents int
 }
@@ -997,12 +1058,12 @@ func newMonitor() *monitor {
 }
 
 func (m *monitor) runSync(opName string, fn func(context.Context)) {
-	ctx, sp := m.tr.StartSpanCtx(context.Background(), opName, tracing.WithRecording(tracing.RecordingVerbose))
+	ctx, sp := m.tr.StartSpanCtx(context.Background(), opName, tracing.WithRecording(tracingpb.RecordingVerbose))
 	g := &monitoredGoroutine{
 		opSeq:  0, // synchronous
 		opName: opName,
 		ctx:    ctx,
-		collect: func() tracing.Recording {
+		collect: func() tracingpb.Recording {
 			return sp.GetConfiguredRecording()
 		},
 		cancel: sp.Finish,
@@ -1014,12 +1075,12 @@ func (m *monitor) runSync(opName string, fn func(context.Context)) {
 
 func (m *monitor) runAsync(opName string, fn func(context.Context)) (cancel func()) {
 	m.seq++
-	ctx, sp := m.tr.StartSpanCtx(context.Background(), opName, tracing.WithRecording(tracing.RecordingVerbose))
+	ctx, sp := m.tr.StartSpanCtx(context.Background(), opName, tracing.WithRecording(tracingpb.RecordingVerbose))
 	g := &monitoredGoroutine{
 		opSeq:  m.seq,
 		opName: opName,
 		ctx:    ctx,
-		collect: func() tracing.Recording {
+		collect: func() tracingpb.Recording {
 			return sp.GetConfiguredRecording()
 		},
 		cancel: sp.Finish,
@@ -1242,7 +1303,7 @@ var goroutineStalledStates = map[string]bool{
 // allocations.
 func goroutineStatus(t *testing.T, filter string, buf *[]byte) []*stack.Goroutine {
 	b := stacks(buf)
-	s, _, err := stack.ScanSnapshot(bytes.NewBuffer(b), ioutil.Discard, stack.DefaultOpts())
+	s, _, err := stack.ScanSnapshot(bytes.NewBuffer(b), io.Discard, stack.DefaultOpts())
 	if err != io.EOF {
 		t.Fatalf("could not parse goroutine dump: %v", err)
 		return nil

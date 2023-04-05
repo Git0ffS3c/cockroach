@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,6 +46,8 @@ func TestHandleCSV(t *testing.T) {
 		},
 	}
 
+	// assertions depend on this seed
+	bank.RandomSeed.Set(1)
 	meta := bank.FromRows(0).Meta()
 	for _, test := range tests {
 		t.Run(test.params, func(t *testing.T) {
@@ -61,7 +62,7 @@ func TestHandleCSV(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			data, err := ioutil.ReadAll(res.Body)
+			data, err := io.ReadAll(res.Body)
 			res.Body.Close()
 			if err != nil {
 				t.Fatal(err)
@@ -115,9 +116,11 @@ func BenchmarkWriteCSVRows(b *testing.B) {
 func TestCSVRowsReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	// assertions depend on this seed
+	bank.RandomSeed.Set(1)
 	table := bank.FromRows(10).Tables()[0]
 	r := workload.NewCSVRowsReader(table, 1, 3)
-	b, err := ioutil.ReadAll(r)
+	b, err := io.ReadAll(r)
 	require.NoError(t, err)
 	expected := `
 1,0,initial-vOpikzTTWxvMqnkpfEIVXgGyhZNDqvpVqpNnHawruAcIVltgbnIEIGmCDJcnkVkfVmAcutkMvRACFuUBPsZTemTDSfZT

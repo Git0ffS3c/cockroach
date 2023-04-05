@@ -62,6 +62,12 @@ const (
 	ReferencedDescID
 	// Comment is the comment metadata on descriptors.
 	Comment
+	// TemporaryIndexID is the index ID of the temporary index being populated
+	// during this index's backfill.
+	TemporaryIndexID
+	// SourceIndexID is the index ID of the source index for a newly created
+	// index.
+	SourceIndexID
 
 	// TargetStatus is the target status of an element.
 	TargetStatus
@@ -71,6 +77,17 @@ const (
 	Element
 	// Target is the reference from a node to a target.
 	Target
+
+	// ReferencedTypeIDs corresponds to a slice of type descriptor IDs referenced
+	// by an element.
+	ReferencedTypeIDs
+	// ReferencedSequenceIDs corresponds to a slice of sequence descriptor IDs
+	// referenced by an element.
+	ReferencedSequenceIDs
+	// ReferencedFunctionIDs corresponds to a slice of function descriptor IDs
+	// referenced by an element.
+	ReferencedFunctionIDs
+
 	// AttrMax is the largest possible Attr value.
 	// Note: add any new enum values before TargetStatus, leave these at the end.
 	AttrMax = iota - 1
@@ -101,9 +118,25 @@ var elementSchemaOptions = []rel.SchemaOption{
 	),
 	rel.EntityMapping(t((*scpb.AliasType)(nil)),
 		rel.EntityAttr(DescID, "TypeID"),
+		rel.EntityAttr(ReferencedTypeIDs, "ClosedTypeIDs"),
 	),
 	rel.EntityMapping(t((*scpb.EnumType)(nil)),
 		rel.EntityAttr(DescID, "TypeID"),
+	),
+	rel.EntityMapping(t((*scpb.EnumTypeValue)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+		rel.EntityAttr(Name, "LogicalRepresentation"),
+	),
+	rel.EntityMapping(t((*scpb.CompositeType)(nil)),
+		rel.EntityAttr(DescID, "TypeID"),
+	),
+	rel.EntityMapping(t((*scpb.CompositeTypeAttrName)(nil)),
+		rel.EntityAttr(DescID, "CompositeTypeID"),
+		rel.EntityAttr(Name, "Name"),
+	),
+	rel.EntityMapping(t((*scpb.CompositeTypeAttrType)(nil)),
+		rel.EntityAttr(DescID, "CompositeTypeID"),
+		rel.EntityAttr(ReferencedTypeIDs, "ClosedTypeIDs"),
 	),
 	rel.EntityMapping(t((*scpb.View)(nil)),
 		rel.EntityAttr(DescID, "ViewID"),
@@ -128,25 +161,51 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(IndexID, "IndexID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(TemporaryIndexID, "TemporaryIndexID"),
+		rel.EntityAttr(SourceIndexID, "SourceIndexID"),
 	),
 	rel.EntityMapping(t((*scpb.SecondaryIndex)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(IndexID, "IndexID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(TemporaryIndexID, "TemporaryIndexID"),
+		rel.EntityAttr(SourceIndexID, "SourceIndexID"),
 	),
 	rel.EntityMapping(t((*scpb.TemporaryIndex)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(IndexID, "IndexID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(SourceIndexID, "SourceIndexID"),
 	),
 	rel.EntityMapping(t((*scpb.UniqueWithoutIndexConstraint)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(IndexID, "IndexIDForValidation"),
+	),
+	rel.EntityMapping(t((*scpb.UniqueWithoutIndexConstraintUnvalidated)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
 	),
 	rel.EntityMapping(t((*scpb.CheckConstraint)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+		rel.EntityAttr(IndexID, "IndexIDForValidation"),
+	),
+	rel.EntityMapping(t((*scpb.CheckConstraintUnvalidated)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
 	),
 	rel.EntityMapping(t((*scpb.ForeignKeyConstraint)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ReferencedDescID, "ReferencedTableID"),
+		rel.EntityAttr(ConstraintID, "ConstraintID"),
+		rel.EntityAttr(IndexID, "IndexIDForValidation"),
+	),
+	rel.EntityMapping(t((*scpb.ForeignKeyConstraintUnvalidated)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ReferencedDescID, "ReferencedTableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
@@ -178,6 +237,7 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ColumnFamilyID, "FamilyID"),
 		rel.EntityAttr(ColumnID, "ColumnID"),
+		rel.EntityAttr(ReferencedTypeIDs, "ClosedTypeIDs"),
 	),
 	rel.EntityMapping(t((*scpb.SequenceOwner)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
@@ -187,10 +247,20 @@ var elementSchemaOptions = []rel.SchemaOption{
 	rel.EntityMapping(t((*scpb.ColumnDefaultExpression)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ColumnID, "ColumnID"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+		rel.EntityAttr(ReferencedFunctionIDs, "UsesFunctionIDs"),
 	),
 	rel.EntityMapping(t((*scpb.ColumnOnUpdateExpression)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ColumnID, "ColumnID"),
+		rel.EntityAttr(ReferencedSequenceIDs, "UsesSequenceIDs"),
+		rel.EntityAttr(ReferencedTypeIDs, "UsesTypeIDs"),
+	),
+	rel.EntityMapping(t((*scpb.ColumnNotNull)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ColumnID, "ColumnID"),
+		rel.EntityAttr(IndexID, "IndexIDForValidation"),
 	),
 	// Index elements.
 	rel.EntityMapping(t((*scpb.IndexName)(nil)),
@@ -207,7 +277,7 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(IndexID, "IndexID"),
 	),
 	// Constraint elements.
-	rel.EntityMapping(t((*scpb.ConstraintName)(nil)),
+	rel.EntityMapping(t((*scpb.ConstraintWithoutIndexName)(nil)),
 		rel.EntityAttr(DescID, "TableID"),
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
 		rel.EntityAttr(Name, "Name"),
@@ -239,9 +309,9 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(DescID, "SchemaID"),
 		rel.EntityAttr(ReferencedDescID, "ParentDatabaseID"),
 	),
-	rel.EntityMapping(t((*scpb.ObjectParent)(nil)),
-		rel.EntityAttr(DescID, "ObjectID"),
-		rel.EntityAttr(ReferencedDescID, "ParentSchemaID"),
+	rel.EntityMapping(t((*scpb.SchemaChild)(nil)),
+		rel.EntityAttr(DescID, "ChildObjectID"),
+		rel.EntityAttr(ReferencedDescID, "SchemaID"),
 	),
 	// Comment elements.
 	rel.EntityMapping(t((*scpb.TableComment)(nil)),
@@ -271,6 +341,53 @@ var elementSchemaOptions = []rel.SchemaOption{
 		rel.EntityAttr(ConstraintID, "ConstraintID"),
 		rel.EntityAttr(Comment, "Comment"),
 	),
+	rel.EntityMapping(t((*scpb.IndexColumn)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(IndexID, "IndexID"),
+		rel.EntityAttr(ColumnID, "ColumnID"),
+	),
+	rel.EntityMapping(t((*scpb.TableZoneConfig)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+	),
+	rel.EntityMapping(t((*scpb.IndexZoneConfig)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(IndexID, "IndexID"),
+	),
+	rel.EntityMapping(t((*scpb.DatabaseData)(nil)),
+		rel.EntityAttr(DescID, "DatabaseID"),
+	),
+	rel.EntityMapping(t((*scpb.TableData)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(ReferencedDescID, "DatabaseID"),
+	),
+	rel.EntityMapping(t((*scpb.IndexData)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+		rel.EntityAttr(IndexID, "IndexID"),
+	),
+	rel.EntityMapping(t((*scpb.TablePartitioning)(nil)),
+		rel.EntityAttr(DescID, "TableID"),
+	),
+	rel.EntityMapping(t((*scpb.Function)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionName)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionVolatility)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionLeakProof)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionNullInputBehavior)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionBody)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
+	rel.EntityMapping(t((*scpb.FunctionParamDefaultExpression)(nil)),
+		rel.EntityAttr(DescID, "FunctionID"),
+	),
 }
 
 // Schema is the schema exported by this package covering the elements of scpb.
@@ -286,21 +403,30 @@ var Schema = rel.MustSchema("screl", append(
 	),
 )...)
 
-// JoinTarget generates a clause that joins the target
-// to the corresponding element.
-func JoinTarget(element, target rel.Var) rel.Clause {
-	return rel.And(
-		target.Type((*scpb.Target)(nil)),
-		target.AttrEqVar(Element, element),
-	)
-}
+var (
+	// JoinTarget generates a clause that joins the target
+	// to the corresponding element.
+	JoinTarget = Schema.Def2(
+		"joinTarget", "element", "target", func(
+			element, target rel.Var,
+		) rel.Clauses {
+			return rel.Clauses{
+				target.Type((*scpb.Target)(nil)),
+				target.AttrEqVar(Element, element),
+				element.AttrEqVar(DescID, rel.Blank),
+			}
+		})
 
-// JoinTargetNode generates a clause that joins the target and node vars
-// to the corresponding element.
-func JoinTargetNode(element, target, node rel.Var) rel.Clause {
-	return rel.And(
-		JoinTarget(element, target),
-		node.Type((*Node)(nil)),
-		node.AttrEqVar(Target, target),
-	)
-}
+	// JoinTargetNode generates a clause that joins the target and node vars
+	// to the corresponding element.
+	JoinTargetNode = Schema.Def3(
+		"joinTargetNode", "element", "target", "node", func(
+			element, target, node rel.Var,
+		) rel.Clauses {
+			return rel.Clauses{
+				JoinTarget(element, target),
+				node.Type((*Node)(nil)),
+				node.AttrEqVar(Target, target),
+			}
+		})
+)

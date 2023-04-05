@@ -20,14 +20,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/errors"
 )
@@ -42,7 +42,7 @@ var confParsers = map[string]ExternalStorageURIParser{}
 
 // implementations maps an ExternalStorageProvider enum value to a constructor
 // of instances of that external storage.
-var implementations = map[roachpb.ExternalStorageProvider]ExternalStorageConstructor{}
+var implementations = map[cloudpb.ExternalStorageProvider]ExternalStorageConstructor{}
 
 // rateAndBurstSettings represents a pair of byteSizeSettings used to configure
 // the rate a burst properties of a quotapool.RateLimiter.
@@ -55,12 +55,50 @@ type readAndWriteSettings struct {
 	read, write rateAndBurstSettings
 }
 
-var limiterSettings = map[roachpb.ExternalStorageProvider]readAndWriteSettings{}
+var limiterSettings = map[cloudpb.ExternalStorageProvider]readAndWriteSettings{}
+
+// registerLimiterSettings registers provider specific settings that allow
+// limiting the number of bytes read/written to the provider specific
+// ExternalStorage.
+func registerLimiterSettings(providerType cloudpb.ExternalStorageProvider) {
+	sinkName := strings.ToLower(providerType.String())
+	if sinkName == "null" {
+		sinkName = "nullsink" // keep the settings name pieces free of reserved keywords.
+	}
+
+	readRateName := fmt.Sprintf("cloudstorage.%s.read.node_rate_limit", sinkName)
+	readBurstName := fmt.Sprintf("cloudstorage.%s.read.node_burst_limit", sinkName)
+	writeRateName := fmt.Sprintf("cloudstorage.%s.write.node_rate_limit", sinkName)
+	writeBurstName := fmt.Sprintf("cloudstorage.%s.write.node_burst_limit", sinkName)
+
+	limiterSettings[providerType] = readAndWriteSettings{
+		read: rateAndBurstSettings{
+			rate: settings.RegisterByteSizeSetting(settings.TenantWritable, readRateName,
+				"limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
+				0,
+			),
+			burst: settings.RegisterByteSizeSetting(settings.TenantWritable, readBurstName,
+				"burst limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
+				0,
+			),
+		},
+		write: rateAndBurstSettings{
+			rate: settings.RegisterByteSizeSetting(settings.TenantWritable, writeRateName,
+				"limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
+				0,
+			),
+			burst: settings.RegisterByteSizeSetting(settings.TenantWritable, writeBurstName,
+				"burst limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
+				0,
+			),
+		},
+	}
+}
 
 // RegisterExternalStorageProvider registers an external storage provider for a
 // given URI scheme and provider type.
 func RegisterExternalStorageProvider(
-	providerType roachpb.ExternalStorageProvider,
+	providerType cloudpb.ExternalStorageProvider,
 	parseFn ExternalStorageURIParser,
 	constructFn ExternalStorageConstructor,
 	redactedParams map[string]struct{},
@@ -80,53 +118,27 @@ func RegisterExternalStorageProvider(
 	}
 	implementations[providerType] = constructFn
 
-	sinkName := strings.ToLower(providerType.String())
-	if sinkName == "null" {
-		sinkName = "nullsink" // keep the settings name pieces free of reserved keywords.
-	}
-
-	readRateName := fmt.Sprintf("cloudstorage.%s.read.node_rate_limit", sinkName)
-	readBurstName := fmt.Sprintf("cloudstorage.%s.read.node_burst_limit", sinkName)
-	writeRateName := fmt.Sprintf("cloudstorage.%s.write.node_rate_limit", sinkName)
-	writeBurstName := fmt.Sprintf("cloudstorage.%s.write.node_burst_limit", sinkName)
-
-	limiterSettings[providerType] = readAndWriteSettings{
-		read: rateAndBurstSettings{
-			rate: settings.RegisterByteSizeSetting(settings.TenantWritable, readRateName,
-				"limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
-				0, settings.NonNegativeInt,
-			),
-			burst: settings.RegisterByteSizeSetting(settings.TenantWritable, readBurstName,
-				"burst limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
-				0, settings.NonNegativeInt,
-			),
-		},
-		write: rateAndBurstSettings{
-			rate: settings.RegisterByteSizeSetting(settings.TenantWritable, writeRateName,
-				"limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
-				0, settings.NonNegativeInt,
-			),
-			burst: settings.RegisterByteSizeSetting(settings.TenantWritable, writeBurstName,
-				"burst limit on number of bytes per second per node across operations writing to the designated cloud storage provider if non-zero",
-				0, settings.NonNegativeInt,
-			),
-		},
+	// We do not register limiter settings for the `external` provider. An
+	// external connection object represents an underlying external resource that
+	// will have its own registered limiters.
+	if providerType != cloudpb.ExternalStorageProvider_external {
+		registerLimiterSettings(providerType)
 	}
 }
 
 // ExternalStorageConfFromURI generates an ExternalStorage config from a URI string.
 func ExternalStorageConfFromURI(
 	path string, user username.SQLUsername,
-) (roachpb.ExternalStorage, error) {
+) (cloudpb.ExternalStorage, error) {
 	uri, err := url.Parse(path)
 	if err != nil {
-		return roachpb.ExternalStorage{}, err
+		return cloudpb.ExternalStorage{}, err
 	}
 	if fn, ok := confParsers[uri.Scheme]; ok {
 		return fn(ExternalStorageURIContext{CurrentUser: user}, uri)
 	}
 	// TODO(adityamaru): Link dedicated ExternalStorage scheme docs once ready.
-	return roachpb.ExternalStorage{}, errors.Errorf("unsupported storage scheme: %q - refer to docs to find supported"+
+	return cloudpb.ExternalStorage{}, errors.Errorf("unsupported storage scheme: %q - refer to docs to find supported"+
 		" storage schemes", uri.Scheme)
 }
 
@@ -138,15 +150,17 @@ func ExternalStorageFromURI(
 	settings *cluster.Settings,
 	blobClientFactory blobs.BlobClientFactory,
 	user username.SQLUsername,
-	ie sqlutil.InternalExecutor,
-	kvDB *kv.DB,
+	db isql.DB,
 	limiters Limiters,
+	metrics metric.Struct,
+	opts ...ExternalStorageOption,
 ) (ExternalStorage, error) {
 	conf, err := ExternalStorageConfFromURI(uri, user)
 	if err != nil {
 		return nil, err
 	}
-	return MakeExternalStorage(ctx, conf, externalConfig, settings, blobClientFactory, ie, kvDB, limiters)
+	return MakeExternalStorage(ctx, conf, externalConfig, settings, blobClientFactory,
+		db, limiters, metrics, opts...)
 }
 
 // SanitizeExternalStorageURI returns the external storage URI with with some
@@ -186,34 +200,57 @@ func SanitizeExternalStorageURI(path string, extraParams []string) (string, erro
 // MakeExternalStorage creates an ExternalStorage from the given config.
 func MakeExternalStorage(
 	ctx context.Context,
-	dest roachpb.ExternalStorage,
+	dest cloudpb.ExternalStorage,
 	conf base.ExternalIODirConfig,
 	settings *cluster.Settings,
 	blobClientFactory blobs.BlobClientFactory,
-	ie sqlutil.InternalExecutor,
-	kvDB *kv.DB,
+	db isql.DB,
 	limiters Limiters,
+	metrics metric.Struct,
+	opts ...ExternalStorageOption,
 ) (ExternalStorage, error) {
+	var cloudMetrics *Metrics
+	var ok bool
+	if cloudMetrics, ok = metrics.(*Metrics); !ok {
+		return nil, errors.Newf("invalid metrics type: %T", metrics)
+	}
 	args := ExternalStorageContext{
 		IOConf:            conf,
 		Settings:          settings,
 		BlobClientFactory: blobClientFactory,
-		InternalExecutor:  ie,
-		DB:                kvDB,
+		DB:                db,
+		Options:           opts,
+		Limiters:          limiters,
+		MetricsRecorder:   cloudMetrics,
 	}
-	if conf.DisableOutbound && dest.Provider != roachpb.ExternalStorageProvider_userfile {
+	if conf.DisableOutbound && dest.Provider != cloudpb.ExternalStorageProvider_userfile {
 		return nil, errors.New("external network access is disabled")
+	}
+	options := ExternalStorageOptions{}
+	for _, o := range opts {
+		o(&options)
 	}
 	if fn, ok := implementations[dest.Provider]; ok {
 		e, err := fn(ctx, args, dest)
 		if err != nil {
 			return nil, err
 		}
-		if l, ok := limiters[dest.Provider]; ok {
-			return &limitWrapper{ExternalStorage: e, lim: l}, nil
+
+		// We do not wrap the ExternalStorage for the `external` provider. An
+		// external connection object represents an underlying external resource
+		// that will have its own `esWrapper`.
+		if dest.Provider == cloudpb.ExternalStorageProvider_external {
+			return e, nil
 		}
-		return e, nil
+
+		return &esWrapper{
+			ExternalStorage: e,
+			lim:             limiters[dest.Provider],
+			ioRecorder:      options.ioAccountingInterceptor,
+			metricsRecorder: newMetricsReadWriter(cloudMetrics),
+		}, nil
 	}
+
 	return nil, errors.Errorf("unsupported external destination type: %s", dest.Provider.String())
 }
 
@@ -223,7 +260,7 @@ type rwLimiter struct {
 
 // Limiters represents a collection of rate limiters for a given server to use
 // when interacting with the providers in the collection.
-type Limiters map[roachpb.ExternalStorageProvider]rwLimiter
+type Limiters map[cloudpb.ExternalStorageProvider]rwLimiter
 
 func makeLimiter(
 	ctx context.Context, sv *settings.Values, s rateAndBurstSettings,
@@ -258,38 +295,65 @@ func MakeLimiters(ctx context.Context, sv *settings.Values) Limiters {
 	return m
 }
 
-type limitWrapper struct {
+type esWrapper struct {
 	ExternalStorage
-	lim rwLimiter
+
+	lim             rwLimiter
+	ioRecorder      ReadWriterInterceptor
+	metricsRecorder ReadWriterInterceptor
 }
 
-func (l *limitWrapper) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
-	r, err := l.ExternalStorage.ReadFile(ctx, basename)
+func (e *esWrapper) wrapReader(ctx context.Context, r ioctx.ReadCloserCtx) ioctx.ReadCloserCtx {
+	if e.lim.read != nil {
+		r = &limitedReader{r: r, lim: e.lim.read}
+	}
+	if e.ioRecorder != nil {
+		r = e.ioRecorder.Reader(ctx, e.ExternalStorage, r)
+	}
+
+	r = e.metricsRecorder.Reader(ctx, e.ExternalStorage, r)
+	return r
+}
+
+func (e *esWrapper) wrapWriter(ctx context.Context, w io.WriteCloser) io.WriteCloser {
+	if e.lim.write != nil {
+		w = &limitedWriter{w: w, ctx: ctx, lim: e.lim.write}
+	}
+	if e.ioRecorder != nil {
+		w = e.ioRecorder.Writer(ctx, e.ExternalStorage, w)
+	}
+
+	w = e.metricsRecorder.Writer(ctx, e.ExternalStorage, w)
+	return w
+}
+
+func (e *esWrapper) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
+	r, err := e.ExternalStorage.ReadFile(ctx, basename)
 	if err != nil {
 		return r, err
 	}
 
-	return &limitedReader{r: r, lim: l.lim.read}, nil
+	return e.wrapReader(ctx, r), nil
 }
 
-func (l *limitWrapper) ReadFileAt(
+func (e *esWrapper) ReadFileAt(
 	ctx context.Context, basename string, offset int64,
 ) (ioctx.ReadCloserCtx, int64, error) {
-	r, s, err := l.ExternalStorage.ReadFileAt(ctx, basename, offset)
+	r, s, err := e.ExternalStorage.ReadFileAt(ctx, basename, offset)
 	if err != nil {
 		return r, s, err
 	}
 
-	return &limitedReader{r: r, lim: l.lim.read}, s, nil
+	return e.wrapReader(ctx, r), s, nil
 }
 
-func (l *limitWrapper) Writer(ctx context.Context, basename string) (io.WriteCloser, error) {
-	w, err := l.ExternalStorage.Writer(ctx, basename)
+func (e *esWrapper) Writer(ctx context.Context, basename string) (io.WriteCloser, error) {
+	w, err := e.ExternalStorage.Writer(ctx, basename)
 	if err != nil {
 		return nil, err
 	}
 
-	return &limitedWriter{w: w, ctx: ctx, lim: l.lim.write}, nil
+	return e.wrapWriter(ctx, w), nil
 }
 
 type limitedReader struct {
@@ -351,4 +415,11 @@ func (l *limitedWriter) Close() error {
 		log.Warningf(l.ctx, "failed to throttle closing write: %+v", err)
 	}
 	return l.w.Close()
+}
+
+// A ReadWriterInterceptor providers methods that construct Readers and Writers from given Readers
+// and Writers.
+type ReadWriterInterceptor interface {
+	Reader(context.Context, ExternalStorage, ioctx.ReadCloserCtx) ioctx.ReadCloserCtx
+	Writer(context.Context, ExternalStorage, io.WriteCloser) io.WriteCloser
 }

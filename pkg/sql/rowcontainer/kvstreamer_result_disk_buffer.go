@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -112,7 +113,7 @@ func (b *kvStreamerResultDiskBuffer) Deserialize(
 		b.iterResultID++
 	}
 	// Now we take the row representing the Result and deserialize it into r.
-	serialized, err := b.iter.Row()
+	serialized, err := b.iter.EncRow()
 	if err != nil {
 		return err
 	}
@@ -146,8 +147,9 @@ func (b *kvStreamerResultDiskBuffer) Close(ctx context.Context) {
 // inOrderResultsBufferSpillTypeSchema is the type schema of a single
 // kvstreamer.Result that is spilled to disk.
 //
-// It contains all the information except for 'ScanResp.Complete', 'memoryTok',
-// and 'Position' fields which are kept in-memory (because they are allocated in
+// It contains all the information except for 'Position', 'memoryTok',
+// 'subRequestIdx', 'subRequestDone', and 'scanComplete' fields which are kept
+// in-memory (because they are allocated in
 // kvstreamer.inOrderBufferedResult.Result anyway).
 var inOrderResultsBufferSpillTypeSchema = []*types.T{
 	types.Bool, // isGet
@@ -161,7 +163,6 @@ var inOrderResultsBufferSpillTypeSchema = []*types.T{
 	// ScanResp:
 	//  BatchResponses [][]byte
 	types.BytesArray,
-	types.IntArray, // EnqueueKeysSatisfied []int
 }
 
 type resultSerializationIndex int
@@ -173,7 +174,6 @@ const (
 	getTSLogicalIdx
 	getTSSyntheticIdx
 	scanBatchResponsesIdx
-	enqueueKeysSatisfiedIdx
 )
 
 // serialize writes the serialized representation of the kvstreamer.Result into
@@ -208,14 +208,6 @@ func serialize(r *kvstreamer.Result, row rowenc.EncDatumRow, alloc *tree.DatumAl
 			row[scanBatchResponsesIdx] = rowenc.EncDatum{Datum: batchResponses}
 		}
 	}
-	enqueueKeysSatisfied := tree.NewDArray(types.Int)
-	enqueueKeysSatisfied.Array = make(tree.Datums, 0, len(r.EnqueueKeysSatisfied))
-	for _, k := range r.EnqueueKeysSatisfied {
-		if err := enqueueKeysSatisfied.Append(alloc.NewDInt(tree.DInt(k))); err != nil {
-			return err
-		}
-	}
-	row[enqueueKeysSatisfiedIdx] = rowenc.EncDatum{Datum: enqueueKeysSatisfied}
 	return nil
 }
 
@@ -223,8 +215,8 @@ func serialize(r *kvstreamer.Result, row rowenc.EncDatumRow, alloc *tree.DatumAl
 // state of the kvstreamer.Result according to
 // inOrderResultsBufferSpillTypeSchema.
 //
-// 'ScanResp.Complete', 'memoryTok', and 'position' fields are left unchanged
-// since those aren't serialized.
+// 'Position', 'memoryTok', 'subRequestIdx', 'subRequestDone', and
+// 'scanComplete' fields are left unchanged since those aren't serialized.
 func deserialize(r *kvstreamer.Result, row rowenc.EncDatumRow, alloc *tree.DatumAlloc) error {
 	for i := range row {
 		if err := row[i].EnsureDecoded(inOrderResultsBufferSpillTypeSchema[i], alloc); err != nil {
@@ -232,7 +224,7 @@ func deserialize(r *kvstreamer.Result, row rowenc.EncDatumRow, alloc *tree.Datum
 		}
 	}
 	if isGet := tree.MustBeDBool(row[isGetIdx].Datum); isGet {
-		r.GetResp = &roachpb.GetResponse{}
+		r.GetResp = &kvpb.GetResponse{}
 		if row[getRawBytesIdx].Datum != tree.DNull {
 			r.GetResp.Value = &roachpb.Value{
 				RawBytes: []byte(tree.MustBeDBytes(row[getRawBytesIdx].Datum)),
@@ -244,17 +236,12 @@ func deserialize(r *kvstreamer.Result, row rowenc.EncDatumRow, alloc *tree.Datum
 			}
 		}
 	} else {
-		r.ScanResp.ScanResponse = &roachpb.ScanResponse{}
+		r.ScanResp = &kvpb.ScanResponse{}
 		batchResponses := tree.MustBeDArray(row[scanBatchResponsesIdx].Datum)
-		r.ScanResp.ScanResponse.BatchResponses = make([][]byte, batchResponses.Len())
+		r.ScanResp.BatchResponses = make([][]byte, batchResponses.Len())
 		for i := range batchResponses.Array {
-			r.ScanResp.ScanResponse.BatchResponses[i] = []byte(tree.MustBeDBytes(batchResponses.Array[i]))
+			r.ScanResp.BatchResponses[i] = []byte(tree.MustBeDBytes(batchResponses.Array[i]))
 		}
-	}
-	enqueueKeysSatisfied := tree.MustBeDArray(row[enqueueKeysSatisfiedIdx].Datum)
-	r.EnqueueKeysSatisfied = make([]int, enqueueKeysSatisfied.Len())
-	for i := range enqueueKeysSatisfied.Array {
-		r.EnqueueKeysSatisfied[i] = int(tree.MustBeDInt(enqueueKeysSatisfied.Array[i]))
 	}
 	return nil
 }

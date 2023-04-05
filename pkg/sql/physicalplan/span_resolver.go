@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan/replicaoracle"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
@@ -29,41 +30,46 @@ import (
 // Sample usage for resolving a bunch of spans:
 //
 // func resolveSpans(
-//   ctx context.Context,
-//   it *execinfra.SpanResolverIterator,
-//   spans ...spanWithDir,
-// ) ([][]kv.ReplicaInfo, error) {
-//   lr := execinfra.NewSpanResolver(
-//     distSender, nodeDescs, nodeDescriptor,
-//     execinfra.BinPackingLeaseHolderChoice)
-//   it := lr.NewSpanResolverIterator(nil)
-//   res := make([][]kv.ReplicaInfo, 0)
-//   for _, span := range spans {
-//     repls := make([]kv.ReplicaInfo, 0)
-//     for it.Seek(ctx, span.Span, span.dir); ; it.Next(ctx) {
-//       if !it.Valid() {
-//         return nil, it.Error()
-//       }
-//       repl, err := it.ReplicaInfo(ctx)
-//       if err != nil {
-//         return nil, err
-//       }
-//       repls = append(repls, repl)
-//       if !it.NeedAnother() {
-//         break
-//       }
-//     }
-//     res = append(res, repls)
-//   }
-//   return res, nil
-// }
 //
+//	ctx context.Context,
+//	it *execinfra.SpanResolverIterator,
+//	spans ...spanWithDir,
 //
+//	) ([][]kv.ReplicaInfo, error) {
+//	  lr := execinfra.NewSpanResolver(
+//	    distSender, nodeDescs, nodeDescriptor,
+//	    execinfra.BinPackingLeaseHolderChoice)
+//	  it := lr.NewSpanResolverIterator(nil)
+//	  res := make([][]kv.ReplicaInfo, 0)
+//	  for _, span := range spans {
+//	    repls := make([]kv.ReplicaInfo, 0)
+//	    for it.Seek(ctx, span.Span, span.dir); ; it.Next(ctx) {
+//	      if !it.Valid() {
+//	        return nil, it.Error()
+//	      }
+//	      repl, err := it.ReplicaInfo(ctx)
+//	      if err != nil {
+//	        return nil, err
+//	      }
+//	      repls = append(repls, repl)
+//	      if !it.NeedAnother() {
+//	        break
+//	      }
+//	    }
+//	    res = append(res, repls)
+//	  }
+//	  return res, nil
+//	}
 type SpanResolver interface {
 	// NewSpanResolverIterator creates a new SpanResolverIterator.
 	// Txn is used for testing and for determining if follower reads are possible.
-	NewSpanResolverIterator(txn *kv.Txn) SpanResolverIterator
+	NewSpanResolverIterator(txn *kv.Txn, optionalOracle replicaoracle.Oracle) SpanResolverIterator
 }
+
+// DefaultReplicaChooser is a nil replicaoracle.Oracle which can be passed in
+// place of a replica oracle to some APIs to indicate they can use their default
+// replica oracle.
+var DefaultReplicaChooser replicaoracle.Oracle
 
 // SpanResolverIterator is used to iterate over the ranges composing a key span.
 type SpanResolverIterator interface {
@@ -117,7 +123,6 @@ type SpanResolverIterator interface {
 type spanResolver struct {
 	st         *cluster.Settings
 	distSender *kvcoord.DistSender
-	nodeDesc   roachpb.NodeDescriptor
 	oracle     replicaoracle.Oracle
 }
 
@@ -128,17 +133,20 @@ func NewSpanResolver(
 	st *cluster.Settings,
 	distSender *kvcoord.DistSender,
 	nodeDescs kvcoord.NodeDescStore,
-	nodeDesc roachpb.NodeDescriptor,
+	nodeID roachpb.NodeID,
+	locality roachpb.Locality,
+	clock *hlc.Clock,
 	rpcCtx *rpc.Context,
 	policy replicaoracle.Policy,
 ) SpanResolver {
 	return &spanResolver{
-		st:       st,
-		nodeDesc: nodeDesc,
+		st: st,
 		oracle: replicaoracle.NewOracle(policy, replicaoracle.Config{
 			NodeDescs:  nodeDescs,
-			NodeDesc:   nodeDesc,
+			NodeID:     nodeID,
+			Locality:   locality,
 			Settings:   st,
+			Clock:      clock,
 			RPCContext: rpcCtx,
 		}),
 		distSender: distSender,
@@ -167,11 +175,17 @@ type spanResolverIterator struct {
 var _ SpanResolverIterator = &spanResolverIterator{}
 
 // NewSpanResolverIterator creates a new SpanResolverIterator.
-func (sr *spanResolver) NewSpanResolverIterator(txn *kv.Txn) SpanResolverIterator {
+func (sr *spanResolver) NewSpanResolverIterator(
+	txn *kv.Txn, optionalOracle replicaoracle.Oracle,
+) SpanResolverIterator {
+	oracle := optionalOracle
+	if optionalOracle == nil {
+		oracle = sr.oracle
+	}
 	return &spanResolverIterator{
 		txn:        txn,
 		it:         kvcoord.MakeRangeIterator(sr.distSender),
-		oracle:     sr.oracle,
+		oracle:     oracle,
 		queryState: replicaoracle.MakeQueryState(),
 	}
 }
@@ -208,6 +222,13 @@ func (it *spanResolverIterator) Seek(
 		seekKey = it.curSpan.Key
 	} else {
 		seekKey = it.curSpan.EndKey
+		if len(seekKey) == 0 {
+			// It is possible that the span doesn't have the EndKey set (when we
+			// want to use the Get request), so we need to use the start Key
+			// even if we're scanning in the reverse direction - having
+			// ReverseScans and Gets is allowed in a single BatchRequest.
+			seekKey = it.curSpan.Key
+		}
 	}
 
 	// Check if the start of the span falls within the descriptor on which we're

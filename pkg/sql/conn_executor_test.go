@@ -25,10 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -40,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/sqllivenesstestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
@@ -82,7 +85,7 @@ INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see')
 	}
 
 	rUnsafe := errors.New("some error")
-	safeErr := sql.WithAnonymizedStatement(rUnsafe, stmt1.AST, vt)
+	safeErr := sql.WithAnonymizedStatement(rUnsafe, stmt1.AST, vt, nil /* ClientNoticeSender */)
 
 	const expMessage = "some error"
 	actMessage := safeErr.Error()
@@ -91,7 +94,7 @@ INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see')
 	}
 
 	const expSafeRedactedMsgPrefix = `some error
-(1) while executing: INSERT INTO _(_, _) VALUES ('_', '_', __more2__)`
+(1) while executing: INSERT INTO _(_, _) VALUES ('_', '_', __more1_10__)`
 
 	actSafeRedactedMessage := string(redact.Sprintf("%+v", safeErr))
 
@@ -326,12 +329,12 @@ func TestErrorOnRollback(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				TestingProposalFilter: func(fArgs kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					if !fArgs.Req.IsSingleRequest() {
 						return nil
 					}
 					req := fArgs.Req.Requests[0]
-					etReq, ok := req.GetInner().(*roachpb.EndTxnRequest)
+					etReq, ok := req.GetInner().(*kvpb.EndTxnRequest)
 					// We only inject the error once. Turns out that during the
 					// life of the test there's two EndTxns being sent - one is
 					// the direct result of the test's call to tx.Rollback(),
@@ -343,7 +346,7 @@ func TestErrorOnRollback(t *testing.T) {
 						atomic.LoadInt64(&injectedErr) == 0 {
 
 						atomic.StoreInt64(&injectedErr, 1)
-						return roachpb.NewErrorf("test injected error")
+						return kvpb.NewErrorf("test injected error")
 					}
 					return nil
 				},
@@ -508,6 +511,43 @@ func TestAppNameStatisticsInitialization(t *testing.T) {
 	}
 }
 
+func TestPrepareStatisticsMetadata(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	defer s.Stopper().Stop(context.Background())
+	defer sqlDB.Close()
+
+	// PREPARE a prepared statement.
+	stmt, err := sqlDB.Prepare("SELECT $1::int")
+	require.NoError(t, err)
+
+	// EXECUTE the prepared statement
+	_, err = stmt.Exec(3)
+	require.NoError(t, err)
+
+	// Verify that query and querySummary are equal in crdb_internal.statement_statistics.metadata.
+	rows, err := sqlDB.Query(`SELECT metadata->>'query', metadata->>'querySummary' FROM crdb_internal.statement_statistics WHERE metadata->>'query' LIKE 'SELECT $1::INT8'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var query, summary string
+	for rows.Next() {
+		if err := rows.Scan(&query, &summary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(query) < 1 {
+		t.Fatal("unable to retrieve query metadata")
+	}
+	if query != summary {
+		t.Fatalf("query is not consistent with querySummary")
+	}
+}
+
 func TestQueryProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -546,9 +586,9 @@ func TestQueryProgress(t *testing.T) {
 				TableReaderBatchBytesLimit: 1500,
 			},
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(_ context.Context, req roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(_ context.Context, req *kvpb.BatchRequest) *kvpb.Error {
 					if req.IsSingleRequest() {
-						scan, ok := req.Requests[0].GetInner().(*roachpb.ScanRequest)
+						scan, ok := req.Requests[0].GetInner().(*kvpb.ScanRequest)
 						if ok && getTableSpan().ContainsKey(scan.Key) && atomic.LoadInt64(&queryRunningAtomic) == 1 {
 							i := atomic.AddInt64(&scannedBatchesAtomic, 1)
 							if i == stallAfterScans {
@@ -597,7 +637,7 @@ func TestQueryProgress(t *testing.T) {
 		// stalled ch as expected.
 		defer func() {
 			select {
-			case <-stalled: //stalled was closed as expected.
+			case <-stalled: // stalled was closed as expected.
 			default:
 				panic("expected stalled to have been closed during execution")
 			}
@@ -709,7 +749,7 @@ func TestRetriableErrorDuringPrepare(t *testing.T) {
 			SQLExecutor: &sql.ExecutorTestingKnobs{
 				BeforePrepare: func(ctx context.Context, stmt string, txn *kv.Txn) error {
 					if strings.Contains(stmt, uniqueString) && atomic.AddInt64(&failed, 1) <= numToFail {
-						return roachpb.NewTransactionRetryWithProtoRefreshError("boom",
+						return kvpb.NewTransactionRetryWithProtoRefreshError("boom",
 							txn.ID(), *txn.TestingCloneTxn())
 					}
 					return nil
@@ -725,6 +765,65 @@ func TestRetriableErrorDuringPrepare(t *testing.T) {
 	stmt, err := sqlDB.Prepare("SELECT " + uniqueString)
 	require.NoError(t, err)
 	defer func() { _ = stmt.Close() }()
+}
+
+// TestRetriableErrorDuringUpgradedTransaction ensures that a retriable error
+// that happens during a transaction that was upgraded from an implicit
+// transaction into an explicit transaction does not cause the BEGIN to be
+// re-executed.
+func TestRetriableErrorDuringUpgradedTransaction(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	var retryCount int64
+	const numToRetry = 2 // only fail on the first two attempts
+	filter := newDynamicRequestFilter()
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				TestingRequestFilter: filter.filter,
+			},
+		},
+	})
+	defer s.Stopper().Stop(context.Background())
+
+	conn, err := sqlDB.Conn(context.Background())
+	require.NoError(t, err)
+	testDB := sqlutils.MakeSQLRunner(conn)
+
+	var fooTableId uint32
+	testDB.Exec(t, "SET enable_implicit_transaction_for_batch_statements = true")
+	testDB.Exec(t, "CREATE TABLE bar (a INT PRIMARY KEY)")
+	testDB.Exec(t, "CREATE TABLE foo (a INT PRIMARY KEY)")
+	testDB.QueryRow(t, "SELECT 'foo'::regclass::oid").Scan(&fooTableId)
+
+	// Inject an error that will happen during execution.
+	filter.setFilter(func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+		if ba.Txn == nil {
+			return nil
+		}
+		if req, ok := ba.GetArg(kvpb.ConditionalPut); ok {
+			put := req.(*kvpb.ConditionalPutRequest)
+			_, tableID, err := keys.SystemSQLCodec.DecodeTablePrefix(put.Key)
+			if err != nil || tableID != fooTableId {
+				return nil
+			}
+			if atomic.AddInt64(&retryCount, 1) <= numToRetry {
+				return kvpb.NewErrorWithTxn(
+					kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "injected retry error"), ba.Txn,
+				)
+			}
+		}
+		return nil
+	})
+
+	testDB.Exec(t, "INSERT INTO bar VALUES(2); BEGIN; INSERT INTO foo VALUES(1); COMMIT;")
+	require.Equal(t, numToRetry+1, int(retryCount))
+
+	var x int
+	testDB.QueryRow(t, "select * from foo").Scan(&x)
+	require.Equal(t, 1, x)
+	testDB.QueryRow(t, "select * from bar").Scan(&x)
+	require.Equal(t, 2, x)
 }
 
 // This test ensures that when in an explicit transaction and statement
@@ -775,19 +874,19 @@ func TestErrorDuringPrepareInExplicitTransactionPropagates(t *testing.T) {
 	require.NoError(t, err)
 
 	// Inject an error that will happen during planning.
-	filter.setFilter(func(ctx context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	filter.setFilter(func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ba.Txn == nil {
 			return nil
 		}
-		if req, ok := ba.GetArg(roachpb.Get); ok {
-			get := req.(*roachpb.GetRequest)
+		if req, ok := ba.GetArg(kvpb.Get); ok {
+			get := req.(*kvpb.GetRequest)
 			_, tableID, err := keys.SystemSQLCodec.DecodeTablePrefix(get.Key)
 			if err != nil || tableID != keys.NamespaceTableID {
 				err = nil
 				return nil
 			}
-			return roachpb.NewErrorWithTxn(
-				roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
+			return kvpb.NewErrorWithTxn(
+				kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "boom"), ba.Txn)
 		}
 		return nil
 	})
@@ -1016,12 +1115,13 @@ func TestShowLastQueryStatisticsUnknown(t *testing.T) {
 }
 
 // TestTransactionDeadline tests that the transaction deadline is set correctly:
-// - In a single-tenant environment, the transaction deadline should use the leased
-//   descriptor expiration.
-// - In a multi-tenant environment, the transaction deadline should be set to
-//   min(sqlliveness.Session expiry, lease descriptor expiration).
+//   - In a single-tenant environment, the transaction deadline should use the leased
+//     descriptor expiration.
+//   - In a multi-tenant environment, the transaction deadline should be set to
+//     min(sqlliveness.Session expiry, lease descriptor expiration).
 func TestTransactionDeadline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	var mu struct {
@@ -1033,7 +1133,7 @@ func TestTransactionDeadline(t *testing.T) {
 	// This will be used in the tests for accessing mu.
 	locked := func(f func()) { mu.Lock(); defer mu.Unlock(); f() }
 	// Set up a kvserverbase.ReplicaRequestFilter which will extract the deadline for the test transaction.
-	checkTransactionDeadlineFilter := func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	checkTransactionDeadlineFilter := func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		if ba.Txn == nil {
 			return nil
 		}
@@ -1044,12 +1144,12 @@ func TestTransactionDeadline(t *testing.T) {
 			return nil
 		}
 
-		if args, ok := ba.GetArg(roachpb.EndTxn); ok {
-			et := args.(*roachpb.EndTxnRequest)
-			if et.Deadline == nil || et.Deadline.IsEmpty() {
+		if args, ok := ba.GetArg(kvpb.EndTxn); ok {
+			et := args.(*kvpb.EndTxnRequest)
+			if et.Deadline.IsEmpty() {
 				return nil
 			}
-			mu.txnDeadline = *et.Deadline
+			mu.txnDeadline = et.Deadline
 		}
 		return nil
 	}
@@ -1091,7 +1191,8 @@ func TestTransactionDeadline(t *testing.T) {
 	}
 	testClusterArgs := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			Knobs: knobs,
+			DefaultTestTenant: base.TestTenantDisabled,
+			Knobs:             knobs,
 		},
 	}
 	tc := serverutils.StartNewTestCluster(t, 1, testClusterArgs)
@@ -1112,12 +1213,15 @@ CREATE DATABASE t1;
 CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 `)
 
+	type fakeSession = sqllivenesstestutils.FakeSession
 	t.Run("session_expiry_overrides_lease_deadline", func(t *testing.T) {
 		// Deliberately set the sessionDuration to be less than the lease duration
 		// to confirm that the sessionDuration overrides the lease duration while
 		// setting the transaction deadline.
 		sessionDuration := base.DefaultDescriptorLeaseDuration - time.Minute
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
+		fs := fakeSession{
+			ExpTS: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0),
+		}
 		defer setClientSessionOverride(&fs)()
 
 		txn, err := sqlConn.Begin()
@@ -1140,7 +1244,9 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		// to confirm that the lease duration overrides the session duration while
 		// setting the transaction deadline
 		sessionDuration := base.DefaultDescriptorLeaseDuration + time.Minute
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
+		fs := fakeSession{
+			ExpTS: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0),
+		}
 		defer setClientSessionOverride(&fs)()
 
 		txn, err := sqlConn.Begin()
@@ -1157,22 +1263,6 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		require.NoError(t, err)
 
 		locked(func() { require.True(t, mu.txnDeadline.Less(fs.Expiration())) })
-	})
-
-	t.Run("expired session leads to clear error", func(t *testing.T) {
-		// In this test we use an intentionally expired session in the tenant
-		// and observe that we get a clear error indicating that the session
-		// was expired.
-		sessionDuration := -time.Nanosecond
-		fs := fakeSession{exp: s.Clock().Now().Add(sessionDuration.Nanoseconds(), 0)}
-		defer setClientSessionOverride(&fs)()
-		txn, err := sqlConn.Begin()
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = txn.ExecContext(ctx, "UPSERT INTO t1.test(k, v) VALUES (1, 'abc')")
-		require.Regexp(t, `liveness session expired (\S+) before transaction`, err)
-		require.NoError(t, txn.Rollback())
 	})
 
 	t.Run("single_tenant_ignore_session_expiry", func(t *testing.T) {
@@ -1194,7 +1284,9 @@ CREATE TABLE t1.test (k INT PRIMARY KEY, v TEXT);
 		}
 
 		// Inject an already expired session to observe that it has no effect.
-		fs := &fakeSession{exp: s.Clock().Now().Add(-time.Minute.Nanoseconds(), 0)}
+		fs := &fakeSession{
+			ExpTS: s.Clock().Now().Add(-time.Minute.Nanoseconds(), 0),
+		}
 		defer setClientSessionOverride(fs)()
 		txn, err := dbConn.Begin()
 		if err != nil {
@@ -1378,6 +1470,12 @@ func TestInjectRetryErrors(t *testing.T) {
 			tx, err := db.BeginTx(ctx, nil)
 			require.NoError(t, err)
 
+			// Verify that SHOW is exempt from error injection.
+			var s string
+			err = tx.QueryRow("SHOW inject_retry_errors_enabled").Scan(&s)
+			require.NoError(t, err)
+			require.Equal(t, "on", s)
+
 			if attemptCount == 5 {
 				_, err = tx.Exec("SET LOCAL inject_retry_errors_enabled = 'false'")
 				require.NoError(t, err)
@@ -1392,6 +1490,67 @@ func TestInjectRetryErrors(t *testing.T) {
 			require.ErrorAs(t, err, &pqErr)
 			require.Equal(t, "40001", string(pqErr.Code), "expected a transaction retry error code. got %v", pqErr)
 			require.NoError(t, tx.Rollback())
+		}
+		require.Equal(t, 5, txRes)
+	})
+
+	t.Run("insert_outside_of_txn", func(t *testing.T) {
+		// Add a special test for INSERTs in an implicit txn, since the 1PC
+		// optimization leads to different transaction commit semantics.
+		_, err := db.ExecContext(ctx, "CREATE TABLE t (a INT)")
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, "INSERT INTO t VALUES(1::INT)")
+		require.NoError(t, err)
+		var res int
+		err = db.QueryRow("SELECT a FROM t LIMIT 1").Scan(&res)
+		require.NoError(t, err)
+		require.Equal(t, 1, res)
+		_, err = db.ExecContext(ctx, "DROP TABLE t")
+		require.NoError(t, err)
+	})
+}
+
+func TestInjectRetryOnCommitErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params := base.TestServerArgs{}
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+	defer db.Close()
+
+	_, err := db.Exec("SET inject_retry_errors_on_commit_enabled = 'true'")
+	require.NoError(t, err)
+
+	t.Run("test_injection_failure_on_commit_without_savepoints", func(t *testing.T) {
+		var txRes int
+		for attemptCount := 1; attemptCount <= 10; attemptCount++ {
+			tx, err := db.BeginTx(ctx, nil)
+			require.NoError(t, err)
+
+			// Verify that SHOW is exempt from error injection.
+			var s string
+			err = tx.QueryRow("SHOW inject_retry_errors_on_commit_enabled").Scan(&s)
+			require.NoError(t, err)
+
+			if attemptCount == 5 {
+				_, err = tx.Exec("SET inject_retry_errors_on_commit_enabled = 'false'")
+				require.NoError(t, err)
+			}
+
+			err = tx.QueryRow("SELECT $1::int8", attemptCount).Scan(&txRes)
+			require.NoError(t, err)
+			err = tx.Commit()
+			if attemptCount >= 5 {
+				require.NoError(t, err)
+				break
+			} else {
+				pqErr := (*pq.Error)(nil)
+				require.ErrorAs(t, err, &pqErr)
+				require.Equal(t, "40001", string(pqErr.Code), "expected a transaction retry error code. got %v", pqErr)
+				// We should not expect a rollback on commit errors.
+			}
 		}
 		require.Equal(t, 5, txRes)
 	})
@@ -1435,7 +1594,7 @@ func TestTrackOnlyUserOpenTransactionsAndActiveStatements(t *testing.T) {
 		_, err := s.InternalExecutor().(*sql.InternalExecutor).ExecEx(ctx,
 			"test-internal-active-stmt-wait",
 			nil,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			selectQuery)
 		require.NoError(t, err, "expected internal SELECT query to be successful, but encountered an error")
 		waitChannel <- struct{}{}
@@ -1571,6 +1730,94 @@ func TestEmptyTxnIsBeingCorrectlyCounted(t *testing.T) {
 			"after executing empty transactions, but it was not")
 }
 
+// TestSessionTotalActiveTime tests that a session's total active time is
+// correctly being recorded as transactions are executed.
+func TestSessionTotalActiveTime(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params := base.TestServerArgs{}
+	s, mainDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	_, err := mainDB.Exec(fmt.Sprintf("CREATE USER %s", username.TestUser))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pgURL, cleanupDB := sqlutils.PGUrl(
+		t, s.ServingSQLAddr(), "TestSessionTotalActiveTime", url.User(username.TestUser))
+	defer cleanupDB()
+	rawSQL, err := gosql.Open("postgres", pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		err := rawSQL.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	getSessionWithTestUser := func() *serverpb.Session {
+		sessions := s.SQLServer().(*sql.Server).GetExecutorConfig().SessionRegistry.SerializeAll()
+		for _, s := range sessions {
+			if s.Username == username.TestUser {
+				return &s
+			}
+		}
+		t.Fatalf("expected session with username %s", username.TestUser)
+		return nil
+	}
+
+	sqlDB := sqlutils.MakeSQLRunner(rawSQL)
+	sqlDB.Exec(t, "SELECT 1")
+	session := getSessionWithTestUser()
+	activeTimeNanos := session.TotalActiveTime.Nanoseconds()
+
+	// We will execute different types of transactions.
+	// After each execution, verify the total active time has increased, but is no
+	// longer increasing after the transaction has completed.
+	testCases := []struct {
+		Query string
+		// SessionActiveAfterExecution signifies that the active time should still be active after this query.
+		SessionActiveAfterExecution bool
+	}{
+		{"SELECT 1", false},
+		// Test explicit transaction.
+		{"BEGIN", true},
+		{"SELECT 1", true},
+		{"SELECT  1, 2", true},
+		{"COMMIT", false},
+		{"BEGIN", true},
+		{"SELECT crdb_internal.force_retry('1s')", true},
+		{"COMMIT", false},
+	}
+
+	for _, tc := range testCases {
+		sqlDB.Exec(t, tc.Query)
+		if tc.Query == "crdb_internal.force_retry('1s'" {
+			continue
+		}
+		// Check that the total active time has increased.
+		session = getSessionWithTestUser()
+		require.Greater(t, session.TotalActiveTime.Nanoseconds(), activeTimeNanos)
+
+		activeTimeNanos = session.TotalActiveTime.Nanoseconds()
+		session = getSessionWithTestUser()
+
+		if tc.SessionActiveAfterExecution {
+			require.Greater(t, session.TotalActiveTime.Nanoseconds(), activeTimeNanos)
+		} else {
+			require.Equal(t, activeTimeNanos, session.TotalActiveTime.Nanoseconds())
+		}
+
+		activeTimeNanos = session.TotalActiveTime.Nanoseconds()
+	}
+}
+
 // dynamicRequestFilter exposes a filter method which is a
 // kvserverbase.ReplicaRequestFilter but can be set dynamically.
 type dynamicRequestFilter struct {
@@ -1592,34 +1839,22 @@ func (f *dynamicRequestFilter) setFilter(filter kvserverbase.ReplicaRequestFilte
 }
 
 // noopRequestFilter is a kvserverbase.ReplicaRequestFilter.
-func (f *dynamicRequestFilter) filter(
-	ctx context.Context, request roachpb.BatchRequest,
-) *roachpb.Error {
+func (f *dynamicRequestFilter) filter(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 	return f.v.Load().(kvserverbase.ReplicaRequestFilter)(ctx, request)
 }
 
 // noopRequestFilter is a kvserverbase.ReplicaRequestFilter that does nothing.
-func noopRequestFilter(ctx context.Context, request roachpb.BatchRequest) *roachpb.Error {
+func noopRequestFilter(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 	return nil
 }
-
-type fakeSession struct{ exp hlc.Timestamp }
-
-func (f fakeSession) ID() sqlliveness.SessionID { return "foo" }
-func (f fakeSession) Expiration() hlc.Timestamp { return f.exp }
-func (f fakeSession) Start() hlc.Timestamp      { panic("unimplemented") }
-func (f fakeSession) RegisterCallbackForSessionExpiry(func(ctx context.Context)) {
-	panic("unimplemented")
-}
-
-var _ sqlliveness.Session = (*fakeSession)(nil)
 
 func getTxnID(t *testing.T, tx *gosql.Tx) (id string) {
 	t.Helper()
 	sqlutils.MakeSQLRunner(tx).QueryRow(t, `
-SELECT id
-  FROM crdb_internal.node_transactions
- WHERE session_id = (SELECT * FROM [SHOW session_id])`,
+SELECT id 
+  FROM crdb_internal.node_transactions a
+  JOIN [SHOW session_id] b ON a.session_id = b.session_id
+`,
 	).Scan(&id)
 	return id
 }

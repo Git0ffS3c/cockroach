@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/errors"
 )
 
 // A Name is an SQL identifier.
@@ -118,6 +119,16 @@ func (l *NameList) Format(ctx *FmtCtx) {
 	}
 }
 
+// Contains returns true if the NameList contains the name.
+func (l NameList) Contains(name Name) bool {
+	for _, n := range l {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
 // ArraySubscript corresponds to the syntax `<name>[ ... ]`.
 type ArraySubscript struct {
 	Begin Expr
@@ -207,13 +218,22 @@ func MakeUnresolvedName(args ...string) UnresolvedName {
 }
 
 // ToUnresolvedObjectName converts an UnresolvedName to an UnresolvedObjectName.
-func (u *UnresolvedName) ToUnresolvedObjectName(idx AnnotationIdx) (*UnresolvedObjectName, error) {
+func (u *UnresolvedName) ToUnresolvedObjectName(idx AnnotationIdx) (UnresolvedObjectName, error) {
 	if u.NumParts == 4 {
-		return nil, pgerror.Newf(pgcode.Syntax, "improper qualified name (too many dotted names): %s", u)
+		return UnresolvedObjectName{}, pgerror.Newf(pgcode.Syntax, "improper qualified name (too many dotted names): %s", u)
 	}
-	return NewUnresolvedObjectName(
+	return MakeUnresolvedObjectName(
 		u.NumParts,
 		[3]string{u.Parts[0], u.Parts[1], u.Parts[2]},
 		idx,
 	)
+}
+
+// ToFunctionName converts an UnresolvedName to a FunctionName.
+func (u *UnresolvedName) ToFunctionName() (FunctionName, error) {
+	un, err := u.ToUnresolvedObjectName(NoAnnotation)
+	if err != nil {
+		return FunctionName{}, errors.Newf("invalid function name: %s", u.String())
+	}
+	return un.ToFunctionName(), nil
 }

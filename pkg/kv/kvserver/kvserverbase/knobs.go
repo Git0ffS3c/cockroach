@@ -14,6 +14,8 @@
 
 package kvserverbase
 
+import "time"
+
 // BatchEvalTestingKnobs contains testing helpers that are used during batch evaluation.
 type BatchEvalTestingKnobs struct {
 	// TestingEvalFilter is called before evaluating each command.
@@ -38,6 +40,16 @@ type BatchEvalTestingKnobs struct {
 	// default, this is not allowed because it is unsafe. See cmd_gc.go for an
 	// explanation of why.
 	AllowGCWithNewThresholdAndKeys bool
+
+	// DisableInitPutFailOnTombstones disables FailOnTombstones for InitPut. This
+	// is useful together with e.g. StoreTestingKnobs.GlobalMVCCRangeTombstone,
+	// where we still want InitPut to succeed on top of the range tombstone.
+	DisableInitPutFailOnTombstones bool
+
+	// UseRangeTombstonesForPointDeletes will use point-sized MVCC range
+	// tombstones when deleting point keys, to increase test coverage. These
+	// should not appear different from a point tombstone to a KV client.
+	UseRangeTombstonesForPointDeletes bool
 }
 
 // IntentResolverTestingKnobs contains testing helpers that are used during
@@ -60,4 +72,14 @@ type IntentResolverTestingKnobs struct {
 	// MaxIntentResolutionBatchSize overrides the maximum number of intent
 	// resolution requests which can be sent in a single batch.
 	MaxIntentResolutionBatchSize int
+
+	// InFlightBackpressureLimit overrides the number of batches in flight above
+	// which sending intent resolution batch requests should experience
+	// backpressure.
+	InFlightBackpressureLimit int
+
+	// MaxIntentResolutionSendBatchTimeout overrides the maximum amount of time
+	// that sending an intent resolution batch request can run for before timing
+	// out.
+	MaxIntentResolutionSendBatchTimeout time.Duration
 }

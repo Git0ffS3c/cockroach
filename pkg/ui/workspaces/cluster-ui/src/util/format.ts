@@ -23,6 +23,7 @@ export const byteUnits: string[] = [
   "YiB",
 ];
 export const durationUnits: string[] = ["ns", "µs", "ms", "s"];
+export const countUnits: string[] = ["", "k", "m", "b"];
 
 interface UnitValue {
   value: number;
@@ -38,7 +39,7 @@ export function ComputePrefixExponent(
   value: number,
   prefixMultiple: number,
   prefixList: string[],
-) {
+): number {
   // Compute the metric prefix that will be used to label the axis.
   let maxUnits = Math.abs(value);
   let prefixScale: number;
@@ -102,13 +103,15 @@ export function Bytes(bytes: number): string {
  * Cast bytes to provided scale units
  */
 // tslint:disable-next-line: variable-name
-export const BytesFitScale = (scale: string) => (bytes: number) => {
-  if (!bytes) {
-    return `0.00 ${scale}`;
-  }
-  const n = byteUnits.indexOf(scale);
-  return `${(bytes / Math.pow(kibi, n)).toFixed(2)} ${scale}`;
-};
+export const BytesFitScale =
+  (scale: string) =>
+  (bytes: number): string => {
+    if (!bytes) {
+      return `0.00 ${scale}`;
+    }
+    const n = byteUnits.indexOf(scale);
+    return `${(bytes / Math.pow(kibi, n)).toFixed(2)} ${scale}`;
+  };
 
 /**
  * Percentage creates a string representation of a fraction as a percentage.
@@ -153,20 +156,45 @@ export function Duration(nanoseconds: number): string {
 }
 
 /**
+ * Duration creates a string representation for a duration. The expectation is
+ * that units are passed in nanoseconds; for larger durations, the value will
+ * be converted into larger units.
+ * If the value is 0, return "no samples".
+ */
+export function DurationCheckSample(nanoseconds: number): string {
+  if (nanoseconds == 0) {
+    return "no samples";
+  }
+  return Duration(nanoseconds);
+}
+
+/**
  * Cast nanoseconds to provided scale units
  */
 // tslint:disable-next-line: variable-name
-export const DurationFitScale = (scale: string) => (nanoseconds: number) => {
-  if (!nanoseconds) {
-    return `0.00 ${scale}`;
-  }
-  const n = durationUnits.indexOf(scale);
-  return `${(nanoseconds / Math.pow(1000, n)).toFixed(2)} ${scale}`;
-};
+export const DurationFitScale =
+  (scale: string) =>
+  (nanoseconds: number): string => {
+    if (!nanoseconds) {
+      return `0.00 ${scale}`;
+    }
+    const n = durationUnits.indexOf(scale);
+    return `${(nanoseconds / Math.pow(1000, n)).toFixed(2)} ${scale}`;
+  };
 
-export const DATE_FORMAT = "MMM DD, YYYY [at] h:mm A";
+export const DATE_FORMAT = "MMM DD, YYYY [at] H:mm";
+export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT =
+  "MMM DD, YYYY [at] H:mm:ss:ms";
 
-export function RenderCount(yesCount: Long, totalCount: Long) {
+/**
+ * Alternate 24 hour UTC formats
+ */
+export const DATE_FORMAT_24_UTC = "MMM DD, YYYY [at] H:mm UTC";
+export const DATE_WITH_SECONDS_FORMAT_24_UTC = "MMM DD, YYYY [at] H:mm:ss UTC";
+export const DATE_WITH_SECONDS_AND_MILLISECONDS_FORMAT_24_UTC =
+  "MMM DD, YYYY [at] H:mm:ss:ms UTC";
+
+export function RenderCount(yesCount: Long, totalCount: Long): string {
   if (longToInt(yesCount) == 0) {
     return "No";
   }
@@ -175,4 +203,200 @@ export function RenderCount(yesCount: Long, totalCount: Long) {
   }
   const noCount = longToInt(totalCount) - longToInt(yesCount);
   return `${longToInt(yesCount)} Yes / ${noCount} No`;
+}
+
+/**
+ * ComputeCountScale calculates an appropriate scale factor and unit to use
+ * to display a given count value, without actually converting the value.
+ */
+function ComputeCountScale(count: number): UnitValue {
+  const scale = ComputePrefixExponent(count, 1000, countUnits);
+  return {
+    value: Math.pow(1000, scale),
+    units: countUnits[scale],
+  };
+}
+
+/**
+ * Count creates a string representation for a count.
+ */
+export function Count(count: number): string {
+  const scale = ComputeCountScale(count);
+  const unitVal = count / scale.value;
+  const fractionDigits = Number.isInteger(unitVal) ? 0 : 1;
+  return unitVal.toFixed(fractionDigits) + " " + scale.units;
+}
+
+// limitText returns a shortened form of text that surpasses a given limit
+export const limitText = (text: string, limit: number): string => {
+  if (!text) {
+    return "";
+  }
+  return text?.length > limit ? text.slice(0, limit - 3).concat("...") : text;
+};
+
+// limitStringArray returns a shortened form of text that surpasses a given limit
+export const limitStringArray = (arr: string[], limit: number): string => {
+  if (!arr || arr.length == 0) {
+    return "";
+  }
+
+  // Remove null and undefined entries in the array.
+  arr = arr.filter(n => n);
+  if (arr.length == 0) {
+    return "";
+  }
+
+  if (arr.length == 1 || arr[0]?.length > limit) {
+    return limitText(arr[0], limit);
+  }
+
+  let str = arr[0];
+  for (let next = 1; next < arr.length; ++next) {
+    const charsLeft = limit - str.length;
+    if (charsLeft < arr[next].length) {
+      str += arr[next].substring(0, charsLeft).concat("...");
+      break;
+    }
+    str += arr[next];
+  }
+
+  return str;
+};
+
+function add(a: string, b: string): string {
+  let c = 0;
+  const r = [];
+  const x = a.split("").map(Number);
+  const y = b.split("").map(Number);
+  while (x.length || y.length) {
+    const s = (x.pop() || 0) + (y.pop() || 0) + c;
+    r.unshift(s < 10 ? s : s - 10);
+    c = s < 10 ? 0 : 1;
+  }
+  if (c) r.unshift(c);
+  return r.join("");
+}
+
+// HexStringToInt64String converts a hex value (in string form)
+// to an int64 (in string form).
+export function HexStringToInt64String(s: string): string {
+  let dec = "0";
+  s?.split("").forEach(function (chr: string) {
+    const n = parseInt(chr, 16);
+    for (let t = 8; t; t >>= 1) {
+      dec = add(dec, dec);
+      if (n & t) dec = add(dec, "1");
+    }
+  });
+  return dec;
+}
+
+// FixFingerprintHexValue adds the leading 0 on strings with hex value that
+// have a length < 16. This can occur because it was returned like this from the DB
+// or because the hex value was generated using `.toString(16)` (which removes the
+// leading zeros).
+// The zeros need to be added back to match the value on our sql stats tables.
+export function FixFingerprintHexValue(s: string): string {
+  if (s === undefined || s === null || s.length === 0) {
+    return "";
+  }
+  while (s.length < 16) {
+    s = `0${s}`;
+  }
+  return s;
+}
+
+// capitalize capitalizes a string.
+export function capitalize(str: string): string {
+  if (!str) return str;
+  return str[0].toUpperCase() + str.substring(1);
+}
+
+export function EncodeUriName(name: string): string {
+  // When a string has a '%' on it, the URI needs to have '%2525' instead, so this
+  // function replaces '%25' with '%252525' because when the link is created
+  // we have [%25]2525 -> %2525 (which is then used as the URI)
+  return encodeURIComponent(name).replace(/%25/g, "%252525");
+}
+
+export function EncodeDatabasesUri(db: string): string {
+  return `/databases/${EncodeUriName(db)}`;
+}
+
+export function EncodeDatabasesToIndexUri(
+  db: string,
+  schema: string,
+  table: string,
+  indexName: string,
+): string {
+  return `${EncodeDatabasesUri(db)}/${EncodeUriName(schema)}/${EncodeUriName(
+    table,
+  )}/${EncodeUriName(indexName)}`;
+}
+
+export function EncodeDatabaseTableUri(db: string, table: string): string {
+  return `${EncodeDatabaseUri(db)}/table/${EncodeUriName(table)}`;
+}
+
+export function EncodeDatabaseTableIndexUri(
+  db: string,
+  table: string,
+  indexName: string,
+): string {
+  return `${EncodeDatabaseTableUri(db, table)}/index/${EncodeUriName(
+    indexName,
+  )}`;
+}
+
+export function EncodeDatabaseUri(db: string): string {
+  return `/database/${EncodeUriName(db)}`;
+}
+
+interface BreakLineReplacement {
+  [key: string]: string;
+}
+
+const breakLinesKeywords: BreakLineReplacement = {
+  " FROM ": " FROM ",
+  " WHERE ": "   WHERE ",
+  " AND ": "    AND ",
+  " ORDER ": " ORDER ",
+  " LIMIT ": " LIMIT ",
+  " JOIN ": "   JOIN ",
+  " ON ": "    ON ",
+  " VALUES ": "   VALUES ",
+};
+const LINE_BREAK_LIMIT = 100;
+
+export function FormatQuery(query: string): string {
+  if (query == null) {
+    return "";
+  }
+  Object.keys(breakLinesKeywords).forEach(key => {
+    query = query.replace(new RegExp(key, "g"), `\n${breakLinesKeywords[key]}`);
+  });
+  const lines = query.split("\n").map(line => {
+    if (line.length <= LINE_BREAK_LIMIT) {
+      return line;
+    }
+    return breakLongLine(line, LINE_BREAK_LIMIT);
+  });
+
+  return lines.join("\n");
+}
+
+function breakLongLine(line: string, limit: number): string {
+  if (line.length <= limit) {
+    return line;
+  }
+  const idxComma = line.indexOf(",", limit);
+  if (idxComma == -1) {
+    return line;
+  }
+
+  return `${line.substring(0, idxComma + 1)}\n${breakLongLine(
+    line.substring(idxComma + 1).trim(),
+    limit,
+  )}`;
 }

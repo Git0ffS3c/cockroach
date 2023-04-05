@@ -1,8 +1,10 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "typedesc",
     srcs = [
+        "hydrate.go",
         "safe_format.go",
         "table_implicit_record_type.go",
         "type_desc.go",
@@ -11,6 +13,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/clusterversion",
         "//pkg/keys",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catpb",
@@ -18,7 +21,6 @@ go_library(
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/multiregion",
         "//pkg/sql/enum",
-        "//pkg/sql/oidext",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/privilege",
@@ -27,6 +29,7 @@ go_library(
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/hlc",
+        "//pkg/util/iterutil",
         "//pkg/util/protoutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
@@ -42,11 +45,12 @@ go_test(
         "safe_format_test.go",
         "type_desc_test.go",
     ],
+    args = ["-test.timeout=55s"],
     deps = [
         ":typedesc",
         "//pkg/clusterversion",
         "//pkg/keys",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
@@ -71,3 +75,5 @@ go_test(
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
+
+get_x_data(name = "get_x_data")

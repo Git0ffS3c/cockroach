@@ -18,12 +18,12 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -37,7 +37,8 @@ var (
 // TestSetups verifies that all setups generate executable SQL.
 func TestSetups(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer utilccl.TestingEnableEnterprise()()
+	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	for name, setup := range Setups {
 		t.Run(name, func(t *testing.T) {
@@ -74,23 +75,24 @@ func TestSetups(t *testing.T) {
 //
 // If this test fails, there is likely a bug in:
 //
-//   1. sqlsmith that makes valid INSERTs impossible or very unlikely
-//   2. Or rand-tables that makes it impossible or very unlikely to ever
-//      generate a successful INSERT
+//  1. sqlsmith that makes valid INSERTs impossible or very unlikely
+//  2. Or rand-tables that makes it impossible or very unlikely to ever
+//     generate a successful INSERT
 //
 // Note that there is a small but non-zero chance that this test produces a
 // false-negative.
 func TestRandTableInserts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	rnd, _ := randutil.NewTestRand()
-	defer utilccl.TestingEnableEnterprise()()
+	defer ccl.TestingEnableEnterprise()()
 
-	setup := randTablesN(rnd, 10)
+	setup := randTablesN(rnd, 10, "")
 	for _, stmt := range setup {
 		if _, err := sqlDB.Exec(stmt); err != nil {
 			t.Log(stmt)
@@ -145,7 +147,8 @@ func TestRandTableInserts(t *testing.T) {
 // sometimes put them into bad states that the parser would never do.
 func TestGenerateParse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer utilccl.TestingEnableEnterprise()()
+	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})

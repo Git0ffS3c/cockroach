@@ -17,22 +17,51 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydratedtables"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/hydrateddesccache"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
 // CollectionFactory is used to construct a new Collection.
 type CollectionFactory struct {
-	settings           *cluster.Settings
-	codec              keys.SQLCodec
-	leaseMgr           *lease.Manager
-	virtualSchemas     catalog.VirtualSchemas
-	hydratedTables     *hydratedtables.Cache
-	systemDatabase     *systemDatabaseNamespaceCache
-	spanConfigSplitter spanconfig.Splitter
-	spanConfigLimiter  spanconfig.Limiter
-	defaultMonitor     *mon.BytesMonitor
+	settings                             *cluster.Settings
+	codec                                keys.SQLCodec
+	leaseMgr                             *lease.Manager
+	virtualSchemas                       catalog.VirtualSchemas
+	hydrated                             *hydrateddesccache.Cache
+	systemDatabase                       *catkv.SystemDatabaseCache
+	spanConfigSplitter                   spanconfig.Splitter
+	spanConfigLimiter                    spanconfig.Limiter
+	defaultMonitor                       *mon.BytesMonitor
+	defaultDescriptorSessionDataProvider DescriptorSessionDataProvider
+}
+
+// GetClusterSettings returns the cluster setting from the collection factory.
+func (cf *CollectionFactory) GetClusterSettings() *cluster.Settings {
+	return cf.settings
+}
+
+type Txn interface {
+	isql.Txn
+	Descriptors() *Collection
+}
+
+// DB is used to enable running multiple queries with an internal
+// executor in a transactional manner.
+type DB interface {
+	isql.DB
+
+	// DescsTxn is similar to DescsTxnWithExecutor but without an internal executor.
+	// It creates a descriptor collection that lives within the scope of the given
+	// function, and is a convenient method for running a transaction on
+	// them.
+	DescsTxn(
+		ctx context.Context,
+		f func(context.Context, Txn) error,
+		opts ...isql.TxnOption,
+	) error
 }
 
 // NewCollectionFactory constructs a new CollectionFactory which holds onto
@@ -42,22 +71,24 @@ func NewCollectionFactory(
 	settings *cluster.Settings,
 	leaseMgr *lease.Manager,
 	virtualSchemas catalog.VirtualSchemas,
-	hydratedTables *hydratedtables.Cache,
+	hydrated *hydrateddesccache.Cache,
 	spanConfigSplitter spanconfig.Splitter,
 	spanConfigLimiter spanconfig.Limiter,
+	defaultDescriptorSessionDataProvider DescriptorSessionDataProvider,
 ) *CollectionFactory {
 	return &CollectionFactory{
 		settings:           settings,
 		codec:              leaseMgr.Codec(),
 		leaseMgr:           leaseMgr,
 		virtualSchemas:     virtualSchemas,
-		hydratedTables:     hydratedTables,
-		systemDatabase:     newSystemDatabaseNamespaceCache(leaseMgr.Codec()),
+		hydrated:           hydrated,
+		systemDatabase:     leaseMgr.SystemDatabaseCache(),
 		spanConfigSplitter: spanConfigSplitter,
 		spanConfigLimiter:  spanConfigLimiter,
 		defaultMonitor: mon.NewUnlimitedMonitor(ctx, "CollectionFactoryDefaultUnlimitedMonitor",
 			mon.MemoryResource, nil /* curCount */, nil, /* maxHist */
 			0 /* noteworthy */, settings),
+		defaultDescriptorSessionDataProvider: defaultDescriptorSessionDataProvider,
 	}
 }
 
@@ -72,24 +103,59 @@ func NewBareBonesCollectionFactory(
 	}
 }
 
-// MakeCollection constructs a Collection for the purposes of embedding.
-func (cf *CollectionFactory) MakeCollection(
-	ctx context.Context, temporarySchemaProvider TemporarySchemaProvider, monitor *mon.BytesMonitor,
-) Collection {
-	if monitor == nil {
-		// If an upstream monitor is not provided, the default, unlimited monitor will be used.
-		// All downstream resource allocation/releases on this default monitor will then be no-ops.
-		monitor = cf.defaultMonitor
-	}
+type constructorConfig struct {
+	dsdp    DescriptorSessionDataProvider
+	monitor *mon.BytesMonitor
+}
 
-	return makeCollection(ctx, cf.leaseMgr, cf.settings, cf.codec, cf.hydratedTables, cf.systemDatabase,
-		cf.virtualSchemas, temporarySchemaProvider, monitor)
+// Option is how optional construction parameters are provided to the
+// CollectionFactory construction method.
+type Option func(b *constructorConfig)
+
+// WithDescriptorSessionDataProvider supplies a DescriptorSessionDataProvider
+// instance to the Collection constructor.
+func WithDescriptorSessionDataProvider(
+	dsdp DescriptorSessionDataProvider,
+) func(cfg *constructorConfig) {
+	return func(cfg *constructorConfig) {
+		cfg.dsdp = dsdp
+	}
+}
+
+// WithMonitor supplies a mon.BytesMonitor instance to the Collection
+// constructor.
+func WithMonitor(monitor *mon.BytesMonitor) func(b *constructorConfig) {
+	return func(cfg *constructorConfig) {
+		cfg.monitor = monitor
+	}
 }
 
 // NewCollection constructs a new Collection.
-func (cf *CollectionFactory) NewCollection(
-	ctx context.Context, temporarySchemaProvider TemporarySchemaProvider,
-) *Collection {
-	c := cf.MakeCollection(ctx, temporarySchemaProvider, nil /* monitor */)
-	return &c
+// When no DescriptorSessionDataProvider is provided, the factory falls back to
+// the default instances which behaves as if the session data stack were empty.
+// Whe no mon.BytesMonitor is provided, the factory falls back to a default,
+// unlimited monitor for which all downstream resource allocation/releases are
+// no-ops.
+func (cf *CollectionFactory) NewCollection(ctx context.Context, options ...Option) *Collection {
+	cfg := constructorConfig{
+		dsdp:    cf.defaultDescriptorSessionDataProvider,
+		monitor: cf.defaultMonitor,
+	}
+	for _, opt := range options {
+		opt(&cfg)
+	}
+	v := cf.settings.Version.ActiveVersion(ctx)
+	return &Collection{
+		settings:                cf.settings,
+		version:                 v,
+		hydrated:                cf.hydrated,
+		virtual:                 makeVirtualDescriptors(cf.virtualSchemas),
+		leased:                  makeLeasedDescriptors(cf.leaseMgr),
+		uncommitted:             makeUncommittedDescriptors(cfg.monitor),
+		uncommittedComments:     makeUncommittedComments(),
+		uncommittedZoneConfigs:  makeUncommittedZoneConfigs(),
+		cr:                      catkv.NewCatalogReader(cf.codec, v, cf.systemDatabase, cfg.monitor),
+		temporarySchemaProvider: cfg.dsdp,
+		validationModeProvider:  cfg.dsdp,
+	}
 }

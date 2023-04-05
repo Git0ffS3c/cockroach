@@ -21,7 +21,7 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.SchemaParent) scop.Op {
+				emit(func(this *scpb.SchemaParent) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
 			),
@@ -29,10 +29,9 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
 				// TODO(postamar): remove revertibility constraint when possible
 				revertible(false),
-				emit(func(this *scpb.SchemaParent) scop.Op {
+				emit(func(this *scpb.SchemaParent) *scop.RemoveSchemaParent {
 					return &scop.RemoveSchemaParent{
 						Parent: *protoutil.Clone(this).(*scpb.SchemaParent),
 					}

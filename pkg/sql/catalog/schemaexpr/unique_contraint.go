@@ -13,6 +13,7 @@ package schemaexpr
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
@@ -30,23 +31,24 @@ import (
 //   - It does not include subqueries.
 //   - It does not include non-immutable, aggregate, window, or set returning
 //     functions.
-//
 func ValidateUniqueWithoutIndexPredicate(
 	ctx context.Context,
 	tn tree.TableName,
 	desc catalog.TableDescriptor,
 	pred tree.Expr,
 	semaCtx *tree.SemaContext,
+	version clusterversion.ClusterVersion,
 ) (string, error) {
 	expr, _, _, err := DequalifyAndValidateExpr(
 		ctx,
 		desc,
 		pred,
 		types.Bool,
-		"unique without index predicate",
+		tree.UniqueWithoutIndexPredicateExpr,
 		semaCtx,
 		volatility.Immutable,
 		&tn,
+		version,
 	)
 	if err != nil {
 		return "", err

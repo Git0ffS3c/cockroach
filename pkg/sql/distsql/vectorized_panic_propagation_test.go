@@ -40,6 +40,7 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: cluster.MakeTestingClusterSettings()},
 	}
 	base := flowinfra.NewFlowBase(
@@ -49,12 +50,14 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 		nil, /* rowSyncFlowConsumer */
 		nil, /* batchSyncFlowConsumer */
 		nil, /* localProcessors */
+		nil, /* localVectorProcessors */
 		nil, /* onFlowCleanup */
 		"",  /* statementSQL */
 	)
 	flow := colflow.NewVectorizedFlow(base)
 
 	mat := colexec.NewMaterializer(
+		nil, /* allocator */
 		&flowCtx,
 		0, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: &colexecop.CallbackOperator{
@@ -68,7 +71,7 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 	ctx, _, err := base.Setup(ctx, nil, flowinfra.FuseAggressively)
 	require.NoError(t, err)
 
-	base.SetProcessors([]execinfra.Processor{mat})
+	require.NoError(t, base.SetProcessorsAndOutputs([]execinfra.Processor{mat}, []execinfra.RowReceiver{nil}))
 	// This test specifically verifies that a flow doesn't get stuck in Wait for
 	// asynchronous components that haven't been signaled to exit. To simulate
 	// this we just create a mock startable.
@@ -83,5 +86,5 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 		}),
 	)
 
-	require.Panics(t, func() { flow.Run(ctx, nil) })
+	require.Panics(t, func() { flow.Run(ctx, false /* noWait */) })
 }

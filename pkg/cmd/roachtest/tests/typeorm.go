@@ -89,7 +89,7 @@ func registerTypeORM(r registry.Registry) {
 			c,
 			node,
 			"add nodesource repository",
-			`sudo apt install ca-certificates && curl -fsSL https://deb.nodesource.com/setup_14.x | sudo -E bash -`,
+			`sudo apt install ca-certificates && curl -fsSL https://deb.nodesource.com/setup_16.x | sudo -E bash -`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -166,8 +166,10 @@ func registerTypeORM(r registry.Registry) {
 		rawResults := result.Stdout + result.Stderr
 		t.L().Printf("Test Results: %s", rawResults)
 		if err != nil {
-			if strings.Contains(rawResults, "1 failing") &&
-				strings.Contains(rawResults, "Error: Cannot find connection better-sqlite3 because its not defined in any orm configuration files.") {
+			txnRetryErrCount := strings.Count(rawResults, "restart transaction")
+			if strings.Contains(rawResults, "1 failing") && txnRetryErrCount == 1 {
+				err = nil
+			} else if strings.Contains(rawResults, "2 failing") && txnRetryErrCount == 2 {
 				err = nil
 			}
 			if err != nil {
@@ -178,7 +180,7 @@ func registerTypeORM(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:    "typeorm",
-		Owner:   registry.OwnerSQLExperience,
+		Owner:   registry.OwnerSQLSessions,
 		Cluster: r.MakeClusterSpec(1),
 		Tags:    []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

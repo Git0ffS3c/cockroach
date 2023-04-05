@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -9,13 +10,18 @@ go_library(
         "//pkg/base",
         "//pkg/gossip",
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/liveness/livenesspb",
+        "//pkg/multitenant/tenantcapabilities",
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/rpc/nodedialer",
         "//pkg/server",
         "//pkg/server/serverpb",
+        "//pkg/spanconfig",
+        "//pkg/sql/catalog",
+        "//pkg/sql/randgen",
         "//pkg/storage",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
@@ -27,10 +33,11 @@ go_library(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/tracing",
+        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
         "@com_github_stretchr_testify//require",
-        "@io_etcd_go_etcd_raft_v3//:raft",
+        "@io_etcd_go_raft_v3//:raft",
     ],
 )
 
@@ -41,14 +48,16 @@ go_test(
         "main_test.go",
         "testcluster_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":testcluster"],
     deps = [
         "//pkg/base",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/rpc",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/server/serverpb",
@@ -62,3 +71,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

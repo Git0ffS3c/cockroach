@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
 	"github.com/stretchr/testify/require"
@@ -66,9 +67,10 @@ func setupRouter(
 			Settings: st,
 		},
 		EvalCtx:     evalCtx,
+		Mon:         evalCtx.TestingMon,
 		DiskMonitor: diskMonitor,
 	}
-	r.init(ctx, &flowCtx, inputTypes)
+	r.init(ctx, &flowCtx, 0 /* processorID */, inputTypes)
 	wg := &sync.WaitGroup{}
 	r.Start(ctx, wg, nil /* flowCtxCancel */)
 	return r, wg
@@ -282,7 +284,7 @@ var (
 		Encodings: []execinfrapb.OutputRouterSpec_RangeRouterSpec_ColumnEncoding{
 			{
 				Column:   0,
-				Encoding: descpb.DatumEncoding_ASCENDING_KEY,
+				Encoding: catenumpb.DatumEncoding_ASCENDING_KEY,
 			},
 		},
 	}
@@ -675,9 +677,10 @@ func TestRouterBlocks(t *testing.T) {
 					Settings: st,
 				},
 				EvalCtx:     &evalCtx,
+				Mon:         evalCtx.TestingMon,
 				DiskMonitor: diskMonitor,
 			}
-			router.init(ctx, &flowCtx, colTypes)
+			router.init(ctx, &flowCtx, 0 /* processorID */, colTypes)
 			var wg sync.WaitGroup
 			router.Start(ctx, &wg, nil /* flowCtxCancel */)
 
@@ -755,7 +758,7 @@ func TestRouterDiskSpill(t *testing.T) {
 
 	// Enable stats recording.
 	tracer := tracing.NewTracer()
-	sp := tracer.StartSpan("root", tracing.WithRecording(tracing.RecordingVerbose))
+	sp := tracer.StartSpan("root", tracing.WithRecording(tracingpb.RecordingVerbose))
 	ctx := tracing.ContextWithSpan(context.Background(), sp)
 
 	st := cluster.MakeTestingClusterSettings()
@@ -785,6 +788,7 @@ func TestRouterDiskSpill(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -798,10 +802,10 @@ func TestRouterDiskSpill(t *testing.T) {
 	// memErrorWhenConsumingRows indicates whether we expect an OOM error to
 	// occur when we're consuming rows from the row channel. By default, it
 	// will occur because routerOutput derives a memory monitor for the row
-	// buffer from evalCtx.Mon which has a limit, and we're going to consume
-	// rows after the spilling has occurred (meaning that evalCtx.Mon reached
-	// its limit). In order for this to not happen we will create a separate
-	// memory account.
+	// buffer from evalCtx.TestingMon which has a limit, and we're going to
+	// consume rows after the spilling has occurred (meaning that
+	// evalCtx.TestingMon reached its limit). In order for this to not happen we
+	// will create a separate memory account.
 	for _, memErrorWhenConsumingRows := range []bool{false, true} {
 		var (
 			rowChan execinfra.RowChannel
@@ -814,7 +818,7 @@ func TestRouterDiskSpill(t *testing.T) {
 		// writes to the channel (after the first one).
 		rowChan.InitWithBufSizeAndNumSenders(types.OneIntCol, 1 /* chanBufSize */, 1 /* numSenders */)
 		rb.setupStreams(&spec, []execinfra.RowReceiver{&rowChan})
-		rb.init(ctx, &flowCtx, types.OneIntCol)
+		rb.init(ctx, &flowCtx, 0 /* processorID */, types.OneIntCol)
 		// output is the sole router output in this test.
 		output := &rb.outputs[0]
 		if !memErrorWhenConsumingRows {

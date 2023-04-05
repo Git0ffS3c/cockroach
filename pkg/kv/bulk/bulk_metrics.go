@@ -13,13 +13,14 @@ package bulk
 import (
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
 
 // Metrics contains pointers to the metrics for
 // monitoring bulk operations.
 type Metrics struct {
-	MaxBytesHist  *metric.Histogram
+	MaxBytesHist  metric.IHistogram
 	CurBytesCount *metric.Gauge
 }
 
@@ -50,7 +51,23 @@ const log10int64times1000 = 19 * 1000
 // MakeBulkMetrics instantiates the metrics holder for bulk operation monitoring.
 func MakeBulkMetrics(histogramWindow time.Duration) Metrics {
 	return Metrics{
-		MaxBytesHist:  metric.NewHistogram(metaMemMaxBytes, histogramWindow, log10int64times1000, 3),
+		MaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+			Metadata: metaMemMaxBytes,
+			Duration: histogramWindow,
+			MaxVal:   log10int64times1000,
+			SigFigs:  3,
+			Buckets:  metric.MemoryUsage64MBBuckets,
+		}),
 		CurBytesCount: metric.NewGauge(metaMemCurBytes),
 	}
 }
+
+type sz int64
+
+func (b sz) String() string { return string(humanizeutil.IBytes(int64(b))) }
+func (b sz) SafeValue()     {}
+
+type timing time.Duration
+
+func (t timing) String() string { return time.Duration(t).Round(time.Second).String() }
+func (t timing) SafeValue()     {}

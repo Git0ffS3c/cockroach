@@ -12,7 +12,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupbase"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -53,6 +53,7 @@ func TestShowBackup(t *testing.T) {
 	defer cleanupEmptyCluster()
 	sqlDB.ExecMultiple(t, strings.Split(`
 SET CLUSTER SETTING sql.cross_db_fks.enabled = TRUE;
+SET CLUSTER SETTING bulkio.backup.file_size = '1';
 CREATE TYPE data.welcome AS ENUM ('hello', 'hi');
 USE data; CREATE SCHEMA sc;
 CREATE TABLE data.sc.t1 (a INT);
@@ -129,7 +130,7 @@ ORDER BY object_type, object_name`, full)
 	require.NotNil(t, matchResult)
 	backupTime, err := time.Parse("2006-01-02 15:04:05.00", matchResult[1])
 	require.NoError(t, err)
-	backupFolder := backupTime.Format(DateBasedIntoFolderName)
+	backupFolder := backupTime.Format(backupbase.DateBasedIntoFolderName)
 	resolvedBackupFolder := full + backupFolder
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data INTO $1 AS OF SYSTEM TIME '%s'`, beforeTS), full)
 	sqlDB.Exec(t, fmt.Sprintf(`BACKUP DATABASE data INTO LATEST IN $1 AS OF SYSTEM TIME '%s'`, incTS), full)
@@ -412,19 +413,33 @@ GRANT UPDATE ON top_secret TO agent_bond;
 		sqlDB.Exec(t, `BACKUP DATABASE mi5 TO $1;`, showPrivs)
 
 		want := [][]string{
-			{`mi5`, `database`, `GRANT ALL ON mi5 TO admin; GRANT ALL ` +
-				`ON mi5 TO agents; GRANT CONNECT ON mi5 TO public; GRANT ALL ON mi5 TO root; `, `root`},
-			{`public`, `schema`, `GRANT ALL ON public TO admin; GRANT CREATE, USAGE ON public TO public; GRANT ALL ON public TO root; `, `admin`},
-			{`locator`, `schema`, `GRANT ALL ON locator TO admin; GRANT CREATE, GRANT ON locator TO agent_bond; GRANT ALL ON locator TO m; ` +
-				`GRANT ALL ON locator TO root; `, `root`},
-			{`continent`, `type`, `GRANT ALL ON continent TO admin; GRANT GRANT ON continent TO agent_bond; GRANT ALL ON continent TO m; GRANT USAGE ON continent TO public; GRANT ALL ON continent TO root; `, `root`},
-			{`_continent`, `type`, `GRANT ALL ON _continent TO admin; GRANT USAGE ON _continent TO public; GRANT ALL ON _continent TO root; `, `root`},
-			{`agent_locations`, `table`, `GRANT ALL ON agent_locations TO admin; ` +
-				`GRANT SELECT ON agent_locations TO agent_bond; GRANT UPDATE ON agent_locations TO agents; ` +
-				`GRANT ALL ON agent_locations TO m; GRANT ALL ON agent_locations TO root; `, `root`},
-			{`top_secret`, `table`, `GRANT ALL ON top_secret TO admin; ` +
-				`GRANT SELECT, UPDATE ON top_secret TO agent_bond; GRANT INSERT ON top_secret TO agents; ` +
-				`GRANT ALL ON top_secret TO m; GRANT ALL ON top_secret TO root; `, `root`},
+			{`mi5`, `database`, `GRANT ALL ON DATABASE mi5 TO admin WITH GRANT OPTION; ` +
+				`GRANT ALL ON DATABASE mi5 TO agents; ` +
+				`GRANT CONNECT ON DATABASE mi5 TO public; ` +
+				`GRANT ALL ON DATABASE mi5 TO root WITH GRANT OPTION; `, `root`},
+			{`public`, `schema`, `GRANT ALL ON SCHEMA public TO admin WITH GRANT OPTION; ` +
+				`GRANT CREATE, USAGE ON SCHEMA public TO public; ` +
+				`GRANT ALL ON SCHEMA public TO root WITH GRANT OPTION; `, `admin`},
+			{`locator`, `schema`, `GRANT ALL ON SCHEMA locator TO admin WITH GRANT OPTION; ` +
+				`GRANT CREATE ON SCHEMA locator TO agent_bond; ` +
+				`GRANT ALL ON SCHEMA locator TO m; ` +
+				`GRANT ALL ON SCHEMA locator TO root WITH GRANT OPTION; `, `root`},
+			{`continent`, `type`, `GRANT ALL ON TYPE continent TO admin WITH GRANT OPTION; ` +
+				`GRANT ALL ON TYPE continent TO m; ` +
+				`GRANT USAGE ON TYPE continent TO public; ` +
+				`GRANT ALL ON TYPE continent TO root WITH GRANT OPTION; `, `root`},
+			{`_continent`, `type`, `GRANT ALL ON TYPE _continent TO admin WITH GRANT OPTION; ` +
+				`GRANT USAGE ON TYPE _continent TO public; ` +
+				`GRANT ALL ON TYPE _continent TO root WITH GRANT OPTION; `, `root`},
+			{`agent_locations`, `table`, `GRANT ALL ON TABLE agent_locations TO admin WITH GRANT OPTION; ` +
+				`GRANT SELECT ON TABLE agent_locations TO agent_bond; ` +
+				`GRANT UPDATE ON TABLE agent_locations TO agents; ` +
+				`GRANT ALL ON TABLE agent_locations TO m; ` +
+				`GRANT ALL ON TABLE agent_locations TO root WITH GRANT OPTION; `, `root`},
+			{`top_secret`, `table`, `GRANT ALL ON TABLE top_secret TO admin WITH GRANT OPTION; ` +
+				`GRANT SELECT, UPDATE ON TABLE top_secret TO agent_bond; ` +
+				`GRANT INSERT ON TABLE top_secret TO agents; GRANT ALL ON TABLE top_secret TO m; ` +
+				`GRANT ALL ON TABLE top_secret TO root WITH GRANT OPTION; `, `root`},
 		}
 
 		showQuery := fmt.Sprintf(`SELECT object_name, object_type, privileges, owner FROM [SHOW BACKUP '%s' WITH privileges]`, showPrivs)
@@ -508,7 +523,7 @@ func TestShowBackups(t *testing.T) {
 
 	// check that full and remote incremental backups appear
 	b3 := sqlDBRestore.QueryStr(t,
-		`SELECT * FROM [SHOW BACKUP LATEST IN $1 WITH incremental_location= 'nodelocal://0/foo/inc'] WHERE object_type='table'`, full)
+		`SELECT * FROM [SHOW BACKUP LATEST IN $1 WITH incremental_location = $2 ] WHERE object_type ='table'`, full, remoteInc)
 	require.Equal(t, 3, len(b3))
 
 }
@@ -530,8 +545,8 @@ func TestShowNonDefaultBackups(t *testing.T) {
 	sqlDB.Exec(t, `BACKUP DATABASE data INTO $1`, fullNonDefault)
 
 	// Get base number of files, schemas, and ranges in the backup
-	var oldCount [3]int
-	for i, typ := range []string{"FILES", "SCHEMAS", "RANGES"} {
+	var oldCount [4]int
+	for i, typ := range []string{"FILES", "SCHEMAS", "RANGES", "VALIDATE"} {
 		query := fmt.Sprintf(`SELECT count(*) FROM [SHOW BACKUP %s FROM LATEST IN '%s']`, typ,
 			fullNonDefault)
 		count, err := strconv.Atoi(sqlDB.QueryStr(t, query)[0][0])
@@ -576,23 +591,23 @@ func TestShowBackupTenantView(t *testing.T) {
 
 	_ = security.EmbeddedTenantIDs()
 
-	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
-	defer conn10.Close()
+	_, conn2 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(2)})
+	defer conn2.Close()
 
-	tenant10 := sqlutils.MakeSQLRunner(conn10)
+	tenant2 := sqlutils.MakeSQLRunner(conn2)
 	dataQuery := `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`
 	backupQuery := `BACKUP TABLE foo.bar INTO $1`
 	showBackupQuery := "SELECT object_name, object_type, rows FROM [SHOW BACKUP FROM LATEST IN $1]"
-	tenant10.Exec(t, dataQuery)
+	tenant2.Exec(t, dataQuery)
 
 	// First, assert that SHOW BACKUPS on a tenant backup returns the same results if
-	// either the system tenant or tenant10 calls it.
+	// either the system tenant or tenant2 calls it.
 	tenantAddr, httpServerCleanup := makeInsecureHTTPServer(t)
 	defer httpServerCleanup()
 
-	tenant10.Exec(t, backupQuery, tenantAddr)
+	tenant2.Exec(t, backupQuery, tenantAddr)
 	systemTenantShowRes := systemDB.QueryStr(t, showBackupQuery, tenantAddr)
-	require.Equal(t, systemTenantShowRes, tenant10.QueryStr(t, showBackupQuery, tenantAddr))
+	require.Equal(t, systemTenantShowRes, tenant2.QueryStr(t, showBackupQuery, tenantAddr))
 
 	// If the system tenant created the same data, and conducted the same backup,
 	// the row counts should look the same.
@@ -615,7 +630,7 @@ func TestShowBackupTenants(t *testing.T) {
 	// NB: tenant certs for 10, 11, 20 are embedded. See:
 	_ = security.EmbeddedTenantIDs()
 
-	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MakeTenantID(10)})
+	_, conn10 := serverutils.StartTenant(t, srv, base.TestTenantArgs{TenantID: roachpb.MustMakeTenantID(10)})
 	defer conn10.Close()
 	tenant10 := sqlutils.MakeSQLRunner(conn10)
 	tenant10.Exec(t, `CREATE DATABASE foo; CREATE TABLE foo.bar(i int primary key); INSERT INTO foo.bar VALUES (110), (210)`)
@@ -685,11 +700,11 @@ func TestShowBackupPrivileges(t *testing.T) {
 
 	_, err = testuser.Exec(`SHOW BACKUPS IN $1`, full)
 	require.True(t, testutils.IsError(err,
-		"only users with the admin role are allowed to SHOW BACKUP from the specified nodelocal URI"))
+		"only users with the admin role or the EXTERNALIOIMPLICITACCESS system privilege are allowed to access the specified nodelocal URI"))
 
 	_, err = testuser.Exec(`SHOW BACKUP $1`, full)
 	require.True(t, testutils.IsError(err,
-		"only users with the admin role are allowed to SHOW BACKUP from the specified nodelocal URI"))
+		"only users with the admin role or the EXTERNALIOIMPLICITACCESS system privilege are allowed to access the specified nodelocal URI"))
 
 	sqlDB.Exec(t, `GRANT admin TO testuser`)
 	_, err = testuser.Exec(`SHOW BACKUPS IN $1`, full)
@@ -697,67 +712,6 @@ func TestShowBackupPrivileges(t *testing.T) {
 
 	_, err = testuser.Exec(`SHOW BACKUP $1`, full)
 	require.NoError(t, err)
-}
-
-func TestShowUpgradedForeignKeys(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	var (
-		testdataBase = testutils.TestDataPath(t, "restore_old_versions")
-		fkRevDirs    = testdataBase + "/fk-rev-history"
-	)
-
-	dirs, err := ioutil.ReadDir(fkRevDirs)
-	require.NoError(t, err)
-	for _, dir := range dirs {
-		require.True(t, dir.IsDir())
-		exportDir, err := filepath.Abs(filepath.Join(fkRevDirs, dir.Name()))
-		require.NoError(t, err)
-		t.Run(dir.Name(), showUpgradedForeignKeysTest(exportDir))
-	}
-}
-
-func showUpgradedForeignKeysTest(exportDir string) func(t *testing.T) {
-	return func(t *testing.T) {
-		params := base.TestServerArgs{}
-		const numAccounts = 1000
-		_, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, singleNode, numAccounts,
-			InitManualReplication, base.TestClusterArgs{ServerArgs: params})
-		defer cleanup()
-		err := os.Symlink(exportDir, filepath.Join(dir, "foo"))
-		require.NoError(t, err)
-
-		type testCase struct {
-			table                     string
-			expectedForeignKeyPattern string
-		}
-		for _, tc := range []testCase{
-			{
-				"circular",
-				"CONSTRAINT self_fk FOREIGN KEY \\(selfid\\) REFERENCES public\\.circular\\(selfid\\) NOT VALID",
-			},
-			{
-				"child",
-				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\)",
-			},
-			{
-				"child_pk",
-				"CONSTRAINT \\w+ FOREIGN KEY \\(\\w+\\) REFERENCES public\\.parent\\(\\w+\\)",
-			},
-		} {
-			results := sqlDB.QueryStr(t, `
-				SELECT
-					create_statement
-				FROM
-					[SHOW BACKUP SCHEMAS $1]
-				WHERE
-					object_type = 'table' AND object_name = $2
-				`, localFoo, tc.table)
-			require.NotEmpty(t, results)
-			require.Regexp(t, regexp.MustCompile(tc.expectedForeignKeyPattern), results[0][0])
-		}
-	}
 }
 
 func TestShowBackupWithDebugIDs(t *testing.T) {
@@ -839,10 +793,13 @@ func TestShowBackupPathIsCollectionRoot(t *testing.T) {
 		"SHOW BACKUP $1", localFoo)
 }
 
-// TestShowBackupCheckFiles verifies the check_files option catches a corrupt backup file
-// in 3 scenarios: 1. SST from a full backup; 2. SST from a default incremental backup; 3.
-// SST from an incremental backup created with the incremental_location parameter.
-// The first two scenarios also get checked with locality aware backups.
+// TestShowBackupCheckFiles verifies the check_files option catches a corrupt
+// backup file in 3 scenarios: 1. SST from a full backup; 2. SST from a default
+// incremental backup; 3. SST from an incremental backup created with the
+// incremental_location parameter. The first two scenarios also get checked with
+// locality aware backups. The test also sanity checks the new file_bytes column
+// in SHOW BACKUP with check_files, which displays the physical size of each
+// table in the backup.
 func TestShowBackupCheckFiles(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -855,8 +812,8 @@ func TestShowBackupCheckFiles(t *testing.T) {
 
 	collectionRoot := "full"
 	incLocRoot := "inc"
-	const c1, c2, c3 = `nodelocal://0/full`, `nodelocal://1/full`, `nodelocal://2/full`
-	const i1, i2, i3 = `nodelocal://0/inc`, `nodelocal://1/inc`, `nodelocal://2/inc`
+	const c1, c2, c3 = `nodelocal://1/full`, `nodelocal://2/full`, `nodelocal://3/full`
+	const i1, i2, i3 = `nodelocal://1/inc`, `nodelocal://2/inc`, `nodelocal://3/inc`
 	localities := []string{"default", "dc=dc1", "dc=dc2"}
 
 	collections := []string{
@@ -879,7 +836,6 @@ func TestShowBackupCheckFiles(t *testing.T) {
 		{dest: collections, inc: incrementals, localities: localities},
 	}
 
-	// create db
 	sqlDB.Exec(t, `CREATE DATABASE fkdb`)
 	sqlDB.Exec(t, `CREATE TABLE fkdb.fk (ind INT)`)
 
@@ -905,11 +861,23 @@ func TestShowBackupCheckFiles(t *testing.T) {
 
 		sqlDB.Exec(t, fmt.Sprintf("BACKUP DATABASE fkdb INTO LATEST IN %s", dest))
 
+		// breakCheckFiles validates that moving an SST will cause SHOW BACKUP with check_files to
+		// error.
 		breakCheckFiles := func(
+			// rootDir identifies the root of the collection or incremental backup dir
+			// of the target backup file.
 			rootDir string,
+
+			// backupDest contains the collection or incremental URIs.
 			backupDest []string,
+
+			// file contains the path to the target file staring from the rootDir.
 			file string,
+
+			// fileLocality contains the expected locality of the target file.
 			fileLocality string,
+
+			// checkQuery contains the 'SHOW BACKUP with check_files' query.
 			checkQuery string) {
 
 			// Ensure no errors first
@@ -921,65 +889,57 @@ func TestShowBackupCheckFiles(t *testing.T) {
 				require.NoError(t, err, "failed to corrupt SST")
 			}
 
-			// To validate the checkFiles error message, resolve the full path of the missing file.
-			// For locality aware backups, it may not live at the default URI (e.g. backupDest[0]).
-			var fileDest string
+			// If the file is from a locality aware backup, check its locality info. Note
+			// that locality aware URIs have the following structure:
+			// `someURI?COCKROACH_LOCALITY ='locality'`.
 			if fileLocality == "NULL" {
-				fileDest = backupDest[0]
 			} else {
+				var locality string
 				fileLocality = url.QueryEscape(fileLocality)
 				for _, destURI := range backupDest {
-					// Locality aware URIs have the following structure:
-					// `someURI?COCKROACH_LOCALITY='locality'`. Given the fileLocality, we
-					// match for the proper URI.
+					// Using the locality, match for the proper URI.
 					destLocality := strings.Split(destURI, "?")
 					if strings.Contains(destLocality[1], fileLocality) {
-						fileDest = destURI
+						locality = destLocality[1]
 						break
 					}
 				}
+				require.NotEmpty(t, locality, "could not find file locality")
 			}
-			require.NotEmpty(t, fileDest, "could not find file locality")
 
-			// The full error message looks like "Error checking file
-			// data/756930828574818306.sst in nodelocal://0/full/2022/04/27-134916.90".
-			//
-			// Note that the expected error message excludes the path to the data file
-			// to avoid a test flake for locality aware backups where two different
-			// nodelocal URI's read to the same place. In this scenario, the test
-			// expects the backup to be in nodelocal://1/foo and the actual error
-			// message resolves the uri to nodelocal://0/foo. While both are correct,
-			// the test fails.
-
-			// Get Path after /data dir
-			toFile := "data" + strings.Split(file, "/data")[1]
-			errorMsg := fmt.Sprintf("Error checking file %s", toFile)
+			// Note that the expected error message excludes the nodelocal portion of
+			// the file path (nodelocal://1/) to avoid a test flake for locality aware
+			// backups where two different nodelocal URI's read to the same place. In
+			// this scenario, the test expects the backup to be in nodelocal://2/foo
+			// and the actual error message resolves the uri to nodelocal://1/foo.
+			// While both are correct, the test fails.
+			errorMsg := fmt.Sprintf("The following files are missing from the backup:\n\t.*%s",
+				filepath.Join(rootDir, file))
 			sqlDB.ExpectErr(t, errorMsg, checkQuery)
 
 			if err := os.Rename(badPath, fullPath); err != nil {
 				require.NoError(t, err, "failed to de-corrupt SST")
 			}
 		}
-
 		fileInfo := sqlDB.QueryStr(t,
 			fmt.Sprintf(`SELECT path, locality, file_bytes FROM [SHOW BACKUP FILES FROM LATEST IN %s with check_files]`, dest))
 
 		checkQuery := fmt.Sprintf(`SHOW BACKUP FROM LATEST IN %s WITH check_files`, dest)
 
-		// break on full backup
+		// Break on full backup.
 		breakCheckFiles(collectionRoot, test.dest, fileInfo[0][0], fileInfo[0][1], checkQuery)
 
-		// break on default inc backup
+		// Break on default inc backup.
 		breakCheckFiles(collectionRoot, test.dest, fileInfo[len(fileInfo)-1][0], fileInfo[len(fileInfo)-1][1], checkQuery)
 
-		// check that each file size is positive
+		// Check that each file size is positive.
 		for _, file := range fileInfo {
 			sz, err := strconv.Atoi(file[2])
 			require.NoError(t, err, "could not get file size")
 			require.Greater(t, sz, 0, "file size is not positive")
 		}
 
-		// check that returned file size is consistent across flavors of SHOW BACKUP
+		// Check that the returned file size is consistent across flavors of SHOW BACKUP.
 		fileSum := sqlDB.QueryStr(t,
 			fmt.Sprintf(`SELECT sum(file_bytes) FROM [SHOW BACKUP FILES FROM LATEST IN %s with check_files]`, dest))
 
@@ -988,7 +948,7 @@ func TestShowBackupCheckFiles(t *testing.T) {
 			fileSum)
 
 		if len(test.dest) == 1 {
-			// break on an incremental backup stored at incremental_location
+			// Break on an incremental backup stored at incremental_location.
 			fileInfo := sqlDB.QueryStr(t,
 				fmt.Sprintf(`SELECT path, locality FROM [SHOW BACKUP FILES FROM LATEST IN %s WITH incremental_location = %s]`,
 					dest, inc))

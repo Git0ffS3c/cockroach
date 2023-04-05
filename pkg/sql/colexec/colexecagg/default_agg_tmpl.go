@@ -117,6 +117,7 @@ func (a *default_AGGKINDAgg) Reset() {
 }
 
 func newDefault_AGGKINDAggAlloc(
+	ctx context.Context,
 	allocator *colmem.Allocator,
 	constructor execagg.AggregateConstructor,
 	evalCtx *eval.Context,
@@ -136,6 +137,7 @@ func newDefault_AGGKINDAggAlloc(
 			allocSize: allocSize,
 		},
 		constructor:        constructor,
+		ctx:                ctx,
 		evalCtx:            evalCtx,
 		inputArgsConverter: inputArgsConverter,
 		resultConverter:    colconv.GetDatumToPhysicalFn(outputType),
@@ -149,6 +151,7 @@ type default_AGGKINDAggAlloc struct {
 	aggFuncs []default_AGGKINDAgg
 
 	constructor execagg.AggregateConstructor
+	ctx         context.Context
 	evalCtx     *eval.Context
 	// inputArgsConverter is a converter from coldata.Vecs to tree.Datums that
 	// is shared among all aggregate functions and is managed by the aggregator
@@ -190,13 +193,13 @@ func (a *default_AGGKINDAggAlloc) newAggFunc() AggregateFunc {
 	f := &a.aggFuncs[0]
 	*f = default_AGGKINDAgg{
 		fn:                 a.constructor(a.evalCtx, a.arguments),
-		ctx:                a.evalCtx.Context,
+		ctx:                a.ctx,
 		inputArgsConverter: a.inputArgsConverter,
 		resultConverter:    a.resultConverter,
 	}
 	f.allocator = a.allocator
 	f.scratch.otherArgs = a.otherArgsScratch
-	a.allocator.AdjustMemoryUsage(f.fn.Size())
+	a.allocator.AdjustMemoryUsageAfterAllocation(f.fn.Size())
 	a.aggFuncs = a.aggFuncs[1:]
 	a.returnedFns = append(a.returnedFns, f)
 	return f

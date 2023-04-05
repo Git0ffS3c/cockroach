@@ -56,10 +56,12 @@ func TestColumnarizeMaterialize(t *testing.T) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 
 	m := NewMaterializer(
+		nil, /* allocator */
 		flowCtx,
 		1, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: c},
@@ -99,6 +101,7 @@ func BenchmarkMaterializer(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	rng, _ := randutil.NewTestRand()
@@ -112,7 +115,7 @@ func BenchmarkMaterializer(b *testing.B) {
 				b.Run(fmt.Sprintf("%s/hasNulls=%t/useSel=%t", typ, hasNulls, useSelectionVector), func(b *testing.B) {
 					nullProb := 0.0
 					if hasNulls {
-						nullProb = nullProbability
+						nullProb = 0.1
 					}
 					batch := testAllocator.NewMemBatchWithMaxCapacity(typs)
 					for _, colVec := range batch.ColVecs() {
@@ -137,6 +140,7 @@ func BenchmarkMaterializer(b *testing.B) {
 					b.SetBytes(int64(nRows * nCols * int(memsize.Int64)))
 					for i := 0; i < b.N; i++ {
 						m := NewMaterializer(
+							nil, /* allocator */
 							flowCtx,
 							0, /* processorID */
 							colexecargs.OpWithMetaInfo{Root: input},
@@ -181,9 +185,11 @@ func TestMaterializerNextErrorAfterConsumerDone(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	m := NewMaterializer(
+		nil, /* allocator */
 		flowCtx,
 		0, /* processorID */
 		colexecargs.OpWithMetaInfo{
@@ -221,12 +227,14 @@ func BenchmarkColumnarizeMaterialize(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 
 	b.SetBytes(int64(nRows * nCols * int(memsize.Int64)))
 	for i := 0; i < b.N; i++ {
 		m := NewMaterializer(
+			nil, /* allocator */
 			flowCtx,
 			1, /* processorID */
 			colexecargs.OpWithMetaInfo{Root: c},

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
@@ -13,6 +14,7 @@ go_library(
         "//pkg/keysbase",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -20,10 +22,11 @@ go_test(
     name = "inverted_test",
     size = "small",
     srcs = ["expression_test.go"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":inverted"],
     deps = [
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/encoding",
         "//pkg/util/leaktest",
         "//pkg/util/treeprinter",
@@ -54,3 +57,5 @@ disallowed_imports_test(
     "inverted",
     ["//pkg/roachpb"],
 )
+
+get_x_data(name = "get_x_data")

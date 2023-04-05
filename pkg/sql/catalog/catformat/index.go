@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -44,12 +45,11 @@ const (
 // If tableName is anonymous then no table name is included in the formatted
 // string. For example:
 //
-//   INDEX i (a) WHERE b > 0
+//	INDEX i (a) WHERE b > 0
 //
 // If tableName is not anonymous, then "ON" and the name is included:
 //
-//   INDEX i ON t (a) WHERE b > 0
-//
+//	INDEX i ON t (a) WHERE b > 0
 func IndexForDisplay(
 	ctx context.Context,
 	table catalog.TableDescriptor,
@@ -158,6 +158,13 @@ func indexForDisplay(
 		predFmtFlag := tree.FmtParsable
 		if f.HasFlags(tree.FmtPGCatalog) {
 			predFmtFlag = tree.FmtPGCatalog
+		} else {
+			if f.HasFlags(tree.FmtMarkRedactionNode) {
+				predFmtFlag |= tree.FmtMarkRedactionNode
+			}
+			if f.HasFlags(tree.FmtOmitNameRedaction) {
+				predFmtFlag |= tree.FmtOmitNameRedaction
+			}
 		}
 		pred, err := schemaexpr.FormatExprForDisplay(ctx, table, index.Predicate, semaCtx, sessionData, predFmtFlag)
 		if err != nil {
@@ -172,6 +179,10 @@ func indexForDisplay(
 		} else {
 			f.WriteString(pred)
 		}
+	}
+
+	if index.NotVisible {
+		f.WriteString(" NOT VISIBLE")
 	}
 
 	return f.CloseAndGetString(), nil
@@ -193,11 +204,18 @@ func FormatIndexElements(
 	elemFmtFlag := tree.FmtParsable
 	if f.HasFlags(tree.FmtPGCatalog) {
 		elemFmtFlag = tree.FmtPGCatalog
+	} else {
+		if f.HasFlags(tree.FmtMarkRedactionNode) {
+			elemFmtFlag |= tree.FmtMarkRedactionNode
+		}
+		if f.HasFlags(tree.FmtOmitNameRedaction) {
+			elemFmtFlag |= tree.FmtOmitNameRedaction
+		}
 	}
 
 	startIdx := index.ExplicitColumnStartIdx()
 	for i, n := startIdx, len(index.KeyColumnIDs); i < n; i++ {
-		col, err := table.FindColumnWithID(index.KeyColumnIDs[i])
+		col, err := catalog.MustFindColumnByID(table, index.KeyColumnIDs[i])
 		if err != nil {
 			return err
 		}
@@ -215,8 +233,20 @@ func FormatIndexElements(
 		} else {
 			f.FormatNameP(&index.KeyColumnNames[i])
 		}
-		f.WriteByte(' ')
-		f.WriteString(index.KeyColumnDirections[i].String())
+		if index.Type == descpb.IndexDescriptor_INVERTED &&
+			col.GetID() == index.InvertedColumnID() && len(index.InvertedColumnKinds) > 0 {
+			switch index.InvertedColumnKinds[0] {
+			case catpb.InvertedIndexColumnKind_TRIGRAM:
+				f.WriteString(" gin_trgm_ops")
+			}
+		}
+		// The last column of an inverted index cannot have a DESC direction.
+		// Since the default direction is ASC, we omit the direction entirely
+		// for inverted index columns.
+		if i < n-1 || index.Type != descpb.IndexDescriptor_INVERTED {
+			f.WriteByte(' ')
+			f.WriteString(index.KeyColumnDirections[i].String())
+		}
 	}
 	return nil
 }
@@ -263,7 +293,7 @@ func formatStorageConfigs(
 		}
 
 		if index.GeoConfig.S2Geometry != nil {
-			col, err := table.FindColumnWithID(index.InvertedColumnID())
+			col, err := catalog.MustFindColumnByID(table, index.InvertedColumnID())
 			if err != nil {
 				return errors.Wrapf(err, "expected column %q to exist in table", index.InvertedColumnName())
 			}

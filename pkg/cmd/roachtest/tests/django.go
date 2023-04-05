@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/errors"
 )
@@ -27,8 +28,8 @@ import (
 var djangoReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)(\.(?P<point>\d+))?$`)
 var djangoCockroachDBReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)\.(?P<minor>\d+)$`)
 
-var djangoSupportedTag = "cockroach-4.0.x"
-var djangoCockroachDBSupportedTag = "4.0.*"
+var djangoSupportedTag = "cockroach-4.1.x"
+var djangoCockroachDBSupportedTag = "4.1.*"
 
 func registerDjango(r registry.Registry) {
 	runDjango := func(
@@ -93,9 +94,7 @@ func registerDjango(r registry.Registry) {
 		}
 
 		if err := repeatRunE(
-			ctx, t, c, node, "create virtualenv",
-			`virtualenv venv &&
-				source venv/bin/activate`,
+			ctx, t, c, node, "create virtualenv", `virtualenv --clear venv`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -106,7 +105,7 @@ func registerDjango(r registry.Registry) {
 			c,
 			node,
 			"install pytest",
-			`pip3 install pytest pytest-xdist psycopg2`,
+			`source venv/bin/activate && pip3 install pytest pytest-xdist psycopg2`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +126,7 @@ func registerDjango(r registry.Registry) {
 			node,
 			"install django-cockroachdb",
 			fmt.Sprintf(
-				`pip3 install django-cockroachdb==%s`,
+				`source venv/bin/activate && pip3 install django-cockroachdb==%s`,
 				djangoCockroachDBSupportedTag,
 			),
 		); err != nil {
@@ -157,6 +156,7 @@ func registerDjango(r registry.Registry) {
 
 		if err := repeatRunE(
 			ctx, t, c, node, "install django's dependencies", `
+				source venv/bin/activate &&
 				cd /mnt/data1/django/tests &&
 				pip3 install -e .. &&
 				pip3 install -r requirements/py3.txt &&
@@ -176,13 +176,7 @@ func registerDjango(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		blocklistName, expectedFailureList, ignoredlistName, ignoredlist := djangoBlocklists.getLists(version)
-		if expectedFailureList == nil {
-			t.Fatalf("No django blocklist defined for cockroach version %s", version)
-		}
-		if ignoredlist == nil {
-			t.Fatalf("No django ignorelist defined for cockroach version %s", version)
-		}
+		blocklistName, ignoredlistName := "djangoBlocklist", "djangoIgnoreList"
 		t.L().Printf("Running cockroach version %s, using blocklist %s, using ignoredlist %s",
 			version, blocklistName, ignoredlistName)
 
@@ -193,16 +187,10 @@ func registerDjango(r registry.Registry) {
 			t.Status("Running django test app ", testName)
 			result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node, fmt.Sprintf(djangoRunTestCmd, testName))
 
-			// Expected to fail but we should still scan the error to check if
-			// there's an SSH/roachprod error.
-			if err != nil {
-				// install.NonZeroExitCode includes unrelated to SSH errors ("255")
-				// or roachprod errors, so we call t.Fatal if the error is not an
-				// install.NonZeroExitCode error
-				commandError := (*install.NonZeroExitCode)(nil)
-				if !errors.As(err, &commandError) {
-					t.Fatal(err)
-				}
+			// Fatal for a roachprod or SSH error. A roachprod error is when result.Err==nil.
+			// Proceed for any other (command) errors
+			if err != nil && (result.Err == nil || errors.Is(err, rperrors.ErrSSH255)) {
+				t.Fatal(err)
 			}
 
 			rawResults := []byte(result.Stdout + result.Stderr)
@@ -219,15 +207,15 @@ func registerDjango(r registry.Registry) {
 		t.Status("collating test results")
 
 		results := newORMTestsResults()
-		results.parsePythonUnitTestOutput(fullTestResults, expectedFailureList, ignoredlist)
+		results.parsePythonUnitTestOutput(fullTestResults, djangoBlocklist, djangoIgnoreList)
 		results.summarizeAll(
-			t, "django" /* ormName */, blocklistName, expectedFailureList, version, djangoSupportedTag,
+			t, "django" /* ormName */, blocklistName, djangoBlocklist, version, djangoSupportedTag,
 		)
 	}
 
 	r.Add(registry.TestSpec{
 		Name:    "django",
-		Owner:   registry.OwnerSQLExperience,
+		Owner:   registry.OwnerSQLSessions,
 		Cluster: r.MakeClusterSpec(1, spec.CPU(16)),
 		Tags:    []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -238,7 +226,7 @@ func registerDjango(r registry.Registry) {
 
 // Test results are only in stderr, so stdout is redirected and printed later.
 const djangoRunTestCmd = `
-cd /mnt/data1/django/tests &&
+source venv/bin/activate && cd /mnt/data1/django/tests &&
 python3 runtests.py %[1]s --settings cockroach_settings -v 2 > %[1]s.stdout
 `
 
@@ -254,7 +242,6 @@ DATABASES = {
         'PASSWORD': '',
         'HOST': 'localhost',
         'PORT': 26257,
-				'DISABLE_COCKROACHDB_TELEMETRY': True,
     },
     'other': {
         'ENGINE': 'django_cockroachdb',
@@ -263,7 +250,6 @@ DATABASES = {
         'PASSWORD': '',
         'HOST': 'localhost',
         'PORT': 26257,
-				'DISABLE_COCKROACHDB_TELEMETRY': True,
     },
 }
 SECRET_KEY = 'django_tests_secret_key'

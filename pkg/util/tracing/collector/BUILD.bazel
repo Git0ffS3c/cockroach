@@ -1,11 +1,9 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "collector",
-    srcs = [
-        "collector.go",
-        "nodes.go",
-    ],
+    srcs = ["collector.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/util/tracing/collector",
     visibility = ["//visibility:public"],
     deps = [
@@ -26,17 +24,20 @@ go_test(
         "collector_test.go",
         "main_test.go",
     ],
+    args = ["-test.timeout=295s"],
     deps = [
         ":collector",
         "//pkg/base",
-        "//pkg/ccl/utilccl",
-        "//pkg/kv/kvserver/liveness",
+        "//pkg/ccl",
         "//pkg/roachpb",
         "//pkg/rpc/nodedialer",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
+        "//pkg/security/username",
         "//pkg/server",
+        "//pkg/testutils",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
@@ -46,3 +47,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

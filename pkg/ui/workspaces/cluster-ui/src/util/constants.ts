@@ -8,10 +8,13 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-export const aggregationIntervalAttr = "aggregation_interval";
+import { duration } from "moment";
+
 export const aggregatedTsAttr = "aggregated_ts";
 export const appAttr = "app";
 export const appNamesAttr = "appNames";
+export const ascendingAttr = "ascending";
+export const columnTitleAttr = "columnTitle";
 export const dashQueryString = "dash";
 export const dashboardNameAttr = "dashboard_name";
 export const databaseAttr = "database";
@@ -25,9 +28,13 @@ export const rangeIDAttr = "range_id";
 export const statementAttr = "statement";
 export const sessionAttr = "session";
 export const tabAttr = "tab";
+export const schemaNameAttr = "schemaName";
 export const tableNameAttr = "table_name";
+export const indexNameAttr = "index_name";
 export const txnFingerprintIdAttr = "txn_fingerprint_id";
+export const unset = "(unset)";
 export const viewAttr = "view";
+export const idAttr = "id";
 
 export const REMOTE_DEBUGGING_ERROR_TEXT =
   "This information is not available due to the current value of the 'server.remote_debugging.mode' setting.";
@@ -38,3 +45,5 @@ export const serverToClientErrorMessageMap = new Map([
     REMOTE_DEBUGGING_ERROR_TEXT,
   ],
 ]);
+
+export const NO_SAMPLES_FOUND = "no samples";

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@bazel_gomock//:gomock.bzl", "gomock")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
@@ -5,7 +6,8 @@ go_library(
     name = "log",
     srcs = [
         "ambient_context.go",
-        "buffer_sink.go",
+        "buffered_sink.go",
+        "buffered_sink_closer.go",
         "channels.go",
         "clog.go",
         "doc.go",
@@ -36,7 +38,6 @@ go_library(
         "log_flush.go",
         "redact.go",
         "registry.go",
-        "server_ident.go",
         "sinks.go",
         "stderr_redirect.go",
         "stderr_redirect_unix.go",
@@ -52,6 +53,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/util/log",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/base/serverident",
         "//pkg/build",
         "//pkg/cli/exit",
         "//pkg/testutils/skip",
@@ -62,7 +64,6 @@ go_library(
         "//pkg/util/fileutil",
         "//pkg/util/jsonbytes",
         "//pkg/util/log/channel",
-        "//pkg/util/log/eventpb",
         "//pkg/util/log/logconfig",
         "//pkg/util/log/logflags",
         "//pkg/util/log/logpb",
@@ -128,10 +129,12 @@ go_library(
 
 go_test(
     name = "log_test",
-    size = "small",
+    size = "medium",
     srcs = [
         "ambient_context_test.go",
-        "buffer_sink_test.go",
+        "buffered_sink_closer_test.go",
+        "buffered_sink_test.go",
+        "channels_test.go",
         "clog_test.go",
         "file_log_gc_test.go",
         "file_names_test.go",
@@ -155,17 +158,19 @@ go_test(
         "trace_test.go",
         ":mock_logsink",  # keep
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":log"],
     deps = [
+        "//pkg/base/serverident",
         "//pkg/build",
         "//pkg/cli/exit",
         "//pkg/settings/cluster",
         "//pkg/util/caller",
         "//pkg/util/ctxgroup",
+        "//pkg/util/envutil",
         "//pkg/util/leaktest",
         "//pkg/util/log/channel",
-        "//pkg/util/log/eventpb",
         "//pkg/util/log/logconfig",
         "//pkg/util/log/logpb",
         "//pkg/util/log/severity",
@@ -174,6 +179,7 @@ go_test(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/tracing",
+        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
@@ -221,3 +227,5 @@ gomock(
         "//pkg/gen:__pkg__",
     ],
 )
+
+get_x_data(name = "get_x_data")

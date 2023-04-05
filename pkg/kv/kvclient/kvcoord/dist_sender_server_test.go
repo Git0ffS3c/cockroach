@@ -26,7 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
@@ -39,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -74,10 +77,8 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	// engine.
 	key := testutils.MakeKey(keys.Meta1Prefix, roachpb.KeyMax)
 	now := s.Clock().Now()
-	txn := roachpb.MakeTransaction("txn", roachpb.Key("foobar"), 0, now, 0, int32(s.SQLInstanceID()))
-	if err := storage.MVCCPutProto(
-		context.Background(), s.Engines()[0],
-		nil, key, now, &txn, &roachpb.RangeDescriptor{}); err != nil {
+	txn := roachpb.MakeTransaction("txn", roachpb.Key("foobar"), isolation.Serializable, 0, now, 0, int32(s.SQLInstanceID()))
+	if err := storage.MVCCPutProto(context.Background(), s.Engines()[0], nil, key, now, hlc.ClockTimestamp{}, &txn, &roachpb.RangeDescriptor{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -120,8 +121,12 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 // client.
 func setupMultipleRanges(ctx context.Context, db *kv.DB, splitAt ...string) error {
 	// Split the keyspace at the given keys.
-	for _, key := range splitAt {
-		if err := db.AdminSplit(ctx, key /* splitKey */, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	for _, splitKey := range splitAt {
+		if err := db.AdminSplit(
+			ctx,
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); err != nil {
 			return err
 		}
 	}
@@ -147,12 +152,17 @@ type checkOptions struct {
 //
 // Args:
 // expSatisfied: A set of indexes into spans representing the scans that
-// 	have been completed and don't need a ResumeSpan. For these scans, having no
-// 	results and also no resume span is acceptable by this function.
+//
+//	have been completed and don't need a ResumeSpan. For these scans, having no
+//	results and also no resume span is acceptable by this function.
+//
 // resultsMode: Specifies how strict the result checking is supposed to be.
-// 	expCount
+//
+//	expCount
+//
 // expCount: If resultsMode == AcceptPrefix, this is the total number of
-// 	expected results. Ignored for resultsMode == Strict.
+//
+//	expected results. Ignored for resultsMode == Strict.
 func checkSpanResults(
 	t *testing.T, spans [][]string, results []kv.Result, expResults [][]string, opt checkOptions,
 ) {
@@ -190,16 +200,16 @@ func checkResumeSpanScanResults(
 	reverse bool,
 	expResults [][]string,
 	expSatisfied map[int]struct{},
-	expReason roachpb.ResumeReason,
+	expReason kvpb.ResumeReason,
 	opt checkOptions,
 ) {
 	t.Helper()
 	for i, res := range results {
 		// Check that satisfied scans don't have resume spans.
 		if _, satisfied := expSatisfied[i]; satisfied {
-			require.Nil(t, res.ResumeSpan, "satisfied scan %d (%s) has ResumeSpan: %v",
+			require.Nilf(t, res.ResumeSpan, "satisfied scan %d (%s) has ResumeSpan: %v",
 				i, spans[i], res.ResumeSpan)
-			require.Zero(t, res.ResumeReason, "satisfied scan %d (%s) has ResumeReason: %v",
+			require.Zerof(t, res.ResumeReason, "satisfied scan %d (%s) has ResumeReason: %v",
 				i, spans[i], res.ResumeReason)
 			continue
 		}
@@ -208,36 +218,36 @@ func checkResumeSpanScanResults(
 		// The resume span should be identical to the original request if no
 		// results have been produced, or should continue after the last result
 		// otherwise.
-		require.NotNil(t, res.ResumeSpan, "scan %d (%s): no resume span", i, spans[i])
-		require.NotZero(t, res.ResumeReason, "scan %d (%s): no resume reason. resume span: %+v",
+		require.NotNilf(t, res.ResumeSpan, "scan %d (%s): no resume span", i, spans[i])
+		require.NotZerof(t, res.ResumeReason, "scan %d (%s): no resume reason. resume span: %+v",
 			i, spans[i], res.ResumeSpan)
-		require.Equal(t, expReason, res.ResumeReason,
+		require.Equalf(t, expReason, res.ResumeReason,
 			"scan %d (%s): unexpected resume reason", i, spans[i])
 
 		if !reverse {
 			if len(res.Rows) == 0 {
-				require.GreaterOrEqual(t, string(res.ResumeSpan.Key), spans[i][0],
+				require.GreaterOrEqualf(t, string(res.ResumeSpan.Key), spans[i][0],
 					"scan %d (%s): expected resume span %s to be at or above scan start", i, spans[i], res.ResumeSpan)
-				require.Less(t, string(res.ResumeSpan.Key), spans[i][1],
+				require.Lessf(t, string(res.ResumeSpan.Key), spans[i][1],
 					"scan %d (%s): expected resume span %s to be below scan end", i, spans[i], res.ResumeSpan)
 			} else {
-				require.Greater(t, string(res.ResumeSpan.Key), expResults[i][len(res.Rows)-1],
+				require.Greaterf(t, string(res.ResumeSpan.Key), expResults[i][len(res.Rows)-1],
 					"scan %d (%s): expected resume span %s to be above last result", i, spans[i], res.ResumeSpan)
 			}
-			require.Equal(t, spans[i][1], string(res.ResumeSpan.EndKey),
+			require.Equalf(t, spans[i][1], string(res.ResumeSpan.EndKey),
 				"scan %d (%s): expected resume span %s to have same end key", i, spans[i], res.ResumeSpan)
 
 		} else {
 			if len(res.Rows) == 0 {
-				require.Greater(t, string(res.ResumeSpan.EndKey), spans[i][0],
+				require.Greaterf(t, string(res.ResumeSpan.EndKey), spans[i][0],
 					"scan %d (%s): expected resume span %s to be above scan start", i, spans[i], res.ResumeSpan)
-				require.LessOrEqual(t, string(res.ResumeSpan.EndKey), spans[i][1],
+				require.LessOrEqualf(t, string(res.ResumeSpan.EndKey), spans[i][1],
 					"scan %d (%s): expected resume span %s to be at or below scan end", i, spans[i], res.ResumeSpan)
 			} else {
-				require.Less(t, string(res.ResumeSpan.EndKey), expResults[i][len(res.Rows)-1],
+				require.Lessf(t, string(res.ResumeSpan.EndKey), expResults[i][len(res.Rows)-1],
 					"scan %d (%s): expected resume span %s to be below last result", i, spans[i], res.ResumeSpan)
 			}
-			require.Equal(t, spans[i][0], string(res.ResumeSpan.Key),
+			require.Equalf(t, spans[i][0], string(res.ResumeSpan.Key),
 				"scan %d (%s): expected resume span %s to have same start key", i, spans[i], res.ResumeSpan)
 		}
 	}
@@ -250,7 +260,7 @@ func checkScanResults(
 	results []kv.Result,
 	expResults [][]string,
 	expSatisfied map[int]struct{},
-	expReason roachpb.ResumeReason,
+	expReason kvpb.ResumeReason,
 	opt checkOptions,
 ) {
 	t.Helper()
@@ -264,7 +274,7 @@ func checkReverseScanResults(
 	results []kv.Result,
 	expResults [][]string,
 	expSatisfied map[int]struct{},
-	expReason roachpb.ResumeReason,
+	expReason kvpb.ResumeReason,
 	opt checkOptions,
 ) {
 	t.Helper()
@@ -320,7 +330,7 @@ func TestMultiRangeBoundedBatchScanSimple(t *testing.T) {
 				expSatisfied[i] = struct{}{}
 			}
 
-			checkScanResults(t, spans, b.Results, expResults, expSatisfied, roachpb.RESUME_KEY_LIMIT, checkOptions{mode: Strict})
+			checkScanResults(t, spans, b.Results, expResults, expSatisfied, kvpb.RESUME_KEY_LIMIT, checkOptions{mode: Strict})
 		})
 	}
 }
@@ -350,6 +360,11 @@ func TestMultiRangeBoundedBatchScan(t *testing.T) {
 		{"f2"},
 	}
 	var expResultsReverse [][]string
+	// reverseProcessOrder contains indices into expResultsReverse ordered with
+	// the descending direction on the first key in each slice (this is the
+	// order in which the DistSender will process the corresponding ReverseScan
+	// requests).
+	reverseProcessOrder := []int{2, 3, 1, 0}
 	for _, res := range expResults {
 		var rres []string
 		for i := len(res) - 1; i >= 0; i-- {
@@ -413,7 +428,8 @@ func TestMultiRangeBoundedBatchScan(t *testing.T) {
 		// The split contains keys [lastK..firstK].
 		firstK := sort.SearchStrings(keys, splits[s]) - 1
 		lastK := sort.SearchStrings(keys, splits[s-1])
-		for j, res := range expResultsReverse {
+		for _, j := range reverseProcessOrder {
+			res := expResultsReverse[j]
 			for expIdx := len(res) - 1; expIdx >= 0; expIdx-- {
 				expK := res[expIdx]
 				for k := firstK; k >= lastK; k-- {
@@ -452,7 +468,7 @@ func TestMultiRangeBoundedBatchScan(t *testing.T) {
 					require.NoError(t, db.Run(ctx, b))
 
 					// Compute the range boundary.
-					expReason := roachpb.RESUME_KEY_LIMIT
+					expReason := kvpb.RESUME_KEY_LIMIT
 					expCount := maxExpCount
 					if bound < maxExpCount {
 						expCount = bound
@@ -466,7 +482,7 @@ func TestMultiRangeBoundedBatchScan(t *testing.T) {
 						}
 						if threshold < expCount {
 							expCount = threshold
-							expReason = roachpb.RESUME_RANGE_BOUNDARY
+							expReason = kvpb.RESUME_RANGE_BOUNDARY
 						}
 					}
 					// Compute the satisfied scans.
@@ -556,26 +572,26 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 		returnOnRangeBoundary bool
 		expResults            [][]string
 		expSatisfied          []int
-		expReason             roachpb.ResumeReason
+		expReason             kvpb.ResumeReason
 	}{
 		{
 			name:  "unsorted, non-overlapping, neither satisfied",
-			bound: 6,
+			bound: 3,
 			spans: [][]string{
 				{"b1", "d"}, {"a", "b1"},
 			},
 			expResults: [][]string{
-				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+				{}, {"a1", "a2", "a3"},
 			},
 		},
 		{
 			name:  "unsorted, non-overlapping, first satisfied",
-			bound: 6,
+			bound: 9,
 			spans: [][]string{
-				{"b1", "c"}, {"a", "b1"},
+				{"b1", "c"}, {"a", "d"},
 			},
 			expResults: [][]string{
-				{"b1", "b2", "b3"}, {"a1", "a2", "a3"},
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1", "b2", "b3"},
 			},
 			expSatisfied: []int{0},
 		},
@@ -651,17 +667,17 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{"b", "g"}, {"a", "d"},
 			},
 			expResults: [][]string{
-				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1"},
+				{"b1"}, {"a1", "a2", "a3", "b1", "b2", "b3"},
 			},
 		},
 		{
 			name:  "unsorted, overlapping, first satisfied",
-			bound: 7,
+			bound: 9,
 			spans: [][]string{
 				{"b", "c"}, {"a", "d"},
 			},
 			expResults: [][]string{
-				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1"},
+				{"b1", "b2", "b3"}, {"a1", "a2", "a3", "b1", "b2", "b3"},
 			},
 			expSatisfied: []int{0},
 		},
@@ -694,7 +710,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{"b", "g"}, {"c", "f"}, {"a", "d"},
 			},
 			expResults: [][]string{
-				{"b1", "b2", "b3"}, {}, {"a1", "a2", "a3", "b1"},
+				{"b1"}, {}, {"a1", "a2", "a3", "b1", "b2", "b3"},
 			},
 		},
 		{
@@ -706,7 +722,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 			expResults: [][]string{
 				{"e1", "e2", "e3"}, {"e2", "e3"},
 			},
-			expReason: roachpb.RESUME_RANGE_BOUNDARY,
+			expReason: kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, overlapping, neither satisfied",
@@ -718,7 +734,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 			expResults: [][]string{
 				{"e1", "e2", "e3"}, {"e2", "e3"},
 			},
-			expReason: roachpb.RESUME_RANGE_BOUNDARY,
+			expReason: kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, overlapping, neither satisfied, bounded below boundary",
@@ -730,7 +746,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 			expResults: [][]string{
 				{"e1", "e2", "e3"}, {"e2"},
 			},
-			expReason: roachpb.RESUME_KEY_LIMIT,
+			expReason: kvpb.RESUME_KEY_LIMIT,
 		},
 		{
 			name:  "range boundary, overlapping, neither satisfied, bounded at boundary",
@@ -742,7 +758,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 			expResults: [][]string{
 				{"e1", "e2", "e3"}, {"e2", "e3"},
 			},
-			expReason: roachpb.RESUME_KEY_LIMIT,
+			expReason: kvpb.RESUME_KEY_LIMIT,
 		},
 		{
 			name:  "range boundary, overlapping, neither satisfied, bounded above boundary",
@@ -754,7 +770,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 			expResults: [][]string{
 				{"e1", "e2", "e3"}, {"e2", "e3"},
 			},
-			expReason: roachpb.RESUME_RANGE_BOUNDARY,
+			expReason: kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, non-overlapping, first satisfied",
@@ -767,7 +783,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{"e1", "e2"}, {},
 			},
 			expSatisfied: []int{0},
-			expReason:    roachpb.RESUME_RANGE_BOUNDARY,
+			expReason:    kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, non-overlapping, second satisfied",
@@ -780,7 +796,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{"e3"}, {"e1"},
 			},
 			expSatisfied: []int{1},
-			expReason:    roachpb.RESUME_RANGE_BOUNDARY,
+			expReason:    kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, non-overlapping, both satisfied",
@@ -804,7 +820,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 			expResults: [][]string{
 				{"c1", "c2", "c3"}, {},
 			},
-			expReason: roachpb.RESUME_RANGE_BOUNDARY,
+			expReason: kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, separate ranges, first satisfied",
@@ -817,7 +833,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{"c1", "c2", "c3"}, {},
 			},
 			expSatisfied: []int{0},
-			expReason:    roachpb.RESUME_RANGE_BOUNDARY,
+			expReason:    kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, separate ranges, second satisfied",
@@ -830,7 +846,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{}, {"c2", "c3"},
 			},
 			expSatisfied: []int{1},
-			expReason:    roachpb.RESUME_RANGE_BOUNDARY,
+			expReason:    kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, separate ranges, first empty",
@@ -843,7 +859,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{}, {"f1"},
 			},
 			expSatisfied: []int{0},
-			expReason:    roachpb.RESUME_RANGE_BOUNDARY,
+			expReason:    kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, separate ranges, second empty",
@@ -856,7 +872,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{"f1"}, {},
 			},
 			expSatisfied: []int{1},
-			expReason:    roachpb.RESUME_RANGE_BOUNDARY,
+			expReason:    kvpb.RESUME_RANGE_BOUNDARY,
 		},
 		{
 			name:  "range boundary, separate ranges, all empty",
@@ -881,7 +897,7 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				{}, {}, {}, {}, {"f1"}, {"f1"},
 			},
 			expSatisfied: []int{0, 1, 2, 3, 5},
-			expReason:    roachpb.RESUME_RANGE_BOUNDARY,
+			expReason:    kvpb.RESUME_RANGE_BOUNDARY,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -898,8 +914,8 @@ func TestMultiRangeBoundedBatchScanPartialResponses(t *testing.T) {
 				expSatisfied[exp] = struct{}{}
 			}
 			opts := checkOptions{mode: Strict}
-			expReason := roachpb.RESUME_KEY_LIMIT
-			if tc.expReason != roachpb.RESUME_UNKNOWN {
+			expReason := kvpb.RESUME_KEY_LIMIT
+			if tc.expReason != kvpb.RESUME_UNKNOWN {
 				expReason = tc.expReason
 			}
 			checkScanResults(t, tc.spans, b.Results, tc.expResults, expSatisfied, expReason, opts)
@@ -1066,88 +1082,78 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	for _, rc := range []roachpb.ReadConsistencyType{
-		roachpb.READ_UNCOMMITTED,
-		roachpb.INCONSISTENT,
+	for _, rc := range []kvpb.ReadConsistencyType{
+		kvpb.READ_UNCOMMITTED,
+		kvpb.INCONSISTENT,
 	} {
 		t.Run(rc.String(), func(t *testing.T) {
-			s, _ := startNoSplitMergeServer(t)
+			s, db := startNoSplitMergeServer(t)
 			ctx := context.Background()
 			defer s.Stopper().Stop(ctx)
-			db := s.DB()
-			if err := setupMultipleRanges(ctx, db, "b"); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, setupMultipleRanges(ctx, db, "b"))
 
 			// Write keys "a" and "b", the latter of which is the first key in the
 			// second range.
-			keys := [2]string{"a", "b"}
-			ts := [2]hlc.Timestamp{}
-			for i, key := range keys {
+			{
 				b := &kv.Batch{}
-				b.Put(key, "value")
-				if err := db.Run(ctx, b); err != nil {
-					t.Fatal(err)
-				}
-				ts[i] = s.Clock().Now()
-				log.Infof(ctx, "%d: %s %s", i, key, ts[i])
-				if i == 0 {
-					testutils.SucceedsSoon(t, func() error {
-						// Enforce that when we write the second key, it's written
-						// with a strictly higher timestamp. We're dropping logical
-						// ticks and the clock may just have been pushed into the
-						// future, so that's necessary. See #3122.
-						if ts[0].WallTime >= s.Clock().Now().WallTime {
-							return errors.New("time stands still")
-						}
-						return nil
-					})
-				}
+				b.Put("a", "value")
+				require.NoError(t, db.Run(ctx, b))
+			}
+			ts := s.Clock().Now()
+			{
+				b := &kv.Batch{}
+				b.Put("b", "value")
+				require.NoError(t, db.Run(ctx, b))
 			}
 
 			// Do an inconsistent Scan/ReverseScan from a new DistSender and verify
 			// it does the read at its local clock and doesn't receive an
 			// OpRequiresTxnError. We set the local clock to the timestamp of
 			// just above the first key to verify it's used to read only key "a".
-			for i, request := range []roachpb.Request{
-				roachpb.NewScan(roachpb.Key("a"), roachpb.Key("c"), false),
-				roachpb.NewReverseScan(roachpb.Key("a"), roachpb.Key("c"), false),
+			for i, request := range []kvpb.Request{
+				kvpb.NewScan(roachpb.Key("a"), roachpb.Key("c"), false),
+				kvpb.NewReverseScan(roachpb.Key("a"), roachpb.Key("c"), false),
 			} {
-				manual := hlc.NewManualClock(ts[0].WallTime + 1)
-				clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
-				ds := kvcoord.NewDistSender(kvcoord.DistSenderConfig{
-					AmbientCtx:         s.AmbientCtx(),
-					Settings:           cluster.MakeTestingClusterSettings(),
-					Clock:              clock,
-					NodeDescs:          s.Gossip(),
-					RPCContext:         s.RPCContext(),
-					NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(s.Gossip())),
-					FirstRangeProvider: s.Gossip(),
+				// The looping is necessary since the Put above of a may not have been
+				// applied by time we execute the scan. If it has not run, then try the
+				// scan again. READ_UNCOMMITTED and INCONSISTENT reads to not push
+				// intents.
+				testutils.SucceedsSoon(t, func() error {
+					clock := hlc.NewClockForTesting(timeutil.NewManualTime(ts.GoTime().Add(1)))
+					ds := kvcoord.NewDistSender(kvcoord.DistSenderConfig{
+						AmbientCtx:         s.AmbientCtx(),
+						Settings:           s.ClusterSettings(),
+						Clock:              clock,
+						NodeDescs:          s.Gossip(),
+						RPCContext:         s.RPCContext(),
+						NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(s.Gossip())),
+						FirstRangeProvider: s.Gossip(),
+					})
+
+					reply, err := kv.SendWrappedWith(ctx, ds, kvpb.Header{ReadConsistency: rc}, request)
+					require.NoError(t, err.GoError())
+
+					var rows []roachpb.KeyValue
+					switch r := reply.(type) {
+					case *kvpb.ScanResponse:
+						rows = r.Rows
+					case *kvpb.ReverseScanResponse:
+						rows = r.Rows
+					default:
+						t.Fatalf("unexpected response %T: %v", reply, reply)
+					}
+
+					if l := len(rows); l != 1 {
+						// This is a retryable error, the row for 'a' may not yet be applied
+						// to the state machine.
+						return errors.Newf("%d: expected 1 row; got %d\n%v", i, l, rows)
+					}
+					if key := string(rows[0].Key); key != "a" {
+						t.Errorf("expected key 'a' got %q", key)
+					}
+
+					return nil
 				})
-
-				reply, err := kv.SendWrappedWith(context.Background(), ds, roachpb.Header{
-					ReadConsistency: rc,
-				}, request)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				var rows []roachpb.KeyValue
-				switch r := reply.(type) {
-				case *roachpb.ScanResponse:
-					rows = r.Rows
-				case *roachpb.ReverseScanResponse:
-					rows = r.Rows
-				default:
-					t.Fatalf("unexpected response %T: %v", reply, reply)
-				}
-
-				if l := len(rows); l != 1 {
-					t.Fatalf("%d: expected 1 row; got %d\n%v", i, l, rows)
-				}
-				if key := string(rows[0].Key); keys[0] != key {
-					t.Errorf("expected key %q; got %q", keys[0], key)
-				}
 			}
 		})
 	}
@@ -1164,12 +1170,16 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	tds := db.NonTransactionalSender()
 
-	if err := db.AdminSplit(ctx, "m", hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := db.AdminSplit(
+		ctx,
+		"m",              /* splitKey */
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 	writes := []roachpb.Key{roachpb.Key("a"), roachpb.Key("z")}
-	get := &roachpb.GetRequest{
-		RequestHeader: roachpb.RequestHeader{Key: writes[0]},
+	get := &kvpb.GetRequest{
+		RequestHeader: kvpb.RequestHeader{Key: writes[0]},
 	}
 	get.EndKey = writes[len(writes)-1]
 	if _, err := kv.SendWrapped(ctx, tds, get); err == nil {
@@ -1177,16 +1187,16 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	}
 	var delTS hlc.Timestamp
 	for i, k := range writes {
-		put := roachpb.NewPut(k, roachpb.MakeValueFromBytes(k))
+		put := kvpb.NewPut(k, roachpb.MakeValueFromBytes(k))
 		if _, err := kv.SendWrapped(ctx, tds, put); err != nil {
 			t.Fatal(err)
 		}
-		scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next(), false)
+		scan := kvpb.NewScan(writes[0], writes[len(writes)-1].Next(), false)
 		reply, err := kv.SendWrapped(ctx, tds, scan)
 		if err != nil {
 			t.Fatal(err)
 		}
-		sr := reply.(*roachpb.ScanResponse)
+		sr := reply.(*kvpb.ScanResponse)
 		if sr.Txn != nil {
 			// This was the other way around at some point in the past.
 			// Same below for Delete, etc.
@@ -1197,18 +1207,18 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		}
 	}
 
-	del := &roachpb.DeleteRangeRequest{
-		RequestHeader: roachpb.RequestHeader{
+	del := &kvpb.DeleteRangeRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key:    writes[0],
 			EndKey: writes[len(writes)-1].Next(),
 		},
 		ReturnKeys: true,
 	}
-	reply, err := kv.SendWrappedWith(ctx, tds, roachpb.Header{Timestamp: delTS}, del)
+	reply, err := kv.SendWrappedWith(ctx, tds, kvpb.Header{Timestamp: delTS}, del)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dr := reply.(*roachpb.DeleteRangeResponse)
+	dr := reply.(*kvpb.DeleteRangeResponse)
 	if dr.Txn != nil {
 		t.Errorf("expected no transaction in response header")
 	}
@@ -1217,12 +1227,12 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	}
 
 	now := s.Clock().NowAsClockTimestamp()
-	txnProto := roachpb.MakeTransaction("MyTxn", nil, 0, now.ToTimestamp(), 0, int32(s.SQLInstanceID()))
+	txnProto := roachpb.MakeTransaction("MyTxn", nil, isolation.Serializable, 0, now.ToTimestamp(), 0, int32(s.SQLInstanceID()))
 	txn := kv.NewTxnFromProto(ctx, db, s.NodeID(), now, kv.RootTxn, &txnProto)
 
-	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next(), false)
-	ba := roachpb.BatchRequest{}
-	ba.Header = roachpb.Header{Txn: &txnProto}
+	scan := kvpb.NewScan(writes[0], writes[len(writes)-1].Next(), false)
+	ba := &kvpb.BatchRequest{}
+	ba.Header = kvpb.Header{Txn: &txnProto}
 	ba.Add(scan)
 	br, pErr := txn.Send(ctx, ba)
 	if pErr != nil {
@@ -1232,7 +1242,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	if replyTxn == nil || replyTxn.Name != "MyTxn" {
 		t.Errorf("wanted Txn to persist, but it changed to %v", txn)
 	}
-	sr := br.Responses[0].GetInner().(*roachpb.ScanResponse)
+	sr := br.Responses[0].GetInner().(*kvpb.ScanResponse)
 	if rows := sr.Rows; len(rows) > 0 {
 		t.Fatalf("scan after delete returned rows: %v", rows)
 	}
@@ -1316,14 +1326,18 @@ func TestMultiRangeScanWithPagination(t *testing.T) {
 			defer s.Stopper().Stop(ctx)
 			tds := db.NonTransactionalSender()
 
-			for _, sk := range tc.splitKeys {
-				if err := db.AdminSplit(ctx, sk, hlc.MaxTimestamp /* expirationTime */); err != nil {
+			for _, splitKey := range tc.splitKeys {
+				if err := db.AdminSplit(
+					ctx,
+					splitKey,
+					hlc.MaxTimestamp, /* expirationTime */
+				); err != nil {
 					t.Fatal(err)
 				}
 			}
 
 			for _, k := range tc.keys {
-				put := roachpb.NewPut(k, roachpb.MakeValueFromBytes(k))
+				put := kvpb.NewPut(k, roachpb.MakeValueFromBytes(k))
 				if _, err := kv.SendWrapped(ctx, tds, put); err != nil {
 					t.Fatal(err)
 				}
@@ -1334,7 +1348,7 @@ func TestMultiRangeScanWithPagination(t *testing.T) {
 			// happens above this.
 			var maxTargetBytes int64
 			{
-				scan := roachpb.NewScan(tc.keys[0], tc.keys[len(tc.keys)-1].Next(), false)
+				scan := kvpb.NewScan(tc.keys[0], tc.keys[len(tc.keys)-1].Next(), false)
 				resp, pErr := kv.SendWrapped(ctx, tds, scan)
 				require.Nil(t, pErr)
 				require.Nil(t, resp.Header().ResumeSpan)
@@ -1370,16 +1384,16 @@ func TestMultiRangeScanWithPagination(t *testing.T) {
 								numPages++
 
 								// Build the batch.
-								var ba roachpb.BatchRequest
+								ba := &kvpb.BatchRequest{}
 								for _, span := range operations {
-									var req roachpb.Request
+									var req kvpb.Request
 									switch {
 									case span.EndKey == nil:
-										req = roachpb.NewGet(span.Key, false /* forUpdate */)
+										req = kvpb.NewGet(span.Key, false /* forUpdate */)
 									case reverse:
-										req = roachpb.NewReverseScan(span.Key, span.EndKey, false /* forUpdate */)
+										req = kvpb.NewReverseScan(span.Key, span.EndKey, false /* forUpdate */)
 									default:
-										req = roachpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
+										req = kvpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
 									}
 									ba.Add(req)
 								}
@@ -1463,8 +1477,12 @@ func TestParallelSender(t *testing.T) {
 
 	// Split into multiple ranges.
 	splitKeys := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
-	for _, key := range splitKeys {
-		if err := db.AdminSplit(context.Background(), key, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	for _, splitKey := range splitKeys {
+		if err := db.AdminSplit(
+			context.Background(),
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1507,9 +1525,13 @@ func initReverseScanTestEnv(s serverutils.TestServerInterface, t *testing.T) *kv
 
 	// Set up multiple ranges:
 	// ["", "b"),["b", "e") ,["e", "g") and ["g", "\xff\xff").
-	for _, key := range []string{"b", "e", "g"} {
+	for _, splitKey := range []string{"b", "e", "g"} {
 		// Split the keyspace at the given key.
-		if err := db.AdminSplit(context.Background(), key, hlc.MaxTimestamp /* expirationTime */); err != nil {
+		if err := db.AdminSplit(
+			context.Background(),
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1609,8 +1631,12 @@ func TestBatchPutWithConcurrentSplit(t *testing.T) {
 
 	// Split first using the default client and scan to make sure that
 	// the range descriptor cache reflects the split.
-	for _, key := range []string{"b", "f"} {
-		if err := db.AdminSplit(context.Background(), key, hlc.MaxTimestamp /* expirationTime */); err != nil {
+	for _, splitKey := range []string{"b", "f"} {
+		if err := db.AdminSplit(
+			context.Background(),
+			splitKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1632,8 +1658,8 @@ func TestBatchPutWithConcurrentSplit(t *testing.T) {
 		FirstRangeProvider: s.Gossip(),
 	})
 	for _, key := range []string{"c"} {
-		req := &roachpb.AdminSplitRequest{
-			RequestHeader: roachpb.RequestHeader{
+		req := &kvpb.AdminSplitRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key: roachpb.Key(key),
 			},
 			SplitKey:       roachpb.Key(key),
@@ -1667,7 +1693,11 @@ func TestReverseScanWithSplitAndMerge(t *testing.T) {
 
 	// Case 1: An encounter with a range split.
 	// Split the range ["b", "e") at "c".
-	if err := db.AdminSplit(context.Background(), "c", hlc.MaxTimestamp /* expirationTime */); err != nil {
+	if err := db.AdminSplit(
+		context.Background(),
+		"c",              /* splitKey */
+		hlc.MaxTimestamp, /* expirationTime */
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1758,20 +1788,21 @@ func TestPropagateTxnOnError(t *testing.T) {
 	var numCPuts int32
 	var storeKnobs kvserver.StoreTestingKnobs
 	storeKnobs.EvalKnobs.TestingEvalFilter =
-		func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
+		func(fArgs kvserverbase.FilterArgs) *kvpb.Error {
 			k := fArgs.Req.Header().Key
 			switch fArgs.Req.(type) {
-			case *roachpb.PutRequest:
+			case *kvpb.PutRequest:
 				if k.Equal(keyA) {
 					fArgs.Hdr.Txn.UpdateObservedTimestamp(ot1.NodeID, ot1.Timestamp)
 				} else if k.Equal(keyC) {
 					fArgs.Hdr.Txn.UpdateObservedTimestamp(ot2.NodeID, ot2.Timestamp)
 				}
-			case *roachpb.ConditionalPutRequest:
+			case *kvpb.ConditionalPutRequest:
 				if k.Equal(keyB) {
 					if atomic.AddInt32(&numCPuts, 1) == 1 {
-						pErr := roachpb.NewReadWithinUncertaintyIntervalError(hlc.Timestamp{}, hlc.Timestamp{}, hlc.Timestamp{}, nil)
-						return roachpb.NewErrorWithTxn(pErr, fArgs.Hdr.Txn)
+						pErr := kvpb.NewReadWithinUncertaintyIntervalError(
+							hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, hlc.Timestamp{}, hlc.ClockTimestamp{})
+						return kvpb.NewErrorWithTxn(pErr, fArgs.Hdr.Txn)
 					}
 				}
 			}
@@ -1825,7 +1856,7 @@ func TestPropagateTxnOnError(t *testing.T) {
 		b.Put(keyC, "val2")
 		err := txn.CommitInBatch(ctx, b)
 		if epoch == 1 {
-			if retErr := (*roachpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(err, &retErr) {
+			if retErr := (*kvpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(err, &retErr) {
 				if !testutils.IsError(retErr, "ReadWithinUncertaintyIntervalError") {
 					t.Errorf("expected ReadWithinUncertaintyIntervalError, but got: %v", retErr)
 				}
@@ -1912,10 +1943,10 @@ func TestAsyncAbortPoisons(t *testing.T) {
 	var storeKnobs kvserver.StoreTestingKnobs
 	keyA, keyB := roachpb.Key("a"), roachpb.Key("b")
 	commitCh := make(chan error, 1)
-	storeKnobs.TestingRequestFilter = func(_ context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+	storeKnobs.TestingRequestFilter = func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 		for _, req := range ba.Requests {
 			switch r := req.GetInner().(type) {
-			case *roachpb.EndTxnRequest:
+			case *kvpb.EndTxnRequest:
 				if r.Key.Equal(keyA) {
 					if r.Poison {
 						close(commitCh)
@@ -1954,7 +1985,7 @@ func TestAsyncAbortPoisons(t *testing.T) {
 
 	_, err := txn.Get(ctx, keyA)
 	require.Error(t, err)
-	require.IsType(t, err, &roachpb.TransactionRetryWithProtoRefreshError{})
+	require.IsType(t, err, &kvpb.TransactionRetryWithProtoRefreshError{})
 	require.Contains(t, err.Error(), "TransactionAbortedError")
 	require.NoError(t, <-commitCh)
 }
@@ -1969,9 +2000,9 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 	var filterFn atomic.Value
 	var storeKnobs kvserver.StoreTestingKnobs
 	storeKnobs.EvalKnobs.TestingEvalFilter =
-		func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
+		func(fArgs kvserverbase.FilterArgs) *kvpb.Error {
 			fnVal := filterFn.Load()
-			if fn, ok := fnVal.(func(kvserverbase.FilterArgs) *roachpb.Error); ok && fn != nil {
+			if fn, ok := fnVal.(func(kvserverbase.FilterArgs) *kvpb.Error); ok && fn != nil {
 				return fn(fArgs)
 			}
 			return nil
@@ -1996,17 +2027,17 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
-	newUncertaintyFilter := func(key roachpb.Key) func(kvserverbase.FilterArgs) *roachpb.Error {
+	newUncertaintyFilter := func(key roachpb.Key) func(kvserverbase.FilterArgs) *kvpb.Error {
 		var count int32
-		return func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
+		return func(fArgs kvserverbase.FilterArgs) *kvpb.Error {
 			if (fArgs.Req.Header().Key.Equal(key) ||
 				fArgs.Req.Header().Span().ContainsKey(key)) && fArgs.Hdr.Txn != nil {
 				if atomic.AddInt32(&count, 1) > 1 {
 					return nil
 				}
-				err := roachpb.NewReadWithinUncertaintyIntervalError(
-					fArgs.Hdr.Timestamp, s.Clock().Now(), hlc.Timestamp{}, fArgs.Hdr.Txn)
-				return roachpb.NewErrorWithTxn(err, fArgs.Hdr.Txn)
+				err := kvpb.NewReadWithinUncertaintyIntervalError(
+					fArgs.Hdr.Timestamp, hlc.ClockTimestamp{}, fArgs.Hdr.Txn, s.Clock().Now(), hlc.ClockTimestamp{})
+				return kvpb.NewErrorWithTxn(err, fArgs.Hdr.Txn)
 			}
 			return nil
 		}
@@ -2023,7 +2054,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 		beforeTxnStart             func(context.Context, *kv.DB) error  // called before the txn starts
 		afterTxnStart              func(context.Context, *kv.DB) error  // called after the txn chooses a timestamp
 		retryable                  func(context.Context, *kv.Txn) error // called during the txn; may be retried
-		filter                     func(kvserverbase.FilterArgs) *roachpb.Error
+		filter                     func(kvserverbase.FilterArgs) *kvpb.Error
 		refreshSpansCondenseFilter func() bool
 		priorReads                 bool
 		tsLeaked                   bool
@@ -2599,7 +2630,8 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 		{
 			name: "write too old with initput failing on tombstone before",
 			beforeTxnStart: func(ctx context.Context, db *kv.DB) error {
-				return db.Del(ctx, "iput")
+				_, err := db.Del(ctx, "iput")
+				return err
 			},
 			afterTxnStart: func(ctx context.Context, db *kv.DB) error {
 				return db.Put(ctx, "iput", "put2")
@@ -2615,7 +2647,8 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				return db.Put(ctx, "iput", "put")
 			},
 			afterTxnStart: func(ctx context.Context, db *kv.DB) error {
-				return db.Del(ctx, "iput")
+				_, err := db.Del(ctx, "iput")
+				return err
 			},
 			retryable: func(ctx context.Context, txn *kv.Txn) error {
 				return txn.InitPut(ctx, "iput", "put", true)
@@ -3094,9 +3127,9 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				// directly. This should be picked up by the transaction's
 				// QueryIntent when chaining on to the pipelined write to
 				// key "a".
-				var ba roachpb.BatchRequest
-				ba.Add(&roachpb.ResolveIntentRequest{
-					RequestHeader: roachpb.RequestHeader{
+				ba := &kvpb.BatchRequest{}
+				ba.Add(&kvpb.ResolveIntentRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key: roachpb.Key("a"),
 					},
 					IntentTxn: txn.TestingCloneTxn().TxnMeta,
@@ -3120,9 +3153,9 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				// Simulate a failed intent write by resolving the intent
 				// directly. This should be picked up by the transaction's
 				// pre-commit QueryIntent for the pipelined write to key "a".
-				var ba roachpb.BatchRequest
-				ba.Add(&roachpb.ResolveIntentRequest{
-					RequestHeader: roachpb.RequestHeader{
+				ba := &kvpb.BatchRequest{}
+				ba.Add(&kvpb.ResolveIntentRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key: roachpb.Key("a"),
 					},
 					IntentTxn: txn.TestingCloneTxn().TxnMeta,
@@ -3148,7 +3181,7 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 
 			if tc.filter != nil {
 				filterFn.Store(tc.filter)
-				defer filterFn.Store((func(kvserverbase.FilterArgs) *roachpb.Error)(nil))
+				defer filterFn.Store((func(kvserverbase.FilterArgs) *kvpb.Error)(nil))
 			}
 			if tc.refreshSpansCondenseFilter != nil {
 				refreshSpansCondenseFilter.Store(tc.refreshSpansCondenseFilter)
@@ -3226,15 +3259,15 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 // EndTxn batch and a STAGING txn record written by a newer attempt of that
 // batch.
 // Namely, the scenario is as follows:
-// 1. client sends CPut(a) + CPut(b) + EndTxn. The CPut(a) is split by the
-//    DistSender from the rest. Note that the parallel commit mechanism is in
-//    effect here.
-// 2. One of the two sides gets a WriteTooOldError, the other succeeds.
-//    The client needs to refresh.
-// 3. The refresh succeeds.
-// 4. The client resends the whole batch (note that we don't keep track of the
-//    previous partial success).
-// 5. The batch is split again, and one of the two sides fails.
+//  1. client sends CPut(a) + CPut(b) + EndTxn. The CPut(a) is split by the
+//     DistSender from the rest. Note that the parallel commit mechanism is in
+//     effect here.
+//  2. One of the two sides gets a WriteTooOldError, the other succeeds.
+//     The client needs to refresh.
+//  3. The refresh succeeds.
+//  4. The client resends the whole batch (note that we don't keep track of the
+//     previous partial success).
+//  5. The batch is split again, and one of the two sides fails.
 //
 // This tests checks that, for the different combinations of failures across the
 // two attempts of the request, the transaction is not erroneously considered to
@@ -3249,9 +3282,9 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 	var filterFn atomic.Value
 	var storeKnobs kvserver.StoreTestingKnobs
 	storeKnobs.EvalKnobs.TestingEvalFilter =
-		func(fArgs kvserverbase.FilterArgs) *roachpb.Error {
+		func(fArgs kvserverbase.FilterArgs) *kvpb.Error {
 			fnVal := filterFn.Load()
-			if fn, ok := fnVal.(func(kvserverbase.FilterArgs) *roachpb.Error); ok && fn != nil {
+			if fn, ok := fnVal.(func(kvserverbase.FilterArgs) *kvpb.Error); ok && fn != nil {
 				return fn(fArgs)
 			}
 			return nil
@@ -3380,8 +3413,8 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 			// Install a filter which will reject requests touching
 			// secondAttemptRejectKey on the retry.
 			var count int32
-			filterFn.Store(func(args kvserverbase.FilterArgs) *roachpb.Error {
-				put, ok := args.Req.(*roachpb.ConditionalPutRequest)
+			filterFn.Store(func(args kvserverbase.FilterArgs) *kvpb.Error {
+				put, ok := args.Req.(*kvpb.ConditionalPutRequest)
 				if !ok {
 					return nil
 				}
@@ -3391,7 +3424,7 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 				count++
 				// Reject the right request on the 2nd attempt.
 				if count == 2 {
-					return roachpb.NewErrorf("injected error; test rejecting request")
+					return kvpb.NewErrorf("injected error; test rejecting request")
 				}
 				return nil
 			})
@@ -3410,17 +3443,17 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 // above the previous time when they've been refreshed, not from the
 // transaction's original read timestamp. To wit, the following scenario should
 // NOT result in a failed refresh:
-// - txn starts at ts 100
-// - someone else writes "a" @ 200
-// - txn attempts to write "a" and is pushed to (200,1). The refresh succeeds.
-// - txn reads something that has a value in [100,200]. For example, "a", which
-//   it just wrote.
-// - someone else writes "b" @ 300
-// - txn attempts to write "b" and is pushed to (300,1). This refresh must also
-//   succeed. If this Refresh request would check for values in the range
-//   [100-300], it would fail (as it would find a@200). But since it only checks
-//   for values in the range [200-300] (i.e. values written beyond the timestamp
-//   that was refreshed before), we're good.
+//   - txn starts at ts 100
+//   - someone else writes "a" @ 200
+//   - txn attempts to write "a" and is pushed to (200,1). The refresh succeeds.
+//   - txn reads something that has a value in [100,200]. For example, "a", which
+//     it just wrote.
+//   - someone else writes "b" @ 300
+//   - txn attempts to write "b" and is pushed to (300,1). This refresh must also
+//     succeed. If this Refresh request would check for values in the range
+//     [100-300], it would fail (as it would find a@200). But since it only checks
+//     for values in the range [200-300] (i.e. values written beyond the timestamp
+//     that was refreshed before), we're good.
 func TestRefreshNoFalsePositive(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -3507,7 +3540,7 @@ func BenchmarkReturnOnRangeBoundary(b *testing.B) {
 	ctx := context.Background()
 	scanCtx := context.WithValue(ctx, scanKey{}, "scan")
 
-	reqFilter := func(ctx context.Context, _ roachpb.BatchRequest) *roachpb.Error {
+	reqFilter := func(ctx context.Context, _ *kvpb.BatchRequest) *kvpb.Error {
 		if ctx.Value(scanKey{}) != nil && Latency > 0 {
 			time.Sleep(Latency)
 		}
@@ -3527,7 +3560,11 @@ func BenchmarkReturnOnRangeBoundary(b *testing.B) {
 
 	for r := 0; r < Ranges; r++ {
 		rangeKey := string(rune('a' + r))
-		require.NoError(b, db.AdminSplit(ctx, rangeKey, hlc.MaxTimestamp))
+		require.NoError(b, db.AdminSplit(
+			ctx,
+			rangeKey,
+			hlc.MaxTimestamp, /* expirationTime */
+		))
 
 		for k := 0; k < KeysPerRange; k++ {
 			key := fmt.Sprintf("%s%d", rangeKey, k)

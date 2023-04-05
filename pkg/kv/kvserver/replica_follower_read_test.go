@@ -16,12 +16,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,8 +35,8 @@ func TestCanServeFollowerRead(t *testing.T) {
 
 	// The clock needs to be higher than the closed-timestamp lag. Otherwise,
 	// trying to close timestamps below zero results in not closing anything.
-	manual := hlc.NewManualClock(5 * time.Second.Nanoseconds())
-	clock := hlc.NewClock(manual.UnixNano, 1)
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 5))
+	clock := hlc.NewClockForTesting(manual)
 	tsc := TestStoreConfig(clock)
 	const closedTimestampLag = time.Second
 	closedts.TargetDuration.Override(ctx, &tsc.Settings.SV, closedTimestampLag)
@@ -81,14 +84,15 @@ func TestCanServeFollowerRead(t *testing.T) {
 			txn := roachpb.MakeTransaction(
 				"test",
 				key,
+				isolation.Serializable,
 				roachpb.NormalUserPriority,
 				test.readTimestamp,
 				clock.MaxOffset().Nanoseconds(),
 				0, // coordinatorNodeID
 			)
 
-			ba := &roachpb.BatchRequest{}
-			ba.Header = roachpb.Header{Txn: &txn}
+			ba := &kvpb.BatchRequest{}
+			ba.Header = kvpb.Header{Txn: &txn}
 			ba.Add(&gArgs)
 			r := tc.repl
 			r.mu.RLock()
@@ -106,13 +110,14 @@ func TestCheckExecutionCanProceedAllowsFollowerReadWithInvalidLease(t *testing.T
 
 	// The clock needs to be higher than the closed-timestamp lag. Otherwise,
 	// trying to close timestamps below zero results in not closing anything.
-	manual := hlc.NewManualClock(5 * time.Second.Nanoseconds())
-	clock := hlc.NewClock(manual.UnixNano, 1)
+	manual := timeutil.NewManualTime(timeutil.Unix(5, 0))
+	clock := hlc.NewClockForTesting(manual)
 	tsc := TestStoreConfig(clock)
+	tsc.TestingKnobs.DisableCanAckBeforeApplication = true
 	// Permit only one lease attempt. The test is flaky if we allow the lease to
 	// be renewed by background processes.
 	var leaseOnce sync.Once
-	tsc.TestingKnobs.LeaseRequestEvent = func(ts hlc.Timestamp, _ roachpb.StoreID, _ roachpb.RangeID) *roachpb.Error {
+	tsc.TestingKnobs.LeaseRequestEvent = func(ts hlc.Timestamp, _ roachpb.StoreID, _ roachpb.RangeID) *kvpb.Error {
 		admitted := false
 		leaseOnce.Do(func() {
 			admitted = true
@@ -120,7 +125,7 @@ func TestCheckExecutionCanProceedAllowsFollowerReadWithInvalidLease(t *testing.T
 		if admitted {
 			return nil
 		}
-		return roachpb.NewErrorf("boom")
+		return kvpb.NewErrorf("boom")
 	}
 	const closedTimestampLag = time.Second
 	closedts.TargetDuration.Override(ctx, &tsc.Settings.SV, closedTimestampLag)
@@ -151,7 +156,7 @@ func TestCheckExecutionCanProceedAllowsFollowerReadWithInvalidLease(t *testing.T
 	ls := r.CurrentLeaseStatus(ctx)
 	require.True(t, ls.IsValid())
 
-	manual.Increment(100 * time.Second.Nanoseconds())
+	manual.Advance(100 * time.Second)
 	// Sanity check - lease should now no longer be valid.
 	ls = r.CurrentLeaseStatus(ctx)
 	require.False(t, ls.IsValid())
@@ -160,20 +165,21 @@ func TestCheckExecutionCanProceedAllowsFollowerReadWithInvalidLease(t *testing.T
 	txn := roachpb.MakeTransaction(
 		"test",
 		key,
+		isolation.Serializable,
 		roachpb.NormalUserPriority,
 		tsBelowClosedTimestamp,
 		clock.MaxOffset().Nanoseconds(),
 		0, // coordinatorNodeID
 	)
 
-	ba := &roachpb.BatchRequest{}
-	ba.Header = roachpb.Header{
+	ba := &kvpb.BatchRequest{}
+	ba.Header = kvpb.Header{
 		Txn:       &txn,
 		Timestamp: txn.ReadTimestamp,
 	}
 	ba.Add(&gArgs)
 
-	ls, err := r.checkExecutionCanProceed(ctx, ba, nil /* g */)
+	ls, err := r.checkExecutionCanProceedBeforeStorageSnapshot(ctx, ba, nil /* g */)
 	require.NoError(t, err)
 	require.Empty(t, ls)
 

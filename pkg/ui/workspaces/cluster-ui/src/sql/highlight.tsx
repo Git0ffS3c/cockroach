@@ -25,21 +25,21 @@ hljs.configure({
 export class Highlight extends React.Component<SqlBoxProps> {
   preNode: React.RefObject<HTMLPreElement> = React.createRef();
 
-  shouldComponentUpdate(newProps: SqlBoxProps) {
+  shouldComponentUpdate(newProps: SqlBoxProps): boolean {
     return newProps.value !== this.props.value;
   }
 
-  componentDidMount() {
+  componentDidMount(): void {
     hljs.highlightBlock(this.preNode.current);
   }
 
-  componentDidUpdate() {
+  componentDidUpdate(): void {
     hljs.highlightBlock(this.preNode.current);
   }
 
-  renderZone = () => {
+  renderZone = (): React.ReactElement => {
     const { zone } = this.props;
-    const zoneConfig = zone.zone_config;
+    const zoneConfig = zone.zoneConfigResp.zone_config;
     return (
       <span className={cx("sql-highlight", "hljs")}>
         <span className="hljs-keyword">CONFIGURE ZONE USING</span>
@@ -73,7 +73,7 @@ export class Highlight extends React.Component<SqlBoxProps> {
     );
   };
 
-  render() {
+  render(): React.ReactElement {
     const { value, zone } = this.props;
     return (
       <>

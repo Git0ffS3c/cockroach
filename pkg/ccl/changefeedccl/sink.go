@@ -10,28 +10,78 @@ package changefeedccl
 
 import (
 	"context"
+	"encoding/json"
+	"math"
 	"net/url"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 // Sink is an abstraction for anything that a changefeed may emit into.
+// This union interface is mainly meant for ease of mocking--an individual
+// changefeed processor should only need one of these.
 type Sink interface {
-	// Dial establishes connection to the sink.
+	EventSink
+	ResolvedTimestampSink
+}
+
+type sinkType int
+
+const (
+	sinkTypeSinklessBuffer sinkType = iota
+	sinkTypeNull
+	sinkTypeKafka
+	sinkTypeWebhook
+	sinkTypePubsub
+	sinkTypeCloudstorage
+	sinkTypeSQL
+)
+
+// externalResource is the interface common to both EventSink and
+// ResolvedTimestampSink.
+type externalResource interface {
+	// Dial establishes a connection to the sink.
 	Dial() error
+
+	// Close does not guarantee delivery of outstanding messages.
+	// It releases resources and may surface diagnostic information
+	// in logs or the returned error.
+	Close() error
+
+	// getConcreteType returns the underlying sink type of a sink that may
+	// be wrapped by middleware.
+	getConcreteType() sinkType
+}
+
+// EventSink is the interface used when emitting changefeed events
+// and ensuring they were received.
+type EventSink interface {
+	externalResource
+
 	// EmitRow enqueues a row message for asynchronous delivery on the sink. An
 	// error may be returned if a previously enqueued message has failed.
 	EmitRow(
@@ -41,25 +91,80 @@ type Sink interface {
 		updated, mvcc hlc.Timestamp,
 		alloc kvevent.Alloc,
 	) error
-	// EmitResolvedTimestamp enqueues a resolved timestamp message for
-	// asynchronous delivery on every topic that has been seen by EmitRow. An
-	// error may be returned if a previously enqueued message has failed.
-	EmitResolvedTimestamp(ctx context.Context, encoder Encoder, resolved hlc.Timestamp) error
-	// Flush blocks until every message enqueued by EmitRow and
-	// EmitResolvedTimestamp has been acknowledged by the sink. If an error is
+
+	// Flush blocks until every message enqueued by EmitRow
+	// has been acknowledged by the sink. If an error is
 	// returned, no guarantees are given about which messages have been
 	// delivered or not delivered.
 	Flush(ctx context.Context) error
-	// Close does not guarantee delivery of outstanding messages.
-	Close() error
+}
+
+// ResolvedTimestampSink is the interface used when emitting resolved
+// timestamps.
+type ResolvedTimestampSink interface {
+	externalResource
+	// EmitResolvedTimestamp enqueues a resolved timestamp message for
+	// asynchronous delivery on every topic. An error may be returned
+	// if a previously enqueued message has failed. Implementations may
+	// alternatively emit synchronously.
+	EmitResolvedTimestamp(ctx context.Context, encoder Encoder, resolved hlc.Timestamp) error
 }
 
 // SinkWithTopics extends the Sink interface to include a method that returns
-// the topics that a changefeed will emit to
+// the topics that a changefeed will emit to.
 type SinkWithTopics interface {
-	Sink
 	Topics() []string
 }
+
+func getEventSink(
+	ctx context.Context,
+	serverCfg *execinfra.ServerConfig,
+	feedCfg jobspb.ChangefeedDetails,
+	timestampOracle timestampLowerBoundOracle,
+	user username.SQLUsername,
+	jobID jobspb.JobID,
+	m metricsRecorder,
+) (EventSink, error) {
+	return getAndDialSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m)
+}
+
+func getResolvedTimestampSink(
+	ctx context.Context,
+	serverCfg *execinfra.ServerConfig,
+	feedCfg jobspb.ChangefeedDetails,
+	timestampOracle timestampLowerBoundOracle,
+	user username.SQLUsername,
+	jobID jobspb.JobID,
+	m metricsRecorder,
+) (ResolvedTimestampSink, error) {
+	return getAndDialSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m)
+}
+
+func getAndDialSink(
+	ctx context.Context,
+	serverCfg *execinfra.ServerConfig,
+	feedCfg jobspb.ChangefeedDetails,
+	timestampOracle timestampLowerBoundOracle,
+	user username.SQLUsername,
+	jobID jobspb.JobID,
+	m metricsRecorder,
+) (Sink, error) {
+	sink, err := getSink(ctx, serverCfg, feedCfg, timestampOracle, user, jobID, m)
+	if err != nil {
+		return nil, err
+	}
+	return sink, sink.Dial()
+}
+
+// NewWebhookSinkEnabled determines whether or not the refactored Webhook sink
+// or the deprecated sink should be used.
+var NewWebhookSinkEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.new_webhook_sink_enabled",
+	"if enabled, this setting enables a new implementation of the webhook sink"+
+		" that allows for a much higher throughput",
+	util.ConstantWithMetamorphicTestBool("changefeed.new_webhook_sink_enabled", false),
+)
 
 func getSink(
 	ctx context.Context,
@@ -68,7 +173,7 @@ func getSink(
 	timestampOracle timestampLowerBoundOracle,
 	user username.SQLUsername,
 	jobID jobspb.JobID,
-	m *sliMetrics,
+	m metricsRecorder,
 ) (Sink, error) {
 	u, err := url.Parse(feedCfg.SinkURI)
 	if err != nil {
@@ -77,6 +182,8 @@ func getSink(
 	if scheme, ok := changefeedbase.NoLongerExperimental[u.Scheme]; ok {
 		u.Scheme = scheme
 	}
+
+	opts := changefeedbase.MakeStatementOptions(feedCfg.Opts)
 
 	// check that options are compatible with the given sink
 	validateOptionsAndMakeSink := func(sinkSpecificOpts map[string]struct{}, makeSink func() (Sink, error)) (Sink, error) {
@@ -87,38 +194,75 @@ func getSink(
 		return makeSink()
 	}
 
+	metricsBuilder := func(recordingRequired bool) metricsRecorder {
+		if recordingRequired {
+			return maybeWrapMetrics(ctx, m, serverCfg.ExternalIORecorder)
+		}
+		return m
+	}
+
 	newSink := func() (Sink, error) {
 		if feedCfg.SinkURI == "" {
 			return &bufferSink{metrics: m}, nil
 		}
 
+		encodingOpts, err := opts.GetEncodingOptions()
+		if err != nil {
+			return nil, err
+		}
+
 		switch {
 		case u.Scheme == changefeedbase.SinkSchemeNull:
-			return makeNullSink(sinkURL{URL: u}, m)
+			nullIsAccounted := false
+			if knobs, ok := serverCfg.TestingKnobs.Changefeed.(*TestingKnobs); ok {
+				nullIsAccounted = knobs.NullSinkIsExternalIOAccounted
+			}
+			return makeNullSink(sinkURL{URL: u}, metricsBuilder(nullIsAccounted))
 		case u.Scheme == changefeedbase.SinkSchemeKafka:
 			return validateOptionsAndMakeSink(changefeedbase.KafkaValidOptions, func() (Sink, error) {
-				return makeKafkaSink(ctx, sinkURL{URL: u}, AllTargets(feedCfg), feedCfg.Opts, m)
+				return makeKafkaSink(ctx, sinkURL{URL: u}, AllTargets(feedCfg), opts.GetKafkaConfigJSON(), serverCfg.Settings, metricsBuilder)
 			})
 		case isWebhookSink(u):
-			return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
-				return makeWebhookSink(ctx, sinkURL{URL: u}, feedCfg.Opts,
-					defaultWorkerCount(), timeutil.DefaultTimeSource{}, m)
-			})
+			webhookOpts, err := opts.GetWebhookSinkOptions()
+			if err != nil {
+				return nil, err
+			}
+			if NewWebhookSinkEnabled.Get(&serverCfg.Settings.SV) {
+				return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
+					return makeWebhookSink(ctx, sinkURL{URL: u}, encodingOpts, webhookOpts,
+						numSinkIOWorkers(serverCfg), newCPUPacerFactory(ctx, serverCfg), timeutil.DefaultTimeSource{}, metricsBuilder)
+				})
+			} else {
+				return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
+					return makeDeprecatedWebhookSink(ctx, sinkURL{URL: u}, encodingOpts, webhookOpts,
+						defaultWorkerCount(), timeutil.DefaultTimeSource{}, metricsBuilder)
+				})
+			}
 		case isPubsubSink(u):
 			// TODO: add metrics to pubsubsink
-			return validateOptionsAndMakeSink(changefeedbase.PubsubValidOptions, func() (Sink, error) {
-				return MakePubsubSink(ctx, u, feedCfg.Opts, AllTargets(feedCfg))
-			})
+			return MakePubsubSink(ctx, u, encodingOpts, AllTargets(feedCfg), opts.IsSet(changefeedbase.OptUnordered))
 		case isCloudStorageSink(u):
 			return validateOptionsAndMakeSink(changefeedbase.CloudStorageValidOptions, func() (Sink, error) {
+				// Placeholder id for canary sink
+				var nodeID base.SQLInstanceID = 0
+				if serverCfg.NodeID != nil {
+					nodeID = serverCfg.NodeID.SQLInstanceID()
+				}
 				return makeCloudStorageSink(
-					ctx, sinkURL{URL: u}, serverCfg.NodeID.SQLInstanceID(), serverCfg.Settings,
-					feedCfg.Opts, timestampOracle, serverCfg.ExternalStorageFromURI, user, m,
+					ctx, sinkURL{URL: u}, nodeID, serverCfg.Settings, encodingOpts,
+					timestampOracle, serverCfg.ExternalStorageFromURI, user, metricsBuilder,
 				)
 			})
 		case u.Scheme == changefeedbase.SinkSchemeExperimentalSQL:
 			return validateOptionsAndMakeSink(changefeedbase.SQLValidOptions, func() (Sink, error) {
-				return makeSQLSink(sinkURL{URL: u}, sqlSinkTableName, AllTargets(feedCfg), m)
+				return makeSQLSink(sinkURL{URL: u}, sqlSinkTableName, AllTargets(feedCfg), metricsBuilder)
+			})
+		case u.Scheme == changefeedbase.SinkSchemeExternalConnection:
+			return validateOptionsAndMakeSink(changefeedbase.ExternalConnectionValidOptions, func() (Sink, error) {
+				return makeExternalConnectionSink(
+					ctx, sinkURL{URL: u}, user, makeExternalConnectionProvider(ctx, serverCfg.DB),
+					serverCfg, feedCfg, timestampOracle, jobID, m,
+				)
 			})
 		case u.Scheme == "":
 			return nil, errors.Errorf(`no scheme found for sink URL %q`, feedCfg.SinkURI)
@@ -133,11 +277,10 @@ func getSink(
 	}
 
 	if knobs, ok := serverCfg.TestingKnobs.Changefeed.(*TestingKnobs); ok && knobs.WrapSink != nil {
-		sink = knobs.WrapSink(sink, jobID)
-	}
-
-	if err := sink.Dial(); err != nil {
-		return nil, err
+		// External connections call getSink recursively and wrap the sink then.
+		if u.Scheme != changefeedbase.SinkSchemeExternalConnection {
+			sink = knobs.WrapSink(sink, jobID)
+		}
 	}
 
 	return sink, nil
@@ -227,7 +370,11 @@ func (u *sinkURL) String() string {
 // verify configuration, but in the steady state, no sink error should be
 // terminal.
 type errorWrapperSink struct {
-	wrapped Sink
+	wrapped externalResource
+}
+
+func (s *errorWrapperSink) getConcreteType() sinkType {
+	return s.wrapped.getConcreteType()
 }
 
 // EmitRow implements Sink interface.
@@ -238,7 +385,7 @@ func (s errorWrapperSink) EmitRow(
 	updated, mvcc hlc.Timestamp,
 	alloc kvevent.Alloc,
 ) error {
-	if err := s.wrapped.EmitRow(ctx, topic, key, value, updated, mvcc, alloc); err != nil {
+	if err := s.wrapped.(EventSink).EmitRow(ctx, topic, key, value, updated, mvcc, alloc); err != nil {
 		return changefeedbase.MarkRetryableError(err)
 	}
 	return nil
@@ -248,7 +395,7 @@ func (s errorWrapperSink) EmitRow(
 func (s errorWrapperSink) EmitResolvedTimestamp(
 	ctx context.Context, encoder Encoder, resolved hlc.Timestamp,
 ) error {
-	if err := s.wrapped.EmitResolvedTimestamp(ctx, encoder, resolved); err != nil {
+	if err := s.wrapped.(ResolvedTimestampSink).EmitResolvedTimestamp(ctx, encoder, resolved); err != nil {
 		return changefeedbase.MarkRetryableError(err)
 	}
 	return nil
@@ -256,7 +403,7 @@ func (s errorWrapperSink) EmitResolvedTimestamp(
 
 // Flush implements Sink interface.
 func (s errorWrapperSink) Flush(ctx context.Context) error {
-	if err := s.wrapped.Flush(ctx); err != nil {
+	if err := s.wrapped.(EventSink).Flush(ctx); err != nil {
 		return changefeedbase.MarkRetryableError(err)
 	}
 	return nil
@@ -268,6 +415,21 @@ func (s errorWrapperSink) Close() error {
 		return changefeedbase.MarkRetryableError(err)
 	}
 	return nil
+}
+
+// EncodeAndEmitRow implements SinkWithEncoder interface.
+func (s errorWrapperSink) EncodeAndEmitRow(
+	ctx context.Context,
+	updatedRow cdcevent.Row,
+	prevRow cdcevent.Row,
+	topic TopicDescriptor,
+	updated, mvcc hlc.Timestamp,
+	alloc kvevent.Alloc,
+) error {
+	if sinkWithEncoder, ok := s.wrapped.(SinkWithEncoder); ok {
+		return sinkWithEncoder.EncodeAndEmitRow(ctx, updatedRow, prevRow, topic, updated, mvcc, alloc)
+	}
+	return errors.AssertionFailedf("Expected a sink with encoder for, found %T", s.wrapped)
 }
 
 // Dial implements Sink interface.
@@ -298,7 +460,11 @@ type bufferSink struct {
 	alloc   tree.DatumAlloc
 	scratch bufalloc.ByteAllocator
 	closed  bool
-	metrics *sliMetrics
+	metrics metricsRecorder
+}
+
+func (s *bufferSink) getConcreteType() sinkType {
+	return sinkTypeSinklessBuffer
 }
 
 // EmitRow implements the Sink interface.
@@ -369,17 +535,26 @@ func (s *bufferSink) Dial() error {
 // TODO (zinger): Make this a tuple or array datum if it can be
 // done without breaking backwards compatibility.
 func (s *bufferSink) getTopicDatum(t TopicDescriptor) *tree.DString {
-	return s.alloc.NewDString(tree.DString(strings.Join(t.GetNameComponents(), ".")))
+	name, components := t.GetNameComponents()
+	if len(components) == 0 {
+		return s.alloc.NewDString(tree.DString(name))
+	}
+	strs := append([]string{string(name)}, components...)
+	return s.alloc.NewDString(tree.DString(strings.Join(strs, ".")))
 }
 
 type nullSink struct {
 	ticker  *time.Ticker
-	metrics *sliMetrics
+	metrics metricsRecorder
+}
+
+func (n *nullSink) getConcreteType() sinkType {
+	return sinkTypeNull
 }
 
 var _ Sink = (*nullSink)(nil)
 
-func makeNullSink(u sinkURL, m *sliMetrics) (Sink, error) {
+func makeNullSink(u sinkURL, m metricsRecorder) (Sink, error) {
 	var pacer *time.Ticker
 	if delay := u.consumeParam(`delay`); delay != "" {
 		pace, err := time.ParseDuration(delay)
@@ -455,4 +630,231 @@ func (n *nullSink) Close() error {
 // Dial implements Sink interface.
 func (n *nullSink) Dial() error {
 	return nil
+}
+
+// safeSink wraps an EventSink in a mutex so it's methods are
+// thread safe.
+type safeSink struct {
+	syncutil.Mutex
+	wrapped EventSink
+}
+
+var _ EventSink = (*safeSink)(nil)
+
+func (s *safeSink) getConcreteType() sinkType {
+	return s.wrapped.getConcreteType()
+}
+
+func (s *safeSink) Dial() error {
+	s.Lock()
+	defer s.Unlock()
+	return s.wrapped.Dial()
+}
+
+func (s *safeSink) Close() error {
+	s.Lock()
+	defer s.Unlock()
+	return s.wrapped.Close()
+}
+
+func (s *safeSink) EmitRow(
+	ctx context.Context,
+	topic TopicDescriptor,
+	key, value []byte,
+	updated, mvcc hlc.Timestamp,
+	alloc kvevent.Alloc,
+) error {
+	s.Lock()
+	defer s.Unlock()
+	return s.wrapped.EmitRow(ctx, topic, key, value, updated, mvcc, alloc)
+}
+
+func (s *safeSink) Flush(ctx context.Context) error {
+	s.Lock()
+	defer s.Unlock()
+	return s.wrapped.Flush(ctx)
+}
+
+// SinkWithEncoder A sink which both encodes and emits row events. Ideally, this
+// should not be embedding the Sink interface because then all the types that
+// implement this interface will also have to implement EmitRow (instead, they
+// should implement EncodeAndEmitRow), which for a sink with encoder, does not
+// make sense. But since we pass around a type of sink everywhere, we need to
+// embed this for now.
+type SinkWithEncoder interface {
+	Sink
+
+	EncodeAndEmitRow(
+		ctx context.Context,
+		updatedRow cdcevent.Row,
+		prevRow cdcevent.Row,
+		topic TopicDescriptor,
+		updated, mvcc hlc.Timestamp,
+		alloc kvevent.Alloc,
+	) error
+
+	Flush(ctx context.Context) error
+}
+
+// proper JSON schema for sink config:
+//
+//	{
+//	  "Flush": {
+//		   "Messages":  ...,
+//		   "Bytes":     ...,
+//		   "Frequency": ...,
+//	  },
+//		 "Retry": {
+//		   "Max":     ...,
+//		   "Backoff": ...,
+//	  }
+//	}
+type sinkJSONConfig struct {
+	Flush sinkBatchConfig `json:",omitempty"`
+	Retry sinkRetryConfig `json:",omitempty"`
+}
+
+type sinkBatchConfig struct {
+	Bytes, Messages int          `json:",omitempty"`
+	Frequency       jsonDuration `json:",omitempty"`
+}
+
+// wrapper structs to unmarshal json, retry.Options will be the actual config
+type sinkRetryConfig struct {
+	Max     jsonMaxRetries `json:",omitempty"`
+	Backoff jsonDuration   `json:",omitempty"`
+}
+
+func defaultRetryConfig() retry.Options {
+	opts := retry.Options{
+		InitialBackoff: 500 * time.Millisecond,
+		MaxRetries:     3,
+		Multiplier:     2,
+	}
+	// max backoff should be initial * 2 ^ maxRetries
+	opts.MaxBackoff = opts.InitialBackoff * time.Duration(int(math.Pow(2.0, float64(opts.MaxRetries))))
+	return opts
+}
+
+func getSinkConfigFromJson(
+	jsonStr changefeedbase.SinkSpecificJSONConfig,
+) (batchCfg sinkBatchConfig, retryCfg retry.Options, err error) {
+	retryCfg = defaultRetryConfig()
+
+	var cfg = sinkJSONConfig{}
+	cfg.Retry.Max = jsonMaxRetries(retryCfg.MaxRetries)
+	cfg.Retry.Backoff = jsonDuration(retryCfg.InitialBackoff)
+	if jsonStr != `` {
+		// set retry defaults to be overridden if included in JSON
+		if err = json.Unmarshal([]byte(jsonStr), &cfg); err != nil {
+			return batchCfg, retryCfg, errors.Wrapf(err, "error unmarshalling json")
+		}
+	}
+
+	// don't support negative values
+	if cfg.Flush.Messages < 0 || cfg.Flush.Bytes < 0 || cfg.Flush.Frequency < 0 ||
+		cfg.Retry.Max < 0 || cfg.Retry.Backoff < 0 {
+		return batchCfg, retryCfg, errors.Errorf("invalid sink config, all values must be non-negative")
+	}
+
+	// errors if other batch values are set, but frequency is not
+	if (cfg.Flush.Messages > 0 || cfg.Flush.Bytes > 0) && cfg.Flush.Frequency == 0 {
+		return batchCfg, retryCfg, errors.Errorf("invalid sink config, Flush.Frequency is not set, messages may never be sent")
+	}
+
+	retryCfg.MaxRetries = int(cfg.Retry.Max)
+	retryCfg.InitialBackoff = time.Duration(cfg.Retry.Backoff)
+	return cfg.Flush, retryCfg, nil
+}
+
+type jsonMaxRetries int
+
+func (j *jsonMaxRetries) UnmarshalJSON(b []byte) error {
+	var i int64
+	// try to parse as int
+	i, err := strconv.ParseInt(string(b), 10, 64)
+	if err == nil {
+		if i <= 0 {
+			return errors.Errorf("Retry.Max must be a positive integer. use 'inf' for infinite retries.")
+		}
+		*j = jsonMaxRetries(i)
+	} else {
+		// if that fails, try to parse as string (only accept 'inf')
+		var s string
+		// using unmarshal here to remove quotes around the string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return errors.Errorf("Retry.Max must be either a positive int or 'inf' for infinite retries.")
+		}
+		if strings.ToLower(s) == "inf" {
+			// if used wants infinite retries, set to zero as retry.Options interprets this as infinity
+			*j = 0
+		} else if n, err := strconv.Atoi(s); err == nil { // also accept ints as strings
+			*j = jsonMaxRetries(n)
+		} else {
+			return errors.Errorf("Retry.Max must be either a positive int or 'inf' for infinite retries.")
+		}
+	}
+	return nil
+}
+
+func numSinkIOWorkers(cfg *execinfra.ServerConfig) int {
+	numWorkers := changefeedbase.SinkIOWorkers.Get(&cfg.Settings.SV)
+	if numWorkers > 0 {
+		return int(numWorkers)
+	}
+
+	idealNumber := runtime.GOMAXPROCS(0)
+	if idealNumber < 1 {
+		return 1
+	}
+	if idealNumber > 32 {
+		return 32
+	}
+	return idealNumber
+}
+
+func newCPUPacerFactory(ctx context.Context, cfg *execinfra.ServerConfig) func() *admission.Pacer {
+	var prevPacer *admission.Pacer
+	var prevRequestUnit time.Duration
+
+	return func() *admission.Pacer {
+		pacerRequestUnit := changefeedbase.SinkPacerRequestSize.Get(&cfg.Settings.SV)
+		enablePacer := changefeedbase.PerEventElasticCPUControlEnabled.Get(&cfg.Settings.SV)
+
+		if enablePacer && prevPacer != nil && prevRequestUnit == pacerRequestUnit {
+			return prevPacer
+		}
+
+		var pacer *admission.Pacer = nil
+		if enablePacer {
+			tenantID, ok := roachpb.ClientTenantFromContext(ctx)
+			if !ok {
+				tenantID = roachpb.SystemTenantID
+			}
+
+			pacer = cfg.AdmissionPacerFactory.NewPacer(
+				pacerRequestUnit,
+				admission.WorkInfo{
+					TenantID:        tenantID,
+					Priority:        admissionpb.BulkNormalPri,
+					CreateTime:      timeutil.Now().UnixNano(),
+					BypassAdmission: false,
+				},
+			)
+		}
+
+		prevPacer = pacer
+		prevRequestUnit = pacerRequestUnit
+
+		return pacer
+	}
+}
+
+func nilPacerFactory() *admission.Pacer {
+	return nil
+}
+
+func sinkSupportsConcurrentEmits(sink EventSink) bool {
+	_, ok := sink.(*batchingSink)
+	return ok
 }

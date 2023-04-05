@@ -13,10 +13,8 @@ package scbuild
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/faketreeeval"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild/internal/scbuildstmt"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -33,19 +31,9 @@ func newSemaCtx(d Dependencies) *tree.SemaContext {
 	semaCtx := tree.MakeSemaContext()
 	semaCtx.Annotations = nil
 	semaCtx.SearchPath = &d.SessionData().SearchPath
-	if d.ClusterSettings().Version.IsActive(context.Background(), clusterversion.IncrementalBackupSubdir) {
-		semaCtx.CastSessionOptions = cast.SessionOptions{
-			IntervalStyleEnabled: true,
-			DateStyleEnabled:     true,
-		}
-	} else {
-		semaCtx.CastSessionOptions = cast.SessionOptions{
-			IntervalStyleEnabled: d.SessionData().IntervalStyleEnabled,
-			DateStyleEnabled:     d.SessionData().DateStyleEnabled,
-		}
-	}
 	semaCtx.TypeResolver = d.CatalogReader()
-	semaCtx.TableNameResolver = d.CatalogReader()
+	semaCtx.FunctionResolver = d.CatalogReader()
+	semaCtx.NameResolver = d.CatalogReader()
 	semaCtx.DateStyle = d.SessionData().GetDateStyle()
 	semaCtx.IntervalStyle = d.SessionData().GetIntervalStyle()
 	return &semaCtx
@@ -57,18 +45,21 @@ func (b buildCtx) EvalCtx() *eval.Context {
 }
 
 func newEvalCtx(ctx context.Context, d Dependencies) *eval.Context {
-	return &eval.Context{
-		ClusterID:          d.ClusterID(),
-		SessionDataStack:   sessiondata.NewStack(d.SessionData()),
-		Context:            ctx,
-		Planner:            &faketreeeval.DummyEvalPlanner{},
-		PrivilegedAccessor: &faketreeeval.DummyPrivilegedAccessor{},
-		SessionAccessor:    &faketreeeval.DummySessionAccessor{},
-		ClientNoticeSender: &faketreeeval.DummyClientNoticeSender{},
-		Sequence:           &faketreeeval.DummySequenceOperators{},
-		Tenant:             &faketreeeval.DummyTenantOperator{},
-		Regions:            &faketreeeval.DummyRegionOperator{},
-		Settings:           d.ClusterSettings(),
-		Codec:              d.Codec(),
+	evalCtx := &eval.Context{
+		ClusterID:            d.ClusterID(),
+		SessionDataStack:     sessiondata.NewStack(d.SessionData()),
+		Planner:              &faketreeeval.DummyEvalPlanner{},
+		StreamManagerFactory: &faketreeeval.DummyStreamManagerFactory{},
+		PrivilegedAccessor:   &faketreeeval.DummyPrivilegedAccessor{},
+		SessionAccessor:      &faketreeeval.DummySessionAccessor{},
+		ClientNoticeSender:   d.ClientNoticeSender(),
+		Sequence:             &faketreeeval.DummySequenceOperators{},
+		Tenant:               &faketreeeval.DummyTenantOperator{},
+		Regions:              &faketreeeval.DummyRegionOperator{},
+		Settings:             d.ClusterSettings(),
+		Codec:                d.Codec(),
+		DescIDGenerator:      d.DescIDGenerator(),
 	}
+	evalCtx.SetDeprecatedContext(ctx)
+	return evalCtx
 }

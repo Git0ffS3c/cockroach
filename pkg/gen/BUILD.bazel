@@ -1,4 +1,19 @@
-load(":gen.bzl", "bindata", "docs", "execgen", "gen", "go_proto", "gomock", "misc", "optgen", "stringer")
+load(
+    ":gen.bzl",
+    "bindata",
+    "bnf",
+    "diagrams",
+    "docs",
+    "execgen",
+    "gen",
+    "go_proto",
+    "gomock",
+    "misc",
+    "optgen",
+    "parser",
+    "schemachanger",
+    "stringer",
+)
 
 bindata()
 
@@ -15,6 +30,14 @@ optgen()
 misc()
 
 docs()
+
+parser()
+
+schemachanger()
+
+diagrams()
+
+bnf()
 
 gen(
     name = "gen",
@@ -33,6 +56,8 @@ gen(
         ":gomock",
         ":misc",
         ":optgen",
+        ":parser",
+        ":schemachanger",
         ":stringer",
     ],
 )

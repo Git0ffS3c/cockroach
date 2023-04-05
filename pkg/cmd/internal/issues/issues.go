@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 	"github.com/google/go-github/github"
@@ -112,6 +113,8 @@ func (p *poster) getProbableMilestone(ctx *postCtx) *int {
 type poster struct {
 	*Options
 
+	l *logger.Logger
+
 	createIssue func(ctx context.Context, owner string, repo string,
 		issue *github.IssueRequest) (*github.Issue, *github.Response, error)
 	searchIssues func(ctx context.Context, query string,
@@ -126,9 +129,10 @@ type poster struct {
 		opt *github.ProjectCardOptions) (*github.ProjectCard, *github.Response, error)
 }
 
-func newPoster(client *github.Client, opts *Options) *poster {
+func newPoster(l *logger.Logger, client *github.Client, opts *Options) *poster {
 	return &poster{
 		Options:           opts,
+		l:                 l,
 		createIssue:       client.Issues.Create,
 		searchIssues:      client.Search.Issues,
 		createComment:     client.Issues.CreateComment,
@@ -138,12 +142,32 @@ func newPoster(client *github.Client, opts *Options) *poster {
 	}
 }
 
+// parameters returns the parameters to be displayed in the failure
+// report. It adds the default parameters (currently, TAGS and
+// GOFLAGS) to the list of parameters passed by the caller.
+func (p *poster) parameters(extraParams map[string]string) map[string]string {
+	ps := map[string]string{}
+	for name, value := range extraParams {
+		ps[name] = value
+	}
+
+	if p.Tags != "" {
+		ps["TAGS"] = p.Tags
+	}
+	if p.Goflags != "" {
+		ps["GOFLAGS"] = p.Goflags
+	}
+
+	return ps
+}
+
 // Options configures the issue poster.
 type Options struct {
 	Token        string // GitHub API token
 	Org          string
 	Repo         string
 	SHA          string
+	BuildTypeID  string
 	BuildID      string
 	ServerURL    string
 	Branch       string
@@ -163,6 +187,7 @@ func DefaultOptionsFromEnv() *Options {
 		githubRepoEnv          = "GITHUB_REPO"
 		githubAPITokenEnv      = "GITHUB_API_TOKEN"
 		teamcityVCSNumberEnv   = "BUILD_VCS_NUMBER"
+		teamcityBuildTypeIDEnv = "TC_BUILDTYPE_ID"
 		teamcityBuildIDEnv     = "TC_BUILD_ID"
 		teamcityServerURLEnv   = "TC_SERVER_URL"
 		teamcityBuildBranchEnv = "TC_BUILD_BRANCH"
@@ -179,6 +204,7 @@ func DefaultOptionsFromEnv() *Options {
 		// at least it'll be obvious that something went wrong (as an
 		// issue will be posted pointing at that SHA).
 		SHA:          maybeEnv(teamcityVCSNumberEnv, "8548987813ff9e1b8a9878023d3abfc6911c16db"),
+		BuildTypeID:  maybeEnv(teamcityBuildTypeIDEnv, "BUILDTYPE_ID-not-found-in-env"),
 		BuildID:      maybeEnv(teamcityBuildIDEnv, "NOTFOUNDINENV"),
 		ServerURL:    maybeEnv(teamcityServerURLEnv, "https://server-url-not-found-in-env.com"),
 		Branch:       maybeEnv(teamcityBuildBranchEnv, "branch-not-found-in-env"),
@@ -214,8 +240,9 @@ type TemplateData struct {
 	PostRequest
 	// This is foo/bar instead of github.com/cockroachdb/cockroach/pkg/foo/bar.
 	PackageNameShort string
-	// GOFLAGS=-foo TAGS=-race etc.
-	Parameters []string
+	// Parameters includes relevant test or build parameters, such as
+	// build tags or cluster configuration
+	Parameters map[string]string
 	// The message, garnished with helpers that allow extracting the useful
 	// bots.
 	CondensedMessage CondensedMessage
@@ -246,7 +273,7 @@ func (p *poster) templateData(
 	}
 	return TemplateData{
 		PostRequest:      req,
-		Parameters:       p.parameters(),
+		Parameters:       p.parameters(req.ExtraParams),
 		CondensedMessage: CondensedMessage(req.Message),
 		Branch:           p.Branch,
 		Commit:           p.SHA,
@@ -278,20 +305,18 @@ func (p *poster) post(origCtx context.Context, formatter IssueFormatter, req Pos
 		p.Repo, p.Org, searchLabel, title)
 
 	releaseLabel := fmt.Sprintf("branch-%s", p.Branch)
-	qExisting := qBase + " label:" + releaseLabel
+	qExisting := qBase + " label:" + releaseLabel + " -label:X-noreuse"
 	qRelated := qBase + " -label:" + releaseLabel
 
 	rExisting, _, err := p.searchIssues(ctx, qExisting, &github.SearchOptions{
 		ListOptions: github.ListOptions{
-			PerPage: 1,
+			PerPage: 10,
 		},
 	})
 	if err != nil {
 		// Tough luck, keep going even if that means we're going to add a duplicate
 		// issue.
-		//
-		// TODO(tbg): surface this error.
-		_ = err
+		p.l.Printf("error trying to find existing GitHub issues: %v", err)
 		rExisting = &github.IssuesSearchResult{}
 	}
 
@@ -302,22 +327,22 @@ func (p *poster) post(origCtx context.Context, formatter IssueFormatter, req Pos
 	})
 	if err != nil {
 		// This is no reason to throw the towel, keep going.
-		//
-		// TODO(tbg): surface this error.
-		_ = err
+		p.l.Printf("error trying to find related GitHub issues: %v", err)
 		rRelated = &github.IssuesSearchResult{}
 	}
 
+	existingIssues := filterByExactTitleMatch(rExisting, title)
 	var foundIssue *int
-	if len(rExisting.Issues) > 0 {
+	if len(existingIssues) > 0 {
 		// We found an existing issue to post a comment into.
-		foundIssue = rExisting.Issues[0].Number
+		foundIssue = existingIssues[0].Number
+		p.l.Printf("found existing GitHub issue: #%d", *foundIssue)
 		// We are not going to create an issue, so don't show
 		// MentionOnCreate to the formatter.Body call below.
 		data.MentionOnCreate = nil
 	}
 
-	data.RelatedIssues = rRelated.Issues
+	data.RelatedIssues = filterByExactTitleMatch(rRelated, title)
 	data.InternalLog = ctx.Builder.String()
 	r := &Renderer{}
 	if err := formatter.Body(r, data); err != nil {
@@ -343,6 +368,7 @@ func (p *poster) post(origCtx context.Context, formatter IssueFormatter, req Pos
 				github.Stringify(issueRequest))
 		}
 
+		p.l.Printf("created GitHub issue #%d", *issue.Number)
 		if req.ProjectColumnID != 0 {
 			_, _, err := p.createProjectCard(ctx, int64(req.ProjectColumnID), &github.ProjectCardOptions{
 				ContentID:   *issue.ID,
@@ -353,7 +379,7 @@ func (p *poster) post(origCtx context.Context, formatter IssueFormatter, req Pos
 				//
 				// TODO(tbg): retrieve the project column ID before posting, so that if
 				// it can't be found we can mention that in the issue we'll file anyway.
-				_ = err
+				p.l.Printf("could not create GitHub project card: %v", err)
 			}
 		}
 	} else {
@@ -362,6 +388,8 @@ func (p *poster) post(origCtx context.Context, formatter IssueFormatter, req Pos
 			ctx, p.Org, p.Repo, *foundIssue, &comment); err != nil {
 			return errors.Wrapf(err, "failed to update issue #%d with %s",
 				*foundIssue, github.Stringify(comment))
+		} else {
+			p.l.Printf("created comment on existing GitHub issue (#%d)", *foundIssue)
 		}
 	}
 
@@ -370,37 +398,25 @@ func (p *poster) post(origCtx context.Context, formatter IssueFormatter, req Pos
 
 func (p *poster) teamcityURL(tab, fragment string) *url.URL {
 	options := url.Values{}
-	options.Add("buildId", p.BuildID)
-	options.Add("tab", tab)
+	options.Add("buildTab", tab)
 
 	u, err := url.Parse(p.ServerURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	u.Scheme = "https"
-	u.Path = "viewLog.html"
+	u.Path = fmt.Sprintf("buildConfiguration/%s/%s", p.BuildTypeID, p.BuildID)
 	u.RawQuery = options.Encode()
 	u.Fragment = fragment
 	return u
 }
 
 func (p *poster) teamcityBuildLogURL() *url.URL {
-	return p.teamcityURL("buildLog", "")
+	return p.teamcityURL("log", "")
 }
 
 func (p *poster) teamcityArtifactsURL(artifacts string) *url.URL {
 	return p.teamcityURL("artifacts", artifacts)
-}
-
-func (p *poster) parameters() []string {
-	var ps []string
-	if p.Tags != "" {
-		ps = append(ps, "TAGS="+p.Tags)
-	}
-	if p.Goflags != "" {
-		ps = append(ps, "GOFLAGS="+p.Goflags)
-	}
-	return ps
 }
 
 // A PostRequest contains the information needed to create an issue about a
@@ -412,6 +428,9 @@ type PostRequest struct {
 	TestName string
 	// The test output.
 	Message string
+	// ExtraParams contains the parameters to be included in a failure
+	// report, other than the defaults (git branch, test flags).
+	ExtraParams map[string]string
 	// A path to the test artifacts relative to the artifacts root. If nonempty,
 	// allows the poster formatter to construct a direct URL to this directory.
 	Artifacts string
@@ -436,7 +455,7 @@ type PostRequest struct {
 // existing open issue. GITHUB_API_TOKEN must be set to a valid GitHub token
 // that has permissions to search and create issues and comments or an error
 // will be returned.
-func Post(ctx context.Context, formatter IssueFormatter, req PostRequest) error {
+func Post(ctx context.Context, l *logger.Logger, formatter IssueFormatter, req PostRequest) error {
 	opts := DefaultOptionsFromEnv()
 	if !opts.CanPost() {
 		return errors.Newf("GITHUB_API_TOKEN env variable is not set; cannot post issue")
@@ -445,7 +464,7 @@ func Post(ctx context.Context, formatter IssueFormatter, req PostRequest) error 
 	client := github.NewClient(oauth2.NewClient(ctx, oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: opts.Token},
 	)))
-	return newPoster(client, opts).post(ctx, formatter, req)
+	return newPoster(l, client, opts).post(ctx, formatter, req)
 }
 
 // ReproductionCommandFromString returns a value for the
@@ -471,4 +490,23 @@ func HelpCommandAsLink(title, href string) func(r *Renderer) {
 		r.A(title, href)
 		r.Escaped("\n\n")
 	}
+}
+
+// filterByExactTitleMatch filters the search result passed and
+// removes any issues where the title does not match the expected
+// title exactly. This is done because the GitHub API does not support
+// searching by exact title; as a consequence, without this function,
+// there is a chance we would group together test failures for two
+// similarly named tests. That is confusing and undesirable behavior.
+func filterByExactTitleMatch(
+	result *github.IssuesSearchResult, expectedTitle string,
+) []github.Issue {
+	var issues []github.Issue
+	for _, issue := range result.Issues {
+		if title := issue.Title; title != nil && *title == expectedTitle {
+			issues = append(issues, issue)
+		}
+	}
+
+	return issues
 }

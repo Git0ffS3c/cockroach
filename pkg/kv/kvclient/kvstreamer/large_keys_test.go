@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/require"
 )
@@ -32,6 +32,9 @@ import (
 // when the keys to lookup (i.e. the enqueued requests themselves) as well as
 // the looked up rows are large. It additionally ensures that the Streamer
 // issues a reasonable number of the KV request.
+//
+// Additionally, this test verifies that the streamer is, in fact, used in all
+// cases when we expect.
 func TestLargeKeys(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -46,22 +49,26 @@ func TestLargeKeys(t *testing.T) {
 		},
 		{
 			name:  "index join, with ordering",
-			query: "SELECT max(extra), max(length(blob)) FROM foo@foo_attribute_idx GROUP BY attribute",
+			query: "SELECT * FROM foo@foo_attribute_idx ORDER BY attribute",
 		},
 		{
 			name:  "lookup join, no ordering",
 			query: "SELECT * FROM bar INNER LOOKUP JOIN foo ON lookup_blob = pk_blob",
 		},
+		{
+			name:  "lookup join, with ordering",
+			query: "SELECT * FROM bar INNER LOOKUP JOIN foo ON lookup_blob = pk_blob ORDER BY pk_blob",
+		},
 	}
 
 	rng, _ := randutil.NewTestRand()
-	recCh := make(chan tracing.Recording, 1)
+	recCh := make(chan tracingpb.Recording, 1)
 	// We want to capture the trace of the query so that we can count how many
 	// KV requests the Streamer issued.
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &sql.ExecutorTestingKnobs{
-				WithStatementTrace: func(trace tracing.Recording, stmt string) {
+				WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
 					for _, tc := range testCases {
 						if tc.query == stmt {
 							recCh <- trace
@@ -82,9 +89,9 @@ func TestLargeKeys(t *testing.T) {
 	// join reader. That processor bumps the memory limit to be at least 100KiB
 	// and uses 1/12 of the limit to buffer its input row batch.
 	//
-	// The vectorized index join, however, uses a quarter of the limit for the
-	// input batch buffer size, so we get to 8.3KiB x 4 which is about 34KiB.
-	_, err := db.Exec("SET distsql_workmem='34KiB'")
+	// The vectorized index join, however, uses 1/8th of the limit for the input
+	// batch buffer size, so we get to 8.3KiB x 8 which is about 67KiB.
+	_, err := db.Exec("SET distsql_workmem='67KiB'")
 	require.NoError(t, err)
 	// To improve the test coverage, occasionally lower the maximum number of
 	// concurrent requests.
@@ -132,7 +139,7 @@ func TestLargeKeys(t *testing.T) {
 						INDEX (attribute)%s
 					);`, familiesSuffix))
 				require.NoError(t, err)
-				_, err = db.Exec("CREATE TABLE bar (lookup_blob STRING)")
+				_, err = db.Exec("CREATE TABLE bar (lookup_blob STRING PRIMARY KEY)")
 				require.NoError(t, err)
 
 				// Insert some number of rows.
@@ -193,6 +200,11 @@ func TestLargeKeys(t *testing.T) {
 								func(t *testing.T) {
 									_, err = db.Exec(tc.query)
 									if err != nil {
+										// Make sure to discard the trace of the
+										// query that resulted in an error. If
+										// we don't do this, then the next test
+										// case will hang.
+										<-recCh
 										t.Fatal(err)
 									}
 									// Now examine the trace and count the async
@@ -215,6 +227,10 @@ func TestLargeKeys(t *testing.T) {
 									// we use a 4x multiple on the number of
 									// rows.
 									require.Greater(t, 4*numRows, numStreamerRequests)
+									// Also assert that there were at least some
+									// requests to verify that the streamer is,
+									// in fact, used when we expect.
+									require.Greater(t, numStreamerRequests, 0)
 								})
 						}
 					}

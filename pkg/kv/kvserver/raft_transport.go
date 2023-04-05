@@ -11,15 +11,14 @@
 package kvserver
 
 import (
-	"bytes"
 	"context"
-	"fmt"
 	"net"
-	"sort"
+	"runtime/pprof"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -29,13 +28,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
 )
 
@@ -61,16 +59,11 @@ const (
 
 // targetRaftOutgoingBatchSize wraps "kv.raft.command.target_batch_size".
 var targetRaftOutgoingBatchSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.raft.command.target_batch_size",
 	"size of a batch of raft commands after which it will be sent without further batching",
 	64<<20, // 64 MB
-	func(size int64) error {
-		if size < 1 {
-			return errors.New("must be positive")
-		}
-		return nil
-	},
+	settings.PositiveInt,
 )
 
 // RaftMessageResponseStream is the subset of the
@@ -106,13 +99,6 @@ type SnapshotResponseStream interface {
 	Recv() (*kvserverpb.SnapshotRequest, error)
 }
 
-// DelegateSnapshotResponseStream is the subset of the
-// MultiRaft_RaftSnapshotServer interface that is needed for sending delegated responses.
-type DelegateSnapshotResponseStream interface {
-	Send(request *kvserverpb.DelegateSnapshotResponse) error
-	Recv() (*kvserverpb.DelegateSnapshotRequest, error)
-}
-
 // RaftMessageHandler is the interface that must be implemented by
 // arguments to RaftTransport.Listen.
 type RaftMessageHandler interface {
@@ -121,7 +107,7 @@ type RaftMessageHandler interface {
 	// If an error is encountered during asynchronous processing, it will be
 	// streamed back to the sender of the message as a RaftMessageResponse.
 	HandleRaftRequest(ctx context.Context, req *kvserverpb.RaftMessageRequest,
-		respStream RaftMessageResponseStream) *roachpb.Error
+		respStream RaftMessageResponseStream) *kvpb.Error
 
 	// HandleRaftResponse is called for each raft response. Note that
 	// not all messages receive a response. An error is returned if and only if
@@ -140,28 +126,9 @@ type RaftMessageHandler interface {
 	// request.
 	HandleDelegatedSnapshot(
 		ctx context.Context,
-		req *kvserverpb.DelegateSnapshotRequest,
-		stream DelegateSnapshotResponseStream,
-		span *tracing.Span,
-	) error
+		req *kvserverpb.DelegateSendSnapshotRequest,
+	) *kvserverpb.DelegateSnapshotResponse
 }
-
-type raftTransportStats struct {
-	nodeID        roachpb.NodeID
-	queue         int
-	queueMax      int32
-	clientSent    int64
-	clientRecv    int64
-	clientDropped int64
-	serverSent    int64
-	serverRecv    int64
-}
-
-type raftTransportStatsSlice []*raftTransportStats
-
-func (s raftTransportStatsSlice) Len() int           { return len(s) }
-func (s raftTransportStatsSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s raftTransportStatsSlice) Less(i, j int) bool { return s[i].nodeID < s[j].nodeID }
 
 // RaftTransport handles the rpc messages for raft.
 //
@@ -177,14 +144,22 @@ func (s raftTransportStatsSlice) Less(i, j int) bool { return s[i].nodeID < s[j]
 // which remote hung up.
 type RaftTransport struct {
 	log.AmbientContext
-	st *cluster.Settings
-
+	st      *cluster.Settings
+	tracer  *tracing.Tracer
 	stopper *stop.Stopper
+	metrics *RaftTransportMetrics
 
-	queues   [rpc.NumConnectionClasses]syncutil.IntMap // map[roachpb.NodeID]*chan *RaftMessageRequest
-	stats    [rpc.NumConnectionClasses]syncutil.IntMap // map[roachpb.NodeID]*raftTransportStats
+	queues   [rpc.NumConnectionClasses]syncutil.IntMap // map[roachpb.NodeID]*raftSendQueue
 	dialer   *nodedialer.Dialer
 	handlers syncutil.IntMap // map[roachpb.StoreID]*RaftMessageHandler
+}
+
+// raftSendQueue is a queue of outgoing RaftMessageRequest messages.
+type raftSendQueue struct {
+	reqs chan *kvserverpb.RaftMessageRequest
+	// The number of bytes in flight. Must be updated *atomically* on sending and
+	// receiving from the reqs channel.
+	bytes atomic.Int64
 }
 
 // NewDummyRaftTransport returns a dummy raft transport for use in tests which
@@ -193,7 +168,7 @@ func NewDummyRaftTransport(st *cluster.Settings, tracer *tracing.Tracer) *RaftTr
 	resolver := func(roachpb.NodeID) (net.Addr, error) {
 		return nil, errors.New("dummy resolver")
 	}
-	return NewRaftTransport(log.MakeTestingAmbientContext(tracer), st,
+	return NewRaftTransport(log.MakeTestingAmbientContext(tracer), st, tracer,
 		nodedialer.New(nil, resolver), nil, nil)
 }
 
@@ -201,6 +176,7 @@ func NewDummyRaftTransport(st *cluster.Settings, tracer *tracing.Tracer) *RaftTr
 func NewRaftTransport(
 	ambient log.AmbientContext,
 	st *cluster.Settings,
+	tracer *tracing.Tracer,
 	dialer *nodedialer.Dialer,
 	grpcServer *grpc.Server,
 	stopper *stop.Stopper,
@@ -208,108 +184,44 @@ func NewRaftTransport(
 	t := &RaftTransport{
 		AmbientContext: ambient,
 		st:             st,
-
-		stopper: stopper,
-		dialer:  dialer,
+		tracer:         tracer,
+		stopper:        stopper,
+		dialer:         dialer,
 	}
-
+	t.initMetrics()
 	if grpcServer != nil {
 		RegisterMultiRaftServer(grpcServer, t)
 	}
-	// statsMap is used to associate a queue with its raftTransportStats.
-	statsMap := make(map[roachpb.NodeID]*raftTransportStats)
-	clearStatsMap := func() {
-		for k := range statsMap {
-			delete(statsMap, k)
-		}
-	}
-	if t.stopper != nil && log.V(1) {
-		ctx := t.AnnotateCtx(context.Background())
-		_ = t.stopper.RunAsyncTask(ctx, "raft-transport", func(ctx context.Context) {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			lastStats := make(map[roachpb.NodeID]raftTransportStats)
-			lastTime := timeutil.Now()
-			var stats raftTransportStatsSlice
-			for {
-				select {
-				case <-ticker.C:
-					stats = stats[:0]
-					getStats := func(k int64, v unsafe.Pointer) bool {
-						s := (*raftTransportStats)(v)
-						// Clear the queue length stat. Note that this field is only
-						// mutated by this goroutine.
-						s.queue = 0
-						stats = append(stats, s)
-						statsMap[roachpb.NodeID(k)] = s
-						return true
-					}
-					setQueueLength := func(k int64, v unsafe.Pointer) bool {
-						ch := *(*chan *kvserverpb.RaftMessageRequest)(v)
-						if s, ok := statsMap[roachpb.NodeID(k)]; ok {
-							s.queue += len(ch)
-						}
-						return true
-					}
-					for c := range t.stats {
-						clearStatsMap()
-						t.stats[c].Range(getStats)
-						t.queues[c].Range(setQueueLength)
-					}
-					clearStatsMap() // no need to hold on to references to stats
-
-					now := timeutil.Now()
-					elapsed := now.Sub(lastTime).Seconds()
-					sort.Sort(stats)
-
-					var buf bytes.Buffer
-					// NB: The header is 80 characters which should display in a single
-					// line on most terminals.
-					fmt.Fprintf(&buf,
-						"         qlen   qmax   qdropped client-sent client-recv server-sent server-recv\n")
-					for _, s := range stats {
-						last := lastStats[s.nodeID]
-						cur := raftTransportStats{
-							nodeID:        s.nodeID,
-							queue:         s.queue,
-							queueMax:      atomic.LoadInt32(&s.queueMax),
-							clientDropped: atomic.LoadInt64(&s.clientDropped),
-							clientSent:    atomic.LoadInt64(&s.clientSent),
-							clientRecv:    atomic.LoadInt64(&s.clientRecv),
-							serverSent:    atomic.LoadInt64(&s.serverSent),
-							serverRecv:    atomic.LoadInt64(&s.serverRecv),
-						}
-						fmt.Fprintf(&buf, "  %3d: %6d %6d %10d %11.1f %11.1f %11.1f %11.1f\n",
-							cur.nodeID, cur.queue, cur.queueMax, cur.clientDropped,
-							float64(cur.clientSent-last.clientSent)/elapsed,
-							float64(cur.clientRecv-last.clientRecv)/elapsed,
-							float64(cur.serverSent-last.serverSent)/elapsed,
-							float64(cur.serverRecv-last.serverRecv)/elapsed)
-						lastStats[s.nodeID] = cur
-					}
-					lastTime = now
-					log.Infof(ctx, "stats:\n%s", buf.String())
-				case <-t.stopper.ShouldQuiesce():
-					return
-				}
-			}
-		})
-	}
-
 	return t
 }
 
-func (t *RaftTransport) queuedMessageCount() int64 {
-	var n int64
-	addLength := func(k int64, v unsafe.Pointer) bool {
-		ch := *(*chan *kvserverpb.RaftMessageRequest)(v)
-		n += int64(len(ch))
-		return true
-	}
+// Metrics returns metrics tracking this transport.
+func (t *RaftTransport) Metrics() *RaftTransportMetrics {
+	return t.metrics
+}
+
+// visitQueues calls the visit callback on each outgoing messages sub-queue.
+func (t *RaftTransport) visitQueues(visit func(*raftSendQueue)) {
 	for class := range t.queues {
-		t.queues[class].Range(addLength)
+		t.queues[class].Range(func(k int64, v unsafe.Pointer) bool {
+			visit((*raftSendQueue)(v))
+			return true
+		})
 	}
-	return n
+}
+
+// queueMessageCount returns the total number of outgoing messages in the queue.
+func (t *RaftTransport) queueMessageCount() int64 {
+	var count int64
+	t.visitQueues(func(q *raftSendQueue) { count += int64(len(q.reqs)) })
+	return count
+}
+
+// queueByteSize returns the total bytes size of outgoing messages in the queue.
+func (t *RaftTransport) queueByteSize() int64 {
+	var size int64
+	t.visitQueues(func(q *raftSendQueue) { size += q.bytes.Load() })
+	return size
 }
 
 func (t *RaftTransport) getHandler(storeID roachpb.StoreID) (RaftMessageHandler, bool) {
@@ -322,12 +234,12 @@ func (t *RaftTransport) getHandler(storeID roachpb.StoreID) (RaftMessageHandler,
 // handleRaftRequest proxies a request to the listening server interface.
 func (t *RaftTransport) handleRaftRequest(
 	ctx context.Context, req *kvserverpb.RaftMessageRequest, respStream RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	handler, ok := t.getHandler(req.ToReplica.StoreID)
 	if !ok {
 		log.Warningf(ctx, "unable to accept Raft message from %+v: no handler registered for %+v",
 			req.FromReplica, req.ToReplica)
-		return roachpb.NewError(roachpb.NewStoreNotFoundError(req.ToReplica.StoreID))
+		return kvpb.NewError(kvpb.NewStoreNotFoundError(req.ToReplica.StoreID))
 	}
 
 	return handler.HandleRaftRequest(ctx, req, respStream)
@@ -336,7 +248,7 @@ func (t *RaftTransport) handleRaftRequest(
 // newRaftMessageResponse constructs a RaftMessageResponse from the
 // given request and error.
 func newRaftMessageResponse(
-	req *kvserverpb.RaftMessageRequest, pErr *roachpb.Error,
+	req *kvserverpb.RaftMessageRequest, pErr *kvpb.Error,
 ) *kvserverpb.RaftMessageResponse {
 	resp := &kvserverpb.RaftMessageResponse{
 		RangeID: req.RangeID,
@@ -348,18 +260,6 @@ func newRaftMessageResponse(
 		resp.Union.SetValue(pErr)
 	}
 	return resp
-}
-
-func (t *RaftTransport) getStats(
-	nodeID roachpb.NodeID, class rpc.ConnectionClass,
-) *raftTransportStats {
-	statsMap := &t.stats[class]
-	value, ok := statsMap.Load(int64(nodeID))
-	if !ok {
-		stats := &raftTransportStats{nodeID: nodeID}
-		value, _ = statsMap.LoadOrStore(int64(nodeID), unsafe.Pointer(stats))
-	}
-	return (*raftTransportStats)(value)
 }
 
 // RaftMessageBatch proxies the incoming requests to the listening server interface.
@@ -376,7 +276,6 @@ func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer
 			SpanOpt:  stop.ChildSpan,
 		}, func(ctx context.Context) {
 			errCh <- func() error {
-				var stats *raftTransportStats
 				stream := &lockedRaftMessageResponseStream{wrapped: stream}
 				for {
 					batch, err := stream.Recv()
@@ -387,31 +286,14 @@ func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer
 						continue
 					}
 
-					// This code always uses the DefaultClass. Class is primarily a
-					// client construct and the server has no way to determine which
-					// class an inbound connection holds on the client side. Because of
-					// this we associate all server receives and sends with the
-					// DefaultClass. This data is exclusively used to print a debug
-					// log message periodically. Using this policy may lead to a
-					// DefaultClass log line showing a high rate of server recv but
-					// a low rate of client sends if most of the traffic is due to
-					// system ranges.
-					//
-					// TODO(ajwerner): consider providing transport metadata to inform
-					// the server of the connection class or keep shared stats for all
-					// connection with a host.
-					if stats == nil {
-						stats = t.getStats(batch.Requests[0].FromReplica.NodeID, rpc.DefaultClass)
-					}
-
 					for i := range batch.Requests {
 						req := &batch.Requests[i]
-						atomic.AddInt64(&stats.serverRecv, 1)
+						t.metrics.MessagesRcvd.Inc(1)
 						if pErr := t.handleRaftRequest(ctx, req, stream); pErr != nil {
-							atomic.AddInt64(&stats.serverSent, 1)
 							if err := stream.Send(newRaftMessageResponse(req, pErr)); err != nil {
 								return err
 							}
+							t.metrics.ReverseSent.Inc(1)
 						}
 					}
 				}
@@ -432,107 +314,72 @@ func (t *RaftTransport) RaftMessageBatch(stream MultiRaft_RaftMessageBatchServer
 // the request to pass off to the sender store. Errors during the snapshots
 // process are sent back as a response.
 func (t *RaftTransport) DelegateRaftSnapshot(stream MultiRaft_DelegateRaftSnapshotServer) error {
-	errCh := make(chan error, 1)
-	taskCtx, cancel := t.stopper.WithCancelOnQuiesce(stream.Context())
-	remoteParent, err := tracing.ExtractSpanMetaFromGRPCCtx(taskCtx, t.Tracer)
-	if err != nil {
-		log.Warningf(taskCtx, "error extracting tracing info from gRPC: %s", err)
-	}
-	taskCtx, span := t.Tracer.StartSpanCtx(
-		taskCtx, tracing.BatchMethodName,
-		tracing.WithRemoteParentFromSpanMeta(remoteParent),
-		tracing.WithServerSpanKind,
-	)
+	ctx, cancel := t.stopper.WithCancelOnQuiesce(stream.Context())
 	defer cancel()
-	if err := t.stopper.RunAsyncTaskEx(
-		taskCtx,
-		stop.TaskOpts{
-			TaskName: "storage.RaftTransport: processing snapshot delegation",
-			SpanOpt:  stop.ChildSpan,
-		}, func(ctx context.Context) {
-			errCh <- func() error {
-				req, err := stream.Recv()
-				if err != nil {
-					return err
-				}
-				// Check to ensure the header is valid.
-				if req == nil {
-					return stream.Send(
-						&kvserverpb.DelegateSnapshotResponse{
-							SnapResponse: &kvserverpb.SnapshotResponse{
-								Status:  kvserverpb.SnapshotResponse_ERROR,
-								Message: "client error: no message in first delegated snapshot request",
-							},
-						},
-					)
-				}
-				// Get the handler of the sender store.
-				handler, ok := t.getHandler(req.DelegatedSender.StoreID)
-				if !ok {
-					log.Warningf(
-						ctx,
-						"unable to accept Raft message: %+v: no handler registered for"+
-							" the sender store"+" %+v",
-						req.CoordinatorReplica.StoreID,
-						req.DelegatedSender.StoreID,
-					)
-					return roachpb.NewStoreNotFoundError(req.DelegatedSender.StoreID)
-				}
+	req, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	resp := t.InternalDelegateRaftSnapshot(ctx, req.GetSend())
+	err = stream.Send(resp)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
-				// Pass off the snapshot request to the sender store.
-				return handler.HandleDelegatedSnapshot(ctx, req, stream, span)
-			}()
-		},
-	); err != nil {
-		return err
+// InternalDelegateRaftSnapshot processes requests in a request/response fashion for normal DelegateSnapshotRequests
+func (t *RaftTransport) InternalDelegateRaftSnapshot(
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
+	if req == nil {
+		err := errors.New("client error: no message in first delegated snapshot request")
+		return &kvserverpb.DelegateSnapshotResponse{
+			Status:       kvserverpb.DelegateSnapshotResponse_ERROR,
+			EncodedError: errors.EncodeError(context.Background(), err),
+		}
 	}
-	select {
-	case <-t.stopper.ShouldQuiesce():
-		return nil
-	case err := <-errCh:
-		return err
+	// Get the handler of the sender store.
+	handler, ok := t.getHandler(req.DelegatedSender.StoreID)
+	if !ok {
+		log.Warningf(
+			ctx,
+			"unable to accept Raft message: %+v: no handler registered for"+
+				" the sender store"+" %+v",
+			req.CoordinatorReplica.StoreID,
+			req.DelegatedSender.StoreID,
+		)
+		err := errors.New("unable to accept Raft message: no handler registered for the sender store")
+		return &kvserverpb.DelegateSnapshotResponse{
+			Status:       kvserverpb.DelegateSnapshotResponse_ERROR,
+			EncodedError: errors.EncodeError(context.Background(), err),
+		}
 	}
+
+	// Pass off the snapshot request to the sender store.
+	return handler.HandleDelegatedSnapshot(ctx, req)
 }
 
 // RaftSnapshot handles incoming streaming snapshot requests.
 func (t *RaftTransport) RaftSnapshot(stream MultiRaft_RaftSnapshotServer) error {
-	errCh := make(chan error, 1)
-	taskCtx, cancel := t.stopper.WithCancelOnQuiesce(stream.Context())
+	ctx, cancel := t.stopper.WithCancelOnQuiesce(stream.Context())
 	defer cancel()
-	if err := t.stopper.RunAsyncTaskEx(
-		taskCtx,
-		stop.TaskOpts{
-			TaskName: "storage.RaftTransport: processing snapshot reception",
-			SpanOpt:  stop.ChildSpan,
-		}, func(ctx context.Context) {
-			errCh <- func() error {
-				req, err := stream.Recv()
-				if err != nil {
-					return err
-				}
-				if req.Header == nil {
-					return stream.Send(&kvserverpb.SnapshotResponse{
-						Status:  kvserverpb.SnapshotResponse_ERROR,
-						Message: "client error: no header in first snapshot request message"})
-				}
-				rmr := req.Header.RaftMessageRequest
-				handler, ok := t.getHandler(rmr.ToReplica.StoreID)
-				if !ok {
-					log.Warningf(ctx, "unable to accept Raft message from %+v: no handler registered for %+v",
-						rmr.FromReplica, rmr.ToReplica)
-					return roachpb.NewStoreNotFoundError(rmr.ToReplica.StoreID)
-				}
-				return handler.HandleSnapshot(ctx, req.Header, stream)
-			}()
-		}); err != nil {
+	req, err := stream.Recv()
+	if err != nil {
 		return err
 	}
-	select {
-	case <-t.stopper.ShouldQuiesce():
-		return nil
-	case err := <-errCh:
-		return err
+	if req.Header == nil {
+		err := errors.New("client error: no header in first snapshot request message")
+		return stream.Send(snapRespErr(err))
 	}
+	rmr := req.Header.RaftMessageRequest
+	handler, ok := t.getHandler(rmr.ToReplica.StoreID)
+	if !ok {
+		log.Warningf(ctx, "unable to accept Raft message from %+v: no handler registered for %+v",
+			rmr.FromReplica, rmr.ToReplica)
+		return kvpb.NewStoreNotFoundError(rmr.ToReplica.StoreID)
+	}
+	return handler.HandleSnapshot(ctx, req.Header, stream)
 }
 
 // Listen registers a raftMessageHandler to receive proxied messages.
@@ -551,11 +398,7 @@ func (t *RaftTransport) Stop(storeID roachpb.StoreID) {
 // lost and a new instance of processQueue will be started by the next message
 // to be sent.
 func (t *RaftTransport) processQueue(
-	nodeID roachpb.NodeID,
-	ch chan *kvserverpb.RaftMessageRequest,
-	stats *raftTransportStats,
-	stream MultiRaft_RaftMessageBatchClient,
-	class rpc.ConnectionClass,
+	q *raftSendQueue, stream MultiRaft_RaftMessageBatchClient,
 ) error {
 	errCh := make(chan error, 1)
 
@@ -570,7 +413,7 @@ func (t *RaftTransport) processQueue(
 					if err != nil {
 						return err
 					}
-					atomic.AddInt64(&stats.clientRecv, 1)
+					t.metrics.ReverseRcvd.Inc(1)
 					handler, ok := t.getHandler(resp.ToReplica.StoreID)
 					if !ok {
 						log.Warningf(ctx, "no handler found for store %s in response %s",
@@ -599,15 +442,19 @@ func (t *RaftTransport) processQueue(
 			return nil
 		case err := <-errCh:
 			return err
-		case req := <-ch:
-			budget := targetRaftOutgoingBatchSize.Get(&t.st.SV) - int64(req.Size())
+		case req := <-q.reqs:
+			size := int64(req.Size())
+			q.bytes.Add(-size)
+			budget := targetRaftOutgoingBatchSize.Get(&t.st.SV) - size
 			batch.Requests = append(batch.Requests, *req)
 			releaseRaftMessageRequest(req)
 			// Pull off as many queued requests as possible, within reason.
 			for budget > 0 {
 				select {
-				case req = <-ch:
-					budget -= int64(req.Size())
+				case req = <-q.reqs:
+					size := int64(req.Size())
+					q.bytes.Add(-size)
+					budget -= size
 					batch.Requests = append(batch.Requests, *req)
 					releaseRaftMessageRequest(req)
 				default:
@@ -619,6 +466,7 @@ func (t *RaftTransport) processQueue(
 			if err != nil {
 				return err
 			}
+			t.metrics.MessagesSent.Inc(int64(len(batch.Requests)))
 
 			// Reuse the Requests slice, but zero out the contents to avoid delaying
 			// GC of memory referenced from within.
@@ -626,8 +474,6 @@ func (t *RaftTransport) processQueue(
 				batch.Requests[i] = kvserverpb.RaftMessageRequest{}
 			}
 			batch.Requests = batch.Requests[:0]
-
-			atomic.AddInt64(&stats.clientSent, 1)
 		}
 	}
 }
@@ -636,14 +482,14 @@ func (t *RaftTransport) processQueue(
 // indicating whether the queue already exists (true) or was created (false).
 func (t *RaftTransport) getQueue(
 	nodeID roachpb.NodeID, class rpc.ConnectionClass,
-) (chan *kvserverpb.RaftMessageRequest, bool) {
+) (*raftSendQueue, bool) {
 	queuesMap := &t.queues[class]
 	value, ok := queuesMap.Load(int64(nodeID))
 	if !ok {
-		ch := make(chan *kvserverpb.RaftMessageRequest, raftSendBufferSize)
-		value, ok = queuesMap.LoadOrStore(int64(nodeID), unsafe.Pointer(&ch))
+		q := raftSendQueue{reqs: make(chan *kvserverpb.RaftMessageRequest, raftSendBufferSize)}
+		value, ok = queuesMap.LoadOrStore(int64(nodeID), unsafe.Pointer(&q))
 	}
-	return *(*chan *kvserverpb.RaftMessageRequest)(value), ok
+	return (*raftSendQueue)(value), ok
 }
 
 // SendAsync sends a message to the recipient specified in the request. It
@@ -655,10 +501,10 @@ func (t *RaftTransport) SendAsync(
 	req *kvserverpb.RaftMessageRequest, class rpc.ConnectionClass,
 ) (sent bool) {
 	toNodeID := req.ToReplica.NodeID
-	stats := t.getStats(toNodeID, class)
 	defer func() {
 		if !sent {
-			atomic.AddInt64(&stats.clientDropped, 1)
+			t.metrics.MessagesDropped.Inc(1)
+			releaseRaftMessageRequest(req)
 		}
 	}()
 
@@ -675,24 +521,26 @@ func (t *RaftTransport) SendAsync(
 		return false
 	}
 
-	ch, existingQueue := t.getQueue(toNodeID, class)
+	q, existingQueue := t.getQueue(toNodeID, class)
 	if !existingQueue {
 		// Note that startProcessNewQueue is in charge of deleting the queue.
 		ctx := t.AnnotateCtx(context.Background())
-		if !t.startProcessNewQueue(ctx, toNodeID, class, stats) {
+		if !t.startProcessNewQueue(ctx, toNodeID, class) {
 			return false
 		}
 	}
 
+	// Note: computing the size of the request *before* sending it to the queue,
+	// because the receiver takes ownership of, and can modify it.
+	size := int64(req.Size())
 	select {
-	case ch <- req:
-		l := int32(len(ch))
-		if v := atomic.LoadInt32(&stats.queueMax); v < l {
-			atomic.CompareAndSwapInt32(&stats.queueMax, v, l)
-		}
+	case q.reqs <- req:
+		q.bytes.Add(size)
 		return true
 	default:
-		releaseRaftMessageRequest(req)
+		if logRaftSendQueueFullEvery.ShouldLog() {
+			log.Warningf(t.AnnotateCtx(context.Background()), "raft send queue to n%d is full", toNodeID)
+		}
 		return false
 	}
 }
@@ -707,12 +555,9 @@ func (t *RaftTransport) SendAsync(
 //
 // Returns whether the worker was started (the queue is deleted either way).
 func (t *RaftTransport) startProcessNewQueue(
-	ctx context.Context,
-	toNodeID roachpb.NodeID,
-	class rpc.ConnectionClass,
-	stats *raftTransportStats,
+	ctx context.Context, toNodeID roachpb.NodeID, class rpc.ConnectionClass,
 ) (started bool) {
-	cleanup := func(ch chan *kvserverpb.RaftMessageRequest) {
+	cleanup := func(q *raftSendQueue) {
 		// Account for the remainder of `ch` which was never sent.
 		// NB: we deleted the queue above, so within a short amount
 		// of time nobody should be writing into the channel any
@@ -721,19 +566,21 @@ func (t *RaftTransport) startProcessNewQueue(
 		// way the code is written).
 		for {
 			select {
-			case <-ch:
-				atomic.AddInt64(&stats.clientDropped, 1)
+			case req := <-q.reqs:
+				q.bytes.Add(-int64(req.Size()))
+				t.metrics.MessagesDropped.Inc(1)
+				releaseRaftMessageRequest(req)
 			default:
 				return
 			}
 		}
 	}
 	worker := func(ctx context.Context) {
-		ch, existingQueue := t.getQueue(toNodeID, class)
+		q, existingQueue := t.getQueue(toNodeID, class)
 		if !existingQueue {
 			log.Fatalf(ctx, "queue for n%d does not exist", toNodeID)
 		}
-		defer cleanup(ch)
+		defer cleanup(q)
 		defer t.queues[class].Delete(int64(toNodeID))
 		// NB: we dial without a breaker here because the caller has already
 		// checked the breaker. Checking it again can cause livelock, see:
@@ -754,11 +601,14 @@ func (t *RaftTransport) startProcessNewQueue(
 			return
 		}
 
-		if err := t.processQueue(toNodeID, ch, stats, stream, class); err != nil {
+		if err := t.processQueue(q, stream); err != nil {
 			log.Warningf(ctx, "while processing outgoing Raft queue to node %d: %s:", toNodeID, err)
 		}
 	}
-	err := t.stopper.RunAsyncTask(ctx, "storage.RaftTransport: sending messages", worker)
+	err := t.stopper.RunAsyncTask(ctx, "storage.RaftTransport: sending/receiving messages",
+		func(ctx context.Context) {
+			pprof.Do(ctx, pprof.Labels("remote_node_id", toNodeID.String()), worker)
+		})
 	if err != nil {
 		t.queues[class].Delete(int64(toNodeID))
 		return false
@@ -773,9 +623,9 @@ func (t *RaftTransport) SendSnapshot(
 	storePool *storepool.StorePool,
 	header kvserverpb.SnapshotRequest_Header,
 	snap *OutgoingSnapshot,
-	newBatch func() storage.Batch,
+	newWriteBatch func() storage.WriteBatch,
 	sent func(),
-	bytesSentCounter *metric.Counter,
+	recordBytesSent snapshotRecordMetrics,
 ) error {
 	nodeID := header.RaftMessageRequest.ToReplica.NodeID
 
@@ -794,30 +644,63 @@ func (t *RaftTransport) SendSnapshot(
 			log.Warningf(ctx, "failed to close snapshot stream: %+v", err)
 		}
 	}()
-	return sendSnapshot(ctx, t.st, stream, storePool, header, snap, newBatch, sent, bytesSentCounter)
+	return sendSnapshot(ctx, t.st, t.tracer, stream, storePool, header, snap, newWriteBatch, sent, recordBytesSent)
 }
 
-// DelegateSnapshot creates a rpc stream between the leaseholder and the
-// new designated sender for delegated snapshot requests.
+// DelegateSnapshot sends a DelegateSnapshotRequest to a remote store
+// and determines if it encountered any errors when sending the snapshot.
 func (t *RaftTransport) DelegateSnapshot(
-	ctx context.Context, req *kvserverpb.DelegateSnapshotRequest,
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
 ) error {
 	nodeID := req.DelegatedSender.NodeID
 	conn, err := t.dialer.Dial(ctx, nodeID, rpc.DefaultClass)
 	if err != nil {
-		return err
+		return errors.Mark(err, errMarkSnapshotError)
 	}
 	client := NewMultiRaftClient(conn)
 
 	// Creates a rpc stream between the leaseholder and sender.
 	stream, err := client.DelegateRaftSnapshot(ctx)
 	if err != nil {
-		return err
+		return errors.Mark(err, errMarkSnapshotError)
 	}
 	defer func() {
 		if err := stream.CloseSend(); err != nil {
-			log.Warningf(ctx, "failed to close snapshot stream: %+v", err)
+			log.Warningf(ctx, "failed to close delegate snapshot stream: %+v", err)
 		}
 	}()
-	return delegateSnapshot(ctx, stream, req)
+
+	// Send the request.
+	wrappedRequest := &kvserverpb.DelegateSnapshotRequest{Value: &kvserverpb.DelegateSnapshotRequest_Send{Send: req}}
+	if err := stream.Send(wrappedRequest); err != nil {
+		return errors.Mark(err, errMarkSnapshotError)
+	}
+	// Wait for response to see if the receiver successfully applied the snapshot.
+	resp, err := stream.Recv()
+	if err != nil {
+		return errors.Mark(
+			errors.Wrapf(err, "%v: remote failed to send snapshot", req), errMarkSnapshotError,
+		)
+	}
+
+	if len(resp.CollectedSpans) != 0 {
+		span := tracing.SpanFromContext(ctx)
+		if span == nil {
+			log.Warningf(ctx, "trying to ingest remote spans but there is no recording span set up")
+		} else {
+			span.ImportRemoteRecording(resp.CollectedSpans)
+		}
+	}
+
+	switch resp.Status {
+	case kvserverpb.DelegateSnapshotResponse_ERROR:
+		return errors.Mark(
+			errors.Wrapf(resp.Error(), "error sending couldn't accept %v", req), errMarkSnapshotError)
+	case kvserverpb.DelegateSnapshotResponse_APPLIED:
+		// This is the response we're expecting. Snapshot successfully applied.
+		log.VEventf(ctx, 2, "%s: delegated snapshot was successfully applied", resp)
+		return nil
+	default:
+		return err
+	}
 }

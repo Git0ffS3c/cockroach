@@ -10,7 +10,10 @@
 
 import React from "react";
 import { Button, Form, Input } from "antd";
-import { InputProps } from "antd/lib/input";
+import "antd/lib/button/style";
+import "antd/lib/form/style";
+import "antd/lib/input/style";
+import type { InputProps } from "antd/lib/input";
 import classNames from "classnames/bind";
 import { noop } from "lodash";
 import {
@@ -25,7 +28,7 @@ interface ISearchProps {
   onClear?: () => void;
   defaultValue?: string;
   placeholder?: string;
-  renderSuffix?: boolean;
+  suffix?: boolean;
 }
 
 interface ISearchState {
@@ -42,7 +45,6 @@ const cx = classNames.bind(styles);
 export class Search extends React.Component<TSearchProps, ISearchState> {
   static defaultProps: Partial<ISearchProps> = {
     placeholder: "Search Statements",
-    renderSuffix: true,
     onSubmit: noop,
     onChange: noop,
     onClear: noop,
@@ -83,7 +85,7 @@ export class Search extends React.Component<TSearchProps, ISearchState> {
   };
 
   renderSuffix = (): React.ReactElement => {
-    if (!this.props.renderSuffix) {
+    if (this.props.suffix === false) {
       return null;
     }
     const { value, submitted } = this.state;

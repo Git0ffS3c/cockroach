@@ -10,23 +10,14 @@
 
 import moment from "moment";
 import { TimeScale, TimeScaleOption, TimeScaleOptions } from "./timeScaleTypes";
+import { dateFormat, timeFormat } from "./timeScaleDropdown";
 
 /**
- * defaultTimeScaleOptions is a preconfigured set of time scales that can be
+ * timeScale1hMinOptions is a preconfigured set of time scales with 1h minimum that can be
  * selected by the user.
  */
-export const defaultTimeScaleOptions: TimeScaleOptions = {
-  "Past 10 Minutes": {
-    windowSize: moment.duration(10, "minutes"),
-    windowValid: moment.duration(10, "seconds"),
-    sampleSize: moment.duration(10, "seconds"),
-  },
-  "Past 30 Minutes": {
-    windowSize: moment.duration(30, "minutes"),
-    windowValid: moment.duration(30, "seconds"),
-    sampleSize: moment.duration(30, "seconds"),
-  },
-  "Past 1 Hour": {
+export const timeScale1hMinOptions: TimeScaleOptions = {
+  "Past Hour": {
     windowSize: moment.duration(1, "hour"),
     windowValid: moment.duration(1, "minute"),
     sampleSize: moment.duration(30, "seconds"),
@@ -36,7 +27,7 @@ export const defaultTimeScaleOptions: TimeScaleOptions = {
     windowValid: moment.duration(5, "minutes"),
     sampleSize: moment.duration(1, "minutes"),
   },
-  "Past 1 Day": {
+  "Past Day": {
     windowSize: moment.duration(1, "day"),
     windowValid: moment.duration(10, "minutes"),
     sampleSize: moment.duration(5, "minutes"),
@@ -73,25 +64,48 @@ export const defaultTimeScaleOptions: TimeScaleOptions = {
   },
 };
 
+/**
+ * defaultTimeScaleOptions is a preconfigured set of time scales that can be
+ * selected by the user.
+ */
+export const defaultTimeScaleOptions: TimeScaleOptions = {
+  "Past 10 Minutes": {
+    windowSize: moment.duration(10, "minutes"),
+    windowValid: moment.duration(10, "seconds"),
+    sampleSize: moment.duration(10, "seconds"),
+  },
+  "Past 30 Minutes": {
+    windowSize: moment.duration(30, "minutes"),
+    windowValid: moment.duration(30, "seconds"),
+    sampleSize: moment.duration(30, "seconds"),
+  },
+  ...timeScale1hMinOptions,
+};
+
 export const defaultTimeScaleSelected: TimeScale = {
-  ...defaultTimeScaleOptions["Past 1 Hour"],
-  key: "Past 1 Hour",
+  ...defaultTimeScaleOptions["Past Hour"],
+  key: "Past Hour",
   fixedWindowEnd: false,
 };
 
+// toDateRange returns the actual value of start and end date, based on
+// the timescale.
+// Since this value is used on componentDidUpdate, we don't want a refresh
+// to happen every millisecond, so we set the millisecond value to 0.
 export const toDateRange = (ts: TimeScale): [moment.Moment, moment.Moment] => {
-  const end = ts.fixedWindowEnd
+  const end = ts?.fixedWindowEnd
     ? moment.utc(ts.fixedWindowEnd)
     : moment().utc();
-  const start = moment.utc(end).subtract(ts.windowSize);
-  return [start, end];
+  const endRounded = end.set({ millisecond: 0 });
+  const start = moment.utc(endRounded).subtract(ts.windowSize);
+  return [start, endRounded];
 };
 
 // toRoundedDateRange round the TimeScale selected, with the start
-// rounded down and end rounded up one hour.
+// rounded down and end rounded up to the limit before the next hour.
 // e.g.
 // start: 17:45:23  ->  17:00:00
-// end:   20:14:32  ->  21:00:00
+// end:   20:14:32  ->  20:59:59
 export const toRoundedDateRange = (
   ts: TimeScale,
 ): [moment.Moment, moment.Moment] => {
@@ -99,7 +113,8 @@ export const toRoundedDateRange = (
   const startRounded = start.set({ minute: 0, second: 0, millisecond: 0 });
   const endRounded = end
     .set({ minute: 0, second: 0, millisecond: 0 })
-    .add(1, "hours");
+    .add(59, "minutes")
+    .add(59, "seconds");
 
   return [startRounded, endRounded];
 };
@@ -138,3 +153,53 @@ export const findClosestTimeScale = (
     ? data[0]
     : { ...data[0], key: "Custom" };
 };
+
+export const timeScaleToString = (ts: TimeScale): string => {
+  const [start, end] = toRoundedDateRange(ts);
+  const endDayIsToday = moment.utc(end).isSame(moment.utc(), "day");
+  const startEndOnSameDay = end.isSame(start, "day");
+  const omitDayFormat = endDayIsToday && startEndOnSameDay;
+  const dateStart = omitDayFormat ? "" : start.format(dateFormat);
+  const dateEnd =
+    omitDayFormat || startEndOnSameDay ? "" : end.format(dateFormat);
+  const timeStart = start.format(timeFormat);
+  const timeEnd = end.format(timeFormat);
+
+  return `${dateStart} ${timeStart} to ${dateEnd} ${timeEnd} (UTC)`;
+};
+
+/**
+ * Create a fixed TimeScale object from a date range.
+ * @param range date range containing start and end as moment objects
+ * @param options A map of time scale options, the computed timescale
+ * will have its properties match the time scale in this list for which
+ * it is the closest match.
+ * @returns new TimeScale object
+ */
+export const createTimeScaleFromDateRange = (
+  range: { start: moment.Moment; end: moment.Moment },
+  options = defaultTimeScaleOptions,
+): TimeScale => {
+  const { start, end } = range;
+  const seconds = end.diff(start, "seconds");
+  const timeScale: TimeScale = {
+    ...findClosestTimeScale(options, seconds),
+    windowSize: moment.duration(end.diff(start)),
+    fixedWindowEnd: end,
+    key: "Custom",
+  };
+
+  return timeScale;
+};
+
+export function timeScaleRangeToObj(ts: TimeScale): {
+  start?: moment.Moment;
+  end?: moment.Moment;
+} {
+  if (ts === null) return {};
+  const [startTime, endTime] = toDateRange(ts);
+  return {
+    start: startTime,
+    end: endTime,
+  };
+}

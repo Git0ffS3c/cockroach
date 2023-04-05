@@ -8,26 +8,31 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// Package rules contains rules to:
-//  - generate dependency edges for a graph which contains op edges,
-//  - mark certain op-edges as no-op.
+// Package common contains shared structures / helper functions
+// for implementing rules in the current and previous releases
+// of cockroach. Allowing old rules to cleanly forward fit
+// to newer versions via abstraction.
 package rules
 
 import (
 	"context"
+	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/rel"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"gopkg.in/yaml.v3"
 )
 
 // ApplyDepRules adds dependency edges to the graph according to the
 // registered dependency rules.
-func ApplyDepRules(g *scgraph.Graph) error {
-	for _, dr := range registry.depRules {
+func (r *Registry) ApplyDepRules(ctx context.Context, g *scgraph.Graph) error {
+	for _, dr := range r.depRules {
 		start := timeutil.Now()
 		var added int
 		if err := dr.q.Iterate(g.Database(), func(r rel.Result) error {
@@ -40,9 +45,15 @@ func ApplyDepRules(g *scgraph.Graph) error {
 		}); err != nil {
 			return errors.Wrapf(err, "applying dep rule %s", dr.name)
 		}
-		if log.V(2) {
+		// Applying the dep rules can be slow in some cases. Check for
+		// cancellation when applying the rules to ensure we don't spin for
+		// too long while the user is waiting for the task to exit cleanly.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if log.ExpensiveLogEnabled(ctx, 2) {
 			log.Infof(
-				context.TODO(), "applying dep rule %s %d took %v",
+				ctx, "applying dep rule %s %d took %v",
 				dr.name, added, timeutil.Since(start),
 			)
 		}
@@ -52,10 +63,10 @@ func ApplyDepRules(g *scgraph.Graph) error {
 
 // ApplyOpRules marks op edges as no-op in a shallow copy of the graph according
 // to the registered rules.
-func ApplyOpRules(g *scgraph.Graph) (*scgraph.Graph, error) {
+func (r *Registry) ApplyOpRules(ctx context.Context, g *scgraph.Graph) (*scgraph.Graph, error) {
 	db := g.Database()
 	m := make(map[*screl.Node][]scgraph.RuleName)
-	for _, rule := range registry.opRules {
+	for _, rule := range r.opRules {
 		var added int
 		start := timeutil.Now()
 		err := rule.q.Iterate(db, func(r rel.Result) error {
@@ -67,9 +78,9 @@ func ApplyOpRules(g *scgraph.Graph) (*scgraph.Graph, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "applying op rule %s", rule.name)
 		}
-		if log.V(2) {
+		if log.ExpensiveLogEnabled(ctx, 2) {
 			log.Infof(
-				context.TODO(), "applying op rule %s %d took %v",
+				ctx, "applying op rule %s %d took %v",
 				rule.name, added, timeutil.Since(start),
 			)
 		}
@@ -84,8 +95,32 @@ func ApplyOpRules(g *scgraph.Graph) (*scgraph.Graph, error) {
 	return ret, nil
 }
 
-// registry is a singleton which contains all the dep and op rules.
-var registry struct {
+func (r *Registry) MarshalDepRules() (string, error) {
+	s := append(([]registeredDepRule)(nil), r.depRules...)
+	sort.SliceStable(s, func(i, j int) bool {
+		return s[i].name < s[j].name
+	})
+	out, err := yaml.Marshal(s)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to marshal deprules")
+	}
+	return string(out), nil
+}
+
+func (r *Registry) MarshalOpRules() (string, error) {
+	s := append(([]registeredOpRule)(nil), r.opRules...)
+	sort.SliceStable(s, func(i, j int) bool {
+		return s[i].name < s[j].name
+	})
+	out, err := yaml.Marshal(s)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to marshal oprules")
+	}
+	return string(out), nil
+}
+
+// Registry contains all the dep and op rules.
+type Registry struct {
 	depRules []registeredDepRule
 	opRules  []registeredOpRule
 }
@@ -103,27 +138,185 @@ type registeredOpRule struct {
 	q    *rel.Query
 }
 
-// registerDepRule registers a rule from which a set of dependency edges will
-// be derived in a graph.
-func registerDepRule(
-	rn scgraph.RuleName, edgeKind scgraph.DepEdgeKind, from, to rel.Var, query *rel.Query,
+func NewRegistry() *Registry {
+	return &Registry{}
+}
+
+// RegisterDepRule registers a rule from which a set of dependency edges will
+// be derived in a graph. The edge will be formed from the Node containing
+// the fromEl entity to the Node containing the toEl entity.
+func (r *Registry) RegisterDepRule(
+	ruleName scgraph.RuleName,
+	kind scgraph.DepEdgeKind,
+	fromEl, toEl string,
+	def func(from, to NodeVars) rel.Clauses,
 ) {
-	registry.depRules = append(registry.depRules, registeredDepRule{
-		name: rn,
-		kind: edgeKind,
-		from: from,
-		to:   to,
-		q:    query,
+	from, to := MkNodeVars(fromEl), MkNodeVars(toEl)
+	c := def(from, to)
+	c = append(c, from.JoinTargetNode(), to.JoinTargetNode())
+	r.depRules = append(r.depRules, registeredDepRule{
+		name: ruleName,
+		kind: kind,
+		from: from.Node,
+		to:   to.Node,
+		q:    screl.MustQuery(c...),
 	})
 }
 
-// registerOpRule adds a graph q that will label as no-op the op edge originating
-// from this node. There can only be one such edge per node, as per the edge
+// RegisterOpRule adds a graph q that will label as no-op the op edge originating
+// from this Node. There can only be one such edge per Node, as per the edge
 // definitions in opgen.
-func registerOpRule(rn scgraph.RuleName, from rel.Var, q *rel.Query) {
-	registry.opRules = append(registry.opRules, registeredOpRule{
+func (r *Registry) RegisterOpRule(rn scgraph.RuleName, from rel.Var, q *rel.Query) {
+	r.opRules = append(r.opRules, registeredOpRule{
 		name: rn,
 		from: from,
 		q:    q,
 	})
+}
+
+// NodeVars represents three variables intended to refer to
+// related element, Target, and Node entities.
+type NodeVars struct {
+	El, Target, Node rel.Var
+}
+
+func (v NodeVars) JoinTargetNode() rel.Clause {
+	return screl.JoinTargetNode(v.El, v.Target, v.Node)
+}
+
+func (v NodeVars) CurrentStatus(status ...scpb.Status) rel.Clause {
+	if len(status) == 0 {
+		panic(errors.AssertionFailedf("empty current status values"))
+	}
+	if len(status) == 1 {
+		return v.Node.AttrEq(screl.CurrentStatus, status[0])
+	}
+	in := make([]interface{}, len(status))
+	for i, s := range status {
+		in[i] = s
+	}
+	return v.Node.AttrIn(screl.CurrentStatus, in...)
+}
+
+func (v NodeVars) JoinTarget() rel.Clause {
+	return screl.JoinTarget(v.El, v.Target)
+}
+
+func (v NodeVars) TargetStatus(status ...scpb.TargetStatus) rel.Clause {
+	if len(status) == 0 {
+		panic(errors.AssertionFailedf("empty current status values"))
+	}
+	if len(status) == 1 {
+		return v.Target.AttrEq(screl.TargetStatus, status[0].Status())
+	}
+	in := make([]interface{}, len(status))
+	for i, s := range status {
+		in[i] = s.Status()
+	}
+	return v.Target.AttrIn(screl.TargetStatus, in...)
+}
+
+// Type delegates to the element var Type method.
+func (v NodeVars) Type(valuesForTypeOf ...interface{}) rel.Clause {
+	if len(valuesForTypeOf) == 0 {
+		panic(errors.AssertionFailedf("empty type list for %q", v.El))
+	}
+	return v.El.Type(valuesForTypeOf[0], valuesForTypeOf[1:]...)
+}
+
+// TypeFilter returns a Type clause which binds the element var to elements of
+// a specific type, filtered by the conjunction of all provided predicates.
+func (v NodeVars) TypeFilter(
+	version clusterversion.Key, predicatesForTypeOf ...func(element scpb.Element) bool,
+) rel.Clause {
+	if len(predicatesForTypeOf) == 0 {
+		panic(errors.AssertionFailedf("empty type predicate for %q", v.El))
+	}
+	cv := clusterversion.ClusterVersion{Version: clusterversion.ByKey(version)}
+	var valuesForTypeOf []interface{}
+	_ = ForEachElementInActiveVersion(cv, func(e scpb.Element) error {
+		for _, p := range predicatesForTypeOf {
+			if !p(e) {
+				return nil
+			}
+		}
+		valuesForTypeOf = append(valuesForTypeOf, e)
+		return nil
+	})
+	return v.Type(valuesForTypeOf...)
+}
+
+// DescIDEq defines a clause which will bind idVar to the DescID of the
+// v's element.
+func (v NodeVars) DescIDEq(idVar rel.Var) rel.Clause {
+	return v.El.AttrEqVar(screl.DescID, idVar)
+}
+
+// ReferencedTypeDescIDsContain defines a clause which will bind containedIDVar
+// to a descriptor ID contained in v's element's referenced type IDs.
+func (v NodeVars) ReferencedTypeDescIDsContain(containedIDVar rel.Var) rel.Clause {
+	return v.El.AttrContainsVar(screl.ReferencedTypeIDs, containedIDVar)
+}
+
+// ReferencedSequenceIDsContains defines a clause which will bind
+// containedIDVar to a descriptor ID contained in v's element's referenced
+// sequence IDs.
+func (v NodeVars) ReferencedSequenceIDsContains(containedIDVar rel.Var) rel.Clause {
+	return v.El.AttrContainsVar(screl.ReferencedSequenceIDs, containedIDVar)
+}
+
+// ReferencedFunctionIDsContains defines a clause which will bind
+// containedIDVar to a descriptor ID contained in v's element's referenced
+// function IDs.
+func (v NodeVars) ReferencedFunctionIDsContains(containedIDVar rel.Var) rel.Clause {
+	return v.El.AttrContainsVar(screl.ReferencedFunctionIDs, containedIDVar)
+}
+
+func MkNodeVars(elStr string) NodeVars {
+	el := rel.Var(elStr)
+	return NodeVars{
+		El:     el,
+		Target: el + "-Target",
+		Node:   el + "-Node",
+	}
+}
+
+func (r registeredDepRule) MarshalYAML() (interface{}, error) {
+	var query yaml.Node
+	if err := query.Encode(r.q.Clauses()); err != nil {
+		return nil, err
+	}
+	return &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Value: "name"},
+			{Kind: yaml.ScalarNode, Value: string(r.name)},
+			{Kind: yaml.ScalarNode, Value: "from"},
+			{Kind: yaml.ScalarNode, Value: string(r.from)},
+			{Kind: yaml.ScalarNode, Value: "kind"},
+			{Kind: yaml.ScalarNode, Value: r.kind.String()},
+			{Kind: yaml.ScalarNode, Value: "to"},
+			{Kind: yaml.ScalarNode, Value: string(r.to)},
+			{Kind: yaml.ScalarNode, Value: "query"},
+			&query,
+		},
+	}, nil
+}
+
+func (r registeredOpRule) MarshalYAML() (interface{}, error) {
+	var query yaml.Node
+	if err := query.Encode(r.q.Clauses()); err != nil {
+		return nil, err
+	}
+	return &yaml.Node{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Value: "name"},
+			{Kind: yaml.ScalarNode, Value: string(r.name)},
+			{Kind: yaml.ScalarNode, Value: "from"},
+			{Kind: yaml.ScalarNode, Value: string(r.from)},
+			{Kind: yaml.ScalarNode, Value: "query"},
+			&query,
+		},
+	}, nil
 }

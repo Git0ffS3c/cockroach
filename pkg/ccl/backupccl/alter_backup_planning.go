@@ -14,13 +14,35 @@ import (
 	"path"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupdest"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backupencryption"
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/exprutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
+
+func alterBackupTypeCheck(
+	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
+) (ok bool, _ colinfo.ResultColumns, _ error) {
+	alterBackupStmt, ok := stmt.(*tree.AlterBackup)
+	if !ok {
+		return false, nil, nil
+	}
+	if err := exprutil.TypeCheck(
+		ctx, "ALTER BACKUP", p.SemaCtx(),
+		exprutil.Strings{
+			alterBackupStmt.Backup,
+			alterBackupStmt.Subdir,
+		},
+	); err != nil {
+		return false, nil, err
+	}
+	return true, nil, nil
+}
 
 func alterBackupPlanHook(
 	ctx context.Context, stmt tree.Statement, p sql.PlanHookState,
@@ -39,30 +61,31 @@ func alterBackupPlanHook(
 		return nil, nil, nil, false, err
 	}
 
-	fromFn, err := p.TypeAsString(ctx, alterBackupStmt.Backup, "ALTER BACKUP")
+	exprEval := p.ExprEvaluator("ALTER BACKUP")
+	backup, err := exprEval.String(ctx, alterBackupStmt.Backup)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
 
-	subdirFn := func() (string, error) { return "", nil }
+	var subdir string
 	if alterBackupStmt.Subdir != nil {
-		subdirFn, err = p.TypeAsString(ctx, alterBackupStmt.Subdir, "ALTER BACKUP")
+		subdir, err = exprEval.String(ctx, alterBackupStmt.Subdir)
 		if err != nil {
 			return nil, nil, nil, false, err
 		}
 	}
 
-	var newKmsFn func() ([]string, error)
-	var oldKmsFn func() ([]string, error)
+	var newKms []string
+	var oldKms []string
 
 	for _, cmd := range alterBackupStmt.Cmds {
 		switch v := cmd.(type) {
 		case *tree.AlterBackupKMS:
-			newKmsFn, err = p.TypeAsStringArray(ctx, tree.Exprs(v.KMSInfo.NewKMSURI), "ALTER BACKUP")
+			newKms, err = exprEval.StringArray(ctx, tree.Exprs(v.KMSInfo.NewKMSURI))
 			if err != nil {
 				return nil, nil, nil, false, err
 			}
-			oldKmsFn, err = p.TypeAsStringArray(ctx, tree.Exprs(v.KMSInfo.OldKMSURI), "ALTER BACKUP")
+			oldKms, err = exprEval.StringArray(ctx, tree.Exprs(v.KMSInfo.OldKMSURI))
 			if err != nil {
 				return nil, nil, nil, false, err
 			}
@@ -70,20 +93,11 @@ func alterBackupPlanHook(
 	}
 
 	fn := func(ctx context.Context, _ []sql.PlanNode, resultsCh chan<- tree.Datums) error {
-		backup, err := fromFn()
-		if err != nil {
-			return err
-		}
-
-		subdir, err := subdirFn()
-		if err != nil {
-			return err
-		}
 
 		if subdir != "" {
 			if strings.EqualFold(subdir, "LATEST") {
 				// set subdir to content of latest file
-				latest, err := readLatestFile(ctx, backup, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, p.User())
+				latest, err := backupdest.ReadLatestFile(ctx, backup, p.ExecCfg().DistSQLSrv.ExternalStorageFromURI, p.User())
 				if err != nil {
 					return err
 				}
@@ -103,18 +117,6 @@ func alterBackupPlanHook(
 			if backup, err = appendPaths(backup, subdir); err != nil {
 				return err
 			}
-		}
-
-		var newKms []string
-		newKms, err = newKmsFn()
-		if err != nil {
-			return err
-		}
-
-		var oldKms []string
-		oldKms, err = oldKmsFn()
-		if err != nil {
-			return err
 		}
 
 		return doAlterBackupPlan(ctx, alterBackupStmt, p, backup, newKms, oldKms)
@@ -141,12 +143,15 @@ func doAlterBackupPlan(
 	}
 	defer baseStore.Close()
 
-	opts, err := readEncryptionOptions(ctx, baseStore)
+	opts, err := backupencryption.ReadEncryptionOptions(ctx, baseStore)
 	if err != nil {
 		return err
 	}
 
 	ioConf := baseStore.ExternalIOConf()
+	kmsEnv := backupencryption.MakeBackupKMSEnv(
+		baseStore.Settings(), &ioConf, p.ExecCfg().InternalDB, p.User(),
+	)
 
 	// Check that at least one of the old keys has been used to encrypt the backup in the past.
 	// Use the first one that works to decrypt the ENCRYPTION-INFO file(s).
@@ -154,11 +159,9 @@ func doAlterBackupPlan(
 	oldKMSFound := false
 	for _, old := range oldKms {
 		for _, encFile := range opts {
-			defaultKMSInfo, err = validateKMSURIsAgainstFullBackup([]string{old},
-				newEncryptedDataKeyMapFromProtoMap(encFile.EncryptedDataKeyByKMSMasterKeyID), &backupKMSEnv{
-					baseStore.Settings(),
-					&ioConf,
-				})
+			defaultKMSInfo, err = backupencryption.ValidateKMSURIsAgainstFullBackup(ctx, []string{old},
+				backupencryption.NewEncryptedDataKeyMapFromProtoMap(encFile.EncryptedDataKeyByKMSMasterKeyID),
+				&kmsEnv)
 
 			if err == nil {
 				oldKMSFound = true
@@ -179,40 +182,41 @@ func doAlterBackupPlan(
 
 	// Recover the encryption key using the old key, so we can encrypt it again with the new keys.
 	var plaintextDataKey []byte
-	plaintextDataKey, err = getEncryptionKey(ctx, encryption, baseStore.Settings(),
-		baseStore.ExternalIOConf())
+	plaintextDataKey, err = backupencryption.GetEncryptionKey(ctx, encryption, &kmsEnv)
 	if err != nil {
 		return err
 	}
 
-	kmsEnv := &backupKMSEnv{settings: p.ExecCfg().Settings, conf: &p.ExecCfg().ExternalIODirConfig}
-
-	encryptedDataKeyByKMSMasterKeyID := newEncryptedDataKeyMap()
+	encryptedDataKeyByKMSMasterKeyID := backupencryption.NewEncryptedDataKeyMap()
 
 	// Add each new key user wants to add to a new data key map.
 	for _, kmsURI := range newKms {
-		masterKeyID, encryptedDataKey, err := getEncryptedDataKeyFromURI(ctx,
-			plaintextDataKey, kmsURI, kmsEnv)
+		masterKeyID, encryptedDataKey, err := backupencryption.GetEncryptedDataKeyFromURI(ctx,
+			plaintextDataKey, kmsURI, &kmsEnv)
 		if err != nil {
 			return errors.Wrap(err, "failed to encrypt data key when adding new KMS")
 		}
 
-		encryptedDataKeyByKMSMasterKeyID.addEncryptedDataKey(plaintextMasterKeyID(masterKeyID),
+		encryptedDataKeyByKMSMasterKeyID.AddEncryptedDataKey(backupencryption.PlaintextMasterKeyID(masterKeyID),
 			encryptedDataKey)
 	}
 
 	encryptedDataKeyMapForProto := make(map[string][]byte)
-	encryptedDataKeyByKMSMasterKeyID.rangeOverMap(
-		func(masterKeyID hashedMasterKeyID, dataKey []byte) {
+	encryptedDataKeyByKMSMasterKeyID.RangeOverMap(
+		func(masterKeyID backupencryption.HashedMasterKeyID, dataKey []byte) {
 			encryptedDataKeyMapForProto[string(masterKeyID)] = dataKey
 		})
 
 	encryptionInfo := &jobspb.EncryptionInfo{EncryptedDataKeyByKMSMasterKeyID: encryptedDataKeyMapForProto}
 
 	// Write the new ENCRYPTION-INFO file.
-	return writeNewEncryptionInfoToBackup(ctx, encryptionInfo, baseStore, len(opts))
+	return backupencryption.WriteNewEncryptionInfoToBackup(ctx, encryptionInfo, baseStore, len(opts))
 }
 
 func init() {
-	sql.AddPlanHook("alter backup", alterBackupPlanHook)
+	sql.AddPlanHook(
+		"alter backup",
+		alterBackupPlanHook,
+		alterBackupTypeCheck,
+	)
 }

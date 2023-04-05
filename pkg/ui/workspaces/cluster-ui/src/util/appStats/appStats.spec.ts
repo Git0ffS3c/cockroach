@@ -22,11 +22,9 @@ import {
 } from "./appStats";
 import IExplainTreePlanNode = protos.cockroach.sql.IExplainTreePlanNode;
 import ISensitiveInfo = protos.cockroach.sql.ISensitiveInfo;
-import { random } from "d3";
-import { exec } from "child_process";
 
 // record is implemented here so we can write the below test as a direct
-// analog of the one in pkg/roachpb/app_stats_test.go.  It's here rather
+// analog of the one in pkg/sql/appstatspb/app_stats_test.go.  It's here rather
 // than in the main source file because we don't actually need it for the
 // application to use.
 function record(l: NumericStat, count: number, val: number) {
@@ -160,7 +158,7 @@ describe("flattenStatementStats", () => {
         key: {
           key_data: {
             query:
-              "INSERT INTO system.public.lease(\"descID\", version, \"nodeID\", expiration) VALUES ('1232', '111', __more2__)",
+              "INSERT INTO system.public.lease(\"descID\", version, \"nodeID\", expiration) VALUES ('1232', '111', __more1_10__)",
             query_summary:
               'INSERT INTO system.public.lease("descID", versi...)',
             app: "test_summary",
@@ -231,7 +229,7 @@ function randomStat(scale = 1): NumericStat {
   };
 }
 
-function randomExecStats(count = 10): Required<ExecStats> {
+function randomExecStats(count = 10): ExecStats {
   return {
     count: Long.fromNumber(randomInt(count)),
     network_bytes: randomStat(),
@@ -239,6 +237,7 @@ function randomExecStats(count = 10): Required<ExecStats> {
     contention_time: randomStat(),
     network_messages: randomStat(),
     max_disk_usage: randomStat(),
+    cpu_sql_nanos: randomStat(),
   };
 }
 
@@ -256,6 +255,7 @@ function randomStats(
     first_attempt_count: Long.fromNumber(first_attempt_count),
     max_retries: Long.fromNumber(max_retries),
     num_rows: randomStat(100),
+    idle_lat: randomStat(),
     parse_lat: randomStat(),
     plan_lat: randomStat(),
     run_lat: randomStat(),
@@ -274,7 +274,18 @@ function randomStats(
       nanos: 111613000,
     },
     nodes: [Long.fromInt(1), Long.fromInt(3), Long.fromInt(4)],
+    regions: ["gcp-us-east1"],
     plan_gists: ["Ais="],
+    index_recommendations: [""],
+    indexes: ["123@456"],
+    latency_info: {
+      min: 0.01,
+      max: 1.2,
+      p50: 0.4,
+      p90: 0.7,
+      p99: 1.1,
+    },
+    last_error_code: "",
   };
 }
 

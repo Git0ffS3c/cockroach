@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -55,7 +56,7 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 	}()
 
 	execCtx := execCtxI.(sql.JobExecContext)
-	if !execCtx.ExecCfg().LogicalClusterID().Equal(r.job.Payload().CreationClusterID) {
+	if !execCtx.ExecCfg().NodeInfo.LogicalClusterID().Equal(r.job.Payload().CreationClusterID) {
 		// When restoring a cluster, we don't want to end up with two instances of
 		// the singleton reconciliation job.
 		//
@@ -63,7 +64,7 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 		// ID; comparing cluster IDs during restore doesn't help when we're
 		// restoring into the same cluster the backup was run from.
 		log.Infof(ctx, "duplicate restored job (source-cluster-id=%s, dest-cluster-id=%s); exiting",
-			r.job.Payload().CreationClusterID, execCtx.ExecCfg().LogicalClusterID())
+			r.job.Payload().CreationClusterID, execCtx.ExecCfg().NodeInfo.LogicalClusterID())
 		return nil
 	}
 
@@ -74,6 +75,21 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 	// safe to wind the SQL pod down whenever it's running -- something we
 	// indicate through the job's idle status.
 	r.job.MarkIdle(true)
+
+	// If the Job's NumRuns is greater than 1, reset it to 0 so that future
+	// resumptions are not delayed by the job system.
+	//
+	// Note that we are doing this before the possible error return below. If
+	// there is a problem starting the reconciler this job will aggressively
+	// restart at the job system level with no backoff.
+	if err := r.job.NoTxn().Update(ctx, func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+		if md.RunStats != nil && md.RunStats.NumRuns > 1 {
+			ju.UpdateRunStats(1, md.RunStats.LastRun)
+		}
+		return nil
+	}); err != nil {
+		log.Warningf(ctx, "failed to reset reconciliation job run stats: %v", err)
+	}
 
 	// Start the protected timestamp reconciler. This will periodically poll the
 	// protected timestamp table to cleanup stale records. We take advantage of
@@ -166,7 +182,7 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 			}
 
 			lastCheckpoint = rc.Checkpoint()
-			return r.job.SetProgress(ctx, nil, jobspb.AutoSpanConfigReconciliationProgress{
+			return r.job.NoTxn().SetProgress(ctx, jobspb.AutoSpanConfigReconciliationProgress{
 				Checkpoint: rc.Checkpoint(),
 			})
 		}); err != nil {
@@ -199,7 +215,7 @@ func (r *resumer) Resume(ctx context.Context, execCtxI interface{}) (jobErr erro
 }
 
 // OnFailOrCancel implements the jobs.Resumer interface.
-func (r *resumer) OnFailOrCancel(ctx context.Context, _ interface{}) error {
+func (r *resumer) OnFailOrCancel(ctx context.Context, _ interface{}, _ error) error {
 	if jobs.HasErrJobCanceled(errors.DecodeError(ctx, *r.job.Payload().FinalResumeError)) {
 		return errors.AssertionFailedf("span config reconciliation job cannot be canceled")
 	}
@@ -210,5 +226,8 @@ func init() {
 	jobs.RegisterConstructor(jobspb.TypeAutoSpanConfigReconciliation,
 		func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
 			return &resumer{job: job}
-		})
+		},
+		// Do not include the cost of span reconciliation in tenant accounting.
+		jobs.DisablesTenantCostControl,
+	)
 }

@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ssh"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
@@ -39,11 +38,15 @@ var (
 	destroyAllLocal       bool
 	extendLifetime        time.Duration
 	wipePreserveCerts     bool
+	grafanaConfig         string
+	grafanaurlOpen        bool
+	grafanaDumpDir        string
 	listDetails           bool
 	listJSON              bool
 	listMine              bool
 	listPattern           string
 	secure                = false
+	tenantName            string
 	extraSSHOptions       = ""
 	nodeEnv               []string
 	tag                   string
@@ -55,6 +58,7 @@ var (
 	useTreeDist           = true
 	sig                   = 9
 	waitFlag              = false
+	maxWait               = 0
 	createVMOpts          = vm.DefaultCreateOpts()
 	startOpts             = roachprod.DefaultStartOpts()
 	stageOS               string
@@ -65,14 +69,14 @@ var (
 	logsFrom              time.Time
 	logsTo                time.Time
 	logsInterval          time.Duration
+	volumeCreateOpts      vm.VolumeCreateOpts
+	listOpts              vm.ListOptions
 
 	monitorOpts        install.MonitorOpts
 	cachedHostsCluster string
 
 	// hostCluster is used for multi-tenant functionality.
 	hostCluster string
-
-	roachprodLibraryLogger *logger.Logger
 )
 
 func initFlags() {
@@ -102,8 +106,9 @@ func initFlags() {
 			vm.AllProviderNames()))
 	createCmd.Flags().BoolVar(&createVMOpts.GeoDistributed,
 		"geo", false, "Create geo-distributed cluster")
+	// N.B. We set "usage=roachprod" as the default, custom label for billing tracking.
 	createCmd.Flags().StringToStringVar(&createVMOpts.CustomLabels,
-		"label", make(map[string]string),
+		"label", map[string]string{"usage": "roachprod"},
 		"The label(s) to be used when creating new vm instances, must be in '--label name=value' format "+
 			"and value can't be empty string after trimming space, a value that has space must be quoted by single "+
 			"quotes, gce label name only allows hyphens (-), underscores (_), lowercase characters, numbers and "+
@@ -183,8 +188,17 @@ func initFlags() {
 		"encrypt", startOpts.EncryptedStores, "start nodes with encryption at rest turned on")
 	startCmd.Flags().BoolVar(&startOpts.SkipInit,
 		"skip-init", startOpts.SkipInit, "skip initializing the cluster")
+	startCmd.Flags().IntVar(&startOpts.InitTarget,
+		"init-target", startOpts.InitTarget, "node on which to run initialization")
 	startCmd.Flags().IntVar(&startOpts.StoreCount,
 		"store-count", startOpts.StoreCount, "number of stores to start each node with")
+	startCmd.Flags().BoolVar(&startOpts.ScheduleBackups,
+		"schedule-backups", startOpts.ScheduleBackups,
+		"create a cluster backup schedule once the cluster has started (by default, "+
+			"full backup hourly and incremental every 15 minutes)")
+	startCmd.Flags().StringVar(&startOpts.ScheduleBackupArgs, "schedule-backup-args", "",
+		`Recurrence and scheduled backup options specification.
+Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS first_run = 'now'"`)
 
 	startTenantCmd.Flags().StringVarP(&hostCluster,
 		"host-cluster", "H", "", "host cluster")
@@ -194,6 +208,9 @@ func initFlags() {
 
 	stopCmd.Flags().IntVar(&sig, "sig", sig, "signal to pass to kill")
 	stopCmd.Flags().BoolVar(&waitFlag, "wait", waitFlag, "wait for processes to exit")
+	stopCmd.Flags().IntVar(&maxWait, "max-wait", maxWait, "approx number of seconds to wait for processes to exit")
+
+	syncCmd.Flags().BoolVar(&listOpts.IncludeVolumes, "include-volumes", false, "Include volumes when syncing")
 
 	wipeCmd.Flags().BoolVar(&wipePreserveCerts, "preserve-certs", false, "do not wipe certificates")
 
@@ -229,6 +246,47 @@ func initFlags() {
 
 	cachedHostsCmd.Flags().StringVar(&cachedHostsCluster,
 		"cluster", "", "print hosts matching cluster")
+
+	grafanaStartCmd.Flags().StringVar(&grafanaConfig,
+		"grafana-config", "", "URI to grafana json config, supports local and http(s) schemes")
+
+	grafanaURLCmd.Flags().BoolVar(&grafanaurlOpen,
+		"open", false, "open the grafana dashboard url on the browser")
+
+	grafanaDumpCmd.Flags().StringVar(&grafanaDumpDir, "dump-dir", "",
+		"the absolute path to dump prometheus data to (use the contained 'prometheus-docker-run.sh' to visualize")
+
+	initCmd.Flags().IntVar(&startOpts.InitTarget,
+		"init-target", startOpts.InitTarget, "node on which to run initialization")
+
+	rootStorageCmd.AddCommand(rootStorageCollectionCmd)
+	rootStorageCollectionCmd.AddCommand(collectionStartCmd)
+	rootStorageCollectionCmd.AddCommand(collectionStopCmd)
+	rootStorageCollectionCmd.AddCommand(storageSnapshotCmd)
+	rootStorageCollectionCmd.AddCommand(collectionListVolumes)
+	collectionStartCmd.Flags().IntVarP(&volumeCreateOpts.Size,
+		"volume-size", "s", 10,
+		"the size of the volume in Gigabytes (GB) to create for each store. Note: This volume will be deleted "+
+			"once the VM is deleted.")
+
+	collectionStartCmd.Flags().BoolVar(&volumeCreateOpts.Encrypted,
+		"volume-encrypted", false,
+		"determines if the volume will be encrypted. Note: This volume will be deleted once the VM is deleted.")
+
+	collectionStartCmd.Flags().StringVar(&volumeCreateOpts.Architecture,
+		"volume-arch", "",
+		"the architecture the volume should target. This flag is only relevant for gcp or azure. It is ignored "+
+			"if supplied for other providers. Note: This volume will be deleted once the VM is deleted.")
+
+	collectionStartCmd.Flags().IntVarP(&volumeCreateOpts.IOPS,
+		"volume-iops", "i", 0,
+		"the iops to provision for the volume. Note: This volume will be deleted once the VM is deleted.")
+
+	collectionStartCmd.Flags().StringVarP(&volumeCreateOpts.Type,
+		"volume-type", "t", "",
+		"the volume type that should be created. Provide a volume type that is connected to"+
+			" the provider chosen for the cluster. If no volume type is provided the provider default will be used. "+
+			"Note: This volume will be deleted once the VM is deleted.")
 
 	for _, cmd := range []*cobra.Command{createCmd, destroyCmd, extendCmd, logsCmd} {
 		cmd.Flags().StringVarP(&username, "username", "u", os.Getenv("ROACHPROD_USER"),
@@ -267,8 +325,13 @@ func initFlags() {
 		cmd.Flags().StringVarP(&config.Binary,
 			"binary", "b", config.Binary, "the remote cockroach binary to use")
 	}
-	for _, cmd := range []*cobra.Command{startCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd} {
+	for _, cmd := range []*cobra.Command{startCmd, startTenantCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd} {
 		cmd.Flags().BoolVar(&secure,
 			"secure", false, "use a secure cluster")
 	}
+	for _, cmd := range []*cobra.Command{pgurlCmd, sqlCmd} {
+		cmd.Flags().StringVar(&tenantName,
+			"tenant-name", "", "specific tenant to connect to")
+	}
+
 }

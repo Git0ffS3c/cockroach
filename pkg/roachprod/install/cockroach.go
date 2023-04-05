@@ -26,7 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ssh"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -73,25 +74,6 @@ func cockroachNodeBinary(c *SyncedCluster, node Node) string {
 	return path
 }
 
-func getCockroachVersion(
-	ctx context.Context, c *SyncedCluster, node Node,
-) (*version.Version, error) {
-	sess, err := c.newSession(node)
-	if err != nil {
-		return nil, err
-	}
-	defer sess.Close()
-
-	cmd := cockroachNodeBinary(c, node) + " version"
-	out, err := sess.CombinedOutput(ctx, cmd+" --build-tag")
-	if err != nil {
-		return nil, errors.Wrapf(err, "~ %s --build-tag\n%s", cmd, out)
-	}
-
-	verString := strings.TrimSpace(string(out))
-	return version.Parse(verString)
-}
-
 func argExists(args []string, target string) int {
 	for i, arg := range args {
 		if arg == target || strings.HasPrefix(arg, target+"=") {
@@ -105,10 +87,22 @@ func argExists(args []string, target string) int {
 type StartOpts struct {
 	Target     StartTarget
 	Sequential bool
-	ExtraArgs  []string
+	// ExtraArgs are extra arguments used when starting the node. Multiple
+	// arguments should be passed as separate items in the slice. For example:
+	//   Instead of: []string{"--flag foo bar"}
+	//   Use:        []string{"--flag", "foo", "bar"}
+	ExtraArgs []string
+
+	// ScheduleBackups starts a backup schedule once the cluster starts
+	ScheduleBackups    bool
+	ScheduleBackupArgs string
 
 	// systemd limits on resources.
 	NumFilesLimit int64
+
+	// InitTarget is the node that Start will run Init on and the default node
+	// that will be used when constructing join arguments.
+	InitTarget int
 
 	// -- Options that apply only to StartDefault target --
 
@@ -117,9 +111,14 @@ type StartOpts struct {
 	EncryptedStores bool
 
 	// -- Options that apply only to StartTenantSQL target --
-	TenantID int
-	KVAddrs  string
+	TenantID  int
+	KVAddrs   string
+	KVCluster *SyncedCluster
 }
+
+// startSQLTimeout identifies the COCKROACH_CONNECT_TIMEOUT to use (in seconds)
+// for sql cmds within syncedCluster.Start().
+const startSQLTimeout = 1200
 
 // StartTarget identifies what flavor of cockroach we are starting.
 type StartTarget int
@@ -133,12 +132,23 @@ const (
 	StartTenantProxy
 )
 
+const defaultInitTarget = Node(1)
+
 func (st StartTarget) String() string {
 	return [...]string{
 		StartDefault:     "default",
 		StartTenantSQL:   "tenant SQL",
 		StartTenantProxy: "tenant proxy",
 	}[st]
+}
+
+// GetInitTarget returns the Node that should be used for
+// initialization operations.
+func (so StartOpts) GetInitTarget() Node {
+	if so.InitTarget == 0 {
+		return defaultInitTarget
+	}
+	return Node(so.InitTarget)
 }
 
 // Start the cockroach process on the cluster.
@@ -153,8 +163,15 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	if startOpts.Target == StartTenantProxy {
 		return fmt.Errorf("start tenant proxy not implemented")
 	}
-	if err := c.distributeCerts(ctx, l); err != nil {
-		return err
+	switch startOpts.Target {
+	case StartDefault:
+		if err := c.distributeCerts(ctx, l); err != nil {
+			return err
+		}
+	case StartTenantSQL:
+		if err := c.distributeTenantCerts(ctx, l, startOpts.KVCluster, startOpts.TenantID); err != nil {
+			return err
+		}
 	}
 
 	nodes := c.TargetNodes()
@@ -164,28 +181,27 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	}
 
 	l.Printf("%s: starting nodes", c.Name)
-	return c.Parallel(l, "", len(nodes), parallelism, func(nodeIdx int) ([]byte, error) {
-		node := nodes[nodeIdx]
-		vers, err := getCockroachVersion(ctx, c, node)
-		if err != nil {
-			return nil, err
-		}
 
+	// SSH retries are disabled by passing nil RunRetryOpts
+	if err := c.Parallel(l, "", len(nodes), parallelism, func(nodeIdx int) (*RunResultDetails, error) {
+		node := nodes[nodeIdx]
+		res := &RunResultDetails{Node: node}
 		// NB: if cockroach started successfully, we ignore the output as it is
 		// some harmless start messaging.
-		if _, err := c.startNode(ctx, l, node, startOpts, vers); err != nil {
-			return nil, err
+		if _, err := c.startNode(ctx, l, node, startOpts); err != nil {
+			res.Err = err
+			return res, err
 		}
 
 		// Code that follows applies only for regular nodes.
 		if startOpts.Target != StartDefault {
-			return nil, nil
+			return res, nil
 		}
 
 		// We reserve a few special operations (bootstrapping, and setting
-		// cluster settings) for node 1.
-		if node != 1 {
-			return nil, nil
+		// cluster settings) to the InitTarget.
+		if startOpts.GetInitTarget() != node {
+			return res, nil
 		}
 
 		// NB: The code blocks below are not parallelized, so it's safe for us
@@ -195,35 +211,32 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 		// 2. We don't init when invoking with `start-single-node`.
 
 		if startOpts.SkipInit {
-			return nil, nil
+			return res, nil
 		}
 
+		// For single node clusters, this can be skipped because during the c.StartNode call above,
+		// the `--start-single-node` flag will handle all of this for us.
 		shouldInit := !c.useStartSingleNode()
 		if shouldInit {
-			l.Printf("%s: initializing cluster", c.Name)
-			initOut, err := c.initializeCluster(ctx, node)
-			if err != nil {
-				return nil, errors.WithDetail(err, "unable to initialize cluster")
-			}
-
-			if initOut != "" {
-				l.Printf(initOut)
+			if err := c.initializeCluster(ctx, l, node); err != nil {
+				res.Err = err
+				return res, errors.Wrap(err, "failed to initialize cluster")
 			}
 		}
-
-		// We're sure to set cluster settings after having initialized the
-		// cluster.
-
-		l.Printf("%s: setting cluster settings", c.Name)
-		clusterSettingsOut, err := c.setClusterSettings(ctx, l, node)
-		if err != nil {
-			return nil, errors.Wrap(err, "unable to set cluster settings")
+		if err := c.setClusterSettings(ctx, l, node); err != nil {
+			res.Err = err
+			return res, errors.Wrap(err, "failed to set cluster settings")
 		}
-		if clusterSettingsOut != "" {
-			l.Printf(clusterSettingsOut)
-		}
-		return nil, nil
-	})
+		return res, nil
+	}, DefaultSSHRetryOpts); err != nil {
+		return err
+	}
+
+	// Only after a successful cluster initialization should we attempt to schedule backups.
+	if startOpts.ScheduleBackups && !startOpts.SkipInit && config.CockroachDevLicense != "" {
+		return c.createFixedBackupSchedule(ctx, l, startOpts.ScheduleBackupArgs)
+	}
+	return nil
 }
 
 // NodeDir returns the data directory for the given node and store.
@@ -254,7 +267,7 @@ func (c *SyncedCluster) CertsDir(node Node) string {
 }
 
 // NodeURL constructs a postgres URL.
-func (c *SyncedCluster) NodeURL(host string, port int) string {
+func (c *SyncedCluster) NodeURL(host string, port int, tenantName string) string {
 	var u url.URL
 	u.User = url.User("root")
 	u.Scheme = "postgres"
@@ -267,6 +280,9 @@ func (c *SyncedCluster) NodeURL(host string, port int) string {
 		v.Add("sslmode", "verify-full")
 	} else {
 		v.Add("sslmode", "disable")
+	}
+	if tenantName != "" {
+		v.Add("options", fmt.Sprintf("-ccluster=%s", tenantName))
 	}
 	u.RawQuery = v.Encode()
 	return "'" + u.String() + "'"
@@ -282,35 +298,30 @@ func (c *SyncedCluster) NodeUIPort(node Node) int {
 	return c.VMs[node-1].AdminUIPort
 }
 
-// SQL runs `cockroach sql`, which starts a SQL shell or runs a SQL command.
+// ExecOrInteractiveSQL ssh's onto a single node and executes `./ cockroach sql`
+// with the provided args, potentially opening an interactive session. Note
+// that the caller can pass the `--e` flag to execute sql cmds and exit the
+// session. See `./cockroch sql -h` for more options.
 //
-// In interactive mode, there must be exactly one node target (as per
-// TargetNodes).
-//
-// In non-interactive mode, a command specified via the `-e` flag is run against
-// all nodes.
-func (c *SyncedCluster) SQL(ctx context.Context, l *logger.Logger, args []string) error {
-	if len(args) == 0 || len(c.Nodes) == 1 {
-		// If no arguments, we're going to get an interactive SQL shell. Require
-		// exactly one target and ask SSH to provide a pseudoterminal.
-		if len(args) == 0 && len(c.Nodes) != 1 {
-			return fmt.Errorf("invalid number of nodes for interactive sql: %d", len(c.Nodes))
-		}
-		url := c.NodeURL("localhost", c.NodePort(c.Nodes[0]))
-		binary := cockroachNodeBinary(c, c.Nodes[0])
-		allArgs := []string{binary, "sql", "--url", url}
-		allArgs = append(allArgs, ssh.Escape(args))
-		return c.SSH(ctx, l, []string{"-t"}, allArgs)
+// CAUTION: this function should not be used by roachtest writers. Use ExecSQL below.
+func (c *SyncedCluster) ExecOrInteractiveSQL(
+	ctx context.Context, l *logger.Logger, tenantName string, args []string,
+) error {
+	if len(c.Nodes) != 1 {
+		return fmt.Errorf("invalid number of nodes for interactive sql: %d", len(c.Nodes))
 	}
-
-	// Otherwise, assume the user provided the "-e" flag, so we can reasonably
-	// execute the query on all specified nodes.
-	return c.RunSQL(ctx, l, args)
+	url := c.NodeURL("localhost", c.NodePort(c.Nodes[0]), tenantName)
+	binary := cockroachNodeBinary(c, c.Nodes[0])
+	allArgs := []string{binary, "sql", "--url", url}
+	allArgs = append(allArgs, ssh.Escape(args))
+	return c.SSH(ctx, l, []string{"-t"}, allArgs)
 }
 
-// RunSQL runs a `cockroach sql` command.
+// ExecSQL runs a `cockroach sql` .
 // It is assumed that the args include the -e flag.
-func (c *SyncedCluster) RunSQL(ctx context.Context, l *logger.Logger, args []string) error {
+func (c *SyncedCluster) ExecSQL(
+	ctx context.Context, l *logger.Logger, tenantName string, args []string,
+) error {
 	type result struct {
 		node   Node
 		output string
@@ -318,30 +329,30 @@ func (c *SyncedCluster) RunSQL(ctx context.Context, l *logger.Logger, args []str
 	resultChan := make(chan result, len(c.Nodes))
 
 	display := fmt.Sprintf("%s: executing sql", c.Name)
-	if err := c.Parallel(l, display, len(c.Nodes), 0, func(nodeIdx int) ([]byte, error) {
+	if err := c.Parallel(l, display, len(c.Nodes), 0, func(nodeIdx int) (*RunResultDetails, error) {
 		node := c.Nodes[nodeIdx]
-		sess, err := c.newSession(node)
-		if err != nil {
-			return nil, err
-		}
-		defer sess.Close()
 
 		var cmd string
 		if c.IsLocal() {
 			cmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
 		}
 		cmd += cockroachNodeBinary(c, node) + " sql --url " +
-			c.NodeURL("localhost", c.NodePort(node)) + " " +
+			c.NodeURL("localhost", c.NodePort(node), tenantName) + " " +
 			ssh.Escape(args)
 
-		out, err := sess.CombinedOutput(ctx, cmd)
-		if err != nil {
-			return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
-		}
+		sess := c.newSession(l, node, cmd, withDebugName("run-sql"))
+		defer sess.Close()
 
-		resultChan <- result{node: node, output: string(out)}
-		return nil, nil
-	}); err != nil {
+		out, cmdErr := sess.CombinedOutput(ctx)
+		res := newRunResultDetails(node, cmdErr)
+		res.CombinedOut = out
+
+		if res.Err != nil {
+			return res, errors.Wrapf(res.Err, "~ %s\n%s", cmd, res.CombinedOut)
+		}
+		resultChan <- result{node: node, output: string(res.CombinedOut)}
+		return res, nil
+	}, DefaultSSHRetryOpts); err != nil {
 		return err
 	}
 
@@ -360,27 +371,25 @@ func (c *SyncedCluster) RunSQL(ctx context.Context, l *logger.Logger, args []str
 }
 
 func (c *SyncedCluster) startNode(
-	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts, vers *version.Version,
+	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts,
 ) (string, error) {
-	startCmd, err := c.generateStartCmd(ctx, l, node, startOpts, vers)
+	startCmd, err := c.generateStartCmd(ctx, l, node, startOpts)
 	if err != nil {
 		return "", err
 	}
 
 	if err := func() error {
-		sess, err := c.newSession(node)
-		if err != nil {
-			return err
-		}
-		defer sess.Close()
-
-		sess.SetStdin(strings.NewReader(startCmd))
 		var cmd string
 		if c.IsLocal() {
 			cmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
 		}
 		cmd += `cat > cockroach.sh && chmod +x cockroach.sh`
-		if out, err := sess.CombinedOutput(ctx, cmd); err != nil {
+
+		sess := c.newSession(l, node, cmd)
+		defer sess.Close()
+
+		sess.SetStdin(strings.NewReader(startCmd))
+		if out, err := sess.CombinedOutput(ctx); err != nil {
 			return errors.Wrapf(err, "failed to upload start script: %s", out)
 		}
 
@@ -389,18 +398,16 @@ func (c *SyncedCluster) startNode(
 		return "", err
 	}
 
-	sess, err := c.newSession(node)
-	if err != nil {
-		return "", err
-	}
-	defer sess.Close()
-
 	var cmd string
 	if c.IsLocal() {
 		cmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
 	}
 	cmd += "./cockroach.sh"
-	out, err := sess.CombinedOutput(ctx, cmd)
+
+	sess := c.newSession(l, node, cmd)
+	defer sess.Close()
+
+	out, err := sess.CombinedOutput(ctx)
 	if err != nil {
 		return "", errors.Wrapf(err, "~ %s\n%s", cmd, out)
 	}
@@ -408,16 +415,20 @@ func (c *SyncedCluster) startNode(
 }
 
 func (c *SyncedCluster) generateStartCmd(
-	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts, vers *version.Version,
+	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts,
 ) (string, error) {
-	args, err := c.generateStartArgs(ctx, l, node, startOpts, vers)
+	args, err := c.generateStartArgs(ctx, l, node, startOpts)
+	if err != nil {
+		return "", err
+	}
+	keyCmd, err := c.generateKeyCmd(ctx, l, node, startOpts)
 	if err != nil {
 		return "", err
 	}
 
 	return execStartTemplate(startTemplateData{
 		LogDir: c.LogDir(node),
-		KeyCmd: c.generateKeyCmd(node, startOpts),
+		KeyCmd: keyCmd,
 		EnvVars: append(append([]string{
 			fmt.Sprintf("ROACHPROD=%s", c.roachprodEnvValue(node)),
 			"GOTRACEBACK=crash",
@@ -462,7 +473,7 @@ func execStartTemplate(data startTemplateData) (string, error) {
 // generateStartArgs generates cockroach binary arguments for starting a node.
 // The first argument is the command (e.g. "start").
 func (c *SyncedCluster) generateStartArgs(
-	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts, vers *version.Version,
+	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts,
 ) ([]string, error) {
 	var args []string
 
@@ -499,12 +510,8 @@ func (c *SyncedCluster) generateStartArgs(
 
 	// if neither --log nor --log-config-file are present
 	if idx1 == -1 && idx2 == -1 {
-		if vers.AtLeast(version.MustParse("v21.1.0-alpha.0")) {
-			// Specify exit-on-error=false to work around #62763.
-			args = append(args, "--log", `file-defaults: {dir: '`+logDir+`', exit-on-error: false}`)
-		} else {
-			args = append(args, `--log-dir`, logDir)
-		}
+		// Specify exit-on-error=false to work around #62763.
+		args = append(args, "--log", `file-defaults: {dir: '`+logDir+`', exit-on-error: false}`)
 	}
 
 	listenHost := ""
@@ -534,7 +541,8 @@ func (c *SyncedCluster) generateStartArgs(
 
 	// --join flags are unsupported/unnecessary in `cockroach start-single-node`.
 	if startOpts.Target == StartDefault && !c.useStartSingleNode() {
-		args = append(args, fmt.Sprintf("--join=%s:%d", c.Host(1), c.NodePort(1)))
+		initTarget := startOpts.GetInitTarget()
+		args = append(args, fmt.Sprintf("--join=%s:%d", c.Host(initTarget), c.NodePort(initTarget)))
 	}
 	if startOpts.Target == StartTenantSQL {
 		args = append(args, fmt.Sprintf("--kv-addrs=%s", startOpts.KVAddrs))
@@ -542,23 +550,25 @@ func (c *SyncedCluster) generateStartArgs(
 	}
 
 	if startOpts.Target == StartDefault {
-		args = append(args, c.generateStartFlagsKV(node, startOpts, vers)...)
+		args = append(args, c.generateStartFlagsKV(node, startOpts)...)
 	}
 
 	if startOpts.Target == StartDefault || startOpts.Target == StartTenantSQL {
-		args = append(args, c.generateStartFlagsSQL(node, startOpts, vers)...)
+		args = append(args, c.generateStartFlagsSQL()...)
 	}
+
+	args = append(args, startOpts.ExtraArgs...)
 
 	// Argument template expansion is node specific (e.g. for {store-dir}).
 	e := expander{
 		node: node,
 	}
-	for _, arg := range startOpts.ExtraArgs {
+	for i, arg := range args {
 		expandedArg, err := e.expand(ctx, l, c, arg)
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, strings.Split(expandedArg, " ")...)
+		args[i] = expandedArg
 	}
 
 	return args, nil
@@ -567,9 +577,7 @@ func (c *SyncedCluster) generateStartArgs(
 // generateStartFlagsKV generates `cockroach start` arguments that are relevant
 // for the KV and storage layers (and consequently are never used by
 // `cockroach mt start-sql`).
-func (c *SyncedCluster) generateStartFlagsKV(
-	node Node, startOpts StartOpts, vers *version.Version,
-) []string {
+func (c *SyncedCluster) generateStartFlagsKV(node Node, startOpts StartOpts) []string {
 	var args []string
 	var storeDirs []string
 	if idx := argExists(startOpts.ExtraArgs, "--store"); idx == -1 {
@@ -577,13 +585,21 @@ func (c *SyncedCluster) generateStartFlagsKV(
 			storeDir := c.NodeDir(node, i)
 			storeDirs = append(storeDirs, storeDir)
 			// Place a store{i} attribute on each store to allow for zone configs
-			// that use specific stores.
+			// that use specific stores. Note that `i` is 1 most of the time, since
+			// it's the i-th store on the *current* node. This isn't always useful,
+			// for example it doesn't let one single out a specific node. We add
+			// nodeX-flavor attributes for that.
 			args = append(args, `--store`,
-				`path=`+storeDir+`,attrs=`+fmt.Sprintf("store%d", i))
+				fmt.Sprintf(`path=%s,attrs=store%d:node%d:node%dstore%d`, storeDir, i, node, node, i))
 		}
-	} else {
+	} else if startOpts.ExtraArgs[idx] == "--store=" {
+		// The flag and path were provided together. Strip the flag prefix.
 		storeDir := strings.TrimPrefix(startOpts.ExtraArgs[idx], "--store=")
 		storeDirs = append(storeDirs, storeDir)
+	} else {
+		// Else, the store flag and path were specified as separate arguments. The
+		// path is the subsequent arg.
+		storeDirs = append(storeDirs, startOpts.ExtraArgs[idx+1])
 	}
 
 	if startOpts.EncryptedStores {
@@ -609,9 +625,7 @@ func (c *SyncedCluster) generateStartFlagsKV(
 // generateStartFlagsSQL generates `cockroach start` and `cockroach mt
 // start-sql` arguments that are relevant for the SQL layers, used by both KV
 // and storage layers (and in particular, are never used by `
-func (c *SyncedCluster) generateStartFlagsSQL(
-	node Node, startOpts StartOpts, vers *version.Version,
-) []string {
+func (c *SyncedCluster) generateStartFlagsSQL() []string {
 	var args []string
 	args = append(args, fmt.Sprintf("--max-sql-memory=%d%%", c.maybeScaleMem(25)))
 	return args
@@ -629,38 +643,39 @@ func (c *SyncedCluster) maybeScaleMem(val int) int {
 	return val
 }
 
-func (c *SyncedCluster) initializeCluster(ctx context.Context, node Node) (string, error) {
-	initCmd := c.generateInitCmd(node)
+func (c *SyncedCluster) initializeCluster(ctx context.Context, l *logger.Logger, node Node) error {
+	l.Printf("%s: initializing cluster\n", c.Name)
+	cmd := c.generateInitCmd(node)
 
-	sess, err := c.newSession(node)
-	if err != nil {
-		return "", err
-	}
+	sess := c.newSession(l, node, cmd, withDebugName("init-cluster"))
 	defer sess.Close()
 
-	out, err := sess.CombinedOutput(ctx, initCmd)
+	out, err := sess.CombinedOutput(ctx)
 	if err != nil {
-		return "", errors.Wrapf(err, "~ %s\n%s", initCmd, out)
+		return errors.Wrapf(err, "~ %s\n%s", cmd, out)
 	}
-	return strings.TrimSpace(string(out)), nil
+
+	if out := strings.TrimSpace(string(out)); out != "" {
+		l.Printf(out)
+	}
+	return nil
 }
 
-func (c *SyncedCluster) setClusterSettings(
-	ctx context.Context, l *logger.Logger, node Node,
-) (string, error) {
-	clusterSettingCmd := c.generateClusterSettingCmd(l, node)
+func (c *SyncedCluster) setClusterSettings(ctx context.Context, l *logger.Logger, node Node) error {
+	l.Printf("%s: setting cluster settings", c.Name)
+	cmd := c.generateClusterSettingCmd(l, node)
 
-	sess, err := c.newSession(node)
-	if err != nil {
-		return "", err
-	}
+	sess := c.newSession(l, node, cmd, withDebugName("set-cluster-settings"))
 	defer sess.Close()
 
-	out, err := sess.CombinedOutput(ctx, clusterSettingCmd)
+	out, err := sess.CombinedOutput(ctx)
 	if err != nil {
-		return "", errors.Wrapf(err, "~ %s\n%s", clusterSettingCmd, out)
+		return errors.Wrapf(err, "~ %s\n%s", cmd, out)
 	}
-	return strings.TrimSpace(string(out)), nil
+	if out := strings.TrimSpace(string(out)); out != "" {
+		l.Printf(out)
+	}
+	return nil
 }
 
 func (c *SyncedCluster) generateClusterSettingCmd(l *logger.Logger, node Node) string {
@@ -671,45 +686,47 @@ func (c *SyncedCluster) generateClusterSettingCmd(l *logger.Logger, node Node) s
 
 	var clusterSettingCmd string
 	if c.IsLocal() {
-		clusterSettingCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(1))
+		clusterSettingCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
 	}
 
 	binary := cockroachNodeBinary(c, node)
 	path := fmt.Sprintf("%s/%s", c.NodeDir(node, 1 /* storeIndex */), "settings-initialized")
-	url := c.NodeURL("localhost", c.NodePort(1))
+	url := c.NodeURL("localhost", c.NodePort(node), "" /* tenantName */)
 
 	// We ignore failures to set remote_debugging.mode, which was
 	// removed in v21.2.
 	clusterSettingCmd += fmt.Sprintf(`
 		if ! test -e %s ; then
-			COCKROACH_CONNECT_TIMEOUT=0 %s sql --url %s -e "SET CLUSTER SETTING server.remote_debugging.mode = 'any'" || true;
-			COCKROACH_CONNECT_TIMEOUT=0 %s sql --url %s -e "
+			COCKROACH_CONNECT_TIMEOUT=%d %s sql --url %s -e "SET CLUSTER SETTING server.remote_debugging.mode = 'any'" || true;
+			COCKROACH_CONNECT_TIMEOUT=%d %s sql --url %s -e "
 				SET CLUSTER SETTING cluster.organization = 'Cockroach Labs - Production Testing';
 				SET CLUSTER SETTING enterprise.license = '%s';" \
 			&& touch %s
-		fi`, path, binary, url, binary, url, config.CockroachDevLicense, path)
+		fi`, path, startSQLTimeout, binary, url, startSQLTimeout, binary, url, config.CockroachDevLicense, path)
 	return clusterSettingCmd
 }
 
 func (c *SyncedCluster) generateInitCmd(node Node) string {
 	var initCmd string
 	if c.IsLocal() {
-		initCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(1))
+		initCmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(node))
 	}
 
 	path := fmt.Sprintf("%s/%s", c.NodeDir(node, 1 /* storeIndex */), "cluster-bootstrapped")
-	url := c.NodeURL("localhost", c.NodePort(node))
+	url := c.NodeURL("localhost", c.NodePort(node), "" /* tenantName */)
 	binary := cockroachNodeBinary(c, node)
 	initCmd += fmt.Sprintf(`
 		if ! test -e %[1]s ; then
-			COCKROACH_CONNECT_TIMEOUT=0 %[2]s init --url %[3]s && touch %[1]s
-		fi`, path, binary, url)
+			COCKROACH_CONNECT_TIMEOUT=%[4]d %[2]s init --url %[3]s && touch %[1]s
+		fi`, path, binary, url, startSQLTimeout)
 	return initCmd
 }
 
-func (c *SyncedCluster) generateKeyCmd(node Node, startOpts StartOpts) string {
+func (c *SyncedCluster) generateKeyCmd(
+	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts,
+) (string, error) {
 	if !startOpts.EncryptedStores {
-		return ""
+		return "", nil
 	}
 
 	var storeDirs []string
@@ -718,9 +735,14 @@ func (c *SyncedCluster) generateKeyCmd(node Node, startOpts StartOpts) string {
 			storeDir := c.NodeDir(node, i)
 			storeDirs = append(storeDirs, storeDir)
 		}
-	} else {
+	} else if startOpts.ExtraArgs[storeArgIdx] == "--store=" {
+		// The flag and path were provided together. Strip the flag prefix.
 		storeDir := strings.TrimPrefix(startOpts.ExtraArgs[storeArgIdx], "--store=")
 		storeDirs = append(storeDirs, storeDir)
+	} else {
+		// Else, the store flag and path were specified as separate arguments. The
+		// path is the subsequent arg.
+		storeDirs = append(storeDirs, startOpts.ExtraArgs[storeArgIdx+1])
 	}
 
 	// Command to create the store key.
@@ -732,7 +754,13 @@ func (c *SyncedCluster) generateKeyCmd(node Node, startOpts StartOpts) string {
 				openssl rand -out %[1]s/aes-128.key 48;
 			fi;`, storeDir)
 	}
-	return keyCmd.String()
+
+	e := expander{node: node}
+	expanded, err := e.expand(ctx, l, c, keyCmd.String())
+	if err != nil {
+		return "", err
+	}
+	return expanded, nil
 }
 
 func (c *SyncedCluster) useStartSingleNode() bool {
@@ -750,6 +778,16 @@ func (c *SyncedCluster) distributeCerts(ctx context.Context, l *logger.Logger) e
 	return nil
 }
 
+// distributeCerts distributes certs if it's a secure cluster.
+func (c *SyncedCluster) distributeTenantCerts(
+	ctx context.Context, l *logger.Logger, hostCluster *SyncedCluster, tenantID int,
+) error {
+	if c.Secure {
+		return c.DistributeTenantCerts(ctx, l, hostCluster, tenantID)
+	}
+	return nil
+}
+
 func (c *SyncedCluster) shouldAdvertisePublicIP() bool {
 	// If we're creating nodes that span VPC (e.g. AWS multi-region or
 	// multi-cloud), we'll tell the nodes to advertise their public IPs
@@ -760,6 +798,58 @@ func (c *SyncedCluster) shouldAdvertisePublicIP() bool {
 		}
 	}
 	return false
+}
+
+// createFixedBackupSchedule creates a cluster backup schedule which, by
+// default, runs an incremental every 15 minutes and a full every hour. On
+// `roachprod create`, the user can provide a different recurrence using the
+// 'schedule-backup-args' flag. If roachprod is local, the backups get stored in
+// nodelocal, and otherwise in 'gs://cockroachdb-backup-testing'.
+// This cmd also ensures that only one schedule will be created for the cluster.
+func (c *SyncedCluster) createFixedBackupSchedule(
+	ctx context.Context, l *logger.Logger, scheduledBackupArgs string,
+) error {
+	externalStoragePath := `gs://cockroachdb-backup-testing`
+	for _, cloud := range c.Clouds() {
+		if !strings.Contains(cloud, gce.ProviderName) {
+			l.Printf(`no scheduled backup created as there exists a vm not on google cloud`)
+			return nil
+		}
+	}
+	l.Printf("%s: creating backup schedule", c.Name)
+	auth := "AUTH=implicit"
+	collectionPath := fmt.Sprintf(`%s/roachprod-scheduled-backups/%s/%v?%s`,
+		externalStoragePath, c.Name, timeutil.Now().UnixNano(), auth)
+
+	// Default scheduled backup runs a full backup every hour and an incremental
+	// every 15 minutes.
+	scheduleArgs := `RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS first_run = 'now'`
+	if scheduledBackupArgs != "" {
+		scheduleArgs = scheduledBackupArgs
+	}
+	createScheduleCmd := fmt.Sprintf(`CREATE SCHEDULE IF NOT EXISTS test_only_backup FOR BACKUP INTO '%s' %s`,
+		collectionPath, scheduleArgs)
+
+	node := c.Nodes[0]
+	binary := cockroachNodeBinary(c, node)
+	url := c.NodeURL("localhost", c.NodePort(node), "" /* tenantName */)
+	fullCmd := fmt.Sprintf(`COCKROACH_CONNECT_TIMEOUT=%d %s sql --url %s -e %q`,
+		startSQLTimeout, binary, url, createScheduleCmd)
+	// Instead of using `c.ExecSQL()`, use the more flexible c.newSession(), which allows us to
+	// 1) prefix the schedule backup cmd with COCKROACH_CONNECT_TIMEOUT.
+	// 2) run the command against the first node in the cluster target.
+	sess := c.newSession(l, node, fullCmd, withDebugName("init-backup-schedule"))
+	defer sess.Close()
+
+	out, err := sess.CombinedOutput(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "~ %s\n%s", fullCmd, out)
+	}
+
+	if out := strings.TrimSpace(string(out)); out != "" {
+		l.Printf(out)
+	}
+	return nil
 }
 
 // getEnvVars returns all COCKROACH_* environment variables, in the form

@@ -12,9 +12,7 @@ package jobs
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -25,14 +23,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
 func TestScheduleControl(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelper(t)
 	defer cleanup()
 
@@ -55,12 +55,14 @@ func TestScheduleControl(t *testing.T) {
 
 	var recurringNever string
 
+	schedules := ScheduledJobDB(th.cfg.DB)
 	makeSchedule := func(name string, cron string) int64 {
 		schedule := th.newScheduledJob(t, name, "sql")
 		if cron != "" {
 			require.NoError(t, schedule.SetSchedule(cron))
 		}
-		require.NoError(t, schedule.Create(ctx, th.cfg.InternalExecutor, nil))
+
+		require.NoError(t, schedules.Create(ctx, schedule))
 		return schedule.ScheduleID()
 	}
 
@@ -83,7 +85,7 @@ func TestScheduleControl(t *testing.T) {
 		ms := time.Microsecond
 		firstRunTime := timeutil.Now().Add(10 * time.Second).Truncate(ms)
 		schedule.SetNextRun(firstRunTime)
-		require.NoError(t, schedule.Create(ctx, th.cfg.InternalExecutor, nil))
+		require.NoError(t, schedules.Create(ctx, schedule))
 		scheduleID := schedule.ScheduleID()
 		require.Equal(t, schedule.NextRun(), firstRunTime)
 		th.sqlDB.Exec(t, "RESUME SCHEDULE $1", scheduleID)
@@ -95,7 +97,7 @@ func TestScheduleControl(t *testing.T) {
 
 	t.Run("cannot-resume-one-off-schedule", func(t *testing.T) {
 		schedule := th.newScheduledJob(t, "test schedule", "select 42")
-		require.NoError(t, schedule.Create(ctx, th.cfg.InternalExecutor, nil))
+		require.NoError(t, schedules.Create(ctx, schedule))
 
 		th.sqlDB.ExpectErr(t, "cannot set next run for schedule",
 			"RESUME SCHEDULE $1", schedule.ScheduleID())
@@ -138,27 +140,12 @@ func TestScheduleControl(t *testing.T) {
 		th.sqlDB.Exec(t, "DROP SCHEDULES "+querySchedules)
 		require.Equal(t, 0, len(th.sqlDB.QueryStr(t, querySchedules)))
 	})
-
-	t.Run("pause-non-privileged-user", func(t *testing.T) {
-		scheduleID := makeSchedule("one-schedule", "@daily")
-
-		th.sqlDB.Exec(t, `CREATE USER testuser`)
-		pgURL, cleanupFunc := sqlutils.PGUrl(
-			t, th.server.ServingSQLAddr(), "NonPrivileged-testuser",
-			url.User("testuser"),
-		)
-		defer cleanupFunc()
-		testuser, err := gosql.Open("postgres", pgURL.String())
-		require.NoError(t, err)
-		defer testuser.Close()
-
-		_, err = testuser.Exec("PAUSE SCHEDULE $1", scheduleID)
-		require.EqualError(t, err, "pq: only users with the admin role are allowed to PAUSE SCHEDULES")
-	})
 }
 
 func TestJobsControlForSchedules(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	th, cleanup := newTestHelperForTables(t, jobstest.UseSystemTables, nil)
 	defer cleanup()
 
@@ -176,7 +163,7 @@ func TestJobsControlForSchedules(t *testing.T) {
 				return nil
 			},
 		}
-	})
+	}, UsesTenantCostControl)
 
 	record := Record{
 		Description: "fake job",
@@ -248,11 +235,11 @@ func TestJobsControlForSchedules(t *testing.T) {
 		t.Run(jobControl, func(t *testing.T) {
 			// Go through internal executor to execute job control command.
 			// This correctly reports the number of effected rows.
-			numEffected, err := th.cfg.InternalExecutor.ExecEx(
+			numEffected, err := th.cfg.DB.Executor().ExecEx(
 				context.Background(),
 				"test-num-effected",
 				nil,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				sessiondata.RootUserSessionDataOverride,
 				jobControl,
 			)
 			require.NoError(t, err)
@@ -267,6 +254,7 @@ func TestJobsControlForSchedules(t *testing.T) {
 // jobs prior to executing the control command.
 func TestFilterJobsControlForSchedules(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	defer ResetConstructors()()
 
 	argsFn := func(args *base.TestServerArgs) {
@@ -289,7 +277,7 @@ func TestFilterJobsControlForSchedules(t *testing.T) {
 				return nil
 			},
 		}
-	})
+	}, UsesTenantCostControl)
 
 	record := Record{
 		Description: "fake job",
@@ -329,11 +317,11 @@ func TestFilterJobsControlForSchedules(t *testing.T) {
 			// correctly reports the number of effected rows which should only be
 			// equal to the number of validStartingStates as all the other states are
 			// invalid/no-ops.
-			numEffected, err := th.cfg.InternalExecutor.ExecEx(
+			numEffected, err := th.cfg.DB.Executor().ExecEx(
 				context.Background(),
 				"test-num-effected",
 				nil,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				sessiondata.RootUserSessionDataOverride,
 				jobControl,
 			)
 			require.NoError(t, err)
@@ -347,6 +335,7 @@ func TestFilterJobsControlForSchedules(t *testing.T) {
 
 func TestJobControlByType(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	defer ResetConstructors()()
 
 	argsFn := func(args *base.TestServerArgs) {
@@ -363,11 +352,11 @@ func TestJobControlByType(t *testing.T) {
 
 	t.Run("Errors if invalid type is specified", func(t *testing.T) {
 		invalidTypeQuery := "PAUSE ALL blah JOBS"
-		_, err := th.cfg.InternalExecutor.ExecEx(
+		_, err := th.cfg.DB.Executor().ExecEx(
 			context.Background(),
 			"test-invalid-type",
 			nil,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			invalidTypeQuery,
 		)
 		require.Error(t, err)
@@ -394,7 +383,7 @@ func TestJobControlByType(t *testing.T) {
 					return nil
 				},
 			}
-		})
+		}, UsesTenantCostControl)
 	}
 
 	for _, jobType := range allJobTypes {
@@ -443,11 +432,11 @@ func TestJobControlByType(t *testing.T) {
 				jobIdsClause := fmt.Sprint(strings.Join(jobIDStrings, ", "))
 
 				// Execute the command and verify its executed on the expected number of rows
-				numEffected, err := th.cfg.InternalExecutor.ExecEx(
+				numEffected, err := th.cfg.DB.Executor().ExecEx(
 					context.Background(),
 					"test-num-effected",
 					nil,
-					sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+					sessiondata.RootUserSessionDataOverride,
 					commandQuery,
 				)
 				require.NoError(t, err)
@@ -474,6 +463,7 @@ func TestJobControlByType(t *testing.T) {
 
 				// Clear the system.jobs table for the next test run.
 				th.sqlDB.Exec(t, fmt.Sprintf("DELETE FROM system.jobs WHERE id IN (%s)", jobIdsClause))
+				th.sqlDB.Exec(t, fmt.Sprintf("DELETE FROM system.job_info WHERE job_id IN (%s)", jobIdsClause))
 			})
 		}
 	}

@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -88,9 +88,10 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 		return err
 	}
 
-	// Configure the fetcher, which is only used to decode the returned keys from
-	// the DeleteRange, and is never used to actually fetch kvs.
-	var spec descpb.IndexFetchSpec
+	// Configure the fetcher, which is only used to decode the returned keys
+	// from the Del and the DelRange operations, and is never used to actually
+	// fetch kvs.
+	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
 		&spec, params.ExecCfg().Codec, d.desc, d.desc.GetPrimaryIndex(), nil, /* columnIDs */
 	); err != nil {
@@ -99,8 +100,9 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 	if err := d.fetcher.Init(
 		params.ctx,
 		row.FetcherInitArgs{
-			Alloc: params.p.alloc,
-			Spec:  &spec,
+			WillUseKVProvider: true,
+			Alloc:             &tree.DatumAlloc{},
+			Spec:              &spec,
 		},
 	); err != nil {
 		return err
@@ -158,15 +160,23 @@ func (d *deleteRangeNode) startExec(params runParams) error {
 	return nil
 }
 
-// deleteSpans adds each input span to a DelRange command in the given batch.
+// deleteSpans adds each input span to a Del or a DelRange command in the given
+// batch.
 func (d *deleteRangeNode) deleteSpans(params runParams, b *kv.Batch, spans roachpb.Spans) {
 	ctx := params.ctx
 	traceKV := params.p.ExtendedEvalContext().Tracing.KVTracingEnabled()
 	for _, span := range spans {
-		if traceKV {
-			log.VEventf(ctx, 2, "DelRange %s - %s", span.Key, span.EndKey)
+		if span.EndKey == nil {
+			if traceKV {
+				log.VEventf(ctx, 2, "Del %s", span.Key)
+			}
+			b.Del(span.Key)
+		} else {
+			if traceKV {
+				log.VEventf(ctx, 2, "DelRange %s - %s", span.Key, span.EndKey)
+			}
+			b.DelRange(span.Key, span.EndKey, true /* returnKeys */)
 		}
-		b.DelRange(span.Key, span.EndKey, true /* returnKeys */)
 	}
 }
 

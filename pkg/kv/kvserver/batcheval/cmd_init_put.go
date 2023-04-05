@@ -13,13 +13,13 @@ package batcheval
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.InitPut, DefaultDeclareIsolatedKeys, InitPut)
+	RegisterReadWriteCommand(kvpb.InitPut, DefaultDeclareIsolatedKeys, InitPut)
 }
 
 // InitPut sets the value for a specified key only if it doesn't exist. It
@@ -27,16 +27,22 @@ func init() {
 // is different from the value provided. If FailOnTombstone is set to true,
 // tombstones count as mismatched values and will cause a ConditionFailedError.
 func InitPut(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.InitPutRequest)
+	args := cArgs.Args.(*kvpb.InitPutRequest)
 	h := cArgs.Header
+
+	if args.FailOnTombstones && cArgs.EvalCtx.EvalKnobs().DisableInitPutFailOnTombstones {
+		args.FailOnTombstones = false
+	}
 
 	var err error
 	if args.Blind {
-		err = storage.MVCCBlindInitPut(ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, args.Value, args.FailOnTombstones, h.Txn)
+		err = storage.MVCCBlindInitPut(
+			ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, cArgs.Now, args.Value, args.FailOnTombstones, h.Txn)
 	} else {
-		err = storage.MVCCInitPut(ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, args.Value, args.FailOnTombstones, h.Txn)
+		err = storage.MVCCInitPut(
+			ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, cArgs.Now, args.Value, args.FailOnTombstones, h.Txn)
 	}
 	// NB: even if MVCC returns an error, it may still have written an intent
 	// into the batch. This allows callers to consume errors like WriteTooOld

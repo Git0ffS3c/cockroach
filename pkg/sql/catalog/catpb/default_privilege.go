@@ -15,15 +15,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
 
 // DefaultPrivilegesRole represents the creator role that the default privileges
 // are being altered for.
 // Either:
-//     role should be populated
-//     forAllRoles should be true.
+//
+//	role should be populated
+//	forAllRoles should be true.
 type DefaultPrivilegesRole struct {
 	Role        username.SQLUsername
 	ForAllRoles bool
@@ -112,7 +112,7 @@ func InitDefaultPrivilegesForRole(
 		}
 		return DefaultPrivilegesForRole{
 			Role:                       defaultPrivilegesRole,
-			DefaultPrivilegesPerObject: map[tree.AlterDefaultPrivilegesTargetObject]PrivilegeDescriptor{},
+			DefaultPrivilegesPerObject: map[privilege.TargetObjectType]PrivilegeDescriptor{},
 		}
 	}
 
@@ -125,6 +125,7 @@ func InitDefaultPrivilegesForRole(
 				RoleHasAllPrivilegesOnSequences: true,
 				RoleHasAllPrivilegesOnSchemas:   true,
 				RoleHasAllPrivilegesOnTypes:     true,
+				RoleHasAllPrivilegesOnFunctions: true,
 			},
 		}
 	} else {
@@ -138,7 +139,7 @@ func InitDefaultPrivilegesForRole(
 	}
 	return DefaultPrivilegesForRole{
 		Role:                       defaultPrivilegesRole,
-		DefaultPrivilegesPerObject: map[tree.AlterDefaultPrivilegesTargetObject]PrivilegeDescriptor{},
+		DefaultPrivilegesPerObject: map[privilege.TargetObjectType]PrivilegeDescriptor{},
 	}
 }
 
@@ -169,11 +170,19 @@ func (p *DefaultPrivilegeDescriptor) Validate() error {
 			return errors.AssertionFailedf("default privilege list is not sorted")
 		}
 		for objectType, defaultPrivileges := range defaultPrivilegesForRole.DefaultPrivilegesPerObject {
-			privilegeObjectType := objectType.ToPrivilegeObjectType()
-			valid, u, remaining := defaultPrivileges.IsValidPrivilegesForObjectType(privilegeObjectType)
+			privilegeObjectType := objectType.ToObjectType()
+			valid, u, remaining, err := defaultPrivileges.IsValidPrivilegesForObjectType(privilegeObjectType)
+			if err != nil {
+				return err
+			}
 			if !valid {
+				privList, err := privilege.ListFromBitField(remaining, privilege.Any)
+				if err != nil {
+					return err
+				}
 				return errors.AssertionFailedf("user %s must not have %s privileges on %s",
-					u.User(), privilege.ListFromBitField(remaining, privilege.Any), privilegeObjectType)
+					u.User(), privList, privilegeObjectType,
+				)
 			}
 		}
 	}

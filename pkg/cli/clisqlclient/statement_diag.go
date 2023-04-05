@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -60,10 +62,32 @@ func stmtDiagListBundlesInternal(ctx context.Context, conn Conn) ([]StmtDiagBund
 		} else if err != nil {
 			return nil, err
 		}
+		i, ok := vals[0].(int64)
+		if !ok {
+			// We're arriving in this function via the interactive shell,
+			// with result type inference disabled.
+			// The value has been read as a string.
+			i, err = strconv.ParseInt(vals[0].(string), 10, 64)
+			if err != nil {
+				return nil, err
+			}
+		}
+		d, ok := vals[2].(time.Time)
+		if !ok {
+			// We're arriving in this function via the interactive shell,
+			// with result type inference disabled.
+			// The value has been read as a string.
+			ts := vals[2].(string)
+			ts = strings.TrimSuffix(ts, "+00")
+			d, err = time.Parse("2006-01-02 15:04:05.999999", ts)
+			if err != nil {
+				return nil, err
+			}
+		}
 		info := StmtDiagBundleInfo{
-			ID:          vals[0].(int64),
+			ID:          i,
 			Statement:   vals[1].(string),
-			CollectedAt: vals[2].(time.Time),
+			CollectedAt: d,
 		}
 		result = append(result, info)
 	}
@@ -80,6 +104,9 @@ type StmtDiagActivationRequest struct {
 	// Statement is the SQL statement fingerprint.
 	Statement   string
 	RequestedAt time.Time
+	// Zero value indicates that there is no sampling probability set on the
+	// request.
+	SamplingProbability float64
 	// Zero value indicates that there is no minimum latency set on the request.
 	MinExecutionLatency time.Duration
 	// Zero value indicates that the request never expires.
@@ -100,17 +127,17 @@ func StmtDiagListOutstandingRequests(
 	return result, nil
 }
 
-// TODO(yuzefovich): remove this in 22.2.
-func isAtLeast22dot1ClusterVersion(ctx context.Context, conn Conn) (bool, error) {
-	// Check whether the migration to add the conditional diagnostics columns to
-	// the statement_diagnostics_requests system table has already been run.
+// TODO(irfansharif): Remove this in 23.1.
+func isAtLeast22dot2ClusterVersion(ctx context.Context, conn Conn) (bool, error) {
+	// Check whether the upgrade to add the sampling_probability column to the
+	// statement_diagnostics_requests system table has already been run.
 	row, err := conn.QueryRow(ctx, `
-SELECT
-  count(*)
-FROM
-  [SHOW COLUMNS FROM system.statement_diagnostics_requests]
-WHERE
-  column_name = 'min_execution_latency';`)
+ SELECT
+   count(*)
+ FROM
+   [SHOW COLUMNS FROM system.statement_diagnostics_requests]
+ WHERE
+   column_name = 'sampling_probability';`)
 	if err != nil {
 		return false, err
 	}
@@ -125,32 +152,33 @@ func stmtDiagListOutstandingRequestsInternal(
 	ctx context.Context, conn Conn,
 ) ([]StmtDiagActivationRequest, error) {
 	var extraColumns string
-	atLeast22dot1, err := isAtLeast22dot1ClusterVersion(ctx, conn)
+	atLeast22dot2, err := isAtLeast22dot2ClusterVersion(ctx, conn)
 	if err != nil {
 		return nil, err
 	}
-	if atLeast22dot1 {
-		// Converting an INTERVAL to a number of milliseconds within that
-		// interval is a pain - we extract the number of seconds and multiply it
-		// by 1000, then we extract the number of milliseconds and add that up
-		// to the previous result; however, we have now double counted the
-		// seconds field, so we have to remove that times 1000.
-		getMilliseconds := `EXTRACT(epoch FROM min_execution_latency)::INT8 * 1000 +
+	if atLeast22dot2 {
+		extraColumns = ", sampling_probability"
+	}
+
+	// Converting an INTERVAL to a number of milliseconds within that interval
+	// is a pain - we extract the number of seconds and multiply it by 1000,
+	// then we extract the number of milliseconds and add that up to the
+	// previous result; however, we have now double counted the seconds field,
+	// so we have to remove that times 1000.
+	getMilliseconds := `EXTRACT(epoch FROM min_execution_latency)::INT8 * 1000 +
                         EXTRACT(millisecond FROM min_execution_latency)::INT8 -
                         EXTRACT(second FROM min_execution_latency)::INT8 * 1000`
-		extraColumns = ", " + getMilliseconds + ", expires_at"
-	}
 	rows, err := conn.Query(ctx,
-		fmt.Sprintf(`SELECT id, statement_fingerprint, requested_at%s
-		 FROM system.statement_diagnostics_requests
-		 WHERE NOT completed
-		 ORDER BY requested_at DESC`, extraColumns),
+		fmt.Sprintf("SELECT id, statement_fingerprint, requested_at, "+getMilliseconds+`, expires_at%s
+			FROM system.statement_diagnostics_requests
+			WHERE NOT completed
+			ORDER BY requested_at DESC`, extraColumns),
 	)
 	if err != nil {
 		return nil, err
 	}
 	var result []StmtDiagActivationRequest
-	vals := make([]driver.Value, 5)
+	vals := make([]driver.Value, 6)
 	for {
 		if err := rows.Next(vals); err == io.EOF {
 			break
@@ -159,18 +187,24 @@ func stmtDiagListOutstandingRequestsInternal(
 		}
 		var minExecutionLatency time.Duration
 		var expiresAt time.Time
-		if atLeast22dot1 {
-			if ms, ok := vals[3].(int64); ok {
-				minExecutionLatency = time.Millisecond * time.Duration(ms)
-			}
-			if e, ok := vals[4].(time.Time); ok {
-				expiresAt = e
+		var samplingProbability float64
+
+		if ms, ok := vals[3].(int64); ok {
+			minExecutionLatency = time.Millisecond * time.Duration(ms)
+		}
+		if e, ok := vals[4].(time.Time); ok {
+			expiresAt = e
+		}
+		if atLeast22dot2 {
+			if sp, ok := vals[5].(float64); ok {
+				samplingProbability = sp
 			}
 		}
 		info := StmtDiagActivationRequest{
 			ID:                  vals[0].(int64),
 			Statement:           vals[1].(string),
 			RequestedAt:         vals[2].(time.Time),
+			SamplingProbability: samplingProbability,
 			MinExecutionLatency: minExecutionLatency,
 			ExpiresAt:           expiresAt,
 		}

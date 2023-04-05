@@ -12,11 +12,12 @@ package batcheval
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,7 +48,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 
 	k, k2 := roachpb.Key("a"), roachpb.Key("b")
 	ts, ts2, ts3 := hlc.Timestamp{WallTime: 1}, hlc.Timestamp{WallTime: 2}, hlc.Timestamp{WallTime: 3}
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0, 1)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1)
 	writes := []roachpb.SequencedWrite{{Key: k, Sequence: 0}}
 	intents := []roachpb.Span{{Key: k2}}
 
@@ -92,14 +94,15 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 	testCases := []struct {
 		name string
 		// Replica state.
-		existingTxn  *roachpb.TransactionRecord
-		canCreateTxn func() (can bool, minTS hlc.Timestamp)
+		existingTxn    *roachpb.TransactionRecord
+		canCreateTxn   bool
+		minTxnCommitTS hlc.Timestamp
 		// Request state.
 		headerTxn      *roachpb.Transaction
 		commit         bool
 		noLockSpans    bool
 		inFlightWrites []roachpb.SequencedWrite
-		deadline       *hlc.Timestamp
+		deadline       hlc.Timestamp
 		// Expected result.
 		expError string
 		expTxn   *roachpb.TransactionRecord
@@ -109,8 +112,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// there are intents to clean up.
 			name: "record missing, try rollback",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: nil, // not needed
+			existingTxn: nil,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    false,
@@ -124,8 +126,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// when all intents are on the transaction record's range.
 			name: "record missing, try rollback without intents",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: nil, // not needed
+			existingTxn: nil,
 			// Request state.
 			headerTxn:   headerTxn,
 			commit:      false,
@@ -142,7 +143,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can't create, try stage",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return false, hlc.Timestamp{} },
+			canCreateTxn: false,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -157,7 +158,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can't create, try commit",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return false, hlc.Timestamp{} },
+			canCreateTxn: false,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    true,
@@ -170,7 +171,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -184,7 +185,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    true,
@@ -197,7 +198,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage without intents",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -218,7 +219,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit without intents",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:   headerTxn,
 			commit:      true,
@@ -235,7 +236,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage at pushed timestamp",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      pushedHeaderTxn,
 			commit:         true,
@@ -250,7 +251,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit at pushed timestamp",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: pushedHeaderTxn,
 			commit:    true,
@@ -264,7 +265,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage at pushed timestamp after refresh",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn:      refreshedHeaderTxn,
 			commit:         true,
@@ -283,7 +284,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit at pushed timestamp after refresh",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: refreshedHeaderTxn,
 			commit:    true,
@@ -296,11 +297,12 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
-			// transaction can be created with. This will trigger a retry error.
-			name: "record missing, can create with min timestamp, try stage",
+			// transaction can be committed with. This will trigger a retry error.
+			name: "record missing, can commit with min timestamp, try stage",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn:      headerTxn,
 			commit:         true,
@@ -310,11 +312,12 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
-			// transaction can be created with. This will trigger a retry error.
-			name: "record missing, can create with min timestamp, try commit",
+			// transaction can be committed with. This will trigger a retry error.
+			name: "record missing, can commit with min timestamp, try commit",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn: headerTxn,
 			commit:    true,
@@ -323,12 +326,13 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
-			// the transaction can be created with. Luckily, the transaction has
+			// the transaction can be committed with. Luckily, the transaction has
 			// already refreshed above this time, so it can avoid a retry error.
-			name: "record missing, can create with min timestamp, try stage at pushed timestamp after refresh",
+			name: "record missing, can commit with min timestamp, try stage at pushed timestamp after refresh",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn:      refreshedHeaderTxn,
 			commit:         true,
@@ -342,12 +346,13 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 		},
 		{
 			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
-			// the transaction can be created with. Luckily, the transaction has
+			// the transaction can be committed with. Luckily, the transaction has
 			// already refreshed above this time, so it can avoid a retry error.
-			name: "record missing, can create with min timestamp, try commit at pushed timestamp after refresh",
+			name: "record missing, can commit with min timestamp, try commit at pushed timestamp after refresh",
 			// Replica state.
-			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, ts2 },
+			existingTxn:    nil,
+			canCreateTxn:   true,
+			minTxnCommitTS: ts2,
 			// Request state.
 			headerTxn: refreshedHeaderTxn,
 			commit:    true,
@@ -364,7 +369,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try stage after write too old",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: func() *roachpb.Transaction {
 				clone := txn.Clone()
@@ -382,7 +387,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			name: "record missing, can create, try commit after write too old",
 			// Replica state.
 			existingTxn:  nil,
-			canCreateTxn: func() (bool, hlc.Timestamp) { return true, hlc.Timestamp{} },
+			canCreateTxn: true,
 			// Request state.
 			headerTxn: func() *roachpb.Transaction {
 				clone := txn.Clone()
@@ -406,9 +411,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: abortedRecord,
 		},
 		{
-			// Standard case where a transaction record is created during a
-			// parallel commit. The record already exists because it has been
-			// heartbeated.
+			// Standard case where a transaction record is staged by a parallel
+			// commit. The record already exists because it has been heartbeated.
 			name: "record pending, try stage",
 			// Replica state.
 			existingTxn: pendingRecord,
@@ -420,9 +424,9 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: stagingRecord,
 		},
 		{
-			// Standard case where a transaction record is created during a
-			// non-parallel commit. The record already exists because it has
-			// been heartbeated.
+			// Standard case where a transaction record is committed during a
+			// non-parallel commit. The record already exists because it has been
+			// heartbeated.
 			name: "record pending, try commit",
 			// Replica state.
 			existingTxn: pendingRecord,
@@ -495,6 +499,74 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
+			// transaction can be committed with. The record already exists because
+			// it has been heartbeated. This will trigger a retry error.
+			name: "record pending, can commit with min timestamp, try stage",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn:      headerTxn,
+			commit:         true,
+			inFlightWrites: writes,
+			// Expected result.
+			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
+		},
+		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that the
+			// transaction can be committed with. The record already exists because
+			// it has been heartbeated. This will trigger a retry error.
+			name: "record pending, can commit with min timestamp, try commit",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn: headerTxn,
+			commit:    true,
+			// Expected result.
+			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
+		},
+		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
+			// the transaction can be committed with. The record already exists
+			// because it has been heartbeated. Luckily, the transaction has
+			// already refreshed above this time, so it can avoid a retry error.
+			name: "record pending, can commit with min timestamp, try stage at pushed timestamp after refresh",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn:      refreshedHeaderTxn,
+			commit:         true,
+			inFlightWrites: writes,
+			// Expected result.
+			expTxn: func() *roachpb.TransactionRecord {
+				record := *stagingRecord
+				record.WriteTimestamp.Forward(ts2)
+				return &record
+			}(),
+		},
+		{
+			// A PushTxn(TIMESTAMP) request bumped the minimum timestamp that
+			// the transaction can be committed with. The record already exists
+			// because it has been heartbeated. Luckily, the transaction has
+			// already refreshed above this time, so it can avoid a retry error.
+			name: "record pending, can commit with min timestamp, try commit at pushed timestamp after refresh",
+			// Replica state.
+			existingTxn:    pendingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn: refreshedHeaderTxn,
+			commit:    true,
+			// Expected result.
+			expTxn: func() *roachpb.TransactionRecord {
+				record := *committedRecord
+				record.WriteTimestamp.Forward(ts2)
+				return &record
+			}(),
+		},
+		{
 			// The transaction has run into a WriteTooOld error during its
 			// lifetime. The stage will be rejected.
 			name: "record pending, try stage after write too old",
@@ -546,7 +618,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Standard case where a transaction record is created during a
+			// Standard case where a transaction record is staged during a
 			// parallel commit after it has written a record at a lower epoch.
 			// The existing record is upgraded.
 			name: "record pending, try stage at higher epoch",
@@ -565,7 +637,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Standard case where a transaction record is created during a
+			// Standard case where a transaction record is committed during a
 			// non-parallel commit after it has written a record at a lower
 			// epoch. The existing record is upgraded.
 			name: "record pending, try commit at higher epoch",
@@ -627,7 +699,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expError: "found txn in indeterminate STAGING state",
 		},
 		{
-			// Standard case where a transaction record is created during a
+			// Standard case where a transaction record is re-staged during a
 			// parallel commit. The record already exists because of a failed
 			// parallel commit attempt.
 			name: "record staging, try re-stage",
@@ -641,9 +713,9 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: stagingRecord,
 		},
 		{
-			// Standard case where a transaction record is created during a
-			// non-parallel commit. The record already exists because of a
-			// failed parallel commit attempt.
+			// Standard case where a transaction record is explicitly committed.
+			// The record already exists and is staging because it was previously
+			// implicitly committed.
 			name: "record staging, try commit",
 			// Replica state.
 			existingTxn: stagingRecord,
@@ -654,8 +726,39 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expTxn: committedRecord,
 		},
 		{
-			// Non-standard case where a transaction record is created during a
+			// Standard case where a transaction record is re-staged during a
 			// parallel commit. The record already exists because of a failed
+			// parallel commit attempt. The timestamp cache's minimum commit
+			// timestamp is ignored when the transaction record is staging.
+			name: "record staging, can commit with min timestamp, try re-stage",
+			// Replica state.
+			existingTxn: stagingRecord,
+			// Request state.
+			headerTxn:      headerTxn,
+			minTxnCommitTS: ts2,
+			commit:         true,
+			inFlightWrites: writes,
+			// Expected result.
+			expTxn: stagingRecord,
+		},
+		{
+			// Non-standard case where a transaction record is explicitly committed.
+			// The record already exists and is staging because it was previously
+			// implicitly committed. The timestamp cache's minimum commit timestamp is
+			// ignored when the transaction record is staging.
+			name: "record staging, can commit with min timestamp, try commit",
+			// Replica state.
+			existingTxn:    stagingRecord,
+			minTxnCommitTS: ts2,
+			// Request state.
+			headerTxn: headerTxn,
+			commit:    true,
+			// Expected result.
+			expTxn: committedRecord,
+		},
+		{
+			// Non-standard case where a transaction record is re-staged during
+			// a parallel commit. The record already exists because of a failed
 			// parallel commit attempt. The re-stage will fail because of the
 			// pushed timestamp.
 			name: "record staging, try re-stage at pushed timestamp",
@@ -669,7 +772,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
 		},
 		{
-			// Non-standard case where a transaction record is created during
+			// Non-standard case where a transaction record is committed during
 			// a non-parallel commit. The record already exists because of a
 			// failed parallel commit attempt. The commit will fail because of
 			// the pushed timestamp.
@@ -701,8 +804,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Non-standard case where a transaction record is created during a
-			// parallel commit. The record already exists because of a failed
+			// Non-standard case where a transaction record is re-staged during
+			// a parallel commit. The record already exists because of a failed
 			// parallel commit attempt in a prior epoch.
 			name: "record staging, try re-stage at higher epoch",
 			// Replica state.
@@ -720,7 +823,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Non-standard case where a transaction record is created during
+			// Non-standard case where a transaction record is committed during
 			// a non-parallel commit. The record already exists because of a
 			// failed parallel commit attempt in a prior epoch.
 			name: "record staging, try commit at higher epoch",
@@ -738,8 +841,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			}(),
 		},
 		{
-			// Non-standard case where a transaction record is created during a
-			// parallel commit. The record already exists because of a failed
+			// Non-standard case where a transaction record is re-staged during
+			// a parallel commit. The record already exists because of a failed
 			// parallel commit attempt in a prior epoch. The re-stage will fail
 			// because of the pushed timestamp.
 			name: "record staging, try re-stage at higher epoch and pushed timestamp",
@@ -753,8 +856,8 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			expError: "TransactionRetryError: retry txn (RETRY_SERIALIZABLE)",
 		},
 		{
-			// Non-standard case where a transaction record is created during a
-			// non-parallel commit. The record already exists because of a
+			// Non-standard case where a transaction record is committed during
+			// a non-parallel commit. The record already exists because of a
 			// failed parallel commit attempt in a prior epoch. The commit will
 			// fail because of the pushed timestamp.
 			name: "record staging, try commit at higher epoch and pushed timestamp",
@@ -908,7 +1011,7 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// Write the existing transaction record, if necessary.
 			txnKey := keys.TransactionKey(txn.Key, txn.ID)
 			if c.existingTxn != nil {
-				if err := storage.MVCCPutProto(ctx, batch, nil, txnKey, hlc.Timestamp{}, nil, c.existingTxn); err != nil {
+				if err := storage.MVCCPutProto(ctx, batch, nil, txnKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, c.existingTxn); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -916,12 +1019,12 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			// Sanity check request args.
 			if !c.commit {
 				require.Nil(t, c.inFlightWrites)
-				require.Nil(t, c.deadline)
+				require.Zero(t, c.deadline)
 			}
 
 			// Issue an EndTxn request.
-			req := roachpb.EndTxnRequest{
-				RequestHeader: roachpb.RequestHeader{Key: txn.Key},
+			req := kvpb.EndTxnRequest{
+				RequestHeader: kvpb.RequestHeader{Key: txn.Key},
 				Commit:        c.commit,
 
 				InFlightWrites: c.inFlightWrites,
@@ -930,21 +1033,23 @@ func TestEndTxnUpdatesTransactionRecord(t *testing.T) {
 			if !c.noLockSpans {
 				req.LockSpans = intents
 			}
-			var resp roachpb.EndTxnResponse
+			var resp kvpb.EndTxnResponse
 			_, err := EndTxn(ctx, batch, CommandArgs{
 				EvalCtx: (&MockEvalCtx{
 					Desc:      &desc,
 					AbortSpan: as,
-					CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
-						require.NotNil(t, c.canCreateTxn, "CanCreateTxnRecord unexpectedly called")
-						if can, minTS := c.canCreateTxn(); can {
-							return true, minTS, 0
+					CanCreateTxnRecordFn: func() (bool, kvpb.TransactionAbortedReason) {
+						if c.canCreateTxn {
+							return true, 0
 						}
-						return false, hlc.Timestamp{}, roachpb.ABORT_REASON_ABORTED_RECORD_FOUND
+						return false, kvpb.ABORT_REASON_ABORTED_RECORD_FOUND
+					},
+					MinTxnCommitTSFn: func() hlc.Timestamp {
+						return c.minTxnCommitTS
 					},
 				}).EvalContext(),
 				Args: &req,
-				Header: roachpb.Header{
+				Header: kvpb.Header{
 					Timestamp: ts,
 					Txn:       c.headerTxn,
 				},
@@ -988,7 +1093,7 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 	k := roachpb.Key("a")
 	ts := hlc.Timestamp{WallTime: 1}
 	ts2 := hlc.Timestamp{WallTime: 2}
-	txn := roachpb.MakeTransaction("test", k, 0, ts, 0, 1)
+	txn := roachpb.MakeTransaction("test", k, 0, 0, ts, 0, 1)
 	endKey := roachpb.Key("z")
 	desc := roachpb.RangeDescriptor{
 		RangeID:  99,
@@ -1012,13 +1117,13 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 		// Write a first value at key.
 		v.SetString("a")
 		txn.Sequence = 1
-		if err := storage.MVCCPut(ctx, batch, nil, k, ts, v, &txn); err != nil {
+		if err := storage.MVCCPut(ctx, batch, nil, k, ts, hlc.ClockTimestamp{}, v, &txn); err != nil {
 			t.Fatal(err)
 		}
 		// Write another value.
 		v.SetString("b")
 		txn.Sequence = 2
-		if err := storage.MVCCPut(ctx, batch, nil, k, ts, v, &txn); err != nil {
+		if err := storage.MVCCPut(ctx, batch, nil, k, ts, hlc.ClockTimestamp{}, v, &txn); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1031,27 +1136,24 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 		txnKey := keys.TransactionKey(txn.Key, txn.ID)
 		if storeTxnBeforeEndTxn {
 			txnRec := txn.AsRecord()
-			if err := storage.MVCCPutProto(ctx, batch, nil, txnKey, hlc.Timestamp{}, nil, &txnRec); err != nil {
+			if err := storage.MVCCPutProto(ctx, batch, nil, txnKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &txnRec); err != nil {
 				t.Fatal(err)
 			}
 		}
 
 		// Issue the end txn command.
-		req := roachpb.EndTxnRequest{
-			RequestHeader: roachpb.RequestHeader{Key: txn.Key},
+		req := kvpb.EndTxnRequest{
+			RequestHeader: kvpb.RequestHeader{Key: txn.Key},
 			Commit:        true,
 			LockSpans:     intents,
 		}
-		var resp roachpb.EndTxnResponse
+		var resp kvpb.EndTxnResponse
 		if _, err := EndTxn(ctx, batch, CommandArgs{
 			EvalCtx: (&MockEvalCtx{
 				Desc: &desc,
-				CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
-					return true, ts, 0
-				},
 			}).EvalContext(),
 			Args: &req,
-			Header: roachpb.Header{
+			Header: kvpb.Header{
 				Timestamp: ts,
 				Txn:       &txn,
 			},
@@ -1061,17 +1163,17 @@ func TestPartialRollbackOnEndTransaction(t *testing.T) {
 
 		// The second write has been rolled back; verify that the remaining
 		// value is from the first write.
-		res, i, err := storage.MVCCGet(ctx, batch, k, ts2, storage.MVCCGetOptions{})
+		res, err := storage.MVCCGet(ctx, batch, k, ts2, storage.MVCCGetOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if i != nil {
-			t.Errorf("found intent, expected none: %+v", i)
+		if res.Intent != nil {
+			t.Errorf("found intent, expected none: %+v", res.Intent)
 		}
-		if res == nil {
+		if res.Value == nil {
 			t.Errorf("no value found, expected one")
 		} else {
-			s, err := res.GetBytes()
+			s, err := res.Value.GetBytes()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1133,8 +1235,7 @@ func TestCommitWaitBeforeIntentResolutionIfCommitTrigger(t *testing.T) {
 				batch := db.NewBatch()
 				defer batch.Close()
 
-				manual := hlc.NewManualClock(123)
-				clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+				clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 				desc := roachpb.RangeDescriptor{
 					RangeID:  99,
 					StartKey: roachpb.RKey("a"),
@@ -1143,31 +1244,28 @@ func TestCommitWaitBeforeIntentResolutionIfCommitTrigger(t *testing.T) {
 
 				now := clock.Now()
 				commitTS := cfg.commitTS(now)
-				txn := roachpb.MakeTransaction("test", desc.StartKey.AsRawKey(), 0, now, 0, 1)
+				txn := roachpb.MakeTransaction("test", desc.StartKey.AsRawKey(), 0, 0, now, 0, 1)
 				txn.ReadTimestamp = commitTS
 				txn.WriteTimestamp = commitTS
 
 				// Issue the end txn command.
-				req := roachpb.EndTxnRequest{
-					RequestHeader: roachpb.RequestHeader{Key: txn.Key},
+				req := kvpb.EndTxnRequest{
+					RequestHeader: kvpb.RequestHeader{Key: txn.Key},
 					Commit:        true,
 				}
 				if commitTrigger {
 					req.InternalCommitTrigger = &roachpb.InternalCommitTrigger{
-						ModifiedSpanTrigger: &roachpb.ModifiedSpanTrigger{SystemConfigSpan: true},
+						ModifiedSpanTrigger: &roachpb.ModifiedSpanTrigger{NodeLivenessSpan: &roachpb.Span{}},
 					}
 				}
-				var resp roachpb.EndTxnResponse
+				var resp kvpb.EndTxnResponse
 				_, err := EndTxn(ctx, batch, CommandArgs{
 					EvalCtx: (&MockEvalCtx{
 						Desc:  &desc,
 						Clock: clock,
-						CanCreateTxn: func() (bool, hlc.Timestamp, roachpb.TransactionAbortedReason) {
-							return true, hlc.Timestamp{}, 0
-						},
 					}).EvalContext(),
 					Args: &req,
-					Header: roachpb.Header{
+					Header: kvpb.Header{
 						Timestamp: commitTS,
 						Txn:       &txn,
 					},
@@ -1175,11 +1273,326 @@ func TestCommitWaitBeforeIntentResolutionIfCommitTrigger(t *testing.T) {
 
 				if cfg.expError {
 					require.Error(t, err)
-					require.Regexp(t, `txn .* with modified-span \(system-config\) commit trigger needs commit wait`, err)
+					require.Regexp(t, `txn .* with modified-span \(node-liveness\) commit trigger needs commit wait`, err)
 				} else {
 					require.NoError(t, err)
 				}
 			})
 		}
 	})
+}
+
+func TestComputeSplitRangeKeyStatsDelta(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	storage.DisableMetamorphicSimpleValueEncoding(t)
+
+	emptyValue := func() storage.MVCCValue {
+		return storage.MVCCValue{}
+	}
+
+	localTSValue := func(ts int) storage.MVCCValue {
+		var v storage.MVCCValue
+		v.MVCCValueHeader.LocalTimestamp = hlc.ClockTimestamp{WallTime: int64(ts)}
+		return v
+	}
+
+	rangeKV := func(start, end string, ts int, value storage.MVCCValue) storage.MVCCRangeKeyValue {
+		valueRaw, err := storage.EncodeMVCCValue(value)
+		require.NoError(t, err)
+		return storage.MVCCRangeKeyValue{
+			RangeKey: storage.MVCCRangeKey{
+				StartKey:  roachpb.Key(start),
+				EndKey:    roachpb.Key(end),
+				Timestamp: hlc.Timestamp{WallTime: int64(ts)},
+			},
+			Value: valueRaw,
+		}
+	}
+
+	const nowNanos = 10e9
+	lhsDesc := roachpb.RangeDescriptor{StartKey: roachpb.RKey("a"), EndKey: roachpb.RKey("l")}
+	rhsDesc := roachpb.RangeDescriptor{StartKey: roachpb.RKey("l"), EndKey: roachpb.RKey("z").PrefixEnd()}
+
+	testcases := map[string]struct {
+		rangeKVs []storage.MVCCRangeKeyValue
+		expect   enginepb.MVCCStats
+	}{
+		// Empty stats shouldn't do anything.
+		"empty": {nil, enginepb.MVCCStats{}},
+		// a-z splits into a-l and l-z: simple +1 range key
+		"full": {[]storage.MVCCRangeKeyValue{rangeKV("a", "z", 1e9, emptyValue())}, enginepb.MVCCStats{
+			RangeKeyCount: 1,
+			RangeKeyBytes: 13,
+			RangeValCount: 1,
+			GCBytesAge:    117,
+		}},
+		// a-z with local timestamp splits into a-l and l-z: simple +1 range key with value
+		"full value": {[]storage.MVCCRangeKeyValue{rangeKV("a", "z", 2e9, localTSValue(1))}, enginepb.MVCCStats{
+			RangeKeyCount: 1,
+			RangeKeyBytes: 13,
+			RangeValCount: 1,
+			RangeValBytes: 9,
+			GCBytesAge:    176,
+		}},
+		// foo-zz splits into foo-l and l-zzzz: contribution is same as for short
+		// keys, because we have to adjust for the change in LHS end key which ends
+		// up only depending on the split key, and that doesn't change.
+		"different key length": {[]storage.MVCCRangeKeyValue{rangeKV("foo", "zzzz", 1e9, emptyValue())}, enginepb.MVCCStats{
+			RangeKeyCount: 1,
+			RangeKeyBytes: 13,
+			RangeValCount: 1,
+			GCBytesAge:    117,
+		}},
+		// Two abutting keys at different timestamps at the split point should not
+		// require a delta.
+		"no straddling, timestamp": {[]storage.MVCCRangeKeyValue{
+			rangeKV("a", "l", 1e9, emptyValue()),
+			rangeKV("l", "z", 2e9, emptyValue()),
+		}, enginepb.MVCCStats{}},
+		// Two abutting keys at different local timestamps (values) at the split
+		// point should not require a delta.
+		"no straddling, value": {[]storage.MVCCRangeKeyValue{
+			rangeKV("a", "l", 2e9, localTSValue(1)),
+			rangeKV("l", "z", 2e9, localTSValue(2)),
+		}, enginepb.MVCCStats{}},
+		// Multiple straddling keys.
+		"multiple": {
+			[]storage.MVCCRangeKeyValue{
+				rangeKV("a", "z", 2e9, localTSValue(1)),
+				rangeKV("k", "p", 3e9, localTSValue(2)),
+				rangeKV("foo", "m", 4e9, emptyValue()),
+			}, enginepb.MVCCStats{
+				RangeKeyCount: 1,
+				RangeKeyBytes: 31,
+				RangeValCount: 3,
+				RangeValBytes: 18,
+				GCBytesAge:    348,
+			}},
+	}
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			engine := storage.NewDefaultInMemForTesting()
+			defer engine.Close()
+
+			for _, rkv := range tc.rangeKVs {
+				value, err := storage.DecodeMVCCValue(rkv.Value)
+				require.NoError(t, err)
+				require.NoError(t, engine.PutMVCCRangeKey(rkv.RangeKey, value))
+			}
+
+			tc.expect.LastUpdateNanos = nowNanos
+
+			msDelta, err := computeSplitRangeKeyStatsDelta(engine, lhsDesc, rhsDesc)
+			require.NoError(t, err)
+			msDelta.AgeTo(nowNanos)
+			require.Equal(t, tc.expect, msDelta)
+		})
+	}
+}
+
+// TestResolveLocalLocks tests resolveLocalLocks for point and ranged intents
+// as well as under a max key or max byte limit, ensuring the returned
+// resolvedLocks, externalLocks, and numBytes are as expected.
+func TestResolveLocalLocks(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	intToKey := func(i int) roachpb.Key {
+		return roachpb.Key(fmt.Sprintf("%01000d", i))
+	}
+	ceil := func(i int, j int) int {
+		return (i + j - 1) / j
+	}
+
+	const (
+		numKeys             = 20
+		keysPerRangedLock   = 4
+		maxKeys             = 11 // not divisible by keysPerRangedLock
+		targetBytes         = 11900
+		keysFromTargetBytes = 12 // divisible by keysPerRangedLock
+	)
+
+	pointLocks := make([]roachpb.Span, numKeys)
+	for i := range pointLocks {
+		pointLocks[i].Key = intToKey(i)
+	}
+	rangedLocks := make([]roachpb.Span, numKeys/keysPerRangedLock)
+	for i := range rangedLocks {
+		rangedLocks[i].Key = intToKey(i * keysPerRangedLock)
+		rangedLocks[i].EndKey = intToKey((i + 1) * keysPerRangedLock)
+	}
+
+	expectedResolvedLocksPointMaxKeys := make([]roachpb.Span, maxKeys)
+	for i := range expectedResolvedLocksPointMaxKeys {
+		expectedResolvedLocksPointMaxKeys[i].Key = intToKey(i)
+	}
+	expectedExternalLocksPointMaxKeys := make([]roachpb.Span, numKeys-maxKeys)
+	for i := range expectedExternalLocksPointMaxKeys {
+		expectedExternalLocksPointMaxKeys[i].Key = intToKey(i + maxKeys)
+	}
+
+	expectedResolvedLocksRangedMaxKeys := make([]roachpb.Span, ceil(maxKeys, keysPerRangedLock))
+	for i := range expectedResolvedLocksRangedMaxKeys {
+		expectedResolvedLocksRangedMaxKeys[i].Key = intToKey(i * keysPerRangedLock)
+		if i == len(expectedResolvedLocksRangedMaxKeys)-1 {
+			expectedResolvedLocksRangedMaxKeys[i].EndKey = intToKey(maxKeys - 1).Next()
+		} else {
+			expectedResolvedLocksRangedMaxKeys[i].EndKey = intToKey((i + 1) * keysPerRangedLock)
+		}
+	}
+	expectedExternalLocksRangedMaxKeys := make([]roachpb.Span, ceil(numKeys, keysPerRangedLock)-ceil(maxKeys, keysPerRangedLock)+1)
+	for i := range expectedExternalLocksRangedMaxKeys {
+		offset := maxKeys / keysPerRangedLock
+		if i == 0 {
+			expectedExternalLocksRangedMaxKeys[i].Key = intToKey(maxKeys - 1).Next()
+		} else {
+			expectedExternalLocksRangedMaxKeys[i].Key = intToKey((i + offset) * keysPerRangedLock)
+		}
+		expectedExternalLocksRangedMaxKeys[i].EndKey = intToKey((i + offset + 1) * keysPerRangedLock)
+	}
+
+	expectedResolvedLocksPointTargetBytes := make([]roachpb.Span, keysFromTargetBytes)
+	for i := range expectedResolvedLocksPointTargetBytes {
+		expectedResolvedLocksPointTargetBytes[i].Key = intToKey(i)
+	}
+	expectedExternalLocksPointTargetBytes := make([]roachpb.Span, numKeys-keysFromTargetBytes)
+	for i := range expectedExternalLocksPointTargetBytes {
+		expectedExternalLocksPointTargetBytes[i].Key = intToKey(i + keysFromTargetBytes)
+	}
+
+	expectedResolvedLocksRangedTargetBytes := make([]roachpb.Span, keysFromTargetBytes/keysPerRangedLock)
+	for i := range expectedResolvedLocksRangedTargetBytes {
+		expectedResolvedLocksRangedTargetBytes[i].Key = intToKey(i * keysPerRangedLock)
+		expectedResolvedLocksRangedTargetBytes[i].EndKey = intToKey((i + 1) * keysPerRangedLock)
+	}
+	expectedExternalLocksRangedTargetBytes := make([]roachpb.Span, ceil(numKeys, keysPerRangedLock)-keysFromTargetBytes/keysPerRangedLock)
+	for i := range expectedExternalLocksRangedTargetBytes {
+		offset := keysFromTargetBytes / keysPerRangedLock
+		expectedExternalLocksRangedTargetBytes[i].Key = intToKey((i + offset) * keysPerRangedLock)
+		expectedExternalLocksRangedTargetBytes[i].EndKey = intToKey((i + offset + 1) * keysPerRangedLock)
+	}
+
+	expectedResolvedLocksNoLimit := make([]roachpb.Span, numKeys)
+	for i := range expectedResolvedLocksNoLimit {
+		expectedResolvedLocksNoLimit[i].Key = intToKey(i)
+	}
+	expectedExternalLocksNoLimit := make([]roachpb.Span, 0)
+
+	testCases := []struct {
+		desc                  string
+		lockSpans             []roachpb.Span
+		resolveAllowance      int64
+		targetBytes           int64
+		expectedResolvedLocks []roachpb.Span
+		expectedExternalLocks []roachpb.Span
+	}{
+		// Point intent resolution with a max keys limit. 20 point intents, 11
+		// become resolved locks and 9 become external locks.
+		{
+			desc:                  "Point locks with max keys",
+			lockSpans:             pointLocks,
+			resolveAllowance:      maxKeys,
+			targetBytes:           0,
+			expectedResolvedLocks: expectedResolvedLocksPointMaxKeys,
+			expectedExternalLocks: expectedExternalLocksPointMaxKeys,
+		},
+		// Ranged intent resolution with a max keys limit. 5 ranged locks (each
+		// containing 4 keys), 3 become resolved locks (containing the first 2
+		// locks and part of the 3rd lock) and 3 become external locks (containing
+		// the remaining part of the 3rd lock and the last 2 locks). Note that the
+		// max key limit splits in between the 3rd lock, so the resolved locks will
+		// contain the first part of the 3rd lock span and the external locks will
+		// contain the remaining part of the 3rd lock span.
+		{
+			desc:                  "Ranged locks with max keys",
+			lockSpans:             rangedLocks,
+			resolveAllowance:      maxKeys,
+			targetBytes:           0,
+			expectedResolvedLocks: expectedResolvedLocksRangedMaxKeys,
+			expectedExternalLocks: expectedExternalLocksRangedMaxKeys,
+		},
+		// Point intent resolution with a target bytes limit. 20 point intents, 12
+		// become resolved locks and 8 become external locks.
+		{
+			desc:                  "Point span with target bytes",
+			lockSpans:             pointLocks,
+			resolveAllowance:      0,
+			targetBytes:           targetBytes,
+			expectedResolvedLocks: expectedResolvedLocksPointTargetBytes,
+			expectedExternalLocks: expectedExternalLocksPointTargetBytes,
+		},
+		// Ranged intent resolution with a target bytes limit. 5 ranged locks (each
+		// containing 4 keys), 3 become resolved locks (containing the first 3
+		// locks) and 2 become external locks (containing the last 2 locks). Note
+		// that the target byte limit does not split in between any locks, so the
+		// resolved and external locks do not contain part of a lock span for any
+		// lock.
+		{
+			desc:                  "Ranged span with target bytes",
+			lockSpans:             rangedLocks,
+			resolveAllowance:      0,
+			targetBytes:           targetBytes,
+			expectedResolvedLocks: expectedResolvedLocksRangedTargetBytes,
+			expectedExternalLocks: expectedExternalLocksRangedTargetBytes,
+		},
+		// Point intent resolution without any limit. 20 point intents, 20 become
+		// resolved locks and 0 become external locks.
+		{
+			desc:                  "No key or byte limit",
+			lockSpans:             pointLocks,
+			resolveAllowance:      0,
+			targetBytes:           0,
+			expectedResolvedLocks: expectedResolvedLocksNoLimit,
+			expectedExternalLocks: expectedExternalLocksNoLimit,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			db := storage.NewDefaultInMemForTesting()
+			defer db.Close()
+			batch := db.NewBatch()
+			defer batch.Close()
+
+			ts := hlc.Timestamp{WallTime: 1}
+			txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, 0, ts, 0, 1)
+			txn.Status = roachpb.COMMITTED
+
+			for i := 0; i < numKeys; i++ {
+				err := storage.MVCCPut(ctx, batch, nil, intToKey(i), ts, hlc.ClockTimestamp{}, roachpb.MakeValueFromString("a"), &txn)
+				require.NoError(t, err)
+			}
+			resolvedLocks, externalLocks, err := resolveLocalLocksWithPagination(
+				ctx,
+				&roachpb.RangeDescriptor{
+					StartKey: roachpb.RKeyMin,
+					EndKey:   roachpb.RKeyMax,
+				},
+				batch,
+				nil,
+				&kvpb.EndTxnRequest{
+					LockSpans:             tc.lockSpans,
+					InternalCommitTrigger: &roachpb.InternalCommitTrigger{},
+				},
+				&txn,
+				(&MockEvalCtx{}).EvalContext(),
+				tc.resolveAllowance,
+				tc.targetBytes,
+			)
+			require.NoError(t, err)
+			require.Equal(t, len(tc.expectedResolvedLocks), len(resolvedLocks))
+			for i, lock := range resolvedLocks {
+				require.Equal(t, tc.expectedResolvedLocks[i].Key, lock.Key)
+				require.Equal(t, tc.expectedResolvedLocks[i].EndKey, lock.EndKey)
+			}
+			require.Equal(t, len(tc.expectedExternalLocks), len(externalLocks))
+			for i, lock := range externalLocks {
+				require.Equal(t, tc.expectedExternalLocks[i].Key, lock.Key)
+				require.Equal(t, tc.expectedExternalLocks[i].EndKey, lock.EndKey)
+			}
+		})
+	}
 }

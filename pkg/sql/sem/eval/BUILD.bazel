@@ -1,4 +1,6 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 filegroup(
     name = "testdata",
@@ -35,29 +37,39 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
+        "//pkg/clusterversion",
         "//pkg/geo",
         "//pkg/geo/geopb",
+        "//pkg/jobs/jobspb",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverbase",
+        "//pkg/repstream/streampb",
         "//pkg/roachpb",
         "//pkg/security/username",
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/catpb",
+        "//pkg/sql/catalog/descpb",
         "//pkg/sql/lex",
+        "//pkg/sql/parser",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/pgwire/pgnotice",
+        "//pkg/sql/pgwire/pgwirecancel",
         "//pkg/sql/privilege",
         "//pkg/sql/roleoption",
         "//pkg/sql/sem/cast",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treebin",
         "//pkg/sql/sem/tree/treecmp",
         "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/sessiondata",
         "//pkg/sql/sessiondatapb",
+        "//pkg/sql/sqlerrors",
         "//pkg/sql/sqlliveness",
         "//pkg/sql/sqltelemetry",
         "//pkg/sql/types",
@@ -73,7 +85,10 @@ go_library(
         "//pkg/util/timeofday",
         "//pkg/util/timeutil",
         "//pkg/util/timeutil/pgdate",
+        "//pkg/util/tochar",
         "//pkg/util/tracing",
+        "//pkg/util/trigram",
+        "//pkg/util/tsearch",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
@@ -90,14 +105,18 @@ go_test(
         "eval_internal_test.go",
         "eval_test.go",
         "like_test.go",
+        "match_test.go",
         "parse_doid_test.go",
         "timeconv_test.go",
         "window_funcs_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":eval"],
     deps = [
         "//pkg/kv",
+        "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/sql/faketreeeval",
@@ -117,6 +136,7 @@ go_test(
         "//pkg/sql/sem/volatility",
         "//pkg/sql/types",
         "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -129,3 +149,12 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+disallowed_imports_test(
+    src = "eval",
+    disallowed_list = [
+        "//pkg/sql/catalog",
+    ],
+)
+
+get_x_data(name = "get_x_data")

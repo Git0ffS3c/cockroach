@@ -16,22 +16,24 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/errors"
 )
 
 // getSchemaIDs returns the set of schema ids from
 // crdb_internal.show_create_all_schemas for a specified database.
 func getSchemaIDs(
 	ctx context.Context, evalPlanner eval.Planner, txn *kv.Txn, dbName string, acc *mon.BoundAccount,
-) ([]int64, error) {
+) (schemaIDs []int64, retErr error) {
 	query := fmt.Sprintf(`
 		SELECT descriptor_id
 		FROM %s.crdb_internal.create_schema_statements
 		WHERE database_name = $1
-		`, dbName)
+		`, lexbase.EscapeSQLIdent(dbName))
 	it, err := evalPlanner.QueryIteratorEx(
 		ctx,
 		"crdb_internal.show_create_all_schemas",
@@ -42,8 +44,9 @@ func getSchemaIDs(
 	if err != nil {
 		return nil, err
 	}
-
-	var schemaIDs []int64
+	defer func() {
+		retErr = errors.CombineErrors(retErr, it.Close())
+	}()
 
 	var ok bool
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
@@ -71,7 +74,7 @@ func getSchemaCreateStatement(
 			create_statement
 		FROM %s.crdb_internal.create_schema_statements
 		WHERE descriptor_id = $1
-	`, dbName)
+	`, lexbase.EscapeSQLIdent(dbName))
 	row, err := evalPlanner.QueryRowEx(
 		ctx,
 		"crdb_internal.show_create_all_schemas",

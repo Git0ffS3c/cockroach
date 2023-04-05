@@ -135,7 +135,8 @@ func (c *githubClientImpl) branchExists(branchName string) (bool, error) {
 }
 
 // issueEvents returns events in chronological order, e.g.
-//   https://api.github.com/repos/cockroachdb/cockroach/issues/77157/timeline
+//
+//	https://api.github.com/repos/cockroachdb/cockroach/issues/77157/timeline
 func (c *githubClientImpl) issueEvents(issueNum int) ([]githubEvent, error) {
 	var details []githubEvent
 	// TODO: This pagination pattern is a potential race condition: we may want to move to graphql api,
@@ -151,6 +152,9 @@ func (c *githubClientImpl) issueEvents(issueNum int) ([]githubEvent, error) {
 			return nil, fmt.Errorf("error calling Issues.ListIssueTimeline: %w", err)
 		}
 		for _, event := range events {
+			if event == nil {
+				continue
+			}
 			detail := githubEvent{
 				Event: *event.Event,
 			}

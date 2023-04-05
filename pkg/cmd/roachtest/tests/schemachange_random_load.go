@@ -25,6 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
+const (
+	txnLogFile = "transactions.ndjson"
+)
+
 type randomLoadBenchSpec struct {
 	Nodes       int
 	Ops         int
@@ -45,9 +49,7 @@ func registerSchemaChangeRandomLoad(r registry.Registry) {
 			spec.Geo(),
 			spec.Zones(geoZonesStr),
 		),
-		// This is set while development is still happening on the workload and we
-		// fix (or bypass) minor schema change bugs that are discovered.
-		NonReleaseBlocker: true,
+		NativeLibs: registry.LibGEOS,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			maxOps := 5000
 			concurrency := 20
@@ -84,10 +86,11 @@ func registerRandomLoadBenchSpec(r registry.Registry, b randomLoadBenchSpec) {
 	name := strings.Join(nameParts, "/")
 
 	r.Add(registry.TestSpec{
-		Name:    name,
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: r.MakeClusterSpec(b.Nodes),
-		Skip:    "https://github.com/cockroachdb/cockroach/issues/56230",
+		Name:       name,
+		Owner:      registry.OwnerSQLSchema,
+		Cluster:    r.MakeClusterSpec(b.Nodes),
+		NativeLibs: registry.LibGEOS,
+		Skip:       "https://github.com/cockroachdb/cockroach/issues/56230",
 		// This is set while development is still happening on the workload and we
 		// fix (or bypass) minor schema change bugs that are discovered.
 		NonReleaseBlocker: true,
@@ -136,9 +139,6 @@ func runSchemaChangeRandomLoad(
 	t.Status("copying binaries")
 	c.Put(ctx, t.Cockroach(), "./cockroach", roachNodes)
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", loadNode)
-	if err := c.PutLibraries(ctx, "./lib"); err != nil {
-		t.Fatal(err)
-	}
 
 	t.Status("starting cockroach nodes")
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), roachNodes)
@@ -157,7 +157,7 @@ func runSchemaChangeRandomLoad(
 		" --histograms=" + t.PerfArtifactsDir() + "/stats.json",
 		fmt.Sprintf("--max-ops %d", maxOps),
 		fmt.Sprintf("--concurrency %d", concurrency),
-		fmt.Sprintf("--txn-log %s", filepath.Join(storeDirectory, "transactions.json")),
+		fmt.Sprintf("--txn-log %s", filepath.Join(storeDirectory, txnLogFile)),
 	}
 	t.Status("running schemachange workload")
 	err = c.RunE(ctx, loadNode, runCmd...)
@@ -201,8 +201,8 @@ func saveArtifacts(ctx context.Context, t test.Test, c cluster.Cluster, storeDir
 
 	remoteBackupFilePath := filepath.Join(storeDirectory, "extern", "schemachange")
 	localBackupFilePath := filepath.Join(t.ArtifactsDir(), "backup")
-	remoteTransactionsFilePath := filepath.Join(storeDirectory, "transactions.ndjson")
-	localTransactionsFilePath := filepath.Join(t.ArtifactsDir(), "transactions.ndjson")
+	remoteTransactionsFilePath := filepath.Join(storeDirectory, txnLogFile)
+	localTransactionsFilePath := filepath.Join(t.ArtifactsDir(), txnLogFile)
 
 	// Copy the backup from the store directory to the artifacts directory.
 	err = c.Get(ctx, t.L(), remoteBackupFilePath, localBackupFilePath, c.Node(1))

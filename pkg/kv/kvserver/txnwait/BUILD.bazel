@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -11,6 +12,7 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverbase",
         "//pkg/roachpb",
         "//pkg/storage/enginepb",
@@ -30,15 +32,20 @@ go_test(
     name = "txnwait_test",
     size = "small",
     srcs = ["queue_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":txnwait"],
     deps = [
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/storage/enginepb",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/stop",
+        "//pkg/util/timeutil",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

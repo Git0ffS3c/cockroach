@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -17,7 +18,9 @@ go_library(
         "//pkg/sql/opt/props",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
-        "//pkg/util",
+        "//pkg/sql/types",
+        "//pkg/util/intsets",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -27,6 +30,7 @@ go_test(
         "constraint_builder_test.go",
         "exports_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":lookupjoin"],
     deps = [
@@ -42,8 +46,10 @@ go_test(
         "//pkg/sql/parser",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/leaktest",
         "@com_github_cockroachdb_datadriven//:datadriven",
     ],
 )
+
+get_x_data(name = "get_x_data")

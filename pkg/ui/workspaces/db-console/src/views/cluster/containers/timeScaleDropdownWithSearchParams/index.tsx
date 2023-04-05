@@ -60,7 +60,10 @@ const TimeScaleDropdownWithSearchParams = (
       // Find the closest time scale just by window size.
       // And temporarily assume the end is "now" with fixedWindowEnd=false.
       const timeScale: TimeScale = {
-        ...findClosestTimeScale(defaultTimeScaleOptions, seconds),
+        ...findClosestTimeScale(
+          props.options || defaultTimeScaleOptions,
+          seconds,
+        ),
         windowSize: moment.duration(end.diff(start)),
         fixedWindowEnd: false,
       };
@@ -91,10 +94,7 @@ const TimeScaleDropdownWithSearchParams = (
     const urlParams = new URLSearchParams(search);
     const seconds = duration.clone().asSeconds();
     const end = dateEnd.clone();
-    const start = moment
-      .utc(end)
-      .subtract(seconds, "seconds")
-      .format("X");
+    const start = moment.utc(end).subtract(seconds, "seconds").format("X");
 
     urlParams.set("start", start);
     urlParams.set("end", moment.utc(dateEnd).format("X"));

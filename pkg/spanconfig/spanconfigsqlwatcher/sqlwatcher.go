@@ -18,11 +18,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedbuffer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -168,7 +170,8 @@ func (s *SQLWatcher) watch(
 			if err != nil {
 				return err
 			}
-			if len(sqlUpdates) == 0 && !checkpointNoops.ShouldProcess(timeutil.Now()) {
+			if len(sqlUpdates) == 0 &&
+				(!checkpointNoops.ShouldProcess(timeutil.Now()) || s.knobs.SQLWatcherSkipNoopCheckpoints) {
 				continue
 			}
 			if err := handler(ctx, sqlUpdates, combinedFrontierTS); err != nil {
@@ -192,7 +195,7 @@ func (s *SQLWatcher) watchForDescriptorUpdates(
 		Key:    descriptorTableStart,
 		EndKey: descriptorTableStart.PrefixEnd(),
 	}
-	handleEvent := func(ctx context.Context, ev *roachpb.RangeFeedValue) {
+	handleEvent := func(ctx context.Context, ev *kvpb.RangeFeedValue) {
 		if !ev.Value.IsPresent() && !ev.PrevValue.IsPresent() {
 			// Event for a tombstone on a tombstone -- nothing for us to do here.
 			return
@@ -201,10 +204,10 @@ func (s *SQLWatcher) watchForDescriptorUpdates(
 		if !ev.Value.IsPresent() {
 			// The descriptor was deleted.
 			value = ev.PrevValue
+			value.Timestamp = ev.Value.Timestamp
 		}
-
-		var descriptor descpb.Descriptor
-		if err := value.GetProto(&descriptor); err != nil {
+		b, err := descbuilder.FromSerializedValue(&value)
+		if err != nil {
 			logcrash.ReportOrPanic(
 				ctx,
 				&s.settings.SV,
@@ -214,34 +217,13 @@ func (s *SQLWatcher) watchForDescriptorUpdates(
 			)
 			return
 		}
-		if descriptor.Union == nil {
+		if b == nil {
 			return
 		}
-
-		table, database, typ, schema := descpb.FromDescriptorWithMVCCTimestamp(&descriptor, ev.Value.Timestamp)
-
-		var id descpb.ID
-		var descType catalog.DescriptorType
-		switch {
-		case table != nil:
-			id = table.GetID()
-			descType = catalog.Table
-		case database != nil:
-			id = database.GetID()
-			descType = catalog.Database
-		case typ != nil:
-			id = typ.GetID()
-			descType = catalog.Type
-		case schema != nil:
-			id = schema.GetID()
-			descType = catalog.Schema
-		default:
-			logcrash.ReportOrPanic(ctx, &s.settings.SV, "unknown descriptor unmarshalled %v", descriptor)
-		}
-
+		desc := b.BuildImmutable()
 		rangefeedEvent := event{
 			timestamp: ev.Value.Timestamp,
-			update:    spanconfig.MakeDescriptorSQLUpdate(id, descType),
+			update:    spanconfig.MakeDescriptorSQLUpdate(desc.GetID(), desc.DescriptorType()),
 		}
 		onEvent(ctx, rangefeedEvent)
 	}
@@ -251,6 +233,7 @@ func (s *SQLWatcher) watchForDescriptorUpdates(
 		[]roachpb.Span{descriptorTableSpan},
 		startTS,
 		handleEvent,
+		rangefeed.WithSystemTablePriority(),
 		rangefeed.WithDiff(true),
 		rangefeed.WithOnFrontierAdvance(func(ctx context.Context, resolvedTS hlc.Timestamp) {
 			onFrontierAdvance(ctx, descriptorsRangefeed, resolvedTS)
@@ -279,18 +262,23 @@ func (s *SQLWatcher) watchForZoneConfigUpdates(
 		Key:    zoneTableStart,
 		EndKey: zoneTableStart.PrefixEnd(),
 	}
-
 	decoder := newZonesDecoder(s.codec)
-	handleEvent := func(ctx context.Context, ev *roachpb.RangeFeedValue) {
-		descID, err := decoder.DecodePrimaryKey(ev.Key)
-		if err != nil {
-			logcrash.ReportOrPanic(
-				ctx,
-				&s.settings.SV,
-				"sql watcher zones range feed error: %v",
-				err,
-			)
-			return
+	handleEvent := func(ctx context.Context, ev *kvpb.RangeFeedValue) {
+		var descID descpb.ID
+		var err error
+		if keys.SystemZonesTableSpan.Key.Equal(ev.Key) {
+			descID = keys.ZonesTableID
+		} else {
+			descID, err = decoder.DecodePrimaryKey(ev.Key)
+			if err != nil {
+				logcrash.ReportOrPanic(
+					ctx,
+					&s.settings.SV,
+					"sql watcher zones range feed error: %v",
+					err,
+				)
+				return
+			}
 		}
 
 		rangefeedEvent := event{
@@ -305,6 +293,7 @@ func (s *SQLWatcher) watchForZoneConfigUpdates(
 		[]roachpb.Span{zoneTableSpan},
 		startTS,
 		handleEvent,
+		rangefeed.WithSystemTablePriority(),
 		rangefeed.WithOnFrontierAdvance(func(ctx context.Context, resolvedTS hlc.Timestamp) {
 			onFrontierAdvance(ctx, zonesRangefeed, resolvedTS)
 		}),
@@ -334,7 +323,7 @@ func (s *SQLWatcher) watchForProtectedTimestampUpdates(
 	}
 
 	decoder := newProtectedTimestampDecoder()
-	handleEvent := func(ctx context.Context, ev *roachpb.RangeFeedValue) {
+	handleEvent := func(ctx context.Context, ev *kvpb.RangeFeedValue) {
 		if !ev.Value.IsPresent() && !ev.PrevValue.IsPresent() {
 			// Event for a tombstone on a tombstone -- nothing for us to do here.
 			return
@@ -400,6 +389,7 @@ func (s *SQLWatcher) watchForProtectedTimestampUpdates(
 		[]roachpb.Span{ptsRecordsTableSpan},
 		startTS,
 		handleEvent,
+		rangefeed.WithSystemTablePriority(),
 		rangefeed.WithOnFrontierAdvance(func(ctx context.Context, resolvedTS hlc.Timestamp) {
 			onFrontierAdvance(ctx, protectedTimestampRangefeed, resolvedTS)
 		}),

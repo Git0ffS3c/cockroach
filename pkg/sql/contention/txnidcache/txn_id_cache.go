@@ -13,8 +13,8 @@ package txnidcache
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/contentionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -26,7 +26,7 @@ type Reader interface {
 	// Lookup returns the corresponding transaction fingerprint ID for a given txnID,
 	// if the given txnID has no entry in the Cache, the returned "found" boolean
 	// will be false.
-	Lookup(txnID uuid.UUID) (result roachpb.TransactionFingerprintID, found bool)
+	Lookup(txnID uuid.UUID) (result appstatspb.TransactionFingerprintID, found bool)
 }
 
 // Writer is the interface that can be used to write to txnidcache.
@@ -55,51 +55,52 @@ const channelSize = 128
 // reaches the limit defined by the cluster setting.
 //
 // Cache's overall architecture is as follows:
-//   +------------------------------------------------------------+
-//   | connExecutor  --------*                                    |
-//   |                       |  writes resolvedTxnID to Writer    |
-//   |                       v                                    |
-//   |      +---------------------------------------------------+ |
-//   |      | Writer                                            | |
-//   |      |                                                   | |
-//   |      |  Writer contains multiple shards of concurrent    | |
-//   |      |  write buffer. Each incoming resolvedTxnID is     | |
-//   |      |  first hashed to a corresponding shard, and then  | |
-//   |      |  is written to the concurrent write buffer        | |
-//   |      |  backing that shard. Once the concurrent write    | |
-//   |      |  buffer is full, a flush is performed and the     | |
-//   |      |  content of the buffer is send into the channel.  | |
-//   |      |                                                   | |
-//   |      | +------------+                                    | |
-//   |      | | shard1     |                                    | |
-//   |      | +------------+                                    | |
-//   |      | | shard2     |                                    | |
-//   |      | +------------+                                    | |
-//   |      | | shard3     |                                    | |
-//   |      | +------------+                                    | |
-//   |      | | .....      |                                    | |
-//   |      | | .....      |                                    | |
-//   |      | +------------+                                    | |
-//   |      | | shard128   |                                    | |
-//   |      | +------------+                                    | |
-//   |      |                                                   | |
-//   |      +-----+---------------------------------------------+ |
-//   +------------|-----------------------------------------------+
-//                |
-//                |
-//                V
-//               channel
-//                ^
-//                |
-//               Cache polls the channel using a goroutine and push the
-//                |   block into its storage.
-//                |
-//   +----------------------------------+
-//   |    Cache:                        |
-//   |     The cache contains a         |
-//   |     FIFO buffer backed by        |
-//   |     fifoCache.                   |
-//   +----------------------------------+
+//
+//	+------------------------------------------------------------+
+//	| connExecutor  --------*                                    |
+//	|                       |  writes resolvedTxnID to Writer    |
+//	|                       v                                    |
+//	|      +---------------------------------------------------+ |
+//	|      | Writer                                            | |
+//	|      |                                                   | |
+//	|      |  Writer contains multiple shards of concurrent    | |
+//	|      |  write buffer. Each incoming resolvedTxnID is     | |
+//	|      |  first hashed to a corresponding shard, and then  | |
+//	|      |  is written to the concurrent write buffer        | |
+//	|      |  backing that shard. Once the concurrent write    | |
+//	|      |  buffer is full, a flush is performed and the     | |
+//	|      |  content of the buffer is send into the channel.  | |
+//	|      |                                                   | |
+//	|      | +------------+                                    | |
+//	|      | | shard1     |                                    | |
+//	|      | +------------+                                    | |
+//	|      | | shard2     |                                    | |
+//	|      | +------------+                                    | |
+//	|      | | shard3     |                                    | |
+//	|      | +------------+                                    | |
+//	|      | | .....      |                                    | |
+//	|      | | .....      |                                    | |
+//	|      | +------------+                                    | |
+//	|      | | shard128   |                                    | |
+//	|      | +------------+                                    | |
+//	|      |                                                   | |
+//	|      +-----+---------------------------------------------+ |
+//	+------------|-----------------------------------------------+
+//	             |
+//	             |
+//	             V
+//	            channel
+//	             ^
+//	             |
+//	            Cache polls the channel using a goroutine and push the
+//	             |   block into its storage.
+//	             |
+//	+----------------------------------+
+//	|    Cache:                        |
+//	|     The cache contains a         |
+//	|     FIFO buffer backed by        |
+//	|     fifoCache.                   |
+//	+----------------------------------+
 type Cache struct {
 	st *cluster.Settings
 
@@ -114,7 +115,7 @@ type Cache struct {
 
 var (
 	entrySize = int64(uuid.UUID{}.Size()) +
-		roachpb.TransactionFingerprintID(0).Size()
+		appstatspb.TransactionFingerprintID(0).Size()
 )
 
 var (
@@ -156,13 +157,13 @@ func (t *Cache) Start(ctx context.Context, stopper *stop.Stopper) {
 }
 
 // Lookup implements the Reader interface.
-func (t *Cache) Lookup(txnID uuid.UUID) (result roachpb.TransactionFingerprintID, found bool) {
+func (t *Cache) Lookup(txnID uuid.UUID) (result appstatspb.TransactionFingerprintID, found bool) {
 	t.metrics.CacheReadCounter.Inc(1)
 
 	txnFingerprintID, found := t.store.get(txnID)
 	if !found {
 		t.metrics.CacheMissCounter.Inc(1)
-		return roachpb.InvalidTransactionFingerprintID, found
+		return appstatspb.InvalidTransactionFingerprintID, found
 	}
 
 	return txnFingerprintID, found

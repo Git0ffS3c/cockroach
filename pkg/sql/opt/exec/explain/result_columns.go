@@ -158,6 +158,9 @@ func getResultColumns(
 		}
 		return nil, nil
 
+	case showCompletionsOp:
+		return colinfo.ShowCompletionsColumns, nil
+
 	case alterTableSplitOp:
 		return colinfo.AlterTableSplitColumns, nil
 
@@ -189,7 +192,8 @@ func getResultColumns(
 		return colinfo.ShowTraceColumns, nil
 
 	case createTableOp, createTableAsOp, createViewOp, controlJobsOp, controlSchedulesOp,
-		cancelQueriesOp, cancelSessionsOp, createStatisticsOp, errorIfRowsOp, deleteRangeOp:
+		cancelQueriesOp, cancelSessionsOp, createStatisticsOp, errorIfRowsOp, deleteRangeOp,
+		createFunctionOp:
 		// These operations produce no columns.
 		return nil, nil
 
@@ -199,6 +203,9 @@ func getResultColumns(
 }
 
 func tableColumns(table cat.Table, ordinals exec.TableColumnOrdinalSet) colinfo.ResultColumns {
+	if table == nil {
+		return nil
+	}
 	cols := make(colinfo.ResultColumns, 0, ordinals.Len())
 	for i, ok := ordinals.Next(0); ok; i, ok = ordinals.Next(i + 1) {
 		// Be defensive about bitset values because they may come from cached

@@ -10,6 +10,8 @@
 
 package scpb
 
+import "github.com/cockroachdb/errors"
+
 const (
 	// PlaceHolderRoleName placeholder string for non-fetched role names.
 	PlaceHolderRoleName string = "__placeholder_role_name__"
@@ -38,12 +40,24 @@ const (
 	// to the schema change, so this target status is used to ensure it comes into
 	// existence before disappearing again. Otherwise, an element whose current
 	// and target statuses are both ABSENT won't experience any state transitions.
-	Transient TargetStatus = TargetStatus(Status_TRANSIENT)
+	Transient TargetStatus = TargetStatus(Status_TRANSIENT_ABSENT)
 )
 
 // Status returns the TargetStatus as a Status.
 func (t TargetStatus) Status() Status {
 	return Status(t)
+}
+
+// InitialStatus returns the initial status for this TargetStatus.
+func (t TargetStatus) InitialStatus() Status {
+	switch t {
+	case ToAbsent:
+		return Status_PUBLIC
+	case ToPublic, Transient:
+		return Status_ABSENT
+	default:
+		panic(errors.AssertionFailedf("unknown target status %v", t.Status()))
+	}
 }
 
 // AsTargetStatus returns the Status as a TargetStatus.
@@ -53,7 +67,7 @@ func AsTargetStatus(s Status) TargetStatus {
 		return ToAbsent
 	case Status_PUBLIC:
 		return ToPublic
-	case Status_TRANSIENT:
+	case Status_TRANSIENT_ABSENT:
 		return Transient
 	default:
 		return InvalidTarget

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -16,12 +17,16 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
+        "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/storage",
         "//pkg/storage/enginepb",
+        "//pkg/util/admission",
         "//pkg/util/bufalloc",
         "//pkg/util/envutil",
+        "//pkg/util/future",
         "//pkg/util/hlc",
         "//pkg/util/interval",
         "//pkg/util/log",
@@ -31,7 +36,6 @@ go_library(
         "//pkg/util/retry",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
-        "//pkg/util/syncutil/singleflight",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
@@ -40,7 +44,7 @@ go_library(
 
 go_test(
     name = "rangefeed_test",
-    size = "medium",
+    size = "large",
     srcs = [
         "budget_test.go",
         "catchup_scan_bench_test.go",
@@ -50,16 +54,23 @@ go_test(
         "resolved_timestamp_test.go",
         "task_test.go",
     ],
+    args = ["-test.timeout=895s"],
     embed = [":rangefeed"],
     deps = [
         "//pkg/base",
+        "//pkg/clusterversion",
         "//pkg/keys",
+        "//pkg/kv/kvpb",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/storage",
         "//pkg/storage/enginepb",
         "//pkg/testutils",
+        "//pkg/testutils/skip",
+        "//pkg/util",
         "//pkg/util/encoding",
+        "//pkg/util/future",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -71,9 +82,10 @@ go_test(
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_errors//oserror",
-        "@com_github_cockroachdb_pebble//:pebble",
         "@com_github_cockroachdb_pebble//vfs",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

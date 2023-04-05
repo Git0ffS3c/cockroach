@@ -11,16 +11,14 @@
 package execinfrapb
 
 import (
-	"context"
 	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/dustin/go-humanize"
 	"github.com/gogo/protobuf/types"
@@ -59,15 +57,15 @@ func FlowComponentID(instanceID base.SQLInstanceID, flowID FlowID) ComponentID {
 	}
 }
 
-// FlowIDTagKey is the key used for flow id tags in tracing spans.
 const (
-	FlowIDTagKey = tracing.TagPrefix + "flowid"
+	// FlowIDTagKey is the key used for flow id tags in tracing spans.
+	FlowIDTagKey = "cockroach.flowid"
 
 	// StreamIDTagKey is the key used for stream id tags in tracing spans.
-	StreamIDTagKey = tracing.TagPrefix + "streamid"
+	StreamIDTagKey = "cockroach.streamid"
 
 	// ProcessorIDTagKey is the key used for processor id tags in tracing spans.
-	ProcessorIDTagKey = tracing.TagPrefix + "processorid"
+	ProcessorIDTagKey = "cockroach.processorid"
 )
 
 // StatsForQueryPlan returns the statistics as a list of strings that can be
@@ -151,6 +149,9 @@ func (s *ComponentStats) formatStats(fn func(suffix string, value interface{})) 
 	if s.KV.BytesRead.HasValue() {
 		fn("KV bytes read", humanize.IBytes(s.KV.BytesRead.Value()))
 	}
+	if s.KV.BatchRequestsIssued.HasValue() {
+		fn("KV gRPC calls", humanizeutil.Count(s.KV.BatchRequestsIssued.Value()))
+	}
 	if s.KV.NumInterfaceSteps.HasValue() {
 		fn("MVCC step count (ext/int)",
 			fmt.Sprintf("%s/%s",
@@ -175,6 +176,9 @@ func (s *ComponentStats) formatStats(fn func(suffix string, value interface{})) 
 	}
 	if s.Exec.MaxAllocatedDisk.HasValue() {
 		fn("max sql temp disk usage", humanize.IBytes(s.Exec.MaxAllocatedDisk.Value()))
+	}
+	if s.Exec.CPUTime.HasValue() {
+		fn("sql cpu time", humanizeutil.Duration(s.Exec.CPUTime.Value()))
 	}
 
 	// Output stats.
@@ -243,11 +247,41 @@ func (s *ComponentStats) Union(other *ComponentStats) *ComponentStats {
 	if !result.KV.NumInternalSeeks.HasValue() {
 		result.KV.NumInternalSeeks = other.KV.NumInternalSeeks
 	}
+	if !result.KV.BlockBytes.HasValue() {
+		result.KV.BlockBytes = other.KV.BlockBytes
+	}
+	if !result.KV.BlockBytesInCache.HasValue() {
+		result.KV.BlockBytesInCache = other.KV.BlockBytesInCache
+	}
+	if !result.KV.KeyBytes.HasValue() {
+		result.KV.KeyBytes = other.KV.KeyBytes
+	}
+	if !result.KV.ValueBytes.HasValue() {
+		result.KV.ValueBytes = other.KV.ValueBytes
+	}
+	if !result.KV.PointCount.HasValue() {
+		result.KV.PointCount = other.KV.PointCount
+	}
+	if !result.KV.PointsCoveredByRangeTombstones.HasValue() {
+		result.KV.PointsCoveredByRangeTombstones = other.KV.PointsCoveredByRangeTombstones
+	}
+	if !result.KV.RangeKeyCount.HasValue() {
+		result.KV.RangeKeyCount = other.KV.RangeKeyCount
+	}
+	if !result.KV.RangeKeyContainedPoints.HasValue() {
+		result.KV.RangeKeyContainedPoints = other.KV.RangeKeyContainedPoints
+	}
+	if !result.KV.RangeKeySkippedPoints.HasValue() {
+		result.KV.RangeKeySkippedPoints = other.KV.RangeKeySkippedPoints
+	}
 	if !result.KV.TuplesRead.HasValue() {
 		result.KV.TuplesRead = other.KV.TuplesRead
 	}
 	if !result.KV.BytesRead.HasValue() {
 		result.KV.BytesRead = other.KV.BytesRead
+	}
+	if !result.KV.BatchRequestsIssued.HasValue() {
+		result.KV.BatchRequestsIssued = other.KV.BatchRequestsIssued
 	}
 
 	// Exec stats.
@@ -259,6 +293,12 @@ func (s *ComponentStats) Union(other *ComponentStats) *ComponentStats {
 	}
 	if !result.Exec.MaxAllocatedDisk.HasValue() {
 		result.Exec.MaxAllocatedDisk = other.Exec.MaxAllocatedDisk
+	}
+	if !result.Exec.ConsumedRU.HasValue() {
+		result.Exec.ConsumedRU = other.Exec.ConsumedRU
+	}
+	if !result.Exec.CPUTime.HasValue() {
+		result.Exec.CPUTime = other.Exec.CPUTime
 	}
 
 	// Output stats.
@@ -275,6 +315,9 @@ func (s *ComponentStats) Union(other *ComponentStats) *ComponentStats {
 	}
 	if !result.FlowStats.MaxDiskUsage.HasValue() {
 		result.FlowStats.MaxDiskUsage = other.FlowStats.MaxDiskUsage
+	}
+	if !result.FlowStats.ConsumedRU.HasValue() {
+		result.FlowStats.ConsumedRU = other.FlowStats.ConsumedRU
 	}
 
 	return &result
@@ -336,15 +379,34 @@ func (s *ComponentStats) MakeDeterministic() {
 	resetUint(&s.KV.NumInternalSteps)
 	resetUint(&s.KV.NumInterfaceSeeks)
 	resetUint(&s.KV.NumInternalSeeks)
+	resetUint(&s.KV.BlockBytes)
+	resetUint(&s.KV.BlockBytesInCache)
+	resetUint(&s.KV.KeyBytes)
+	resetUint(&s.KV.ValueBytes)
+	resetUint(&s.KV.PointCount)
+	resetUint(&s.KV.PointsCoveredByRangeTombstones)
+	resetUint(&s.KV.RangeKeyCount)
+	resetUint(&s.KV.RangeKeyContainedPoints)
+	resetUint(&s.KV.RangeKeySkippedPoints)
 	if s.KV.BytesRead.HasValue() {
 		// BytesRead is overridden to a useful value for tests.
 		s.KV.BytesRead.Set(8 * s.KV.TuplesRead.Value())
+	}
+	if s.KV.BatchRequestsIssued.HasValue() {
+		// BatchRequestsIssued is overridden to a useful value for tests.
+		s.KV.BatchRequestsIssued.Set(s.KV.TuplesRead.Value())
 	}
 
 	// Exec.
 	timeVal(&s.Exec.ExecTime)
 	resetUint(&s.Exec.MaxAllocatedMem)
 	resetUint(&s.Exec.MaxAllocatedDisk)
+	resetUint(&s.Exec.ConsumedRU)
+	if s.Exec.CPUTime.HasValue() {
+		// The CPU time won't be set on all platforms, so we can't output it when
+		// determinism is required.
+		s.Exec.CPUTime.Clear()
+	}
 
 	// Output.
 	resetUint(&s.Output.NumBatches)
@@ -402,8 +464,8 @@ func ExtractStatsFromSpans(
 
 // ExtractNodesFromSpans extracts a list of node ids from a set of tracing
 // spans.
-func ExtractNodesFromSpans(ctx context.Context, spans []tracingpb.RecordedSpan) util.FastIntSet {
-	var nodes util.FastIntSet
+func ExtractNodesFromSpans(spans []tracingpb.RecordedSpan) intsets.Fast {
+	var nodes intsets.Fast
 	// componentStats is only used to check whether a structured payload item is
 	// of ComponentStats type.
 	var componentStats ComponentStats

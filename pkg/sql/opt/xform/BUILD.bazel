@@ -1,9 +1,11 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "xform",
     srcs = [
         "coster.go",
+        "cycle_funcs.go",
         "explorer.go",
         "general_funcs.go",
         "groupby_funcs.go",
@@ -30,6 +32,7 @@ go_library(
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/constraint",
+        "//pkg/sql/opt/cycle",
         "//pkg/sql/opt/distribution",
         "//pkg/sql/opt/idxconstraint",
         "//pkg/sql/opt/invertedexpr",
@@ -46,15 +49,14 @@ go_library(
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
-        "//pkg/util",
         "//pkg/util/buildutil",
+        "//pkg/util/cancelchecker",
         "//pkg/util/errorutil",
+        "//pkg/util/intsets",
         "//pkg/util/log",
-        "//pkg/util/randutil",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
-        "@org_golang_x_tools//container/intsets",
     ],
 )
 
@@ -69,6 +71,7 @@ go_test(
         "optimizer_test.go",
         "physical_props_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]) + [
         "//c-deps:libgeos",
         "//pkg/sql/opt/testutils/opttester:testfixtures",
@@ -77,7 +80,7 @@ go_test(
     deps = [
         "//pkg/config/zonepb",
         "//pkg/roachpb",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/settings/cluster",
         "//pkg/sql/opt",
@@ -91,7 +94,7 @@ go_test(
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/randutil",
@@ -124,3 +127,5 @@ genrule(
         "//pkg/gen:__pkg__",
     ],
 )
+
+get_x_data(name = "get_x_data")

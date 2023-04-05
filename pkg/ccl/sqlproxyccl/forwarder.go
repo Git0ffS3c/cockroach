@@ -71,6 +71,17 @@ type forwarder struct {
 	mu struct {
 		syncutil.Mutex
 
+		// isInitialized indicates that the forwarder has been initialized.
+		//
+		// TODO(jaylim-crl): This prevents the connection from being transferred
+		// before we fully resume the processors (because the balancer now
+		// tracks assignments instead of forwarders). If we don't do this, there
+		// could be a situation where we resume the processors mid transfer. One
+		// alternative idea is to replace both isInitialized and isTransferring
+		// with a lock, which is held by the owner of the forwarder (e.g. main
+		// thread, or connection migrator thread).
+		isInitialized bool
+
 		// isTransferring indicates that a connection migration is in progress.
 		isTransferring bool
 
@@ -154,7 +165,7 @@ func newForwarder(
 //
 // run can only be called once throughout the lifetime of the forwarder.
 func (f *forwarder) run(clientConn net.Conn, serverConn net.Conn) error {
-	initialize := func() error {
+	setup := func() error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 
@@ -165,8 +176,9 @@ func (f *forwarder) run(clientConn net.Conn, serverConn net.Conn) error {
 			return f.ctx.Err()
 		}
 
-		// Run can only be called once.
-		if f.isInitializedLocked() {
+		// Run can only be called once. If lastUpdated has already been set
+		// (i.e. non-zero), it has to be the case where run has been called.
+		if !f.mu.activity.lastUpdated.IsZero() {
 			return errors.AssertionFailedf("forwarder has already been started")
 		}
 
@@ -185,10 +197,23 @@ func (f *forwarder) run(clientConn net.Conn, serverConn net.Conn) error {
 		f.mu.activity.lastUpdated = f.timeSource.Now()
 		return nil
 	}
-	if err := initialize(); err != nil {
-		return err
+	markInitialized := func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.mu.isInitialized = true
 	}
-	return f.resumeProcessors()
+
+	if err := setup(); err != nil {
+		return errors.Wrap(err, "setting up forwarder")
+	}
+
+	if err := f.resumeProcessors(); err != nil {
+		return errors.Wrap(err, "resuming processors")
+	}
+
+	// Mark the forwarder as initialized, and connection is ready for a transfer.
+	markInitialized()
+	return nil
 }
 
 // Context returns the context associated with the forwarder.
@@ -202,6 +227,8 @@ func (f *forwarder) Context() context.Context {
 //
 // Close implements the balancer.ConnectionHandle interface.
 func (f *forwarder) Close() {
+	// Cancelling the forwarder's context and connections will automatically
+	// cause the processors to exit, and close themselves.
 	f.ctxCancel()
 
 	// Whenever Close is called while both of the processors are suspended, the
@@ -235,7 +262,7 @@ func (f *forwarder) IsIdle() (idle bool) {
 	defer f.mu.Unlock()
 
 	// If the forwarder hasn't been initialized, it is considered active.
-	if !f.isInitializedLocked() {
+	if !f.mu.isInitialized {
 		return false
 	}
 
@@ -266,12 +293,6 @@ func (f *forwarder) IsIdle() (idle bool) {
 	// No activity from the forwarder. If the idle timeout hasn't elapsed, the
 	// forwarder is still considered active.
 	return now.Sub(f.mu.activity.lastUpdated) >= idleTimeout
-}
-
-// isInitializedLocked returns true if the forwarder has been initialized
-// through Run, or false otherwise.
-func (f *forwarder) isInitializedLocked() bool {
-	return f.mu.request != nil && f.mu.response != nil
 }
 
 // resumeProcessors starts both the request and response processors
@@ -354,7 +375,12 @@ func wrapClientToServerError(err error) error {
 		errors.IsAny(err, context.Canceled, context.DeadlineExceeded) {
 		return nil
 	}
-	return newErrorf(codeClientDisconnected, "copying from client to target server: %v", err)
+	if err := wrapConnectionError(err); err != nil {
+		return err
+	}
+	return withCode(errors.Wrap(err,
+		"unexpected error copying from client to target server"),
+		codeClientDisconnected)
 }
 
 // wrapServerToClientError overrides server to client errors for external
@@ -369,7 +395,12 @@ func wrapServerToClientError(err error) error {
 		errors.IsAny(err, context.Canceled, context.DeadlineExceeded) {
 		return nil
 	}
-	return newErrorf(codeBackendDisconnected, "copying from target server to client: %s", err)
+	if err := wrapConnectionError(err); err != nil {
+		return err
+	}
+	return withCode(errors.Wrap(err,
+		"unexpected error copying from target server to client"),
+		codeBackendDisconnected)
 }
 
 // makeLogicalClockFn returns a function that implements a simple logical clock.
@@ -389,7 +420,10 @@ func makeLogicalClockFn() func() uint64 {
 // cancellation of dials.
 var aLongTimeAgo = timeutil.Unix(1, 0)
 
-var errProcessorResumed = errors.New("processor has already been resumed")
+var (
+	errProcessorResumed = errors.New("processor has already been resumed")
+	errProcessorClosed  = errors.New("processor has been closed")
+)
 
 // processor must always be constructed through newProcessor.
 type processor struct {
@@ -402,6 +436,7 @@ type processor struct {
 	mu struct {
 		syncutil.Mutex
 		cond       *sync.Cond
+		closed     bool
 		resumed    bool
 		inPeek     bool
 		suspendReq bool // Indicates that a suspend has been requested.
@@ -424,13 +459,15 @@ func newProcessor(logicalClockFn func() uint64, src, dst *interceptor.PGConn) *p
 
 // resume starts the processor and blocks during the processing. When the
 // processing has been terminated, this returns nil if the processor can be
-// resumed again in the future. If an error (except errProcessorResumed) was
-// returned, the processor should not be resumed again, and the forwarder should
-// be closed.
-func (p *processor) resume(ctx context.Context) error {
+// resumed again in the future. If an error was returned, the processor should
+// not be resumed again, and the forwarder must be closed.
+func (p *processor) resume(ctx context.Context) (retErr error) {
 	enterResume := func() error {
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		if p.mu.closed {
+			return errProcessorClosed
+		}
 		if p.mu.resumed {
 			return errProcessorResumed
 		}
@@ -441,6 +478,10 @@ func (p *processor) resume(ctx context.Context) error {
 	exitResume := func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		// If there's an error, close the processor.
+		if retErr != nil {
+			p.mu.closed = true
+		}
 		p.mu.resumed = false
 		p.mu.cond.Broadcast()
 	}
@@ -495,6 +536,9 @@ func (p *processor) resume(ctx context.Context) error {
 	}
 
 	if err := enterResume(); err != nil {
+		if errors.Is(err, errProcessorResumed) {
+			return nil
+		}
 		return err
 	}
 	defer exitResume()
@@ -524,6 +568,9 @@ func (p *processor) waitResumed(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if p.mu.closed {
+			return errProcessorClosed
+		}
 		p.mu.cond.Wait()
 	}
 	return nil
@@ -535,6 +582,11 @@ func (p *processor) waitResumed(ctx context.Context) error {
 func (p *processor) suspend(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// If the processor has been closed, it cannot be suspended at all.
+	if p.mu.closed {
+		return errProcessorClosed
+	}
 
 	defer func() {
 		if p.mu.suspendReq {

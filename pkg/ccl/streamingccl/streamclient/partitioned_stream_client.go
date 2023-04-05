@@ -10,43 +10,62 @@ package streamclient
 
 import (
 	"context"
-	gosql "database/sql"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"net"
 	"net/url"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/jackc/pgx/v4"
 )
 
 type partitionedStreamClient struct {
-	srcDB          *gosql.DB // DB handle to the source cluster
 	urlPlaceholder url.URL
+	pgxConfig      *pgx.ConnConfig
 
 	mu struct {
 		syncutil.Mutex
 
 		closed              bool
 		activeSubscriptions map[*partitionedStreamSubscription]struct{}
+		srcConn             *pgx.Conn // pgx connection to the source cluster
 	}
 }
 
-func newPartitionedStreamClient(remote *url.URL) (*partitionedStreamClient, error) {
-	db, err := gosql.Open("postgres", remote.String())
+func NewPartitionedStreamClient(
+	ctx context.Context, remote *url.URL,
+) (*partitionedStreamClient, error) {
+
+	noInlineCertURI, tlsInfo, err := uriWithInlineTLSCertsRemoved(remote)
+	if err != nil {
+		return nil, err
+	}
+	config, err := pgx.ParseConfig(noInlineCertURI.String())
+	if err != nil {
+		return nil, err
+	}
+	tlsInfo.addTLSCertsToConfig(config.TLSConfig)
+
+	conn, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 
 	client := &partitionedStreamClient{
-		srcDB:          db,
 		urlPlaceholder: *remote,
+		pgxConfig:      config,
 	}
 	client.mu.activeSubscriptions = make(map[*partitionedStreamSubscription]struct{})
+	client.mu.srcConn = conn
 	return client, nil
 }
 
@@ -54,52 +73,56 @@ var _ Client = &partitionedStreamClient{}
 
 // Create implements Client interface.
 func (p *partitionedStreamClient) Create(
-	ctx context.Context, tenantID roachpb.TenantID,
-) (streaming.StreamID, error) {
-	streamID := streaming.InvalidStreamID
+	ctx context.Context, tenantName roachpb.TenantName,
+) (streampb.ReplicationProducerSpec, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "streamclient.Client.Create")
+	defer sp.Finish()
 
-	conn, err := p.srcDB.Conn(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var rawReplicationProducerSpec []byte
+	row := p.mu.srcConn.QueryRow(ctx, `SELECT crdb_internal.start_replication_stream($1)`, tenantName)
+	err := row.Scan(&rawReplicationProducerSpec)
 	if err != nil {
-		return streamID, err
+		return streampb.ReplicationProducerSpec{}, errors.Wrapf(err, "error creating replication stream for tenant %s", tenantName)
+	}
+	var replicationProducerSpec streampb.ReplicationProducerSpec
+	if err := protoutil.Unmarshal(rawReplicationProducerSpec, &replicationProducerSpec); err != nil {
+		return streampb.ReplicationProducerSpec{}, err
 	}
 
-	row := conn.QueryRowContext(ctx, `SELECT crdb_internal.start_replication_stream($1)`, tenantID.ToUint64())
-	if row.Err() != nil {
-		return streamID, errors.Wrapf(row.Err(), "Error in creating replication stream for tenant %s", tenantID.String())
-	}
+	return replicationProducerSpec, err
+}
 
-	err = row.Scan(&streamID)
-	return streamID, err
+// Dial implements Client interface.
+func (p *partitionedStreamClient) Dial(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	err := p.mu.srcConn.Ping(ctx)
+	return errors.Wrap(err, "failed to dial client")
 }
 
 // Heartbeat implements Client interface.
 func (p *partitionedStreamClient) Heartbeat(
-	ctx context.Context, streamID streaming.StreamID, consumed hlc.Timestamp,
-) error {
-	conn, err := p.srcDB.Conn(ctx)
-	if err != nil {
-		return err
-	}
+	ctx context.Context, streamID streampb.StreamID, consumed hlc.Timestamp,
+) (streampb.StreamReplicationStatus, error) {
+	ctx, sp := tracing.ChildSpan(ctx, "streamclient.Client.Heartbeat")
+	defer sp.Finish()
 
-	row := conn.QueryRowContext(ctx,
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	row := p.mu.srcConn.QueryRow(ctx,
 		`SELECT crdb_internal.replication_stream_progress($1, $2)`, streamID, consumed.String())
-	if row.Err() != nil {
-		return errors.Wrapf(row.Err(), "Error in sending heartbeats to replication stream %d", streamID)
-	}
-
 	var rawStatus []byte
 	if err := row.Scan(&rawStatus); err != nil {
-		return err
+		return streampb.StreamReplicationStatus{},
+			errors.Wrapf(err, "error sending heartbeat to replication stream %d", streamID)
 	}
 	var status streampb.StreamReplicationStatus
 	if err := protoutil.Unmarshal(rawStatus, &status); err != nil {
-		return err
+		return streampb.StreamReplicationStatus{}, err
 	}
-	// TODO(casper): add observability for stream protected timestamp
-	if status.StreamStatus != streampb.StreamReplicationStatus_STREAM_ACTIVE {
-		return streamingccl.NewStreamStatusErr(streamID, status.StreamStatus)
-	}
-	return nil
+	return status, nil
 }
 
 // postgresURL converts an SQL serving address into a postgres URL.
@@ -115,50 +138,49 @@ func (p *partitionedStreamClient) postgresURL(servingAddr string) (url.URL, erro
 
 // Plan implements Client interface.
 func (p *partitionedStreamClient) Plan(
-	ctx context.Context, streamID streaming.StreamID,
+	ctx context.Context, streamID streampb.StreamID,
 ) (Topology, error) {
-	conn, err := p.srcDB.Conn(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	row := conn.QueryRowContext(ctx, `SELECT crdb_internal.replication_stream_spec($1)`, streamID)
-	if row.Err() != nil {
-		return nil, errors.Wrap(row.Err(), "Error in planning a replication stream")
-	}
-
-	var rawSpec []byte
-	if err := row.Scan(&rawSpec); err != nil {
-		return nil, err
-	}
 	var spec streampb.ReplicationStreamSpec
-	if err := protoutil.Unmarshal(rawSpec, &spec); err != nil {
-		return nil, err
+	{
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		row := p.mu.srcConn.QueryRow(ctx, `SELECT crdb_internal.replication_stream_spec($1)`, streamID)
+		var rawSpec []byte
+		if err := row.Scan(&rawSpec); err != nil {
+			return Topology{}, errors.Wrapf(err, "error planning replication stream %d", streamID)
+		}
+		if err := protoutil.Unmarshal(rawSpec, &spec); err != nil {
+			return Topology{}, err
+		}
 	}
 
-	topology := Topology{}
+	topology := Topology{
+		SourceTenantID: spec.SourceTenantID,
+	}
 	for _, sp := range spec.Partitions {
 		pgURL, err := p.postgresURL(sp.SQLAddress.String())
 		if err != nil {
-			return nil, err
+			return Topology{}, err
 		}
 		rawSpec, err := protoutil.Marshal(sp.PartitionSpec)
 		if err != nil {
-			return nil, err
+			return Topology{}, err
 		}
-		topology = append(topology, PartitionInfo{
+		topology.Partitions = append(topology.Partitions, PartitionInfo{
 			ID:                sp.NodeID.String(),
 			SubscriptionToken: SubscriptionToken(rawSpec),
 			SrcInstanceID:     int(sp.NodeID),
 			SrcAddr:           streamingccl.PartitionAddress(pgURL.String()),
 			SrcLocality:       sp.Locality,
+			Spans:             sp.PartitionSpec.Spans,
 		})
 	}
 	return topology, nil
 }
 
 // Close implements Client interface.
-func (p *partitionedStreamClient) Close() error {
+func (p *partitionedStreamClient) Close(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -171,18 +193,26 @@ func (p *partitionedStreamClient) Close() error {
 		close(sub.closeChan)
 		delete(p.mu.activeSubscriptions, sub)
 	}
-	return p.srcDB.Close()
+	return p.mu.srcConn.Close(ctx)
 }
 
 // Subscribe implements Client interface.
 func (p *partitionedStreamClient) Subscribe(
-	ctx context.Context, stream streaming.StreamID, spec SubscriptionToken, checkpoint hlc.Timestamp,
+	ctx context.Context,
+	streamID streampb.StreamID,
+	spec SubscriptionToken,
+	initialScanTime hlc.Timestamp,
+	previousHighWater hlc.Timestamp,
 ) (Subscription, error) {
+	_, sp := tracing.ChildSpan(ctx, "streamclient.Client.Subscribe")
+	defer sp.Finish()
+
 	sps := streampb.StreamPartitionSpec{}
 	if err := protoutil.Unmarshal(spec, &sps); err != nil {
 		return nil, err
 	}
-	sps.StartFrom = checkpoint
+	sps.InitialScanTimestamp = initialScanTime
+	sps.PreviousHighWaterTimestamp = previousHighWater
 
 	specBytes, err := protoutil.Marshal(&sps)
 	if err != nil {
@@ -190,11 +220,11 @@ func (p *partitionedStreamClient) Subscribe(
 	}
 
 	res := &partitionedStreamSubscription{
-		eventsChan: make(chan streamingccl.Event),
-		db:         p.srcDB,
-		specBytes:  specBytes,
-		streamID:   stream,
-		closeChan:  make(chan struct{}),
+		eventsChan:    make(chan streamingccl.Event),
+		srcConnConfig: p.pgxConfig,
+		specBytes:     specBytes,
+		streamID:      streamID,
+		closeChan:     make(chan struct{}),
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -203,28 +233,32 @@ func (p *partitionedStreamClient) Subscribe(
 }
 
 // Complete implements the streamclient.Client interface.
-func (p *partitionedStreamClient) Complete(ctx context.Context, streamID streaming.StreamID) error {
-	conn, err := p.srcDB.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	row := conn.QueryRowContext(ctx, `SELECT crdb_internal.complete_replication_stream($1)`, streamID)
-	if row.Err() != nil {
-		return errors.Wrap(row.Err(), "Error in completing a replication stream")
+func (p *partitionedStreamClient) Complete(
+	ctx context.Context, streamID streampb.StreamID, successfulIngestion bool,
+) error {
+	ctx, sp := tracing.ChildSpan(ctx, "streamclient.Client.Complete")
+	defer sp.Finish()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	row := p.mu.srcConn.QueryRow(ctx,
+		`SELECT crdb_internal.complete_replication_stream($1, $2)`, streamID, successfulIngestion)
+	if err := row.Scan(&streamID); err != nil {
+		return errors.Wrapf(err, "error completing replication stream %d", streamID)
 	}
 	return nil
 }
 
 type partitionedStreamSubscription struct {
-	err        error
-	db         *gosql.DB
-	eventsChan chan streamingccl.Event
+	err           error
+	srcConnConfig *pgx.ConnConfig
+	eventsChan    chan streamingccl.Event
 	// Channel to send signal to close the subscription.
 	closeChan chan struct{}
 
 	streamEvent *streampb.StreamEvent
 	specBytes   []byte
-	streamID    streaming.StreamID
+	streamID    streampb.StreamID
 }
 
 var _ Subscription = (*partitionedStreamSubscription)(nil)
@@ -236,34 +270,54 @@ func parseEvent(streamEvent *streampb.StreamEvent) streamingccl.Event {
 	}
 
 	if streamEvent.Checkpoint != nil {
-		event := streamingccl.MakeCheckpointEvent(streamEvent.Checkpoint.Spans[0].Timestamp)
+		event := streamingccl.MakeCheckpointEvent(streamEvent.Checkpoint.ResolvedSpans)
 		streamEvent.Checkpoint = nil
 		return event
 	}
+
+	var event streamingccl.Event
 	if streamEvent.Batch != nil {
-		event := streamingccl.MakeKVEvent(streamEvent.Batch.KeyValues[0])
-		streamEvent.Batch.KeyValues = streamEvent.Batch.KeyValues[1:]
-		if len(streamEvent.Batch.KeyValues) == 0 {
+		if len(streamEvent.Batch.Ssts) > 0 {
+			event = streamingccl.MakeSSTableEvent(streamEvent.Batch.Ssts[0])
+			streamEvent.Batch.Ssts = streamEvent.Batch.Ssts[1:]
+		} else if len(streamEvent.Batch.KeyValues) > 0 {
+			event = streamingccl.MakeKVEvent(streamEvent.Batch.KeyValues[0])
+			streamEvent.Batch.KeyValues = streamEvent.Batch.KeyValues[1:]
+		} else if len(streamEvent.Batch.DelRanges) > 0 {
+			event = streamingccl.MakeDeleteRangeEvent(streamEvent.Batch.DelRanges[0])
+			streamEvent.Batch.DelRanges = streamEvent.Batch.DelRanges[1:]
+		}
+		if len(streamEvent.Batch.KeyValues) == 0 &&
+			len(streamEvent.Batch.Ssts) == 0 &&
+			len(streamEvent.Batch.DelRanges) == 0 {
 			streamEvent.Batch = nil
 		}
-		return event
 	}
-	return nil
+	return event
 }
 
 // Subscribe implements the Subscription interface.
 func (p *partitionedStreamSubscription) Subscribe(ctx context.Context) error {
-	defer close(p.eventsChan)
-	conn, err := p.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
+	ctx, sp := tracing.ChildSpan(ctx, "Subscription.Subscribe")
+	defer sp.Finish()
 
-	_, err = conn.ExecContext(ctx, `SET avoid_buffering = true`)
+	defer close(p.eventsChan)
+	// Each subscription has its own pgx connection.
+	srcConn, err := pgx.ConnectConfig(ctx, p.srcConnConfig)
 	if err != nil {
 		return err
 	}
-	rows, err := conn.QueryContext(ctx, `SELECT * FROM crdb_internal.stream_partition($1, $2)`,
+	defer func() {
+		if err != nil {
+			log.Warningf(ctx, "error when closing subscription connection: %v", err)
+		}
+	}()
+
+	_, err = srcConn.Exec(ctx, `SET avoid_buffering = true`)
+	if err != nil {
+		return err
+	}
+	rows, err := srcConn.Query(ctx, `SELECT * FROM crdb_internal.stream_partition($1, $2)`,
 		p.streamID, p.specBytes)
 	if err != nil {
 		return err
@@ -321,4 +375,102 @@ func (p *partitionedStreamSubscription) Events() <-chan streamingccl.Event {
 // Err implements the Subscription interface.
 func (p *partitionedStreamSubscription) Err() error {
 	return p.err
+}
+
+type tlsCerts struct {
+	certs        []tls.Certificate
+	rootCertPool *x509.CertPool
+}
+
+const (
+	// sslInlineURLParam is a non-standard connection URL
+	// parameter. When true, we assume that sslcert, sslkey, and
+	// sslrootcert contain URL-encoded data rather than paths.
+	sslInlineURLParam = "sslinline"
+
+	sslModeURLParam     = "sslmode"
+	sslCertURLParam     = "sslcert"
+	sslKeyURLParam      = "sslkey"
+	sslRootCertURLParam = "sslrootcert"
+)
+
+var RedactableURLParameters = []string{
+	sslCertURLParam,
+	sslKeyURLParam,
+	sslRootCertURLParam,
+}
+
+// uriWithInlineTLSCertsRemoved handles the non-standard sslinline
+// option. The returned URL can be passed to pgx. The returned
+// tlsCerts struct can be used to apply the certificate data to the
+// tls.Config produced by pgx.
+func uriWithInlineTLSCertsRemoved(remote *url.URL) (*url.URL, *tlsCerts, error) {
+	if remote.Query().Get(sslInlineURLParam) != "true" {
+		return remote, nil, nil
+	}
+
+	retURL := *remote
+	v := retURL.Query()
+	cert := v.Get(sslCertURLParam)
+	key := v.Get(sslKeyURLParam)
+	rootcert := v.Get(sslRootCertURLParam)
+
+	if (cert != "" && key == "") || (cert == "" && key != "") {
+		return nil, nil, errors.New(`both "sslcert" and "sslkey" are required`)
+	}
+
+	tlsInfo := &tlsCerts{}
+	if rootcert != "" {
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM([]byte(rootcert)) {
+			return nil, nil, errors.New("unable to add CA to cert pool")
+		}
+		tlsInfo.rootCertPool = caCertPool
+	}
+	if cert != "" && key != "" {
+		// TODO(ssd): pgx supports sslpassword here. But, it
+		// only supports PKCS#1 and relies on functions that
+		// are deprecated in the stdlib. For now, I've skipped
+		// it.
+		block, _ := pem.Decode([]byte(key))
+		pemKey := pem.EncodeToMemory(block)
+		keyPair, err := tls.X509KeyPair([]byte(cert), pemKey)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "unable to construct x509 key pair")
+		}
+		tlsInfo.certs = []tls.Certificate{keyPair}
+	}
+
+	// lib/pq, pgx, and the C libpq implement this backwards
+	// compatibility quirk. Since we are removing sslrootcert, we
+	// have to re-implement it here.
+	//
+	// TODO(ssd): This may be a sign that we should implement the
+	// entire configTLS function from pgx and remove all tls
+	// options.
+	if v.Get(sslModeURLParam) == "require" && rootcert != "" {
+		v.Set(sslModeURLParam, "verify-ca")
+	}
+
+	v.Del(sslCertURLParam)
+	v.Del(sslKeyURLParam)
+	v.Del(sslRootCertURLParam)
+	v.Del(sslInlineURLParam)
+	retURL.RawQuery = v.Encode()
+	return &retURL, tlsInfo, nil
+}
+
+func (c *tlsCerts) addTLSCertsToConfig(tlsConfig *tls.Config) {
+	if c == nil {
+		return
+	}
+
+	if c.rootCertPool != nil {
+		tlsConfig.RootCAs = c.rootCertPool
+		tlsConfig.ClientCAs = c.rootCertPool
+	}
+
+	if len(c.certs) > 0 {
+		tlsConfig.Certificates = c.certs
+	}
 }

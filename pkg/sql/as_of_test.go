@@ -20,8 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -36,10 +36,15 @@ func TestAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	params, _ := tests.CreateTestServerParams()
-	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { select {} }}
+	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error {
+		<-ctx.Done()
+		return nil
+	}}
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
+	defer cancel()
 
 	const val1 = 1
 	const val2 = 2
@@ -312,28 +317,28 @@ func TestAsOfRetry(t *testing.T) {
 		name: 5,
 	}
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args kvserverbase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *kvpb.Error {
 			magicVals.Lock()
 			defer magicVals.Unlock()
 
 			switch req := args.Req.(type) {
-			case *roachpb.GetRequest:
+			case *kvpb.GetRequest:
 				if kv.TestingIsRangeLookupRequest(req) {
 					return nil
 				}
 				for key, count := range magicVals.restartCounts {
 					if err := checkCorrectTxn(string(req.Key), magicVals, args.Hdr.Txn); err != nil {
-						return roachpb.NewError(err)
+						return kvpb.NewError(err)
 					}
 					if count > 0 && bytes.Contains(req.Key, []byte(key)) {
 						magicVals.restartCounts[key]--
-						err := roachpb.NewTransactionRetryError(
-							roachpb.RETRY_REASON_UNKNOWN, "filter err")
+						err := kvpb.NewTransactionRetryError(
+							kvpb.RETRY_REASON_UNKNOWN, "filter err")
 						magicVals.failedValues[string(req.Key)] =
 							failureRecord{err, args.Hdr.Txn}
 						txn := args.Hdr.Txn.Clone()
 						txn.WriteTimestamp = txn.WriteTimestamp.Add(0, 1)
-						return roachpb.NewErrorWithTxn(err, txn)
+						return kvpb.NewErrorWithTxn(err, txn)
 					}
 				}
 			}

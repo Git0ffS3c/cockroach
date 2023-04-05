@@ -40,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
@@ -135,7 +134,7 @@ func TestOutboxInbox(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	require.NoError(t, err)
 
@@ -270,14 +269,18 @@ func TestOutboxInbox(t *testing.T) {
 
 			inputMemAcc := testMemMonitor.MakeBoundAccount()
 			defer inputMemAcc.Close(outboxCtx)
-			input := coldatatestutils.NewRandomDataOp(
+			input, _ := coldatatestutils.NewRandomDataOp(
 				colmem.NewAllocator(outboxCtx, &inputMemAcc, coldata.StandardColumnFactory), rng, args,
 			)
 			outboxMemAcc := testMemMonitor.MakeBoundAccount()
 			defer outboxMemAcc.Close(outboxCtx)
+			outboxConverterMemAcc := testMemMonitor.MakeBoundAccount()
+			defer outboxConverterMemAcc.Close(ctx)
 			outbox, err := NewOutbox(
+				&execinfra.FlowCtx{Gateway: false},
+				0, /* processorID */
 				colmem.NewAllocator(outboxCtx, &outboxMemAcc, coldata.StandardColumnFactory),
-				colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
+				&outboxConverterMemAcc, colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
 			)
 			require.NoError(t, err)
 
@@ -486,7 +489,7 @@ func TestInboxHostCtxCancellation(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	require.NoError(t, err)
 
@@ -519,8 +522,10 @@ func TestInboxHostCtxCancellation(t *testing.T) {
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(outboxHostCtx)
 	outbox, err := NewOutbox(
+		&execinfra.FlowCtx{Gateway: false},
+		0, /* processorID */
 		colmem.NewAllocator(outboxHostCtx, &outboxMemAcc, coldata.StandardColumnFactory),
-		colexecargs.OpWithMetaInfo{Root: outboxInput}, typs, nil, /* getStats */
+		testMemAcc, colexecargs.OpWithMetaInfo{Root: outboxInput}, typs, nil, /* getStats */
 	)
 	require.NoError(t, err)
 	var wg sync.WaitGroup
@@ -574,7 +579,7 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticSQLInstanceID,
+		hlc.NewClockForTesting(nil), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(t, err)
 
@@ -682,7 +687,7 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 				serverStreamNotification = <-mockServer.InboundStreams
 				serverStream             = serverStreamNotification.Stream
 				typs                     = []*types.T{types.Int}
-				input                    = coldatatestutils.NewRandomDataOp(
+				input, _                 = coldatatestutils.NewRandomDataOp(
 					testAllocator,
 					rng,
 					coldatatestutils.RandomDataOpArgs{
@@ -700,7 +705,10 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 				expectedMetadata = tc.overrideExpectedMetadata
 			}
 			outbox, err := NewOutbox(
+				&execinfra.FlowCtx{Gateway: false},
+				0, /* processorID */
 				colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
+				testMemAcc,
 				colexecargs.OpWithMetaInfo{
 					Root: input,
 					MetadataSources: []colexecop.MetadataSource{
@@ -766,7 +774,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	defer stopper.Stop(ctx)
 
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticSQLInstanceID,
+		hlc.NewClockForTesting(nil), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(b, err)
 
@@ -795,8 +803,10 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(ctx)
 	outbox, err := NewOutbox(
+		&execinfra.FlowCtx{Gateway: false},
+		0, /* processorID */
 		colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-		colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
+		testMemAcc, colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
 	)
 	require.NoError(b, err)
 
@@ -839,7 +849,7 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticSQLInstanceID,
+		hlc.NewClockForTesting(nil), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(t, err)
 	dialer := &execinfrapb.MockDialer{Addr: addr}
@@ -860,8 +870,10 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(ctx)
 	outbox, err := NewOutbox(
+		&execinfra.FlowCtx{Gateway: false},
+		0, /* processorID */
 		colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-		colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
+		testMemAcc, colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
 	)
 	require.NoError(t, err)
 
@@ -871,7 +883,6 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 			ctx,
 			dialer,
 			base.SQLInstanceID(0),
-			execinfrapb.FlowID{UUID: uuid.MakeV4()},
 			outboxStreamID,
 			nil, /* flowCtxCancel */
 			0,   /* connectionTimeout */
@@ -942,11 +953,11 @@ func TestInboxCtxStreamIDTagging(t *testing.T) {
 			}, nil)
 
 			inboxTested := make(chan struct{})
-			go func() {
+			go func(tester func(*Inbox)) {
 				inbox.Init(ctx)
-				tc.test(inbox)
+				tester(inbox)
 				inboxTested <- struct{}{}
-			}()
+			}(tc.test)
 
 			<-ctxExtract
 			require.NoError(t, rpcLayer.client.CloseSend())

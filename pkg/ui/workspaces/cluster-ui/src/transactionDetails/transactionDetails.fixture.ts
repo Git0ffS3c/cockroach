@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { RequestError, TimestampToString } from "../util";
+import { RequestError } from "../util";
 import moment from "moment";
 import { createMemoryHistory } from "history";
 import Long from "long";
@@ -124,6 +124,8 @@ export const transaction = {
 
 export const transactionDetailsData: StatementsResponse = {
   toJSON: () => ({}),
+  stmts_total_runtime_secs: 1,
+  txns_total_runtime_secs: 1,
   statements: [
     {
       key: {

@@ -21,8 +21,11 @@ import {
 } from "../util";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { TimeScale, toRoundedDateRange } from "../timeScaleDropdown";
-import { selectTimeScale } from "../statementsPage/statementsPage.selectors";
-type StatementDetailsResponseMessage = cockroach.server.serverpb.StatementDetailsResponse;
+import { selectTimeScale } from "../store/utils/selectors";
+import moment from "moment";
+
+type StatementDetailsResponseMessage =
+  cockroach.server.serverpb.StatementDetailsResponse;
 
 export const selectStatementDetails = createSelector(
   (_state: AppState, props: RouteComponentProps): string =>
@@ -30,7 +33,7 @@ export const selectStatementDetails = createSelector(
   (_state: AppState, props: RouteComponentProps): string =>
     queryByName(props.location, appNamesAttr),
   (state: AppState): TimeScale => selectTimeScale(state),
-  (state: AppState) => state.adminUI.sqlDetailsStats.cachedData,
+  (state: AppState) => state.adminUI?.sqlDetailsStats.cachedData,
   (
     fingerprintID,
     appNames,
@@ -39,6 +42,8 @@ export const selectStatementDetails = createSelector(
   ): {
     statementDetails: StatementDetailsResponseMessage;
     isLoading: boolean;
+    lastError: Error;
+    lastUpdated: moment.Moment | null;
   } => {
     // Since the aggregation interval is 1h, we want to round the selected timeScale to include
     // the full hour. If a timeScale is between 14:32 - 15:17 we want to search for values
@@ -56,13 +61,20 @@ export const selectStatementDetails = createSelector(
       return {
         statementDetails: statementDetailsStatsData[key].data,
         isLoading: statementDetailsStatsData[key].inFlight,
+        lastError: statementDetailsStatsData[key].lastError,
+        lastUpdated: statementDetailsStatsData[key].lastUpdated,
       };
     }
-    return { statementDetails: null, isLoading: true };
+    return {
+      statementDetails: null,
+      isLoading: true,
+      lastError: null,
+      lastUpdated: null,
+    };
   },
 );
 
 export const selectStatementDetailsUiConfig = createSelector(
-  (state: AppState) => state.adminUI.uiConfig.pages.statementDetails,
+  (state: AppState) => state.adminUI?.uiConfig.pages.statementDetails,
   statementDetailsUiConfig => statementDetailsUiConfig,
 );

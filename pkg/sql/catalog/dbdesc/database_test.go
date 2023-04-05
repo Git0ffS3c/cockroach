@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
@@ -160,15 +159,6 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 			},
 		},
 		{ // 2
-			desc: descpb.DatabaseDescriptor{
-				ID:   51,
-				Name: "db1",
-				Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
-					"schema1": {ID: 53, Dropped: true},
-				},
-			},
-		},
-		{ // 3
 			err: `schema mapping entry "schema1" (500): referenced schema ID 500: referenced descriptor not found`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -178,7 +168,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 4
+		{ // 3
 			err: `schema mapping entry "schema1" (52): schema name is actually "foo"`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -195,7 +185,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 5
+		{ // 4
 			err: `schema mapping entry "schema1" (52): schema parentID is actually 500`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -212,7 +202,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 6
+		{ // 5
 			err: `multi-region enum: referenced type ID 500: referenced descriptor not found`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -223,7 +213,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				},
 			},
 		},
-		{ // 7
+		{ // 6
 			err: `multi-region enum: parentID is actually 500`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -238,7 +228,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				ParentID: 500,
 			},
 		},
-		{ // 8
+		{ // 7
 			err: `schema mapping entry "schema1" (53): referenced schema ID 53: descriptor is a *typedesc.immutable: unexpected descriptor type`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -252,7 +242,7 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 				ParentID: 51,
 			},
 		},
-		{ // 9
+		{ // 8
 			err: `multi-region enum: referenced type ID 53: descriptor is a *schemadesc.immutable: unexpected descriptor type`,
 			desc: descpb.DatabaseDescriptor{
 				ID:   51,
@@ -277,19 +267,19 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 		var cb nstree.MutableCatalog
 		test.desc.Privileges = privilege
 		desc := NewBuilder(&test.desc).BuildImmutable()
-		cb.UpsertDescriptorEntry(desc)
+		cb.UpsertDescriptor(desc)
 		test.multiRegionEnum.Privileges = privilege
-		cb.UpsertDescriptorEntry(typedesc.NewBuilder(&test.multiRegionEnum).BuildImmutable())
+		cb.UpsertDescriptor(typedesc.NewBuilder(&test.multiRegionEnum).BuildImmutable())
 		for _, schemaDesc := range test.schemaDescs {
 			schemaDesc.Privileges = privilege
-			cb.UpsertDescriptorEntry(schemadesc.NewBuilder(&schemaDesc).BuildImmutable())
+			cb.UpsertDescriptor(schemadesc.NewBuilder(&schemaDesc).BuildImmutable())
 		}
-		_ = cb.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
-			cb.UpsertNamespaceEntry(desc, desc.GetID())
+		_ = cb.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			cb.UpsertNamespaceEntry(desc, desc.GetID(), desc.GetModificationTime())
 			return nil
 		})
 		expectedErr := fmt.Sprintf("%s %q (%d): %s", desc.DescriptorType(), desc.GetName(), desc.GetID(), test.err)
-		results := cb.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, catalog.ValidationLevelAllPreTxnCommit, desc)
+		results := cb.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, validate.Write, desc)
 		if err := results.CombinedError(); err == nil {
 			if test.err != "" {
 				t.Errorf("%d: expected \"%s\", but found success: %+v", i, expectedErr, test.desc)
@@ -298,34 +288,6 @@ func TestValidateCrossDatabaseReferences(t *testing.T) {
 			t.Errorf("%d: expected \"%s\", but found \"%s\"", i, expectedErr, err.Error())
 		}
 	}
-}
-
-// TestFixDroppedSchemaName tests fixing a corrupted descriptor as part of
-// RunPostDeserializationChanges. It tests for a particular corruption that
-// happened when a schema was dropped that had the same name as its parent
-// database name.
-func TestFixDroppedSchemaName(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	const (
-		dbName = "foo"
-		dbID   = 1
-	)
-	dbDesc := descpb.DatabaseDescriptor{
-		Name: dbName,
-		ID:   dbID,
-		Schemas: map[string]descpb.DatabaseDescriptor_SchemaInfo{
-			dbName: {ID: dbID, Dropped: true},
-		},
-		Privileges: catpb.NewBasePrivilegeDescriptor(username.RootUserName()),
-	}
-	b := NewBuilder(&dbDesc)
-	require.NoError(t, b.RunPostDeserializationChanges())
-	desc := b.BuildCreatedMutableDatabase()
-	require.Truef(t, desc.GetPostDeserializationChanges().HasChanges(),
-		"expected changes in descriptor, found none")
-	_, ok := desc.Schemas[dbName]
-	require.Falsef(t, ok, "erroneous entry exists")
 }
 
 func TestMaybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(t *testing.T) {
@@ -351,7 +313,7 @@ func TestMaybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(t *testing.T) {
 			privilegeDesc:        catpb.PrivilegeDescriptor{},
 			defaultPrivilegeDesc: catpb.DefaultPrivilegeDescriptor{},
 			privileges: privilege.List{
-				privilege.CONNECT, privilege.CREATE, privilege.DROP, privilege.GRANT, privilege.ZONECONFIG,
+				privilege.CONNECT, privilege.CREATE, privilege.DROP, privilege.ZONECONFIG,
 			},
 			incompatiblePrivileges: privilege.List{},
 			shouldChange:           false,
@@ -384,7 +346,7 @@ func TestMaybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(t *testing.T) {
 			privilegeDesc:        catpb.PrivilegeDescriptor{},
 			defaultPrivilegeDesc: catpb.DefaultPrivilegeDescriptor{},
 			privileges: privilege.List{
-				privilege.CONNECT, privilege.CREATE, privilege.DROP, privilege.GRANT, privilege.ZONECONFIG,
+				privilege.CONNECT, privilege.CREATE, privilege.DROP, privilege.ZONECONFIG,
 			},
 			incompatiblePrivileges: privilege.List{},
 			shouldChange:           false,
@@ -404,21 +366,21 @@ func TestMaybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(t *testing.T) {
 		require.Equal(t, shouldChange, test.shouldChange)
 
 		for _, testUser := range test.users {
-			for _, privilege := range test.incompatiblePrivileges {
+			for _, priv := range test.incompatiblePrivileges {
 				// Check that the incompatible privileges are removed from the
 				// PrivilegeDescriptor.
-				if test.privilegeDesc.CheckPrivilege(testUser, privilege) {
-					t.Errorf("found incompatible privilege %s", privilege.String())
+				if test.privilegeDesc.CheckPrivilege(testUser, priv) {
+					t.Errorf("found incompatible privilege %s", priv.String())
 				}
 
 				forAllRoles := test.defaultPrivilegeDesc.
 					FindOrCreateUser(catpb.DefaultPrivilegesRole{ForAllRoles: true})
 				// Check that the incompatible privileges have been converted to the
 				// equivalent default privileges.
-				if !forAllRoles.DefaultPrivilegesPerObject[tree.Tables].CheckPrivilege(testUser, privilege) {
+				if !forAllRoles.DefaultPrivilegesPerObject[privilege.Tables].CheckPrivilege(testUser, priv) {
 					t.Errorf(
 						"expected incompatible privilege %s to be converted to a default privilege",
-						privilege.String(),
+						priv.String(),
 					)
 				}
 			}

@@ -1,33 +1,35 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "asim",
-    srcs = [
-        "asim.go",
-        "config_loader.go",
-        "workload.go",
-    ],
+    srcs = ["asim.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/kv/kvserver/allocator/allocatorimpl",
-        "//pkg/roachpb",
-        "//pkg/util/timeutil",
-        "@com_github_google_btree//:btree",
+        "//pkg/kv/kvserver/asim/config",
+        "//pkg/kv/kvserver/asim/gossip",
+        "//pkg/kv/kvserver/asim/metrics",
+        "//pkg/kv/kvserver/asim/op",
+        "//pkg/kv/kvserver/asim/queue",
+        "//pkg/kv/kvserver/asim/state",
+        "//pkg/kv/kvserver/asim/storerebalancer",
+        "//pkg/kv/kvserver/asim/workload",
     ],
 )
 
 go_test(
     name = "asim_test",
-    srcs = [
-        "asim_test.go",
-        "config_loader_test.go",
-        "workload_test.go",
-    ],
-    embed = [":asim"],
+    srcs = ["asim_test.go"],
+    args = ["-test.timeout=295s"],
     deps = [
-        "//pkg/roachpb",
-        "//pkg/util/timeutil",
+        ":asim",
+        "//pkg/kv/kvserver/asim/config",
+        "//pkg/kv/kvserver/asim/metrics",
+        "//pkg/kv/kvserver/asim/state",
+        "//pkg/kv/kvserver/asim/workload",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

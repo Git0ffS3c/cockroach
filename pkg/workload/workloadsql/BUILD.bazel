@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -10,6 +11,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/sql/lexbase",
+        "//pkg/sql/sem/tree",
         "//pkg/util/ctxgroup",
         "//pkg/util/errorutil",
         "//pkg/util/log",
@@ -30,12 +32,14 @@ go_test(
         "sliceslice_test.go",
         "workloadsql_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":workloadsql"],
     deps = [
         "//pkg/base",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
+        "//pkg/sql/sem/tree",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
@@ -46,3 +50,5 @@ go_test(
         "//pkg/workload/bank",
     ],
 )
+
+get_x_data(name = "get_x_data")

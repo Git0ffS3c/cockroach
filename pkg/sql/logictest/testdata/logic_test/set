@@ -141,6 +141,14 @@ SET server_encoding = 'UTF8'
 statement error parameter "server_encoding" cannot be changed
 SET server_encoding = 'other'
 
+query T
+SHOW ssl
+----
+on
+
+statement error parameter "ssl" cannot be changed
+SET ssl = 'off'
+
 statement ok
 SET escape_string_warning = 'ON'
 
@@ -172,9 +180,6 @@ SHOW datestyle
 ISO, MDY
 
 statement ok
-SET datestyle_enabled = true
-
-statement ok
 SET datestyle = 'ymd'
 
 query T
@@ -204,9 +209,6 @@ SET datestyle = 'other'
 
 statement ok
 SET intervalstyle = 'postgres'
-
-statement ok
-SET intervalstyle_enabled = true
 
 statement ok
 SET intervalstyle = 'iso_8601'
@@ -283,12 +285,20 @@ SHOW server_version_num
 server_version_num
 130000
 
+query T
+SHOW log_timezone
+----
+UTC
+
 # Test read-only variables
 statement error parameter "max_index_keys" cannot be changed
 SET max_index_keys = 32
 
 statement error parameter "node_id" cannot be changed
 SET node_id = 123
+
+statement error invalid value for parameter "log_timezone"
+SET log_timezone = 'Australia/South'
 
 query TT
 SELECT name, value FROM system.settings WHERE name = 'testing.str'
@@ -749,6 +759,11 @@ SELECT name FROM pg_catalog.pg_settings WHERE name LIKE 'custom_option.%'
 ----
 
 query T
+SHOW tracing
+----
+off
+
+query T
 SHOW tracing.custom
 ----
 ijk
@@ -815,3 +830,45 @@ query T
 SHOW opt_split_scan_limit
 ----
 2048
+
+query T
+SHOW enable_auto_rehoming
+----
+off
+
+query T
+SHOW experimental_enable_auto_rehoming
+----
+off
+
+statement ok
+SET enable_auto_rehoming = on
+
+query T
+SHOW enable_auto_rehoming
+----
+on
+
+query T
+SHOW experimental_enable_auto_rehoming
+----
+on
+
+statement ok
+SET experimental_enable_auto_rehoming = off
+
+query T
+SHOW experimental_enable_auto_rehoming
+----
+off
+
+query T
+SHOW enable_auto_rehoming
+----
+off
+
+statement error pq: parameter "enable_auto_rehoming" requires a Boolean value
+SET enable_auto_rehoming = bogus
+
+statement error pq: parameter "enable_auto_rehoming" requires a Boolean value
+SET experimental_enable_auto_rehoming = bogus

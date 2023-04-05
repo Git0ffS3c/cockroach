@@ -17,17 +17,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colencoding"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
@@ -40,12 +39,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 type cTableInfo struct {
@@ -55,7 +56,7 @@ type cTableInfo struct {
 
 	// The set of required value-component column ordinals among only needed
 	// columns.
-	neededValueColsByIdx util.FastIntSet
+	neededValueColsByIdx intsets.Fast
 
 	// Map used to get the column index based on the descpb.ColumnID.
 	// It's kept as a pointer so we don't have to re-allocate to sort it each
@@ -69,7 +70,7 @@ type cTableInfo struct {
 
 	// The set of column ordinals which are both composite and part of the index
 	// key.
-	compositeIndexColOrdinals util.FastIntSet
+	compositeIndexColOrdinals intsets.Fast
 
 	// One number per column coming from the "key suffix" that is part of the
 	// value; each number is a column ordinal among only needed columns; -1 if
@@ -164,27 +165,30 @@ func (m colIdxMap) Swap(i, j int) {
 }
 
 type cFetcherArgs struct {
-	// lockStrength represents the row-level locking mode to use when fetching
-	// rows.
-	lockStrength descpb.ScanLockingStrength
-	// lockWaitPolicy represents the policy to be used for handling conflicting
-	// locks held by other active transactions.
-	lockWaitPolicy descpb.ScanLockingWaitPolicy
-	// lockTimeout specifies the maximum amount of time that the fetcher will
-	// wait while attempting to acquire a lock on a key or while blocking on an
-	// existing lock in order to perform a non-locking read on a key.
-	lockTimeout time.Duration
 	// memoryLimit determines the maximum memory footprint of the output batch.
 	memoryLimit int64
 	// estimatedRowCount is the optimizer-derived number of expected rows that
 	// this fetch will produce, if non-zero.
 	estimatedRowCount uint64
-	// reverse denotes whether or not the spans should be read in reverse or not
-	// when StartScan is invoked.
-	reverse bool
 	// traceKV indicates whether or not session tracing is enabled. It is set
 	// when initializing the fetcher.
 	traceKV bool
+	// singleUse, if true, indicates that the cFetcher will only need to scan a
+	// single set of spans. This allows the cFetcher to close itself eagerly,
+	// once it finishes the first fetch.
+	singleUse bool
+	// collectStats, if true, indicates that cFetcher should collect execution
+	// statistics (e.g. CPU time).
+	collectStats bool
+	// alwaysReallocate indicates whether the cFetcher will allocate new batches
+	// on each NextBatch invocation (if true), or will reuse a single batch (if
+	// false).
+	//
+	// Note that if alwaysReallocate=true is used, it is the caller's
+	// responsibility to perform memory accounting for all batches except for
+	// the last one returned on the NextBatch calls if the caller wishes to keep
+	// multiple batches at the same time.
+	alwaysReallocate bool
 }
 
 // noOutputColumn is a sentinel value to denote that a system column is not
@@ -194,21 +198,22 @@ const noOutputColumn = -1
 // cFetcher handles fetching kvs and forming table rows for an
 // arbitrary number of tables.
 // Usage:
-//   var cf cFetcher
-//   err := cf.Init(..)
-//   // Handle err
-//   err := cf.StartScan(..)
-//   // Handle err
-//   for {
-//      res, err := cf.NextBatch()
-//      // Handle err
-//      if res.colBatch.Length() == 0 {
-//         // Done
-//         break
-//      }
-//      // Process res.colBatch
-//   }
-//   cf.Close(ctx)
+//
+//	var cf cFetcher
+//	err := cf.Init(..)
+//	// Handle err
+//	err := cf.StartScan(..)
+//	// Handle err
+//	for {
+//	   res, err := cf.NextBatch()
+//	   // Handle err
+//	   if res.colBatch.Length() == 0 {
+//	      // Done
+//	      break
+//	   }
+//	   // Process res.colBatch
+//	}
+//	cf.Close(ctx)
 type cFetcher struct {
 	cFetcherArgs
 
@@ -222,18 +227,27 @@ type cFetcher struct {
 	// mvccDecodeStrategy controls whether or not MVCC timestamps should
 	// be decoded from KV's fetched. It is set if any of the requested tables
 	// are required to produce an MVCC timestamp system column.
-	mvccDecodeStrategy row.MVCCDecodingStrategy
+	mvccDecodeStrategy storage.MVCCDecodingStrategy
 
-	// fetcher is the underlying fetcher that provides KVs.
+	// nextKVer provides KVs.
+	nextKVer storage.NextKVer
+	// fetcher, if set, is the same object as nextKVer.
 	fetcher *row.KVFetcher
-	// bytesRead stores the cumulative number of bytes read by this cFetcher
-	// throughout its whole existence (i.e. between its construction and
-	// Release()). It accumulates the bytes read statistic across StartScan* and
-	// Close methods.
+	// stableKVs indicates whether the KVs returned by nextKVer are stable (i.e.
+	// are not invalidated) across NextKV() calls.
+	stableKVs bool
+	// bytesRead and batchRequestsIssued store the total number of bytes read
+	// and of BatchRequests issued, respectively, by this cFetcher throughout
+	// its lifetime in case when the underlying row.KVFetcher has already been
+	// closed and nil-ed out.
 	//
-	// The field should not be accessed directly by the users of the cFetcher -
-	// getBytesRead() should be used instead.
-	bytesRead int64
+	// The fields should not be accessed directly by the users of the cFetcher -
+	// getBytesRead() and getBatchRequestsIssued() should be used instead.
+	bytesRead           int64
+	batchRequestsIssued int64
+	// cpuStopWatch tracks the CPU time spent by this cFetcher while fulfilling KV
+	// requests *in the current goroutine*.
+	cpuStopWatch *timeutil.CPUStopWatch
 
 	// machine contains fields that get updated during the run of the fetcher.
 	machine struct {
@@ -256,11 +270,13 @@ type cFetcher struct {
 
 		// remainingValueColsByIdx is the set of value columns that are yet to be
 		// seen during the decoding of the current row.
-		remainingValueColsByIdx util.FastIntSet
+		remainingValueColsByIdx intsets.Fast
 		// lastRowPrefix is the row prefix for the last row we saw a key for. New
 		// keys are compared against this prefix to determine whether they're part
 		// of a new row or not.
 		lastRowPrefix roachpb.Key
+		// firstKeyOfRow, if set, is the first key in the current row.
+		firstKeyOfRow roachpb.Key
 		// prettyValueBuf is a temp buffer used to create strings for tracing.
 		prettyValueBuf *bytes.Buffer
 
@@ -279,36 +295,25 @@ type cFetcher struct {
 		tableoidCol coldata.DatumVec
 	}
 
-	// scratch is a scratch space used when decoding bytes-like and decimal
-	// keys.
-	scratch []byte
+	scratch struct {
+		decoding       []byte
+		nextKVKey      []byte
+		nextKVRawBytes []byte
+	}
 
 	accountingHelper colmem.SetAccountingHelper
-
-	// kvFetcherMemAcc is a memory account that will be used by the underlying
-	// KV fetcher.
-	kvFetcherMemAcc *mon.BoundAccount
-
-	// maxCapacity if non-zero indicates the target capacity of the output
-	// batch. It is set when at the row finalization we realize that the output
-	// batch has exceeded the memory limit.
-	maxCapacity int
 }
 
 func (cf *cFetcher) resetBatch() {
 	var reallocated bool
-	var minDesiredCapacity int
-	if cf.maxCapacity > 0 {
-		// If we have already exceeded the memory limit for the output batch, we
-		// will only be using the same batch from now on.
-		minDesiredCapacity = cf.maxCapacity
-	} else if cf.machine.limitHint > 0 && (cf.estimatedRowCount == 0 || uint64(cf.machine.limitHint) < cf.estimatedRowCount) {
+	var tuplesToBeSet int
+	if cf.machine.limitHint > 0 && (cf.estimatedRowCount == 0 || uint64(cf.machine.limitHint) < cf.estimatedRowCount) {
 		// If we have a limit hint, and either
 		//   1) we don't have an estimate, or
 		//   2) we have a soft limit,
 		// use the hint to size the batch. Note that if it exceeds
 		// coldata.BatchSize, ResetMaybeReallocate will chop it down.
-		minDesiredCapacity = cf.machine.limitHint
+		tuplesToBeSet = cf.machine.limitHint
 	} else {
 		// Otherwise, use the estimate. Note that if the estimate is not
 		// present, it'll be 0 and ResetMaybeReallocate will allocate the
@@ -318,13 +323,13 @@ func (cf *cFetcher) resetBatch() {
 		// into an int. We have to be careful: if we just cast it directly, a
 		// giant estimate will wrap around and become negative.
 		if cf.estimatedRowCount > uint64(coldata.BatchSize()) {
-			minDesiredCapacity = coldata.BatchSize()
+			tuplesToBeSet = coldata.BatchSize()
 		} else {
-			minDesiredCapacity = int(cf.estimatedRowCount)
+			tuplesToBeSet = int(cf.estimatedRowCount)
 		}
 	}
 	cf.machine.batch, reallocated = cf.accountingHelper.ResetMaybeReallocate(
-		cf.table.typs, cf.machine.batch, minDesiredCapacity, cf.memoryLimit,
+		cf.table.typs, cf.machine.batch, tuplesToBeSet,
 	)
 	if reallocated {
 		cf.machine.colvecs.SetBatch(cf.machine.batch)
@@ -341,15 +346,16 @@ func (cf *cFetcher) resetBatch() {
 	}
 }
 
-// Init sets up a Fetcher based on the table args. Only columns present in
-// tableArgs.cols will be fetched.
+// Init sets up the cFetcher based on the table args. Only columns present in
+// tableArgs.spec will be fetched.
+//
+// Note: the allocator must **not** be shared with any other component.
 func (cf *cFetcher) Init(
-	allocator *colmem.Allocator, kvFetcherMemAcc *mon.BoundAccount, tableArgs *cFetcherTableArgs,
+	allocator *colmem.Allocator, nextKVer storage.NextKVer, tableArgs *cFetcherTableArgs,
 ) error {
-	if tableArgs.spec.Version != descpb.IndexFetchSpecVersionInitial {
+	if tableArgs.spec.Version != fetchpb.IndexFetchSpecVersionInitial {
 		return errors.Newf("unsupported IndexFetchSpec version %d", tableArgs.spec.Version)
 	}
-	cf.kvFetcherMemAcc = kvFetcherMemAcc
 	table := newCTableInfo()
 	nCols := tableArgs.ColIdxMap.Len()
 	if cap(table.orderedColIdxMap.vals) < nCols {
@@ -388,7 +394,7 @@ func (cf *cFetcher) Init(
 			switch colinfo.GetSystemColumnKindFromColumnID(colID) {
 			case catpb.SystemColumnKind_MVCCTIMESTAMP:
 				table.timestampOutputIdx = idx
-				cf.mvccDecodeStrategy = row.MVCCDecodingRequired
+				cf.mvccDecodeStrategy = storage.MVCCDecodingRequired
 				table.neededValueColsByIdx.Remove(idx)
 			case catpb.SystemColumnKind_TABLEOID:
 				table.oidOutputIdx = idx
@@ -428,12 +434,12 @@ func (cf *cFetcher) Init(
 			indexColOrdinals[i] = -1
 		}
 	}
-	if needToDecodeDecimalKey && cap(cf.scratch) < 64 {
+	if needToDecodeDecimalKey && cap(cf.scratch.decoding) < 64 {
 		// If we need to decode the decimal key encoding, it might use a scratch
 		// byte slice internally, so we'll allocate such a space to be reused
 		// for every decimal.
 		// TODO(yuzefovich): 64 was chosen arbitrarily, tune it.
-		cf.scratch = make([]byte, 64)
+		cf.scratch.decoding = make([]byte, 64)
 	}
 	// Unique secondary indexes contain the extra column IDs as part of
 	// the value component. We process these separately, so we need to know
@@ -479,45 +485,22 @@ func (cf *cFetcher) Init(
 	}
 
 	cf.table = table
-	cf.accountingHelper.Init(allocator, cf.table.typs)
+	cf.nextKVer = nextKVer
+	if kvFetcher, ok := nextKVer.(*row.KVFetcher); ok {
+		cf.fetcher = kvFetcher
+	}
+	cf.stableKVs = nextKVer.Init(cf.getFirstKeyOfRow)
+	cf.accountingHelper.Init(allocator, cf.memoryLimit, cf.table.typs, cf.alwaysReallocate)
+	if cf.cFetcherArgs.collectStats {
+		cf.cpuStopWatch = timeutil.NewCPUStopWatch()
+	}
+	cf.machine.state[0] = stateResetBatch
+	cf.machine.state[1] = stateInitFetch
 
 	return nil
 }
 
-//gcassert:inline
-func (cf *cFetcher) setFetcher(f *row.KVFetcher, limitHint rowinfra.RowLimit) {
-	cf.fetcher = f
-	cf.machine.lastRowPrefix = nil
-	cf.machine.limitHint = int(limitHint)
-	cf.machine.state[0] = stateResetBatch
-	cf.machine.state[1] = stateInitFetch
-}
-
-// StartScan initializes and starts the key-value scan. Can be used multiple
-// times.
-//
-// The fetcher takes ownership of the spans slice - it can modify the slice and
-// will perform the memory accounting accordingly. The caller can only reuse the
-// spans slice after the fetcher has been closed (which happens when the fetcher
-// emits the first zero batch), and if the caller does, it becomes responsible
-// for the memory accounting.
-func (cf *cFetcher) StartScan(
-	ctx context.Context,
-	txn *kv.Txn,
-	spans roachpb.Spans,
-	bsHeader *roachpb.BoundedStalenessHeader,
-	limitBatches bool,
-	batchBytesLimit rowinfra.BytesLimit,
-	limitHint rowinfra.RowLimit,
-	forceProductionKVBatchSize bool,
-) error {
-	if len(spans) == 0 {
-		return errors.AssertionFailedf("no spans")
-	}
-	if !limitBatches && batchBytesLimit != rowinfra.NoBytesLimit {
-		return errors.AssertionFailedf("batchBytesLimit set without limitBatches")
-	}
-
+func cFetcherFirstBatchLimit(limitHint rowinfra.RowLimit, maxKeysPerRow uint32) rowinfra.KeyLimit {
 	// If we have a limit hint, we limit the first batch size. Subsequent
 	// batches get larger to avoid making things too slow (e.g. in case we have
 	// a very restrictive filter and actually have to retrieve a lot of rows).
@@ -540,52 +523,40 @@ func (cf *cFetcher) StartScan(
 		//   - KVs for some column families are omitted for some rows - then we
 		//     will actually fetch more KVs than necessary, but we'll decode
 		//     limitHint number of rows.
-		firstBatchLimit = rowinfra.KeyLimit(int(limitHint) * int(cf.table.spec.MaxKeysPerRow))
+		firstBatchLimit = rowinfra.KeyLimit(int(limitHint) * int(maxKeysPerRow))
 	}
-
-	f, err := row.NewKVFetcher(
-		ctx,
-		txn,
-		spans,
-		nil, /* spanIDs */
-		bsHeader,
-		cf.reverse,
-		batchBytesLimit,
-		firstBatchLimit,
-		cf.lockStrength,
-		cf.lockWaitPolicy,
-		cf.lockTimeout,
-		cf.kvFetcherMemAcc,
-		forceProductionKVBatchSize,
-	)
-	if err != nil {
-		return err
-	}
-	cf.setFetcher(f, limitHint)
-	return nil
+	return firstBatchLimit
 }
 
-// StartScanStreaming initializes and starts the key-value scan using the
-// Streamer API. Can be used multiple times.
+// StartScan initializes and starts the key-value scan. Can only be used
+// multiple times if cFetcherArgs.singleUse was set to false in Init().
 //
 // The fetcher takes ownership of the spans slice - it can modify the slice and
 // will perform the memory accounting accordingly. The caller can only reuse the
-// spans slice after the fetcher has been closed (which happens when the fetcher
-// emits the first zero batch), and if the caller does, it becomes responsible
-// for the memory accounting.
-func (cf *cFetcher) StartScanStreaming(
+// spans slice after the fetcher emits a zero-length batch, and if the caller
+// does, it becomes responsible for the memory accounting.
+func (cf *cFetcher) StartScan(
 	ctx context.Context,
-	streamer *kvstreamer.Streamer,
 	spans roachpb.Spans,
+	limitBatches bool,
+	batchBytesLimit rowinfra.BytesLimit,
 	limitHint rowinfra.RowLimit,
 ) error {
-	kvBatchFetcher, err := row.NewTxnKVStreamer(ctx, streamer, spans, nil /* spanIDs */, cf.lockStrength)
-	if err != nil {
-		return err
+	if len(spans) == 0 {
+		return errors.AssertionFailedf("no spans")
 	}
-	f := row.NewKVStreamingFetcher(kvBatchFetcher)
-	cf.setFetcher(f, limitHint)
-	return nil
+	if !limitBatches && batchBytesLimit != rowinfra.NoBytesLimit {
+		return errors.AssertionFailedf("batchBytesLimit set without limitBatches")
+	}
+
+	firstBatchLimit := cFetcherFirstBatchLimit(limitHint, cf.table.spec.MaxKeysPerRow)
+	cf.machine.lastRowPrefix = nil
+	cf.machine.limitHint = int(limitHint)
+	cf.machine.state[0] = stateResetBatch
+	cf.machine.state[1] = stateInitFetch
+	return cf.fetcher.SetupNextFetch(
+		ctx, spans, nil /* spanIDs */, batchBytesLimit, firstBatchLimit, false, /* spansCanOverlap */
+	)
 }
 
 // fetcherState is the state enum for NextBatch.
@@ -659,27 +630,39 @@ func (cf *cFetcher) setEstimatedRowCount(estimatedRowCount uint64) {
 	cf.estimatedRowCount = estimatedRowCount
 }
 
-// setNextKV sets the next KV to process to the input KV. needsCopy, if true,
-// causes the input kv to be deep copied. needsCopy should be set to true if
-// the input KV is pointing to the last KV of a batch, so that the batch can
-// be garbage collected before fetching the next one.
+func (cf *cFetcher) getFirstKeyOfRow() roachpb.Key {
+	return cf.machine.firstKeyOfRow
+}
+
+// setNextKV sets the next KV to process to the input KV. The KV will be
+// deep-copied if necessary, however, the copy is only valid until the next
+// setNextKV call.
 // gcassert:inline
-func (cf *cFetcher) setNextKV(kv roachpb.KeyValue, needsCopy bool) {
-	if !needsCopy {
+func (cf *cFetcher) setNextKV(kv roachpb.KeyValue) {
+	// If the kv is not stable and the table has multiple column families, then
+	// we must perform a deep copy. This is due to the fact that we keep a
+	// shallow reference to the first KV of each row (in
+	// cf.machine.lastRowPrefix and cf.machine.firstKeyOfRow).
+	//
+	// However, even if the kv is not stable, but there is only one column
+	// family, then we will have finalized the row (meaning we'll have deep
+	// copied necessary part of the kv into the batch) by the time NextKV is
+	// called again, so we avoid the copy in those cases.
+	if cf.stableKVs || cf.table.spec.MaxKeysPerRow == 1 {
 		cf.machine.nextKV = kv
 		return
 	}
-
-	// If we've made it to the very last key in the batch, copy out the key
-	// so that the GC can reclaim the large backing slice before we call
-	// NextKV() again.
-	kvCopy := roachpb.KeyValue{}
-	kvCopy.Key = make(roachpb.Key, len(kv.Key))
-	copy(kvCopy.Key, kv.Key)
-	kvCopy.Value.RawBytes = make([]byte, len(kv.Value.RawBytes))
-	copy(kvCopy.Value.RawBytes, kv.Value.RawBytes)
-	kvCopy.Value.Timestamp = kv.Value.Timestamp
-	cf.machine.nextKV = kvCopy
+	// We can reuse the scratch space since we only need to keep at most one KV
+	// at a time.
+	cf.scratch.nextKVKey = append(cf.scratch.nextKVKey[:0], kv.Key...)
+	cf.scratch.nextKVRawBytes = append(cf.scratch.nextKVRawBytes[:0], kv.Value.RawBytes...)
+	cf.machine.nextKV = roachpb.KeyValue{
+		Key: cf.scratch.nextKVKey,
+		Value: roachpb.Value{
+			RawBytes:  cf.scratch.nextKVRawBytes,
+			Timestamp: kv.Value.Timestamp,
+		},
+	}
 }
 
 // NextBatch processes keys until we complete one batch of rows (subject to the
@@ -698,9 +681,15 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 		case stateInvalid:
 			return nil, errors.New("invalid fetcher state")
 		case stateInitFetch:
-			moreKVs, kv, _, finalReferenceToBatch, err := cf.fetcher.NextKV(ctx, cf.mvccDecodeStrategy)
+			cf.machine.firstKeyOfRow = nil
+			cf.cpuStopWatch.Start()
+			// Here we ignore partialRow return parameter because it can only be
+			// true when moreKVs is false, in which case we have already
+			// finalized the last row and will emit the batch as is.
+			moreKVs, _, kv, err := cf.nextKVer.NextKV(ctx, cf.mvccDecodeStrategy)
+			cf.cpuStopWatch.Stop()
 			if err != nil {
-				return nil, cf.convertFetchError(ctx, err)
+				return nil, convertFetchError(&cf.table.spec, err)
 			}
 			if !moreKVs {
 				cf.machine.state[0] = stateEmitLastBatch
@@ -728,7 +717,7 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 				}
 			*/
 
-			cf.setNextKV(kv, finalReferenceToBatch)
+			cf.setNextKV(kv)
 			cf.machine.state[0] = stateDecodeFirstKVOfRow
 
 		case stateResetBatch:
@@ -737,6 +726,7 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 		case stateDecodeFirstKVOfRow:
 			// Reset MVCC metadata for the table, since this is the first KV of a row.
 			cf.table.rowLastModified = hlc.Timestamp{}
+			cf.machine.firstKeyOfRow = cf.machine.nextKV.Key
 
 			// foundNull is set when decoding a new index key for a row finds a NULL value
 			// in the index key. This is used when decoding unique secondary indexes in order
@@ -755,7 +745,7 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 				// to determine whether a KV belongs to the same row as the
 				// previous KV or a different row.
 				checkAllColsForNull := cf.table.spec.IsSecondaryIndex && cf.table.spec.IsUniqueIndex && cf.table.spec.MaxKeysPerRow != 1
-				key, foundNull, cf.scratch, err = colencoding.DecodeKeyValsToCols(
+				key, foundNull, cf.scratch.decoding, err = colencoding.DecodeKeyValsToCols(
 					&cf.table.da,
 					&cf.machine.colvecs,
 					cf.machine.rowIdx,
@@ -764,7 +754,7 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 					cf.table.spec.KeyFullColumns(),
 					nil, /* unseen */
 					cf.machine.nextKV.Key[cf.table.spec.KeyPrefixLength:],
-					cf.scratch,
+					cf.scratch.decoding,
 				)
 				if err != nil {
 					return nil, err
@@ -848,31 +838,46 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 			cf.machine.state[0] = stateFetchNextKVWithUnfinishedRow
 
 		case stateFetchNextKVWithUnfinishedRow:
-			moreKVs, kv, _, finalReferenceToBatch, err := cf.fetcher.NextKV(ctx, cf.mvccDecodeStrategy)
+			cf.cpuStopWatch.Start()
+			moreKVs, partialRow, kv, err := cf.nextKVer.NextKV(ctx, cf.mvccDecodeStrategy)
+			cf.cpuStopWatch.Stop()
 			if err != nil {
-				return nil, cf.convertFetchError(ctx, err)
+				return nil, convertFetchError(&cf.table.spec, err)
 			}
 			if !moreKVs {
-				// No more data. Finalize the row and exit.
+				// No more data.
+				if partialRow {
+					// The stream of KVs stopped in the middle of the last row,
+					// so we need to remove that last row from the batch. We
+					// achieve this by simply not incrementing rowIdx and not
+					// finalizing this last partial row; instead, we proceed
+					// straight to emitting the last batch.
+					cf.machine.state[0] = stateEmitLastBatch
+					continue
+				}
+				// Finalize the row and exit.
 				cf.machine.state[0] = stateFinalizeRow
 				cf.machine.state[1] = stateEmitLastBatch
 				continue
 			}
-			// TODO(jordan): if nextKV returns newSpan = true, set the new span
-			// prefix and indicate that it needs decoding.
-			cf.setNextKV(kv, finalReferenceToBatch)
 			if debugState {
-				log.Infof(ctx, "decoding next key %s", cf.machine.nextKV.Key)
+				log.Infof(ctx, "decoding next key %s", kv.Key)
 			}
 
 			// TODO(yuzefovich): optimize this prefix check by skipping logical
 			// longest common span prefix.
 			if !bytes.HasPrefix(kv.Key[cf.table.spec.KeyPrefixLength:], cf.machine.lastRowPrefix[cf.table.spec.KeyPrefixLength:]) {
 				// The kv we just found is from a different row.
+				cf.setNextKV(kv)
 				cf.machine.state[0] = stateFinalizeRow
 				cf.machine.state[1] = stateDecodeFirstKVOfRow
 				continue
 			}
+
+			// No need to copy this kv even if it is unstable since we only use
+			// it before issuing the following NextKV() call (which could
+			// invalidate it).
+			cf.machine.nextKV = kv
 
 			familyID, err := cf.getCurrentColumnFamilyID()
 			if err != nil {
@@ -917,33 +922,26 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 			// column is requested) yet, but it is ok for the purposes of the
 			// memory accounting - oids are fixed length values and, thus, have
 			// already been accounted for when the batch was allocated.
-			cf.accountingHelper.AccountForSet(cf.machine.rowIdx)
+			emitBatch := cf.accountingHelper.AccountForSet(cf.machine.rowIdx)
 			cf.machine.rowIdx++
 			cf.shiftState()
 
-			var emitBatch bool
-			if cf.maxCapacity == 0 && cf.accountingHelper.Allocator.Used() >= cf.memoryLimit {
-				cf.maxCapacity = cf.machine.rowIdx
-			}
-			if cf.machine.rowIdx >= cf.machine.batch.Capacity() ||
-				(cf.maxCapacity > 0 && cf.machine.rowIdx >= cf.maxCapacity) ||
-				(cf.machine.limitHint > 0 && cf.machine.rowIdx >= cf.machine.limitHint) {
-				// We either
-				//   1. have no more room in our batch, so output it immediately
-				// or
-				//   2. we made it to our limit hint, so output our batch early
-				//      to make sure that we don't bother filling in extra data
-				//      if we don't need to.
+			if cf.machine.limitHint > 0 && cf.machine.rowIdx >= cf.machine.limitHint {
+				// We made it to our limit hint, so output our batch early to
+				// make sure that we don't bother filling in extra data if we
+				// don't need to.
 				emitBatch = true
-				// Update the limit hint to track the expected remaining rows to
-				// be fetched.
-				//
-				// Note that limitHint might become negative at which point we
-				// will start ignoring it.
-				cf.machine.limitHint -= cf.machine.rowIdx
 			}
 
 			if emitBatch {
+				if cf.machine.limitHint > 0 {
+					// Update the limit hint to track the expected remaining
+					// rows to be fetched.
+					//
+					// Note that limitHint might become negative at which point
+					// we will start ignoring it.
+					cf.machine.limitHint -= cf.machine.rowIdx
+				}
 				cf.pushState(stateResetBatch)
 				cf.finalizeBatch()
 				return cf.machine.batch, nil
@@ -952,13 +950,17 @@ func (cf *cFetcher) NextBatch(ctx context.Context) (coldata.Batch, error) {
 		case stateEmitLastBatch:
 			cf.machine.state[0] = stateFinished
 			cf.finalizeBatch()
-			// Close the fetcher eagerly so that its memory could be GCed.
-			cf.Close(ctx)
+			if cf.singleUse {
+				// Close the fetcher eagerly so that its memory could be GCed.
+				cf.Close(ctx)
+			}
 			return cf.machine.batch, nil
 
 		case stateFinished:
-			// Close the fetcher eagerly so that its memory could be GCed.
-			cf.Close(ctx)
+			if cf.singleUse {
+				// Close the fetcher eagerly so that its memory could be GCed.
+				cf.Close(ctx)
+			}
 			return coldata.ZeroBatch, nil
 		}
 	}
@@ -1032,7 +1034,7 @@ func (cf *cFetcher) processValue(ctx context.Context, familyID descpb.FamilyID) 
 	}
 
 	val := cf.machine.nextKV.Value
-	if !table.spec.IsSecondaryIndex || table.spec.EncodingType == descpb.PrimaryIndexEncoding {
+	if !table.spec.IsSecondaryIndex || table.spec.EncodingType == catenumpb.PrimaryIndexEncoding {
 		// If familyID is 0, kv.Value contains values for composite key columns.
 		// These columns already have a table.row value assigned above, but that value
 		// (obtained from the key encoding) might not be correct (e.g. for decimals,
@@ -1096,7 +1098,7 @@ func (cf *cFetcher) processValue(ctx context.Context, familyID descpb.FamilyID) 
 			if table.spec.IsSecondaryIndex && table.spec.IsUniqueIndex {
 				// This is a unique secondary index; decode the extra
 				// column values from the value.
-				valueBytes, _, cf.scratch, err = colencoding.DecodeKeyValsToCols(
+				valueBytes, _, cf.scratch.decoding, err = colencoding.DecodeKeyValsToCols(
 					&table.da,
 					&cf.machine.colvecs,
 					cf.machine.rowIdx,
@@ -1105,7 +1107,7 @@ func (cf *cFetcher) processValue(ctx context.Context, familyID descpb.FamilyID) 
 					table.spec.KeySuffixColumns(),
 					&cf.machine.remainingValueColsByIdx,
 					valueBytes,
-					cf.scratch,
+					cf.scratch.decoding,
 				)
 				if err != nil {
 					return scrub.WrapError(scrub.SecondaryIndexKeyExtraValueDecodingError, err)
@@ -1209,7 +1211,10 @@ func (cf *cFetcher) processValueBytes(
 	)
 	// Continue reading data until there's none left or we've finished
 	// populating the data for all of the requested columns.
-	for len(valueBytes) > 0 && cf.machine.remainingValueColsByIdx.Len() > 0 {
+	// Keep track of the number of remaining values columns separately, because
+	// it's expensive to keep calling .Len() in the loop.
+	remainingValueCols := cf.machine.remainingValueColsByIdx.Len()
+	for len(valueBytes) > 0 && remainingValueCols > 0 {
 		_, dataOffset, colIDDiff, typ, err = encoding.DecodeValueTag(valueBytes)
 		if err != nil {
 			return "", "", err
@@ -1257,6 +1262,7 @@ func (cf *cFetcher) processValueBytes(
 			return "", "", err
 		}
 		cf.machine.remainingValueColsByIdx.Remove(vecIdx)
+		remainingValueCols--
 		if cf.traceKV {
 			dVal := cf.getDatumAt(vecIdx, cf.machine.rowIdx)
 			if _, err := fmt.Fprintf(cf.machine.prettyValueBuf, "/%v", dVal.String()); err != nil {
@@ -1306,7 +1312,8 @@ func (cf *cFetcher) finalizeBatch() {
 			// Note that we don't need to update the memory accounting because
 			// oids are fixed length values and have already been accounted for
 			// when finalizing each row.
-			cf.machine.tableoidCol.Set(i, cf.table.da.NewDOid(tree.MakeDOid(tree.DInt(id), types.Oid)))
+			// descpb.ID is a uint32, so the Oid type conversion is safe.
+			cf.machine.tableoidCol.Set(i, cf.table.da.NewDOid(tree.MakeDOid(oid.Oid(id), types.Oid)))
 		}
 	}
 	cf.machine.batch.SetLength(cf.machine.rowIdx)
@@ -1337,20 +1344,28 @@ func (cf *cFetcher) getCurrentColumnFamilyID() (descpb.FamilyID, error) {
 // storage error that will propagate through the exec subsystem unchanged. The
 // error may also undergo a mapping to make it more user friendly for SQL
 // consumers.
-func (cf *cFetcher) convertFetchError(ctx context.Context, err error) error {
-	err = row.ConvertFetchError(&cf.table.spec, err)
+func convertFetchError(indexFetchSpec *fetchpb.IndexFetchSpec, err error) error {
+	err = row.ConvertFetchError(indexFetchSpec, err)
 	err = colexecerror.NewStorageError(err)
 	return err
 }
 
 // getBytesRead returns the number of bytes read by the cFetcher throughout its
-// existence so far. This number accumulates the bytes read statistic across
-// StartScan* and Close methods.
+// lifetime so far.
 func (cf *cFetcher) getBytesRead() int64 {
 	if cf.fetcher != nil {
-		cf.bytesRead += cf.fetcher.ResetBytesRead()
+		return cf.fetcher.GetBytesRead()
 	}
 	return cf.bytesRead
+}
+
+// getBatchRequestsIssued returns the number of BatchRequests issued by the
+// cFetcher throughout its lifetime so far.
+func (cf *cFetcher) getBatchRequestsIssued() int64 {
+	if cf.fetcher != nil {
+		return cf.fetcher.GetBatchRequestsIssued()
+	}
+	return cf.batchRequestsIssued
 }
 
 var cFetcherPool = sync.Pool{
@@ -1366,17 +1381,22 @@ func (cf *cFetcher) Release() {
 	}
 	colvecs := cf.machine.colvecs
 	colvecs.Reset()
-	*cf = cFetcher{
-		scratch: cf.scratch[:0],
-	}
+	*cf = cFetcher{scratch: cf.scratch}
+	cf.scratch.decoding = cf.scratch.decoding[:0]
+	cf.scratch.nextKVKey = cf.scratch.nextKVKey[:0]
+	cf.scratch.nextKVRawBytes = cf.scratch.nextKVRawBytes[:0]
 	cf.machine.colvecs = colvecs
 	cFetcherPool.Put(cf)
 }
 
 func (cf *cFetcher) Close(ctx context.Context) {
-	if cf != nil && cf.fetcher != nil {
-		cf.bytesRead += cf.fetcher.GetBytesRead()
-		cf.fetcher.Close(ctx)
-		cf.fetcher = nil
+	if cf != nil {
+		cf.nextKVer = nil
+		if cf.fetcher != nil {
+			cf.bytesRead = cf.fetcher.GetBytesRead()
+			cf.batchRequestsIssued = cf.fetcher.GetBatchRequestsIssued()
+			cf.fetcher.Close(ctx)
+			cf.fetcher = nil
+		}
 	}
 }

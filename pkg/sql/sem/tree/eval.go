@@ -14,7 +14,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
@@ -22,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -69,9 +69,8 @@ type UnaryOp struct {
 	types   TypeList
 	retType ReturnTyper
 
-	// counter, if non-nil, should be incremented every time the
-	// operator is type checked.
-	counter telemetry.Counter
+	// OnTypeCheck is called when the op is type checked.
+	OnTypeCheck func()
 }
 
 func (op *UnaryOp) params() TypeList {
@@ -87,128 +86,145 @@ func (*UnaryOp) preferred() bool {
 }
 
 func unaryOpFixups(
-	ops map[UnaryOperatorSymbol]unaryOpOverload,
-) map[UnaryOperatorSymbol]unaryOpOverload {
-	for op, overload := range ops {
-		for i, impl := range overload {
-			casted := impl.(*UnaryOp)
-			casted.types = ArgTypes{{"arg", casted.Typ}}
-			casted.retType = FixedReturnType(casted.ReturnType)
-			ops[op][i] = casted
+	ops map[UnaryOperatorSymbol]*UnaryOpOverloads,
+) map[UnaryOperatorSymbol]*UnaryOpOverloads {
+	for _, overload := range ops {
+		for _, impl := range overload.overloads {
+			impl.types = ParamTypes{{"arg", impl.Typ}}
+			impl.retType = FixedReturnType(impl.ReturnType)
 		}
 	}
 	return ops
 }
 
-// unaryOpOverload is an overloaded set of unary operator implementations.
-type unaryOpOverload []overloadImpl
+// UnaryOpOverloads is an overloaded set of unary operator implementations.
+// It implements overloadSet.
+type UnaryOpOverloads struct {
+	overloads []*UnaryOp
+}
+
+func (u *UnaryOpOverloads) len() int               { return len(u.overloads) }
+func (u *UnaryOpOverloads) get(i int) overloadImpl { return u.overloads[i] }
+
+// ForEachUnaryOp iterates the set of overloads.
+func (u *UnaryOpOverloads) ForEachUnaryOp(f func(op *UnaryOp) error) error {
+	if u == nil {
+		return nil
+	}
+	for _, op := range u.overloads {
+		if err := f(op); err != nil {
+			return iterutil.Map(err)
+		}
+	}
+	return nil
+}
 
 // UnaryOps contains the unary operations indexed by operation type.
-var UnaryOps = unaryOpFixups(map[UnaryOperatorSymbol]unaryOpOverload{
-	UnaryPlus: {
-		&UnaryOp{
+var UnaryOps = unaryOpFixups(map[UnaryOperatorSymbol]*UnaryOpOverloads{
+	UnaryPlus: {overloads: []*UnaryOp{
+		{
 			Typ:        types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &UnaryNoop{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &UnaryNoop{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &UnaryNoop{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Interval,
 			ReturnType: types.Interval,
 			EvalOp:     &UnaryNoop{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	UnaryMinus: {
-		&UnaryOp{
+	UnaryMinus: {overloads: []*UnaryOp{
+		{
 			Typ:        types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &UnaryMinusIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &UnaryMinusFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &UnaryMinusDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Interval,
 			ReturnType: types.Interval,
 			EvalOp:     &UnaryMinusIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	UnaryComplement: {
-		&UnaryOp{
+	UnaryComplement: {overloads: []*UnaryOp{
+		{
 			Typ:        types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &ComplementIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.VarBit,
 			ReturnType: types.VarBit,
 			EvalOp:     &ComplementVarBitOp{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.INet,
 			ReturnType: types.INet,
 			EvalOp:     &ComplementINetOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	UnarySqrt: {
-		&UnaryOp{
+	UnarySqrt: {overloads: []*UnaryOp{
+		{
 			Typ:        types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &SqrtFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &SqrtDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	UnaryCbrt: {
-		&UnaryOp{
+	UnaryCbrt: {overloads: []*UnaryOp{
+		{
 			Typ:        types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &CbrtFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&UnaryOp{
+		{
 			Typ:        types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &CbrtDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 })
 
 // BinOp is a binary operator.
@@ -216,7 +232,7 @@ type BinOp struct {
 	LeftType          *types.T
 	RightType         *types.T
 	ReturnType        *types.T
-	NullableArgs      bool
+	CalledOnNullInput bool
 	EvalOp            BinaryEvalOp
 	Volatility        volatility.V
 	PreferredOverload bool
@@ -224,9 +240,7 @@ type BinOp struct {
 	types   TypeList
 	retType ReturnTyper
 
-	// counter, if non-nil, should be incremented every time the
-	// operator is type checked.
-	counter telemetry.Counter
+	OnTypeCheck func()
 }
 
 func (op *BinOp) params() TypeList {
@@ -286,22 +300,20 @@ func PrependToMaybeNullArray(typ *types.T, left Datum, right Datum) (Datum, erro
 func initArrayElementConcatenation() {
 	for _, t := range types.Scalar {
 		typ := t
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
-			LeftType:     types.MakeArray(typ),
-			RightType:    typ,
-			ReturnType:   types.MakeArray(typ),
-			NullableArgs: true,
-			EvalOp:       &AppendToMaybeNullArrayOp{Typ: typ},
-			Volatility:   volatility.Immutable,
-		})
-
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
-			LeftType:     typ,
-			RightType:    types.MakeArray(typ),
-			ReturnType:   types.MakeArray(typ),
-			NullableArgs: true,
-			EvalOp:       &PrependToMaybeNullArrayOp{Typ: typ},
-			Volatility:   volatility.Immutable,
+		addBinOp(treebin.Concat, &BinOp{
+			LeftType:          types.MakeArray(typ),
+			RightType:         typ,
+			ReturnType:        types.MakeArray(typ),
+			CalledOnNullInput: true,
+			EvalOp:            &AppendToMaybeNullArrayOp{Typ: typ},
+			Volatility:        volatility.Immutable,
+		}, &BinOp{
+			LeftType:          typ,
+			RightType:         types.MakeArray(typ),
+			ReturnType:        types.MakeArray(typ),
+			CalledOnNullInput: true,
+			EvalOp:            &PrependToMaybeNullArrayOp{Typ: typ},
+			Volatility:        volatility.Immutable,
 		})
 	}
 }
@@ -341,7 +353,9 @@ func ArrayContains(ctx CompareContext, haystack *DArray, needles *DArray) (*DBoo
 		}
 		var found bool
 		for _, hay := range haystack.Array {
-			if needle.Compare(ctx, hay) == 0 {
+			if cmp, err := needle.CompareError(ctx, hay); err != nil {
+				return DBoolFalse, err
+			} else if cmp == 0 {
 				found = true
 				break
 			}
@@ -365,7 +379,9 @@ func ArrayOverlaps(ctx CompareContext, array, other *DArray) (*DBool, error) {
 			continue
 		}
 		for _, hay := range other.Array {
-			if needle.Compare(ctx, hay) == 0 {
+			if cmp, err := needle.CompareError(ctx, hay); err != nil {
+				return DBoolFalse, err
+			} else if cmp == 0 {
 				return DBoolTrue, nil
 			}
 		}
@@ -395,13 +411,13 @@ func initArrayToArrayConcatenation() {
 	for _, t := range types.Scalar {
 		typ := t
 		at := types.MakeArray(typ)
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
-			LeftType:     at,
-			RightType:    at,
-			ReturnType:   at,
-			NullableArgs: true,
-			EvalOp:       &ConcatArraysOp{Typ: typ},
-			Volatility:   volatility.Immutable,
+		addBinOp(treebin.Concat, &BinOp{
+			LeftType:          at,
+			RightType:         at,
+			ReturnType:        at,
+			CalledOnNullInput: true,
+			EvalOp:            &ConcatArraysOp{Typ: typ},
+			Volatility:        volatility.Immutable,
 		})
 	}
 }
@@ -410,11 +426,11 @@ func initArrayToArrayConcatenation() {
 // and nonarrayelement + string concatenation.
 func initNonArrayToNonArrayConcatenation() {
 	addConcat := func(leftType, rightType *types.T, volatility volatility.V) {
-		BinOps[treebin.Concat] = append(BinOps[treebin.Concat], &BinOp{
-			LeftType:     leftType,
-			RightType:    rightType,
-			ReturnType:   types.String,
-			NullableArgs: false,
+		addBinOp(treebin.Concat, &BinOp{
+			LeftType:          leftType,
+			RightType:         rightType,
+			ReturnType:        types.String,
+			CalledOnNullInput: false,
 			EvalOp: &ConcatOp{
 				Left:  leftType,
 				Right: rightType,
@@ -446,24 +462,45 @@ func init() {
 }
 
 func init() {
-	for op, overload := range BinOps {
-		for i, impl := range overload {
-			casted := impl.(*BinOp)
-			casted.types = ArgTypes{{"left", casted.LeftType}, {"right", casted.RightType}}
-			casted.retType = FixedReturnType(casted.ReturnType)
-			BinOps[op][i] = casted
-		}
+	for _, overload := range BinOps {
+		_ = overload.ForEachBinOp(func(impl *BinOp) error {
+			impl.types = ParamTypes{{"left", impl.LeftType}, {"right", impl.RightType}}
+			impl.retType = FixedReturnType(impl.ReturnType)
+			return nil
+		})
 	}
 }
 
-// binOpOverload is an overloaded set of binary operator implementations.
-type binOpOverload []overloadImpl
+// BinOpOverloads is an overloaded set of binary operator implementations.
+// It implements overloadSet.
+type BinOpOverloads struct {
+	overloads []*BinOp
+}
 
-func (o binOpOverload) LookupImpl(left, right *types.T) (*BinOp, bool) {
-	for _, fn := range o {
-		casted := fn.(*BinOp)
-		if casted.matchParams(left, right) {
-			return casted, true
+// ForEachBinOp iterates the BinOps in the set.
+func (o *BinOpOverloads) ForEachBinOp(f func(op *BinOp) error) error {
+	if o == nil {
+		return nil
+	}
+	for _, ol := range o.overloads {
+		if err := f(ol); err != nil {
+			return iterutil.Map(err)
+		}
+	}
+	return nil
+}
+
+func (o *BinOpOverloads) len() int               { return len(o.overloads) }
+func (o *BinOpOverloads) get(i int) overloadImpl { return o.overloads[i] }
+
+// LookupImpl can be used to look up the overload which match the requested types.
+func (o *BinOpOverloads) LookupImpl(left, right *types.T) (*BinOp, bool) {
+	if o == nil {
+		return nil, false
+	}
+	for _, ol := range o.overloads {
+		if ol.matchParams(left, right) {
+			return ol, true
 		}
 	}
 	return nil, false
@@ -483,407 +520,416 @@ func GetJSONPath(j json.JSON, ary DArray) (json.JSON, error) {
 	return json.FetchPath(j, path)
 }
 
+func addBinOp(symbol treebin.BinaryOperatorSymbol, ops ...*BinOp) {
+	s, ok := BinOps[symbol]
+	if !ok {
+		s = new(BinOpOverloads)
+		BinOps[symbol] = s
+	}
+	s.overloads = append(s.overloads, ops...)
+}
+
 // BinOps contains the binary operations indexed by operation type.
-var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
-	treebin.Bitand: {
-		&BinOp{
+var BinOps = map[treebin.BinaryOperatorSymbol]*BinOpOverloads{
+	treebin.Bitand: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &BitAndIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.VarBit,
 			RightType:  types.VarBit,
 			ReturnType: types.VarBit,
 			EvalOp:     &BitAndVarBitOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.INet,
 			RightType:  types.INet,
 			ReturnType: types.INet,
 			EvalOp:     &BitAndINetOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Bitor: {
-		&BinOp{
+	treebin.Bitor: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &BitOrIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.VarBit,
 			RightType:  types.VarBit,
 			ReturnType: types.VarBit,
 			EvalOp:     &BitOrVarBitOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.INet,
 			RightType:  types.INet,
 			ReturnType: types.INet,
 			EvalOp:     &BitOrINetOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Bitxor: {
-		&BinOp{
+	treebin.Bitxor: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &BitXorIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.VarBit,
 			RightType:  types.VarBit,
 			ReturnType: types.VarBit,
 			EvalOp:     &BitXorVarBitOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Plus: {
-		&BinOp{
+	treebin.Plus: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &PlusIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &PlusFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &PlusDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &PlusDecimalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &PlusIntDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.Int,
 			ReturnType: types.Date,
 			EvalOp:     &PlusDateIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Date,
 			ReturnType: types.Date,
 			EvalOp:     &PlusIntDateOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.Time,
 			ReturnType: types.Timestamp,
 			EvalOp:     &PlusDateTimeOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Time,
 			RightType:  types.Date,
 			ReturnType: types.Timestamp,
 			EvalOp:     &PlusTimeDateOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.TimeTZ,
 			ReturnType: types.TimestampTZ,
 			EvalOp:     &PlusDateTimeTZOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.TimeTZ,
 			RightType:  types.Date,
 			ReturnType: types.TimestampTZ,
 			EvalOp:     &PlusTimeTZDateOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Time,
 			RightType:  types.Interval,
 			ReturnType: types.Time,
 			EvalOp:     &PlusTimeIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Time,
 			ReturnType: types.Time,
 			EvalOp:     &PlusIntervalTimeOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.TimeTZ,
 			RightType:  types.Interval,
 			ReturnType: types.TimeTZ,
 			EvalOp:     &PlusTimeTZIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.TimeTZ,
 			ReturnType: types.TimeTZ,
 			EvalOp:     &PlusIntervalTimeTZOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Timestamp,
 			RightType:  types.Interval,
 			ReturnType: types.Timestamp,
 			EvalOp:     &PlusTimestampIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Timestamp,
 			ReturnType: types.Timestamp,
 			EvalOp:     &PlusIntervalTimestampOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.Interval,
 			ReturnType: types.TimestampTZ,
 			EvalOp:     &PlusTimestampTZIntervalOp{},
 			Volatility: volatility.Stable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.TimestampTZ,
 			ReturnType: types.TimestampTZ,
 			EvalOp:     &PlusIntervalTimestampTZOp{},
 			Volatility: volatility.Stable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
 			EvalOp:     &PlusIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.Interval,
 			ReturnType: types.Timestamp,
 			EvalOp:     &PlusDateIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Date,
 			ReturnType: types.Timestamp,
 			EvalOp:     &PlusIntervalDateOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.INet,
 			RightType:  types.Int,
 			ReturnType: types.INet,
 			EvalOp:     &PlusINetIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.INet,
 			ReturnType: types.INet,
 			EvalOp:     &PlusIntINetOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Minus: {
-		&BinOp{
+	treebin.Minus: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &MinusIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &MinusFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &MinusDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &MinusDecimalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &MinusIntDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.Int,
 			ReturnType: types.Date,
 			EvalOp:     &MinusDateIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.Date,
 			ReturnType: types.Int,
 			EvalOp:     &MinusDateOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.Time,
 			ReturnType: types.Timestamp,
 			EvalOp:     &MinusDateTimeOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Time,
 			RightType:  types.Time,
 			ReturnType: types.Interval,
 			EvalOp:     &MinusTimeOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Timestamp,
 			RightType:  types.Timestamp,
 			ReturnType: types.Interval,
 			EvalOp:     &MinusTimestampOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.TimestampTZ,
 			ReturnType: types.Interval,
 			EvalOp:     &MinusTimestampTZOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Timestamp,
 			RightType:  types.TimestampTZ,
 			ReturnType: types.Interval,
 			EvalOp:     &MinusTimestampTimestampTZOp{},
 			Volatility: volatility.Stable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.Timestamp,
 			ReturnType: types.Interval,
 			EvalOp:     &MinusTimestampTZTimestampOp{},
 			Volatility: volatility.Stable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Time,
 			RightType:  types.Interval,
 			ReturnType: types.Time,
 			EvalOp:     &MinusTimeIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.TimeTZ,
 			RightType:  types.Interval,
 			ReturnType: types.TimeTZ,
 			EvalOp:     &MinusTimeTZIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Timestamp,
 			RightType:  types.Interval,
 			ReturnType: types.Timestamp,
 			EvalOp:     &MinusTimestampIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.TimestampTZ,
 			RightType:  types.Interval,
 			ReturnType: types.TimestampTZ,
 			EvalOp:     &MinusTimestampTZIntervalOp{},
 			Volatility: volatility.Stable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Date,
 			RightType:  types.Interval,
 			ReturnType: types.Timestamp,
 			EvalOp:     &MinusDateIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
 			EvalOp:     &MinusIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.String,
 			ReturnType: types.Jsonb,
 			EvalOp:     &MinusJsonbStringOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.Int,
 			ReturnType: types.Jsonb,
 			EvalOp:     &MinusJsonbIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.MakeArray(types.String),
 			ReturnType: types.Jsonb,
 			EvalOp:     &MinusJsonbStringArrayOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.INet,
 			RightType:  types.INet,
 			ReturnType: types.Int,
 			EvalOp:     &MinusINetOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			// Note: postgres ver 10 does NOT have Int - INet. Throws ERROR: 42883.
 			LeftType:   types.INet,
 			RightType:  types.Int,
@@ -891,24 +937,24 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 			EvalOp:     &MinusINetIntOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Mult: {
-		&BinOp{
+	treebin.Mult: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &MultIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &MultFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
@@ -918,312 +964,321 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 		// The following two overloads are needed because DInt/DInt = DDecimal. Due
 		// to this operation, normalization may sometimes create a DInt * DDecimal
 		// operation.
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &MultDecimalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &MultIntDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
 			EvalOp:     &MultIntIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Int,
 			ReturnType: types.Interval,
 			EvalOp:     &MultIntervalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Float,
 			ReturnType: types.Interval,
 			EvalOp:     &MultIntervalFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
 			EvalOp:     &MultFloatIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Interval,
 			ReturnType: types.Interval,
 			EvalOp:     &MultDecimalIntervalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Decimal,
 			ReturnType: types.Interval,
 			EvalOp:     &MultIntervalDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Div: {
-		&BinOp{
+	treebin.Div: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &DivIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &DivFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &DivDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &DivDecimalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &DivIntDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Int,
 			ReturnType: types.Interval,
 			EvalOp:     &DivIntervalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Interval,
 			RightType:  types.Float,
 			ReturnType: types.Interval,
 			EvalOp:     &DivIntervalFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.FloorDiv: {
-		&BinOp{
+	treebin.FloorDiv: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &FloorDivIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &FloorDivFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &FloorDivDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &FloorDivDecimalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &FloorDivIntDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Mod: {
-		&BinOp{
+	treebin.Mod: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &ModIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &ModFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &ModDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &ModDecimalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &ModIntDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+		{
+			LeftType:   types.String,
+			RightType:  types.String,
+			ReturnType: types.Bool,
+			EvalOp:     &ModStringOp{},
+			// This operator is only stable because its result depends on the value
+			// of the pg_trgm.similarity_threshold session setting.
+			Volatility: volatility.Stable,
+		},
+	}},
 
-	treebin.Concat: {
-		&BinOp{
+	treebin.Concat: {overloads: []*BinOp{
+		{
 			LeftType:   types.String,
 			RightType:  types.String,
 			ReturnType: types.String,
 			EvalOp:     &ConcatStringOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Bytes,
 			RightType:  types.Bytes,
 			ReturnType: types.Bytes,
 			EvalOp:     &ConcatBytesOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.VarBit,
 			RightType:  types.VarBit,
 			ReturnType: types.VarBit,
 			EvalOp:     &ConcatVarBitOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.Jsonb,
 			ReturnType: types.Jsonb,
 			EvalOp:     &ConcatJsonbOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
 	// TODO(pmattis): Check that the shift is valid.
-	treebin.LShift: {
-		&BinOp{
+	treebin.LShift: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &LShiftIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.VarBit,
 			RightType:  types.Int,
 			ReturnType: types.VarBit,
 			EvalOp:     &LShiftVarBitIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.INet,
 			RightType:  types.INet,
 			ReturnType: types.Bool,
 			EvalOp:     &LShiftINetOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.RShift: {
-		&BinOp{
+	treebin.RShift: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &RShiftIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.VarBit,
 			RightType:  types.Int,
 			ReturnType: types.VarBit,
 			EvalOp:     &RShiftVarBitIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.INet,
 			RightType:  types.INet,
 			ReturnType: types.Bool,
 			EvalOp:     &RShiftINetOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.Pow: {
-		&BinOp{
+	treebin.Pow: {overloads: []*BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Int,
 			ReturnType: types.Int,
 			EvalOp:     &PowIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Float,
 			RightType:  types.Float,
 			ReturnType: types.Float,
 			EvalOp:     &PowFloatOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &PowDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Decimal,
 			RightType:  types.Int,
 			ReturnType: types.Decimal,
 			EvalOp:     &PowDecimalIntOp{},
 			Volatility: volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Int,
 			RightType:  types.Decimal,
 			ReturnType: types.Decimal,
 			EvalOp:     &PowIntDecimalOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.JSONFetchVal: {
-		&BinOp{
+	treebin.JSONFetchVal: {overloads: []*BinOp{
+		{
 			LeftType:          types.Jsonb,
 			RightType:         types.String,
 			ReturnType:        types.Jsonb,
@@ -1231,27 +1286,27 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 			PreferredOverload: true,
 			Volatility:        volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.Int,
 			ReturnType: types.Jsonb,
 			EvalOp:     &JSONFetchValIntOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.JSONFetchValPath: {
-		&BinOp{
+	treebin.JSONFetchValPath: {overloads: []*BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.MakeArray(types.String),
 			ReturnType: types.Jsonb,
 			EvalOp:     &JSONFetchValPathOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.JSONFetchText: {
-		&BinOp{
+	treebin.JSONFetchText: {overloads: []*BinOp{
+		{
 			LeftType:          types.Jsonb,
 			RightType:         types.String,
 			ReturnType:        types.String,
@@ -1259,24 +1314,24 @@ var BinOps = map[treebin.BinaryOperatorSymbol]binOpOverload{
 			EvalOp:            &JSONFetchTextStringOp{},
 			Volatility:        volatility.Immutable,
 		},
-		&BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.Int,
 			ReturnType: types.String,
 			EvalOp:     &JSONFetchTextIntOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treebin.JSONFetchTextPath: {
-		&BinOp{
+	treebin.JSONFetchTextPath: {overloads: []*BinOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.MakeArray(types.String),
 			ReturnType: types.String,
 			EvalOp:     &JSONFetchTextPathOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 }
 
 // CmpOp is a comparison operator.
@@ -1289,13 +1344,11 @@ type CmpOp struct {
 	// Datum return type is a union between *DBool and dNull.
 	EvalOp BinaryEvalOp
 
-	// counter, if non-nil, should be incremented every time the
-	// operator is type checked.
-	counter telemetry.Counter
+	OnTypeCheck func()
 
-	// If NullableArgs is false, the operator returns NULL
+	// If CalledOnNullInput is false, the operator returns NULL
 	// whenever either argument is NULL.
-	NullableArgs bool
+	CalledOnNullInput bool
 
 	Volatility volatility.V
 
@@ -1321,11 +1374,10 @@ func (op *CmpOp) preferred() bool {
 }
 
 func cmpOpFixups(
-	cmpOps map[treecmp.ComparisonOperatorSymbol]cmpOpOverload,
-) map[treecmp.ComparisonOperatorSymbol]cmpOpOverload {
+	cmpOps map[treecmp.ComparisonOperatorSymbol]*CmpOpOverloads,
+) map[treecmp.ComparisonOperatorSymbol]*CmpOpOverloads {
 	findVolatility := func(op treecmp.ComparisonOperatorSymbol, t *types.T) volatility.V {
-		for _, impl := range cmpOps[treecmp.EQ] {
-			o := impl.(*CmpOp)
+		for _, o := range cmpOps[treecmp.EQ].overloads {
 			if o.LeftType.Equivalent(t) && o.RightType.Equivalent(t) {
 				return o.Volatility
 			}
@@ -1335,67 +1387,94 @@ func cmpOpFixups(
 
 	// Array equality comparisons.
 	for _, t := range append(types.Scalar, types.AnyEnum) {
-		cmpOps[treecmp.EQ] = append(cmpOps[treecmp.EQ], &CmpOp{
+		appendCmpOp := func(sym treecmp.ComparisonOperatorSymbol, cmpOp *CmpOp) {
+			s, ok := cmpOps[sym]
+			if !ok {
+				s = new(CmpOpOverloads)
+				cmpOps[sym] = s
+			}
+			s.overloads = append(s.overloads, cmpOp)
+		}
+		appendCmpOp(treecmp.EQ, &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			EvalOp:     &CompareScalarOp{treecmp.MakeComparisonOperator(treecmp.EQ)},
 			Volatility: findVolatility(treecmp.EQ, t),
 		})
-		cmpOps[treecmp.LE] = append(cmpOps[treecmp.LE], &CmpOp{
+		appendCmpOp(treecmp.LE, &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			EvalOp:     &CompareScalarOp{treecmp.MakeComparisonOperator(treecmp.LE)},
 			Volatility: findVolatility(treecmp.LE, t),
 		})
-		cmpOps[treecmp.LT] = append(cmpOps[treecmp.LT], &CmpOp{
+		appendCmpOp(treecmp.LT, &CmpOp{
 			LeftType:   types.MakeArray(t),
 			RightType:  types.MakeArray(t),
 			EvalOp:     &CompareScalarOp{treecmp.MakeComparisonOperator(treecmp.LT)},
 			Volatility: findVolatility(treecmp.LT, t),
 		})
-
-		cmpOps[treecmp.IsNotDistinctFrom] = append(cmpOps[treecmp.IsNotDistinctFrom], &CmpOp{
-			LeftType:     types.MakeArray(t),
-			RightType:    types.MakeArray(t),
-			EvalOp:       &CompareScalarOp{treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom)},
-			NullableArgs: true,
-			Volatility:   findVolatility(treecmp.IsNotDistinctFrom, t),
+		appendCmpOp(treecmp.IsNotDistinctFrom, &CmpOp{
+			LeftType:          types.MakeArray(t),
+			RightType:         types.MakeArray(t),
+			EvalOp:            &CompareScalarOp{treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom)},
+			CalledOnNullInput: true,
+			Volatility:        findVolatility(treecmp.IsNotDistinctFrom, t),
 		})
 	}
 
-	for op, overload := range cmpOps {
-		for i, impl := range overload {
-			casted := impl.(*CmpOp)
-			casted.types = ArgTypes{{"left", casted.LeftType}, {"right", casted.RightType}}
-			cmpOps[op][i] = casted
-		}
+	for _, overloads := range cmpOps {
+		_ = overloads.ForEachCmpOp(func(op *CmpOp) error {
+			op.types = ParamTypes{{"left", op.LeftType}, {"right", op.RightType}}
+			return nil
+		})
 	}
 
 	return cmpOps
 }
 
-// cmpOpOverload is an overloaded set of comparison operator implementations.
-type cmpOpOverload []overloadImpl
+// CmpOpOverloads is an overloaded set of comparison operator implementations.
+type CmpOpOverloads struct {
+	overloads []*CmpOp
+}
 
-func (o cmpOpOverload) LookupImpl(left, right *types.T) (*CmpOp, bool) {
-	for _, fn := range o {
-		casted := fn.(*CmpOp)
-		if casted.matchParams(left, right) {
-			return casted, true
+func (o *CmpOpOverloads) len() int               { return len(o.overloads) }
+func (o *CmpOpOverloads) get(i int) overloadImpl { return o.overloads[i] }
+
+// LookupImpl is used to look up the overload for a pair of types.
+func (o *CmpOpOverloads) LookupImpl(left, right *types.T) (*CmpOp, bool) {
+	if o == nil {
+		return nil, false
+	}
+	for _, fn := range o.overloads {
+		if fn.matchParams(left, right) {
+			return fn, true
 		}
 	}
 	return nil, false
 }
 
+// ForEachCmpOp iterates the ops in the set.
+func (o *CmpOpOverloads) ForEachCmpOp(f func(op *CmpOp) error) error {
+	if o == nil {
+		return nil
+	}
+	for _, ol := range o.overloads {
+		if err := f(ol); err != nil {
+			return iterutil.Map(err)
+		}
+	}
+	return nil
+}
+
 func makeCmpOpOverload(
-	op treecmp.ComparisonOperatorSymbol, a, b *types.T, nullableArgs bool, v volatility.V,
+	op treecmp.ComparisonOperatorSymbol, a, b *types.T, calledOnNullInput bool, v volatility.V,
 ) *CmpOp {
 	return &CmpOp{
-		LeftType:     a,
-		RightType:    b,
-		EvalOp:       &CompareScalarOp{ComparisonOperator: treecmp.MakeComparisonOperator(op)},
-		NullableArgs: nullableArgs,
-		Volatility:   v,
+		LeftType:          a,
+		RightType:         b,
+		EvalOp:            &CompareScalarOp{ComparisonOperator: treecmp.MakeComparisonOperator(op)},
+		CalledOnNullInput: calledOnNullInput,
+		Volatility:        v,
 	}
 }
 
@@ -1413,46 +1492,48 @@ func makeIsFn(a, b *types.T, v volatility.V) *CmpOp {
 }
 
 // CmpOps contains the comparison operations indexed by operation type.
-var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
-	treecmp.EQ: {
+var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]*CmpOpOverloads{
+	treecmp.EQ: {overloads: []*CmpOp{
 		// Single-type comparisons.
 		makeEqFn(types.AnyEnum, types.AnyEnum, volatility.Immutable),
-		makeEqFn(types.Bool, types.Bool, volatility.LeakProof),
-		makeEqFn(types.Bytes, types.Bytes, volatility.LeakProof),
-		makeEqFn(types.Date, types.Date, volatility.LeakProof),
+		makeEqFn(types.Bool, types.Bool, volatility.Leakproof),
+		makeEqFn(types.Bytes, types.Bytes, volatility.Leakproof),
+		makeEqFn(types.Date, types.Date, volatility.Leakproof),
 		makeEqFn(types.Decimal, types.Decimal, volatility.Immutable),
 		// Note: it is an error to compare two strings with different collations;
-		// the operator is leak proof under the assumption that these cases will be
+		// the operator is leakproof under the assumption that these cases will be
 		// detected during type checking.
-		makeEqFn(types.AnyCollatedString, types.AnyCollatedString, volatility.LeakProof),
-		makeEqFn(types.Float, types.Float, volatility.LeakProof),
-		makeEqFn(types.Box2D, types.Box2D, volatility.LeakProof),
-		makeEqFn(types.Geography, types.Geography, volatility.LeakProof),
-		makeEqFn(types.Geometry, types.Geometry, volatility.LeakProof),
-		makeEqFn(types.INet, types.INet, volatility.LeakProof),
-		makeEqFn(types.Int, types.Int, volatility.LeakProof),
-		makeEqFn(types.Interval, types.Interval, volatility.LeakProof),
+		makeEqFn(types.AnyCollatedString, types.AnyCollatedString, volatility.Leakproof),
+		makeEqFn(types.Float, types.Float, volatility.Leakproof),
+		makeEqFn(types.Box2D, types.Box2D, volatility.Leakproof),
+		makeEqFn(types.Geography, types.Geography, volatility.Leakproof),
+		makeEqFn(types.Geometry, types.Geometry, volatility.Leakproof),
+		makeEqFn(types.INet, types.INet, volatility.Leakproof),
+		makeEqFn(types.Int, types.Int, volatility.Leakproof),
+		makeEqFn(types.Interval, types.Interval, volatility.Leakproof),
 		makeEqFn(types.Jsonb, types.Jsonb, volatility.Immutable),
-		makeEqFn(types.Oid, types.Oid, volatility.LeakProof),
-		makeEqFn(types.String, types.String, volatility.LeakProof),
-		makeEqFn(types.Time, types.Time, volatility.LeakProof),
-		makeEqFn(types.TimeTZ, types.TimeTZ, volatility.LeakProof),
-		makeEqFn(types.Timestamp, types.Timestamp, volatility.LeakProof),
-		makeEqFn(types.TimestampTZ, types.TimestampTZ, volatility.LeakProof),
-		makeEqFn(types.Uuid, types.Uuid, volatility.LeakProof),
-		makeEqFn(types.VarBit, types.VarBit, volatility.LeakProof),
+		makeEqFn(types.Oid, types.Oid, volatility.Leakproof),
+		makeEqFn(types.String, types.String, volatility.Leakproof),
+		makeEqFn(types.Time, types.Time, volatility.Leakproof),
+		makeEqFn(types.TimeTZ, types.TimeTZ, volatility.Leakproof),
+		makeEqFn(types.Timestamp, types.Timestamp, volatility.Leakproof),
+		makeEqFn(types.TimestampTZ, types.TimestampTZ, volatility.Leakproof),
+		makeEqFn(types.TSQuery, types.TSQuery, volatility.Immutable),
+		makeEqFn(types.TSVector, types.TSVector, volatility.Immutable),
+		makeEqFn(types.Uuid, types.Uuid, volatility.Leakproof),
+		makeEqFn(types.VarBit, types.VarBit, volatility.Leakproof),
 
 		// Mixed-type comparisons.
 		makeEqFn(types.Date, types.Timestamp, volatility.Immutable),
 		makeEqFn(types.Date, types.TimestampTZ, volatility.Stable),
-		makeEqFn(types.Decimal, types.Float, volatility.LeakProof),
-		makeEqFn(types.Decimal, types.Int, volatility.LeakProof),
-		makeEqFn(types.Float, types.Decimal, volatility.LeakProof),
-		makeEqFn(types.Float, types.Int, volatility.LeakProof),
-		makeEqFn(types.Int, types.Decimal, volatility.LeakProof),
-		makeEqFn(types.Int, types.Float, volatility.LeakProof),
-		makeEqFn(types.Int, types.Oid, volatility.LeakProof),
-		makeEqFn(types.Oid, types.Int, volatility.LeakProof),
+		makeEqFn(types.Decimal, types.Float, volatility.Leakproof),
+		makeEqFn(types.Decimal, types.Int, volatility.Leakproof),
+		makeEqFn(types.Float, types.Decimal, volatility.Leakproof),
+		makeEqFn(types.Float, types.Int, volatility.Leakproof),
+		makeEqFn(types.Int, types.Decimal, volatility.Leakproof),
+		makeEqFn(types.Int, types.Float, volatility.Leakproof),
+		makeEqFn(types.Int, types.Oid, volatility.Leakproof),
+		makeEqFn(types.Oid, types.Int, volatility.Leakproof),
 		makeEqFn(types.Timestamp, types.Date, volatility.Immutable),
 		makeEqFn(types.Timestamp, types.TimestampTZ, volatility.Stable),
 		makeEqFn(types.TimestampTZ, types.Date, volatility.Stable),
@@ -1461,7 +1542,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		makeEqFn(types.TimeTZ, types.Time, volatility.Stable),
 
 		// Tuple comparison.
-		&CmpOp{
+		{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			EvalOp: &CompareTupleOp{
@@ -1469,46 +1550,46 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.LT: {
+	treecmp.LT: {overloads: []*CmpOp{
 		// Single-type comparisons.
 		makeLtFn(types.AnyEnum, types.AnyEnum, volatility.Immutable),
-		makeLtFn(types.Bool, types.Bool, volatility.LeakProof),
-		makeLtFn(types.Bytes, types.Bytes, volatility.LeakProof),
-		makeLtFn(types.Date, types.Date, volatility.LeakProof),
+		makeLtFn(types.Bool, types.Bool, volatility.Leakproof),
+		makeLtFn(types.Bytes, types.Bytes, volatility.Leakproof),
+		makeLtFn(types.Date, types.Date, volatility.Leakproof),
 		makeLtFn(types.Decimal, types.Decimal, volatility.Immutable),
 		// Note: it is an error to compare two strings with different collations;
-		// the operator is leak proof under the assumption that these cases will be
+		// the operator is leakproof under the assumption that these cases will be
 		// detected during type checking.
-		makeLtFn(types.AnyCollatedString, types.AnyCollatedString, volatility.LeakProof),
-		makeLtFn(types.Float, types.Float, volatility.LeakProof),
-		makeLtFn(types.Box2D, types.Box2D, volatility.LeakProof),
-		makeLtFn(types.Geography, types.Geography, volatility.LeakProof),
-		makeLtFn(types.Geometry, types.Geometry, volatility.LeakProof),
-		makeLtFn(types.INet, types.INet, volatility.LeakProof),
-		makeLtFn(types.Int, types.Int, volatility.LeakProof),
-		makeLtFn(types.Interval, types.Interval, volatility.LeakProof),
-		makeLtFn(types.Oid, types.Oid, volatility.LeakProof),
-		makeLtFn(types.String, types.String, volatility.LeakProof),
-		makeLtFn(types.Time, types.Time, volatility.LeakProof),
-		makeLtFn(types.TimeTZ, types.TimeTZ, volatility.LeakProof),
-		makeLtFn(types.Timestamp, types.Timestamp, volatility.LeakProof),
-		makeLtFn(types.TimestampTZ, types.TimestampTZ, volatility.LeakProof),
-		makeLtFn(types.Uuid, types.Uuid, volatility.LeakProof),
-		makeLtFn(types.VarBit, types.VarBit, volatility.LeakProof),
+		makeLtFn(types.AnyCollatedString, types.AnyCollatedString, volatility.Leakproof),
+		makeLtFn(types.Float, types.Float, volatility.Leakproof),
+		makeLtFn(types.Box2D, types.Box2D, volatility.Leakproof),
+		makeLtFn(types.Geography, types.Geography, volatility.Leakproof),
+		makeLtFn(types.Geometry, types.Geometry, volatility.Leakproof),
+		makeLtFn(types.INet, types.INet, volatility.Leakproof),
+		makeLtFn(types.Int, types.Int, volatility.Leakproof),
+		makeLtFn(types.Interval, types.Interval, volatility.Leakproof),
+		makeLtFn(types.Oid, types.Oid, volatility.Leakproof),
+		makeLtFn(types.String, types.String, volatility.Leakproof),
+		makeLtFn(types.Time, types.Time, volatility.Leakproof),
+		makeLtFn(types.TimeTZ, types.TimeTZ, volatility.Leakproof),
+		makeLtFn(types.Timestamp, types.Timestamp, volatility.Leakproof),
+		makeLtFn(types.TimestampTZ, types.TimestampTZ, volatility.Leakproof),
+		makeLtFn(types.Uuid, types.Uuid, volatility.Leakproof),
+		makeLtFn(types.VarBit, types.VarBit, volatility.Leakproof),
 
 		// Mixed-type comparisons.
 		makeLtFn(types.Date, types.Timestamp, volatility.Immutable),
 		makeLtFn(types.Date, types.TimestampTZ, volatility.Stable),
-		makeLtFn(types.Decimal, types.Float, volatility.LeakProof),
-		makeLtFn(types.Decimal, types.Int, volatility.LeakProof),
-		makeLtFn(types.Float, types.Decimal, volatility.LeakProof),
-		makeLtFn(types.Float, types.Int, volatility.LeakProof),
-		makeLtFn(types.Int, types.Decimal, volatility.LeakProof),
-		makeLtFn(types.Int, types.Float, volatility.LeakProof),
-		makeLtFn(types.Int, types.Oid, volatility.LeakProof),
-		makeLtFn(types.Oid, types.Int, volatility.LeakProof),
+		makeLtFn(types.Decimal, types.Float, volatility.Leakproof),
+		makeLtFn(types.Decimal, types.Int, volatility.Leakproof),
+		makeLtFn(types.Float, types.Decimal, volatility.Leakproof),
+		makeLtFn(types.Float, types.Int, volatility.Leakproof),
+		makeLtFn(types.Int, types.Decimal, volatility.Leakproof),
+		makeLtFn(types.Int, types.Float, volatility.Leakproof),
+		makeLtFn(types.Int, types.Oid, volatility.Leakproof),
+		makeLtFn(types.Oid, types.Int, volatility.Leakproof),
 		makeLtFn(types.Timestamp, types.Date, volatility.Immutable),
 		makeLtFn(types.Timestamp, types.TimestampTZ, volatility.Stable),
 		makeLtFn(types.TimestampTZ, types.Date, volatility.Stable),
@@ -1517,7 +1598,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		makeLtFn(types.TimeTZ, types.Time, volatility.Stable),
 
 		// Tuple comparison.
-		&CmpOp{
+		{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			EvalOp: &CompareTupleOp{
@@ -1525,46 +1606,46 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.LE: {
+	treecmp.LE: {overloads: []*CmpOp{
 		// Single-type comparisons.
 		makeLeFn(types.AnyEnum, types.AnyEnum, volatility.Immutable),
-		makeLeFn(types.Bool, types.Bool, volatility.LeakProof),
-		makeLeFn(types.Bytes, types.Bytes, volatility.LeakProof),
-		makeLeFn(types.Date, types.Date, volatility.LeakProof),
+		makeLeFn(types.Bool, types.Bool, volatility.Leakproof),
+		makeLeFn(types.Bytes, types.Bytes, volatility.Leakproof),
+		makeLeFn(types.Date, types.Date, volatility.Leakproof),
 		makeLeFn(types.Decimal, types.Decimal, volatility.Immutable),
 		// Note: it is an error to compare two strings with different collations;
-		// the operator is leak proof under the assumption that these cases will be
+		// the operator is leakproof under the assumption that these cases will be
 		// detected during type checking.
-		makeLeFn(types.AnyCollatedString, types.AnyCollatedString, volatility.LeakProof),
-		makeLeFn(types.Float, types.Float, volatility.LeakProof),
-		makeLeFn(types.Box2D, types.Box2D, volatility.LeakProof),
-		makeLeFn(types.Geography, types.Geography, volatility.LeakProof),
-		makeLeFn(types.Geometry, types.Geometry, volatility.LeakProof),
-		makeLeFn(types.INet, types.INet, volatility.LeakProof),
-		makeLeFn(types.Int, types.Int, volatility.LeakProof),
-		makeLeFn(types.Interval, types.Interval, volatility.LeakProof),
-		makeLeFn(types.Oid, types.Oid, volatility.LeakProof),
-		makeLeFn(types.String, types.String, volatility.LeakProof),
-		makeLeFn(types.Time, types.Time, volatility.LeakProof),
-		makeLeFn(types.TimeTZ, types.TimeTZ, volatility.LeakProof),
-		makeLeFn(types.Timestamp, types.Timestamp, volatility.LeakProof),
-		makeLeFn(types.TimestampTZ, types.TimestampTZ, volatility.LeakProof),
-		makeLeFn(types.Uuid, types.Uuid, volatility.LeakProof),
-		makeLeFn(types.VarBit, types.VarBit, volatility.LeakProof),
+		makeLeFn(types.AnyCollatedString, types.AnyCollatedString, volatility.Leakproof),
+		makeLeFn(types.Float, types.Float, volatility.Leakproof),
+		makeLeFn(types.Box2D, types.Box2D, volatility.Leakproof),
+		makeLeFn(types.Geography, types.Geography, volatility.Leakproof),
+		makeLeFn(types.Geometry, types.Geometry, volatility.Leakproof),
+		makeLeFn(types.INet, types.INet, volatility.Leakproof),
+		makeLeFn(types.Int, types.Int, volatility.Leakproof),
+		makeLeFn(types.Interval, types.Interval, volatility.Leakproof),
+		makeLeFn(types.Oid, types.Oid, volatility.Leakproof),
+		makeLeFn(types.String, types.String, volatility.Leakproof),
+		makeLeFn(types.Time, types.Time, volatility.Leakproof),
+		makeLeFn(types.TimeTZ, types.TimeTZ, volatility.Leakproof),
+		makeLeFn(types.Timestamp, types.Timestamp, volatility.Leakproof),
+		makeLeFn(types.TimestampTZ, types.TimestampTZ, volatility.Leakproof),
+		makeLeFn(types.Uuid, types.Uuid, volatility.Leakproof),
+		makeLeFn(types.VarBit, types.VarBit, volatility.Leakproof),
 
 		// Mixed-type comparisons.
 		makeLeFn(types.Date, types.Timestamp, volatility.Immutable),
 		makeLeFn(types.Date, types.TimestampTZ, volatility.Stable),
-		makeLeFn(types.Decimal, types.Float, volatility.LeakProof),
-		makeLeFn(types.Decimal, types.Int, volatility.LeakProof),
-		makeLeFn(types.Float, types.Decimal, volatility.LeakProof),
-		makeLeFn(types.Float, types.Int, volatility.LeakProof),
-		makeLeFn(types.Int, types.Decimal, volatility.LeakProof),
-		makeLeFn(types.Int, types.Float, volatility.LeakProof),
-		makeLeFn(types.Int, types.Oid, volatility.LeakProof),
-		makeLeFn(types.Oid, types.Int, volatility.LeakProof),
+		makeLeFn(types.Decimal, types.Float, volatility.Leakproof),
+		makeLeFn(types.Decimal, types.Int, volatility.Leakproof),
+		makeLeFn(types.Float, types.Decimal, volatility.Leakproof),
+		makeLeFn(types.Float, types.Int, volatility.Leakproof),
+		makeLeFn(types.Int, types.Decimal, volatility.Leakproof),
+		makeLeFn(types.Int, types.Float, volatility.Leakproof),
+		makeLeFn(types.Int, types.Oid, volatility.Leakproof),
+		makeLeFn(types.Oid, types.Int, volatility.Leakproof),
 		makeLeFn(types.Timestamp, types.Date, volatility.Immutable),
 		makeLeFn(types.Timestamp, types.TimestampTZ, volatility.Stable),
 		makeLeFn(types.TimestampTZ, types.Date, volatility.Stable),
@@ -1573,7 +1654,7 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		makeLeFn(types.TimeTZ, types.Time, volatility.Stable),
 
 		// Tuple comparison.
-		&CmpOp{
+		{
 			LeftType:  types.AnyTuple,
 			RightType: types.AnyTuple,
 			EvalOp: &CompareTupleOp{
@@ -1581,67 +1662,69 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 			},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.IsNotDistinctFrom: {
-		&CmpOp{
+	treecmp.IsNotDistinctFrom: {overloads: []*CmpOp{
+		{
 			LeftType:  types.Unknown,
 			RightType: types.Unknown,
 			EvalOp: &CompareScalarOp{
 				ComparisonOperator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
 			},
-			NullableArgs: true,
+			CalledOnNullInput: true,
 			// Avoids ambiguous comparison error for NULL IS NOT DISTINCT FROM NULL.
 			PreferredOverload: true,
-			Volatility:        volatility.LeakProof,
+			Volatility:        volatility.Leakproof,
 		},
-		&CmpOp{
+		{
 			LeftType:  types.AnyArray,
 			RightType: types.Unknown,
 			EvalOp: &CompareScalarOp{
 				ComparisonOperator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
 			},
-			NullableArgs: true,
-			Volatility:   volatility.LeakProof,
+			CalledOnNullInput: true,
+			Volatility:        volatility.Leakproof,
 		},
 		// Single-type comparisons.
 		makeIsFn(types.AnyEnum, types.AnyEnum, volatility.Immutable),
-		makeIsFn(types.Bool, types.Bool, volatility.LeakProof),
-		makeIsFn(types.Bytes, types.Bytes, volatility.LeakProof),
-		makeIsFn(types.Date, types.Date, volatility.LeakProof),
+		makeIsFn(types.Bool, types.Bool, volatility.Leakproof),
+		makeIsFn(types.Bytes, types.Bytes, volatility.Leakproof),
+		makeIsFn(types.Date, types.Date, volatility.Leakproof),
 		makeIsFn(types.Decimal, types.Decimal, volatility.Immutable),
 		// Note: it is an error to compare two strings with different collations;
-		// the operator is leak proof under the assumption that these cases will be
+		// the operator is leakproof under the assumption that these cases will be
 		// detected during type checking.
-		makeIsFn(types.AnyCollatedString, types.AnyCollatedString, volatility.LeakProof),
-		makeIsFn(types.Float, types.Float, volatility.LeakProof),
-		makeIsFn(types.Box2D, types.Box2D, volatility.LeakProof),
-		makeIsFn(types.Geography, types.Geography, volatility.LeakProof),
-		makeIsFn(types.Geometry, types.Geometry, volatility.LeakProof),
-		makeIsFn(types.INet, types.INet, volatility.LeakProof),
-		makeIsFn(types.Int, types.Int, volatility.LeakProof),
-		makeIsFn(types.Interval, types.Interval, volatility.LeakProof),
+		makeIsFn(types.AnyCollatedString, types.AnyCollatedString, volatility.Leakproof),
+		makeIsFn(types.Float, types.Float, volatility.Leakproof),
+		makeIsFn(types.Box2D, types.Box2D, volatility.Leakproof),
+		makeIsFn(types.Geography, types.Geography, volatility.Leakproof),
+		makeIsFn(types.Geometry, types.Geometry, volatility.Leakproof),
+		makeIsFn(types.INet, types.INet, volatility.Leakproof),
+		makeIsFn(types.Int, types.Int, volatility.Leakproof),
+		makeIsFn(types.Interval, types.Interval, volatility.Leakproof),
 		makeIsFn(types.Jsonb, types.Jsonb, volatility.Immutable),
-		makeIsFn(types.Oid, types.Oid, volatility.LeakProof),
-		makeIsFn(types.String, types.String, volatility.LeakProof),
-		makeIsFn(types.Time, types.Time, volatility.LeakProof),
-		makeIsFn(types.TimeTZ, types.TimeTZ, volatility.LeakProof),
-		makeIsFn(types.Timestamp, types.Timestamp, volatility.LeakProof),
-		makeIsFn(types.TimestampTZ, types.TimestampTZ, volatility.LeakProof),
-		makeIsFn(types.Uuid, types.Uuid, volatility.LeakProof),
-		makeIsFn(types.VarBit, types.VarBit, volatility.LeakProof),
+		makeIsFn(types.Oid, types.Oid, volatility.Leakproof),
+		makeIsFn(types.String, types.String, volatility.Leakproof),
+		makeIsFn(types.Time, types.Time, volatility.Leakproof),
+		makeIsFn(types.TimeTZ, types.TimeTZ, volatility.Leakproof),
+		makeIsFn(types.Timestamp, types.Timestamp, volatility.Leakproof),
+		makeIsFn(types.TimestampTZ, types.TimestampTZ, volatility.Leakproof),
+		makeIsFn(types.TSQuery, types.TSQuery, volatility.Immutable),
+		makeIsFn(types.TSVector, types.TSVector, volatility.Immutable),
+		makeIsFn(types.Uuid, types.Uuid, volatility.Leakproof),
+		makeIsFn(types.VarBit, types.VarBit, volatility.Leakproof),
 
 		// Mixed-type comparisons.
 		makeIsFn(types.Date, types.Timestamp, volatility.Immutable),
 		makeIsFn(types.Date, types.TimestampTZ, volatility.Stable),
-		makeIsFn(types.Decimal, types.Float, volatility.LeakProof),
-		makeIsFn(types.Decimal, types.Int, volatility.LeakProof),
-		makeIsFn(types.Float, types.Decimal, volatility.LeakProof),
-		makeIsFn(types.Float, types.Int, volatility.LeakProof),
-		makeIsFn(types.Int, types.Decimal, volatility.LeakProof),
-		makeIsFn(types.Int, types.Float, volatility.LeakProof),
-		makeIsFn(types.Int, types.Oid, volatility.LeakProof),
-		makeIsFn(types.Oid, types.Int, volatility.LeakProof),
+		makeIsFn(types.Decimal, types.Float, volatility.Leakproof),
+		makeIsFn(types.Decimal, types.Int, volatility.Leakproof),
+		makeIsFn(types.Float, types.Decimal, volatility.Leakproof),
+		makeIsFn(types.Float, types.Int, volatility.Leakproof),
+		makeIsFn(types.Int, types.Decimal, volatility.Leakproof),
+		makeIsFn(types.Int, types.Float, volatility.Leakproof),
+		makeIsFn(types.Int, types.Oid, volatility.Leakproof),
+		makeIsFn(types.Oid, types.Int, volatility.Leakproof),
 		makeIsFn(types.Timestamp, types.Date, volatility.Immutable),
 		makeIsFn(types.Timestamp, types.TimestampTZ, volatility.Stable),
 		makeIsFn(types.TimestampTZ, types.Date, volatility.Stable),
@@ -1649,178 +1732,198 @@ var CmpOps = cmpOpFixups(map[treecmp.ComparisonOperatorSymbol]cmpOpOverload{
 		makeIsFn(types.Time, types.TimeTZ, volatility.Stable),
 		makeIsFn(types.TimeTZ, types.Time, volatility.Stable),
 
+		// Void is unique in that it is not equivalent with itself, so implicit
+		// equivalence with Unknown in function ArgTypes.MatchAt due to the check
+		// `(typ.Family() == types.UnknownFamily || a[i].Typ.Equivalent(typ))` does
+		// not occur. Therefore, to allow the comparison
+		// `''::VOID IS DISTINCT FROM NULL`, an explicit equivalence with Unknown is
+		// added:
+		makeIsFn(types.Void, types.Unknown, volatility.Leakproof),
+		makeIsFn(types.Unknown, types.Void, volatility.Leakproof),
+
 		// Tuple comparison.
-		&CmpOp{
-			LeftType:     types.AnyTuple,
-			RightType:    types.AnyTuple,
-			NullableArgs: true,
+		{
+			LeftType:          types.AnyTuple,
+			RightType:         types.AnyTuple,
+			CalledOnNullInput: true,
 			EvalOp: &CompareAnyTupleOp{
 				ComparisonOperator: treecmp.MakeComparisonOperator(treecmp.IsNotDistinctFrom),
 			},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.In: {
-		makeEvalTupleIn(types.AnyEnum, volatility.LeakProof),
-		makeEvalTupleIn(types.Bool, volatility.LeakProof),
-		makeEvalTupleIn(types.Bytes, volatility.LeakProof),
-		makeEvalTupleIn(types.Date, volatility.LeakProof),
-		makeEvalTupleIn(types.Decimal, volatility.LeakProof),
-		makeEvalTupleIn(types.AnyCollatedString, volatility.LeakProof),
-		makeEvalTupleIn(types.AnyTuple, volatility.LeakProof),
-		makeEvalTupleIn(types.Float, volatility.LeakProof),
-		makeEvalTupleIn(types.Box2D, volatility.LeakProof),
-		makeEvalTupleIn(types.Geography, volatility.LeakProof),
-		makeEvalTupleIn(types.Geometry, volatility.LeakProof),
-		makeEvalTupleIn(types.INet, volatility.LeakProof),
-		makeEvalTupleIn(types.Int, volatility.LeakProof),
-		makeEvalTupleIn(types.Interval, volatility.LeakProof),
-		makeEvalTupleIn(types.Jsonb, volatility.LeakProof),
-		makeEvalTupleIn(types.Oid, volatility.LeakProof),
-		makeEvalTupleIn(types.String, volatility.LeakProof),
-		makeEvalTupleIn(types.Time, volatility.LeakProof),
-		makeEvalTupleIn(types.TimeTZ, volatility.LeakProof),
-		makeEvalTupleIn(types.Timestamp, volatility.LeakProof),
-		makeEvalTupleIn(types.TimestampTZ, volatility.LeakProof),
-		makeEvalTupleIn(types.Uuid, volatility.LeakProof),
-		makeEvalTupleIn(types.VarBit, volatility.LeakProof),
-	},
+	treecmp.In: {overloads: []*CmpOp{
+		makeEvalTupleIn(types.AnyEnum, volatility.Leakproof),
+		makeEvalTupleIn(types.Bool, volatility.Leakproof),
+		makeEvalTupleIn(types.Bytes, volatility.Leakproof),
+		makeEvalTupleIn(types.Date, volatility.Leakproof),
+		makeEvalTupleIn(types.Decimal, volatility.Leakproof),
+		makeEvalTupleIn(types.AnyCollatedString, volatility.Leakproof),
+		makeEvalTupleIn(types.AnyTuple, volatility.Leakproof),
+		makeEvalTupleIn(types.Float, volatility.Leakproof),
+		makeEvalTupleIn(types.Box2D, volatility.Leakproof),
+		makeEvalTupleIn(types.Geography, volatility.Leakproof),
+		makeEvalTupleIn(types.Geometry, volatility.Leakproof),
+		makeEvalTupleIn(types.INet, volatility.Leakproof),
+		makeEvalTupleIn(types.Int, volatility.Leakproof),
+		makeEvalTupleIn(types.Interval, volatility.Leakproof),
+		makeEvalTupleIn(types.Jsonb, volatility.Leakproof),
+		makeEvalTupleIn(types.Oid, volatility.Leakproof),
+		makeEvalTupleIn(types.String, volatility.Leakproof),
+		makeEvalTupleIn(types.Time, volatility.Leakproof),
+		makeEvalTupleIn(types.TimeTZ, volatility.Leakproof),
+		makeEvalTupleIn(types.Timestamp, volatility.Leakproof),
+		makeEvalTupleIn(types.TimestampTZ, volatility.Leakproof),
+		makeEvalTupleIn(types.Uuid, volatility.Leakproof),
+		makeEvalTupleIn(types.VarBit, volatility.Leakproof),
+	}},
 
-	treecmp.Like: {
-		&CmpOp{
+	treecmp.Like: {overloads: []*CmpOp{
+		{
 			LeftType:   types.String,
 			RightType:  types.String,
 			EvalOp:     &MatchLikeOp{CaseInsensitive: false},
-			Volatility: volatility.LeakProof,
+			Volatility: volatility.Leakproof,
 		},
-	},
+	}},
 
-	treecmp.ILike: {
-		&CmpOp{
+	treecmp.ILike: {overloads: []*CmpOp{
+		{
 			LeftType:   types.String,
 			RightType:  types.String,
 			EvalOp:     &MatchLikeOp{CaseInsensitive: true},
-			Volatility: volatility.LeakProof,
+			Volatility: volatility.Leakproof,
 		},
-	},
+	}},
 
-	treecmp.SimilarTo: {
-		&CmpOp{
+	treecmp.SimilarTo: {overloads: []*CmpOp{
+		{
 			LeftType:   types.String,
 			RightType:  types.String,
 			EvalOp:     &SimilarToOp{Escape: '\\'},
-			Volatility: volatility.LeakProof,
+			Volatility: volatility.Leakproof,
+		},
+	}},
+
+	treecmp.RegMatch: {overloads: append([]*CmpOp{
+		{
+			LeftType:   types.String,
+			RightType:  types.String,
+			EvalOp:     &MatchRegexpOp{},
+			Volatility: volatility.Immutable,
 		},
 	},
-
-	treecmp.RegMatch: append(
-		cmpOpOverload{
-			&CmpOp{
-				LeftType:   types.String,
-				RightType:  types.String,
-				EvalOp:     &MatchRegexpOp{},
-				Volatility: volatility.Immutable,
-			},
-		},
 		makeBox2DComparisonOperators(
 			func(lhs, rhs *geo.CartesianBoundingBox) bool {
 				return lhs.Covers(rhs)
 			},
 		)...,
-	),
+	)},
 
-	treecmp.RegIMatch: {
-		&CmpOp{
+	treecmp.RegIMatch: {overloads: []*CmpOp{
+		{
 			LeftType:   types.String,
 			RightType:  types.String,
 			EvalOp:     &MatchRegexpOp{CaseInsensitive: true},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.JSONExists: {
-		&CmpOp{
+	treecmp.JSONExists: {overloads: []*CmpOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.String,
 			EvalOp:     &JSONExistsOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.JSONSomeExists: {
-		&CmpOp{
+	treecmp.JSONSomeExists: {overloads: []*CmpOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.StringArray,
 			EvalOp:     &JSONSomeExistsOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.JSONAllExists: {
-		&CmpOp{
+	treecmp.JSONAllExists: {overloads: []*CmpOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.StringArray,
 			EvalOp:     &JSONAllExistsOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.Contains: {
-		&CmpOp{
+	treecmp.Contains: {overloads: []*CmpOp{
+		{
 			LeftType:   types.AnyArray,
 			RightType:  types.AnyArray,
 			EvalOp:     &ContainsArrayOp{},
 			Volatility: volatility.Immutable,
 		},
-		&CmpOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.Jsonb,
 			EvalOp:     &ContainsJsonbOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
+	}},
 
-	treecmp.ContainedBy: {
-		&CmpOp{
+	treecmp.ContainedBy: {overloads: []*CmpOp{
+		{
 			LeftType:   types.AnyArray,
 			RightType:  types.AnyArray,
 			EvalOp:     &ContainedByArrayOp{},
 			Volatility: volatility.Immutable,
 		},
-		&CmpOp{
+		{
 			LeftType:   types.Jsonb,
 			RightType:  types.Jsonb,
 			EvalOp:     &ContainedByJsonbOp{},
 			Volatility: volatility.Immutable,
 		},
-	},
-	treecmp.Overlaps: append(
-		cmpOpOverload{
-			&CmpOp{
-				LeftType:   types.AnyArray,
-				RightType:  types.AnyArray,
-				EvalOp:     &OverlapsArrayOp{},
-				Volatility: volatility.Immutable,
-			},
-			&CmpOp{
-				LeftType:   types.INet,
-				RightType:  types.INet,
-				EvalOp:     &OverlapsINetOp{},
-				Volatility: volatility.Immutable,
-			},
+	}},
+	treecmp.Overlaps: {overloads: append([]*CmpOp{
+		{
+			LeftType:   types.AnyArray,
+			RightType:  types.AnyArray,
+			EvalOp:     &OverlapsArrayOp{},
+			Volatility: volatility.Immutable,
 		},
-		makeBox2DComparisonOperators(
-			func(lhs, rhs *geo.CartesianBoundingBox) bool {
-				return lhs.Intersects(rhs)
-			},
-		)...,
-	),
+		{
+			LeftType:   types.INet,
+			RightType:  types.INet,
+			EvalOp:     &OverlapsINetOp{},
+			Volatility: volatility.Immutable,
+		},
+	}, makeBox2DComparisonOperators(
+		func(lhs, rhs *geo.CartesianBoundingBox) bool {
+			return lhs.Intersects(rhs)
+		},
+	)...),
+	},
+	treecmp.TSMatches: {overloads: []*CmpOp{
+		{
+			LeftType:   types.TSQuery,
+			RightType:  types.TSVector,
+			EvalOp:     &TSMatchesQueryVectorOp{},
+			Volatility: volatility.Immutable,
+		},
+		{
+			LeftType:   types.TSVector,
+			RightType:  types.TSQuery,
+			EvalOp:     &TSMatchesVectorQueryOp{},
+			Volatility: volatility.Immutable,
+		},
+	}},
 })
 
-func makeBox2DComparisonOperators(op func(lhs, rhs *geo.CartesianBoundingBox) bool) cmpOpOverload {
-	return cmpOpOverload{
-		&CmpOp{
+func makeBox2DComparisonOperators(op func(lhs, rhs *geo.CartesianBoundingBox) bool) []*CmpOp {
+	return []*CmpOp{
+		{
 			LeftType:  types.Box2D,
 			RightType: types.Box2D,
 			EvalOp: &CompareBox2DOp{Op: func(left, right Datum) bool {
@@ -1831,7 +1934,7 @@ func makeBox2DComparisonOperators(op func(lhs, rhs *geo.CartesianBoundingBox) bo
 			}},
 			Volatility: volatility.Immutable,
 		},
-		&CmpOp{
+		{
 			LeftType:  types.Box2D,
 			RightType: types.Geometry,
 			EvalOp: &CompareBox2DOp{Op: func(left, right Datum) bool {
@@ -1842,7 +1945,7 @@ func makeBox2DComparisonOperators(op func(lhs, rhs *geo.CartesianBoundingBox) bo
 			}},
 			Volatility: volatility.Immutable,
 		},
-		&CmpOp{
+		{
 			LeftType:  types.Geometry,
 			RightType: types.Box2D,
 			EvalOp: &CompareBox2DOp{Op: func(left, right Datum) bool {
@@ -1853,7 +1956,7 @@ func makeBox2DComparisonOperators(op func(lhs, rhs *geo.CartesianBoundingBox) bo
 			}},
 			Volatility: volatility.Immutable,
 		},
-		&CmpOp{
+		{
 			LeftType:  types.Geometry,
 			RightType: types.Geometry,
 			EvalOp: &CompareBox2DOp{Op: func(left, right Datum) bool {
@@ -1891,11 +1994,11 @@ func CmpOpInverse(i treecmp.ComparisonOperatorSymbol) (treecmp.ComparisonOperato
 
 func makeEvalTupleIn(typ *types.T, v volatility.V) *CmpOp {
 	return &CmpOp{
-		LeftType:     typ,
-		RightType:    types.AnyTuple,
-		EvalOp:       &InTupleOp{},
-		NullableArgs: true,
-		Volatility:   v,
+		LeftType:          typ,
+		RightType:         types.AnyTuple,
+		EvalOp:            &InTupleOp{},
+		CalledOnNullInput: true,
+		Volatility:        v,
 	}
 }
 

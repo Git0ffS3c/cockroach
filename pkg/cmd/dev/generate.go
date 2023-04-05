@@ -34,11 +34,21 @@ func makeGenerateCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.
 		Long:    `Generate the specified files.`,
 		Example: `
         dev generate
-        dev generate bazel     # DEPS.bzl and BUILD.bazel files
-        dev generate cgo       # files that help non-Bazel systems (IDEs, go) link to our C dependencies
-        dev generate docs      # generates documentation
-        dev generate go        # generates go code (execgen, stringer, protobufs, etc.)
-        dev generate protobuf  # *.pb.go files (subset of 'dev generate go')
+        dev generate bazel         # DEPS.bzl and BUILD.bazel files
+        dev generate cgo           # files that help non-Bazel systems (IDEs, go) link to our C dependencies
+        dev generate docs          # generates documentation
+        dev generate diagrams      # generates syntax diagrams
+        dev generate bnf           # generates syntax bnf files
+        dev generate js            # generates JS protobuf client and seeds local tooling
+        dev generate go            # generates go code (execgen, stringer, protobufs, etc.), plus everything 'cgo' generates
+        dev generate go_nocgo      # generates go code (execgen, stringer, protobufs, etc.)
+        dev generate protobuf      # *.pb.go files (subset of 'dev generate go')
+        dev generate parser        # sql.go and parser dependencies (subset of 'dev generate go')
+        dev generate optgen        # optgen targets (subset of 'dev generate go')
+        dev generate execgen       # execgen targets (subset of 'dev generate go')
+        dev generate schemachanger # schemachanger targets (subset of 'dev generate go')
+        dev generate stringer      # stringer targets (subset of 'dev generate go')
+        dev generate testlogic     # logictest generated code (subset of 'dev generate bazel')
 `,
 		Args: cobra.MinimumNArgs(0),
 		// TODO(irfansharif): Errors but default just eaten up. Let's wrap these
@@ -48,6 +58,7 @@ func makeGenerateCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.
 	}
 	generateCmd.Flags().Bool(mirrorFlag, false, "mirror new dependencies to cloud storage (use if vendoring)")
 	generateCmd.Flags().Bool(forceFlag, false, "force regeneration even if relevant files are unchanged from upstream")
+	generateCmd.Flags().Bool(shortFlag, false, "if used for the bazel target, only update BUILD.bazel files and skip checks")
 	return generateCmd
 }
 
@@ -56,56 +67,62 @@ type configuration struct {
 	Arch string
 }
 
-var archivedCdepConfigurations = []configuration{
-	{"linux", "amd64"},
-	{"linux", "arm64"},
-	{"darwin", "amd64"},
-	{"darwin", "arm64"},
-	{"windows", "amd64"},
-}
-
-// archivedCdepConfig returns eturn the cross config string associated with the
-// current machine configuration (e.g. "macosarm").
-func archivedCdepConfig() string {
-	for _, config := range archivedCdepConfigurations {
-		if config.Os == runtime.GOOS && config.Arch == runtime.GOARCH {
-			ret := config.Os
-			if ret == "darwin" {
-				ret = "macos"
-			}
-			if config.Arch == "arm64" {
-				ret += "arm"
-			}
-			return ret
-		}
-	}
-	return ""
-}
-
 func (d *dev) generate(cmd *cobra.Command, targets []string) error {
 	var generatorTargetMapping = map[string]func(cmd *cobra.Command) error{
-		"bazel":    d.generateBazel,
-		"cgo":      d.generateCgo,
-		"docs":     d.generateDocs,
-		"go":       d.generateGo,
-		"protobuf": d.generateProtobuf,
+		"bazel":         d.generateBazel,
+		"bnf":           d.generateBNF,
+		"cgo":           d.generateCgo,
+		"diagrams":      d.generateDiagrams,
+		"docs":          d.generateDocs,
+		"execgen":       d.generateExecgen,
+		"js":            d.generateJs,
+		"go":            d.generateGo,
+		"go_nocgo":      d.generateGoNoCgo,
+		"logictest":     d.generateLogicTest,
+		"protobuf":      d.generateProtobuf,
+		"parser":        d.generateParser,
+		"optgen":        d.generateOptGen,
+		"schemachanger": d.generateSchemaChanger,
+		"stringer":      d.generateStringer,
+		"testlogic":     d.generateLogicTest,
 	}
 
 	if len(targets) == 0 {
-		targets = append(targets, "bazel", "go", "docs", "cgo")
+		targets = append(targets, "bazel", "go_nocgo", "docs", "cgo")
 	}
 
 	targetsMap := make(map[string]struct{})
 	for _, target := range targets {
 		targetsMap[target] = struct{}{}
 	}
-	_, includesGo := targetsMap["go"]
-	_, includesDocs := targetsMap["docs"]
-	if includesGo && includesDocs {
-		delete(targetsMap, "go")
-		delete(targetsMap, "docs")
-		if err := d.generateGoAndDocs(cmd); err != nil {
+	// NB: We have to run the bazel generator first if it's specified.
+	if _, ok := targetsMap["bazel"]; ok {
+		delete(targetsMap, "bazel")
+		if err := generatorTargetMapping["bazel"](cmd); err != nil {
 			return err
+		}
+	}
+	{
+		// In this case, generating both go and cgo would duplicate work.
+		// Generate go_nocgo instead.
+		_, includesGo := targetsMap["go"]
+		_, includesCgo := targetsMap["cgo"]
+		if includesGo && includesCgo {
+			delete(targetsMap, "go")
+			targetsMap["go_nocgo"] = struct{}{}
+		}
+	}
+	{
+		// generateGoAndDocs is a faster way to generate both (non-cgo)
+		// go code as well as the docs
+		_, includesGonocgo := targetsMap["go_nocgo"]
+		_, includesDocs := targetsMap["docs"]
+		if includesGonocgo && includesDocs {
+			delete(targetsMap, "go_nocgo")
+			delete(targetsMap, "docs")
+			if err := d.generateGoAndDocs(cmd); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -119,11 +136,33 @@ func (d *dev) generate(cmd *cobra.Command, targets []string) error {
 		}
 	}
 
-	return nil
+	short := mustGetFlagBool(cmd, shortFlag)
+	if short {
+		return nil
+	}
+
+	ctx := cmd.Context()
+	env := os.Environ()
+	envvar := "COCKROACH_BAZEL_CHECK_FAST=1"
+	d.log.Printf("export %s", envvar)
+	env = append(env, envvar)
+	workspace, err := d.getWorkspace(ctx)
+	if err != nil {
+		return err
+	}
+	return d.exec.CommandContextWithEnv(ctx, env, filepath.Join(workspace, "build", "bazelutil", "check.sh"))
 }
 
 func (d *dev) generateBazel(cmd *cobra.Command) error {
 	ctx := cmd.Context()
+
+	short := mustGetFlagBool(cmd, shortFlag)
+	if short {
+		return d.exec.CommandContextInheritingStdStreams(
+			ctx, "bazel", "run", "//:gazelle",
+		)
+	}
+
 	mirror := mustGetFlagBool(cmd, mirrorFlag)
 	force := mustGetFlagBool(cmd, forceFlag)
 	workspace, err := d.getWorkspace(ctx)
@@ -147,26 +186,66 @@ func (d *dev) generateBazel(cmd *cobra.Command) error {
 
 func (d *dev) generateDocs(cmd *cobra.Command) error {
 	ctx := cmd.Context()
-	if err := d.generateTarget(ctx, "//pkg/gen:docs"); err != nil {
-		return err
-	}
-	return d.generateRedactSafe(ctx)
+	return d.generateTarget(ctx, "//pkg/gen:docs")
+}
+
+func (d *dev) generateExecgen(cmd *cobra.Command) error {
+	return d.generateTarget(cmd.Context(), "//pkg/gen:execgen")
 }
 
 func (d *dev) generateGoAndDocs(cmd *cobra.Command) error {
 	ctx := cmd.Context()
-	if err := d.generateTarget(ctx, "//pkg/gen"); err != nil {
-		return err
-	}
-	return d.generateRedactSafe(ctx)
+	return d.generateTarget(ctx, "//pkg/gen")
 }
 
 func (d *dev) generateGo(cmd *cobra.Command) error {
+	if err := d.generateGoNoCgo(cmd); err != nil {
+		return err
+	}
+	return d.generateCgo(cmd)
+}
+
+func (d *dev) generateGoNoCgo(cmd *cobra.Command) error {
 	return d.generateTarget(cmd.Context(), "//pkg/gen:code")
+}
+
+func (d *dev) generateLogicTest(cmd *cobra.Command) error {
+	ctx := cmd.Context()
+	workspace, err := d.getWorkspace(ctx)
+	if err != nil {
+		return err
+	}
+	return d.exec.CommandContextInheritingStdStreams(
+		ctx, "bazel", "run", "pkg/cmd/generate-logictest", "--", fmt.Sprintf("-out-dir=%s", workspace),
+	)
 }
 
 func (d *dev) generateProtobuf(cmd *cobra.Command) error {
 	return d.generateTarget(cmd.Context(), "//pkg/gen:go_proto")
+}
+
+func (d *dev) generateParser(cmd *cobra.Command) error {
+	return d.generateTarget(cmd.Context(), "//pkg/gen:parser")
+}
+
+func (d *dev) generateOptGen(cmd *cobra.Command) error {
+	return d.generateTarget(cmd.Context(), "//pkg/gen:optgen")
+}
+
+func (d *dev) generateSchemaChanger(cmd *cobra.Command) error {
+	return d.generateTarget(cmd.Context(), "//pkg/gen:schemachanger")
+}
+
+func (d *dev) generateStringer(cmd *cobra.Command) error {
+	return d.generateTarget(cmd.Context(), "//pkg/gen:stringer")
+}
+
+func (d *dev) generateDiagrams(cmd *cobra.Command) error {
+	return d.generateTarget(cmd.Context(), "//pkg/gen:diagrams")
+}
+
+func (d *dev) generateBNF(cmd *cobra.Command) error {
+	return d.generateTarget(cmd.Context(), "//pkg/gen:bnf")
 }
 
 func (d *dev) generateTarget(ctx context.Context, target string) error {
@@ -179,27 +258,9 @@ func (d *dev) generateTarget(ctx context.Context, target string) error {
 	return nil
 }
 
-func (d *dev) generateRedactSafe(ctx context.Context) error {
-	// docs/generated/redact_safe.md needs special handling.
-	workspace, err := d.getWorkspace(ctx)
-	if err != nil {
-		return err
-	}
-	output, err := d.exec.CommandContextSilent(
-		ctx, filepath.Join(workspace, "build", "bazelutil", "generate_redact_safe.sh"),
-	)
-	if err != nil {
-		// nolint:errwrap
-		return fmt.Errorf("generating redact_safe.md: %s", err.Error())
-	}
-	return d.os.WriteFile(
-		filepath.Join(workspace, "docs", "generated", "redact_safe.md"), string(output),
-	)
-}
-
 func (d *dev) generateCgo(cmd *cobra.Command) error {
 	ctx := cmd.Context()
-	args := []string{"build", "//c-deps:libjemalloc", "//c-deps:libproj"}
+	args := []string{"build", "//build/bazelutil:test_force_build_cdeps", "//c-deps:libjemalloc", "//c-deps:libproj"}
 	if runtime.GOOS == "linux" {
 		args = append(args, "//c-deps:libkrb5")
 	}
@@ -211,6 +272,11 @@ func (d *dev) generateCgo(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
+	bazelBin, err := d.getBazelBin(ctx)
+	if err != nil {
+		return err
+	}
+
 	const cgoTmpl = `// GENERATED FILE DO NOT EDIT
 
 package {{ .Package }}
@@ -221,8 +287,12 @@ import "C"
 `
 
 	tpl := template.Must(template.New("source").Parse(cgoTmpl))
+	archived, err := d.getArchivedCdepString(bazelBin)
+	if err != nil {
+		return err
+	}
+	// Figure out where to find the c-deps libraries.
 	var jemallocDir, projDir, krbDir string
-	archived := archivedCdepConfig()
 	if archived != "" {
 		execRoot, err := d.getExecutionRoot(ctx)
 		if err != nil {
@@ -234,10 +304,6 @@ import "C"
 			krbDir = filepath.Join(execRoot, "external", fmt.Sprintf("archived_cdep_libkrb5_%s", archived))
 		}
 	} else {
-		bazelBin, err := d.getBazelBin(ctx)
-		if err != nil {
-			return err
-		}
 		jemallocDir = filepath.Join(bazelBin, "c-deps/libjemalloc_foreign")
 		projDir = filepath.Join(bazelBin, "c-deps/libproj_foreign")
 		if runtime.GOOS == "linux" {
@@ -275,4 +341,42 @@ import "C"
 	}
 
 	return nil
+}
+
+func (d *dev) generateJs(cmd *cobra.Command) error {
+	ctx := cmd.Context()
+
+	args := []string{
+		"build",
+		"//pkg/ui/workspaces/eslint-plugin-crdb:eslint-plugin-crdb",
+		"//pkg/ui/workspaces/db-console/src/js:crdb-protobuf-client",
+		"//pkg/ui/workspaces/cluster-ui:ts_project",
+	}
+	logCommand("bazel", args...)
+	if err := d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...); err != nil {
+		return fmt.Errorf("building JS development prerequisites: %w", err)
+	}
+
+	bazelBin, err := d.getBazelBin(ctx)
+	if err != nil {
+		return err
+	}
+	workspace, err := d.getWorkspace(ctx)
+	if err != nil {
+		return err
+	}
+
+	eslintPluginDist := "./pkg/ui/workspaces/eslint-plugin-crdb/dist"
+	// Delete eslint-plugin output tree that was previously copied out of the
+	// sandbox.
+	if err := d.os.RemoveAll(filepath.Join(workspace, eslintPluginDist)); err != nil {
+		return err
+	}
+
+	// Copy the eslint-plugin output tree back out of the sandbox, since eslint
+	// plugins in editors default to only searching in ./node_modules for plugins.
+	return d.os.CopyAll(
+		filepath.Join(bazelBin, eslintPluginDist),
+		filepath.Join(workspace, eslintPluginDist),
+	)
 }

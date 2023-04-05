@@ -15,6 +15,10 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// errMarkSnapshotError is used as an error mark for errors that get returned
+// to the initiator of a snapshot. This generally classifies errors as transient,
+// i.e. communicates an intention for the caller to retry.
+//
 // NB: don't change the string here; this will cause cross-version issues
 // since this singleton is used as a marker.
 var errMarkSnapshotError = errors.New("snapshot failed")
@@ -32,7 +36,9 @@ var errMarkCanRetryReplicationChangeWithUpdatedDesc = errors.New("should retry w
 // assumed to have been emitted by the KV layer during a replication change
 // operation) is likely to succeed when retried with an updated descriptor.
 func IsRetriableReplicationChangeError(err error) bool {
-	return errors.Is(err, errMarkCanRetryReplicationChangeWithUpdatedDesc) || isSnapshotError(err)
+	return errors.Is(err, errMarkCanRetryReplicationChangeWithUpdatedDesc) ||
+		IsLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(err) ||
+		isSnapshotError(err)
 }
 
 const (
@@ -82,8 +88,21 @@ func IsIllegalReplicationChangeError(err error) bool {
 var errMarkReplicationChangeInProgress = errors.New("replication change in progress")
 
 // IsReplicationChangeInProgressError detects whether an error (assumed to have
-// been emitted a replication change) indicates that the replication change
+// been emitted by a replication change) indicates that the replication change
 // failed because another replication change was in progress on the range.
 func IsReplicationChangeInProgressError(err error) bool {
 	return errors.Is(err, errMarkReplicationChangeInProgress)
+}
+
+var errMarkLeaseTransferRejectedBecauseTargetMayNeedSnapshot = errors.New(
+	"lease transfer rejected because the target may need a snapshot")
+
+// IsLeaseTransferRejectedBecauseTargetMayNeedSnapshotError detects whether an
+// error (assumed to have been emitted by a lease transfer request) indicates
+// that the lease transfer failed because the current leaseholder could not
+// prove that the lease transfer target did not need a Raft snapshot. In order
+// to prove this, the current leaseholder must also be the Raft leader, which is
+// periodically requested in maybeTransferRaftLeadershipToLeaseholderLocked.
+func IsLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(err error) bool {
+	return errors.Is(err, errMarkLeaseTransferRejectedBecauseTargetMayNeedSnapshot)
 }

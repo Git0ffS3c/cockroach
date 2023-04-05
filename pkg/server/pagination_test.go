@@ -19,8 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
@@ -39,17 +40,18 @@ import (
 //
 // Calls paginate().
 // input args:
-//  - limit: max number of elements to return.
-//  - offset: index offset since the start of slice.
-//  - input: comma-separated list of ints used as input to simplePaginate.
+//   - limit: max number of elements to return.
+//   - offset: index offset since the start of slice.
+//   - input: comma-separated list of ints used as input to simplePaginate.
+//
 // output args:
-//  - result: the sub-sliced input returned from simplePaginate.
-//  - next: the next offset.
+//   - result: the sub-sliced input returned from simplePaginate.
+//   - next: the next offset.
 func TestSimplePaginate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	datadriven.RunTest(t, testutils.TestDataPath(t, "simple_paginate"), func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "simple_paginate"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "paginate":
 			var input interface{}
@@ -99,14 +101,14 @@ func TestSimplePaginate(t *testing.T) {
 //
 // Resets and defines a new paginationState.
 // input args:
-//  - queried: list of queried nodeIDs, comma-separated
-//  - in-progress: node ID of current cursor position's node
-//  - in-progress-index: index of current cursor position within current node's
-//    response
-//  - to-query: list of node IDs yet to query, comma-separated
-// output args:
-//  - printed-state: textual representation of current pagination state.
+//   - queried: list of queried nodeIDs, comma-separated
+//   - in-progress: node ID of current cursor position's node
+//   - in-progress-index: index of current cursor position within current node's
+//     response
+//   - to-query: list of node IDs yet to query, comma-separated
 //
+// output args:
+//   - printed-state: textual representation of current pagination state.
 //
 // merge-node-ids
 // <nodes>
@@ -115,10 +117,10 @@ func TestSimplePaginate(t *testing.T) {
 //
 // Calls mergeNodeIDs().
 // input args:
-//  - nodes: sorted node IDs to merge into pagination state, using mergeNodeIDs.
-// output args:
-//  - printed-state: textual representation of current pagination state.
+//   - nodes: sorted node IDs to merge into pagination state, using mergeNodeIDs.
 //
+// output args:
+//   - printed-state: textual representation of current pagination state.
 //
 // paginate
 // limit=<limit>
@@ -132,16 +134,16 @@ func TestSimplePaginate(t *testing.T) {
 //
 // Calls paginate()
 // input args:
-//  - limit: Max objects to return from paginate().
-//  - nodeID: ID of node the response is coming from.
-//  - length: length of values in current node's response.
-// output args:
-//  - start: Start idx of response slice.
-//  - end: End idx of response slice.
-//  - newLimit: Limit to be used on next call to paginate(), if current slice
-//    doesn't have `limit` remaining items. 0 if `limit` was reached.
-//  - printed-state: textual representation of current pagination state.
+//   - limit: Max objects to return from paginate().
+//   - nodeID: ID of node the response is coming from.
+//   - length: length of values in current node's response.
 //
+// output args:
+//   - start: Start idx of response slice.
+//   - end: End idx of response slice.
+//   - newLimit: Limit to be used on next call to paginate(), if current slice
+//     doesn't have `limit` remaining items. 0 if `limit` was reached.
+//   - printed-state: textual representation of current pagination state.
 //
 // unmarshal
 // <input>
@@ -150,10 +152,10 @@ func TestSimplePaginate(t *testing.T) {
 //
 // Unmarshals base64-encoded string into a paginationState. Opposite of marshal.
 // input args:
-//  - input: base64-encoded string to unmarshal.
-// output args:
-//  - printed-state: textual representation of unmarshalled pagination state.
+//   - input: base64-encoded string to unmarshal.
 //
+// output args:
+//   - printed-state: textual representation of unmarshalled pagination state.
 //
 // marshal
 // ----
@@ -161,7 +163,7 @@ func TestSimplePaginate(t *testing.T) {
 //
 // Marshals current state to base64-encoded string.
 // output args:
-//  - text: base64-encoded string that can be passed to unmarshal.
+//   - text: base64-encoded string that can be passed to unmarshal.
 func TestPaginationState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -201,7 +203,7 @@ func TestPaginationState(t *testing.T) {
 	}
 
 	var state paginationState
-	datadriven.RunTest(t, testutils.TestDataPath(t, "pagination_state"), func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "pagination_state"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "define":
 			state = paginationState{}
@@ -376,7 +378,7 @@ func TestRPCPaginator(t *testing.T) {
 							numNodes:     len(nodesToQuery),
 							errorCtx:     "test",
 							pagState:     pagState,
-							nodeStatuses: make(map[roachpb.NodeID]nodeStatusWithLiveness),
+							nodeStatuses: make(map[serverID]livenesspb.NodeLivenessStatus),
 							dialFn:       dialFn,
 							nodeFn:       nodeFn,
 							responseFn:   responseFn,

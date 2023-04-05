@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -75,7 +76,7 @@ func TestDebugCheckStore(t *testing.T) {
 	// Should not error out randomly.
 	for _, dir := range storePaths {
 		out, err := check(dir)
-		require.NoError(t, err, dir)
+		require.NoError(t, err, "dir=%s\nout=%s\n", dir, out)
 		require.Contains(t, out, "total stats", dir)
 	}
 
@@ -83,6 +84,7 @@ func TestDebugCheckStore(t *testing.T) {
 	func() {
 		eng, err := storage.Open(ctx,
 			storage.Filesystem(storePaths[0]),
+			cluster.MakeClusterSettings(),
 			storage.CacheSize(10<<20 /* 10 MiB */),
 			storage.MustExist)
 		require.NoError(t, err)

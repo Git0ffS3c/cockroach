@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
@@ -15,6 +16,7 @@ go_library(
         "float.go",
         "int.go",
         "masked.go",
+        "protobuf.go",
         "registry.go",
         "setting.go",
         "string.go",
@@ -27,11 +29,15 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/util/buildutil",
+        "//pkg/util/envutil",
         "//pkg/util/humanizeutil",
+        "//pkg/util/protoutil",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_cockroachdb_redact//interfaces",
+        "@com_github_gogo_protobuf//jsonpb",
+        "@com_github_gogo_protobuf//proto",
     ],
 )
 
@@ -40,8 +46,10 @@ go_test(
     size = "small",
     srcs = [
         "encoding_test.go",
+        "internal_test.go",
         "settings_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":settings"],
     deps = [
         "//pkg/testutils",
@@ -70,3 +78,5 @@ go_proto_library(
     visibility = ["//visibility:public"],
     deps = ["@com_github_gogo_protobuf//gogoproto"],
 )
+
+get_x_data(name = "get_x_data")

@@ -19,7 +19,7 @@ database_name  schema_name  type_name   grantee   privilege_type  is_grantable
 d              public       testuser_t  admin     ALL             true
 d              public       testuser_t  public    USAGE           false
 d              public       testuser_t  root      ALL             true
-d              public       testuser_t  testuser  ALL             false
+d              public       testuser_t  testuser  ALL             true
 
 statement ok
 ALTER DEFAULT PRIVILEGES REVOKE ALL ON TYPES FROM testuser;
@@ -33,9 +33,10 @@ CREATE TYPE testuser_t2 AS ENUM();
 query TTTTTB colnames
 SHOW GRANTS ON TYPE testuser_t2
 ----
-database_name  schema_name  type_name    grantee  privilege_type  is_grantable
-d              public       testuser_t2  admin    ALL             true
-d              public       testuser_t2  root     ALL             true
+database_name  schema_name  type_name    grantee   privilege_type  is_grantable
+d              public       testuser_t2  admin     ALL             true
+d              public       testuser_t2  root      ALL             true
+d              public       testuser_t2  testuser  ALL             true
 
 user root
 
@@ -58,8 +59,8 @@ database_name  schema_name  type_name  grantee    privilege_type  is_grantable
 test           public       t          admin      ALL             true
 test           public       t          public     USAGE           false
 test           public       t          root       ALL             true
-test           public       t          testuser   ALL             true
-test           public       t          testuser2  ALL             true
+test           public       t          testuser   ALL             false
+test           public       t          testuser2  ALL             false
 
 statement ok
 ALTER DEFAULT PRIVILEGES REVOKE USAGE ON TYPES FROM testuser, testuser2
@@ -70,12 +71,10 @@ CREATE TYPE t2 AS ENUM()
 query TTTTTB colnames
 SHOW GRANTS ON TYPE t2
 ----
-database_name  schema_name  type_name  grantee    privilege_type  is_grantable
-test           public       t2         admin      ALL             true
-test           public       t2         public     USAGE           false
-test           public       t2         root       ALL             true
-test           public       t2         testuser   GRANT           true
-test           public       t2         testuser2  GRANT           true
+database_name  schema_name  type_name  grantee  privilege_type  is_grantable
+test           public       t2         admin    ALL             true
+test           public       t2         public   USAGE           false
+test           public       t2         root     ALL             true
 
 statement ok
 ALTER DEFAULT PRIVILEGES REVOKE ALL ON TYPES FROM testuser, testuser2
@@ -107,9 +106,10 @@ CREATE TYPE t4 AS ENUM()
 query TTTTTB colnames
 SHOW GRANTS ON TYPE t4
 ----
-database_name  schema_name  type_name  grantee  privilege_type  is_grantable
-d              public       t4         admin    ALL             true
-d              public       t4         root     ALL             true
+database_name  schema_name  type_name  grantee   privilege_type  is_grantable
+d              public       t4         admin     ALL             true
+d              public       t4         root      ALL             true
+d              public       t4         testuser  ALL             true
 
 user root
 statement ok
@@ -131,6 +131,7 @@ CREATE TYPE t5 AS ENUM()
 query TTTTTB colnames
 SHOW GRANTS ON TYPE t5
 ----
-database_name  schema_name  type_name  grantee  privilege_type  is_grantable
-d              public       t5         admin    ALL             true
-d              public       t5         root     ALL             true
+database_name  schema_name  type_name  grantee   privilege_type  is_grantable
+d              public       t5         admin     ALL             true
+d              public       t5         root      ALL             true
+d              public       t5         testuser  ALL             true

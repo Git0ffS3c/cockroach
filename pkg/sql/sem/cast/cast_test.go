@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -36,41 +36,40 @@ import (
 // types that we do not support, and we ignore geospatial types because they are
 // an extension of Postgres and have no official OIDs.
 //
-//   \copy (
-//     WITH ignored_types AS (
-//       SELECT t::regtype::oid t
-//       FROM (VALUES
-//         ('geography'),
-//         ('geometry'),
-//         ('box2d'),
-//         ('box3d'),
-//         ('tstzmultirange'),
-//         ('int4multirange'),
-//         ('int8multirange'),
-//         ('tstzmultirange'),
-//         ('tsmultirange'),
-//         ('datemultirange'),
-//         ('nummultirange')
-//       ) AS types(t)
-//     )
-//     SELECT
-//       c.castsource,
-//       c.casttarget,
-//       p.provolatile,
-//       p.proleakproof,
-//       c.castcontext,
-//       substring(version(), 'PostgreSQL (\d+\.\d+)') pg_version
-//     FROM pg_cast c JOIN pg_proc p ON (c.castfunc = p.oid)
-//     WHERE
-//       c.castsource NOT IN (SELECT t FROM ignored_types)
-//       AND c.casttarget NOT IN (SELECT t FROM ignored_types)
-//     ORDER BY 1, 2
-//   ) TO pg_cast_dump.csv WITH CSV DELIMITER '|' HEADER;
-//
+//	\copy (
+//	  WITH ignored_types AS (
+//	    SELECT t::regtype::oid t
+//	    FROM (VALUES
+//	      ('geography'),
+//	      ('geometry'),
+//	      ('box2d'),
+//	      ('box3d'),
+//	      ('tstzmultirange'),
+//	      ('int4multirange'),
+//	      ('int8multirange'),
+//	      ('tstzmultirange'),
+//	      ('tsmultirange'),
+//	      ('datemultirange'),
+//	      ('nummultirange')
+//	    ) AS types(t)
+//	  )
+//	  SELECT
+//	    c.castsource,
+//	    c.casttarget,
+//	    p.provolatile,
+//	    p.proleakproof,
+//	    c.castcontext,
+//	    substring(version(), 'PostgreSQL (\d+\.\d+)') pg_version
+//	  FROM pg_cast c JOIN pg_proc p ON (c.castfunc = p.oid)
+//	  WHERE
+//	    c.castsource NOT IN (SELECT t FROM ignored_types)
+//	    AND c.casttarget NOT IN (SELECT t FROM ignored_types)
+//	  ORDER BY 1, 2
+//	) TO pg_cast_dump.csv WITH CSV DELIMITER '|' HEADER;
 func TestCastsMatchPostgres(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	csvPath := testutils.TestDataPath(t, "pg_cast_dump.csv")
+	csvPath := datapathutils.TestDataPath(t, "pg_cast_dump.csv")
 	f, err := os.Open(csvPath)
 	require.NoError(t, err)
 
@@ -175,7 +174,7 @@ func TestCastsFromUnknown(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	for _, typ := range types.OidToType {
-		_, ok := LookupCast(types.Unknown, typ, SessionOptions{})
+		_, ok := LookupCast(types.Unknown, typ)
 		if !ok {
 			t.Errorf("cast from Unknown to %s does not exist", typ.String())
 		}
@@ -193,7 +192,7 @@ func TestTupleCastVolatility(t *testing.T) {
 		{
 			from: nil,
 			to:   nil,
-			exp:  "leak-proof",
+			exp:  "leakproof",
 		},
 		{
 			from: nil,
@@ -227,7 +226,7 @@ func TestTupleCastVolatility(t *testing.T) {
 		from.InternalType.TupleContents = tc.from
 		to := *types.EmptyTuple
 		to.InternalType.TupleContents = tc.to
-		v, ok := LookupCastVolatility(&from, &to, SessionOptions{})
+		v, ok := LookupCastVolatility(&from, &to)
 		res := "error"
 		if ok {
 			res = v.String()

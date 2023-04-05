@@ -11,6 +11,8 @@
 package sql
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -33,7 +35,6 @@ var maxSerializedSessionSize = settings.RegisterByteSizeSetting(
 	"if set to non-zero, then serializing a session will fail if it requires more"+
 		"than the specified size",
 	0,
-	settings.NonNegativeInt,
 )
 
 // SerializeSessionState is a wrapper for serializeSessionState, and uses the
@@ -111,7 +112,9 @@ func serializeSessionState(
 }
 
 // DeserializeSessionState deserializes the given state into the current session.
-func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, error) {
+func (p *planner) DeserializeSessionState(
+	ctx context.Context, state *tree.DBytes,
+) (*tree.DBool, error) {
 	evalCtx := p.ExtendedEvalContext()
 	if !evalCtx.TxnIsSingleStmt {
 		return nil, pgerror.Newf(
@@ -137,19 +140,27 @@ func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, erro
 			"can only deserialize matching session users",
 		)
 	}
-	if err := p.checkCanBecomeUser(evalCtx.Ctx(), sd.User()); err != nil {
+	if err := p.checkCanBecomeUser(ctx, sd.User()); err != nil {
 		return nil, err
 	}
 
 	for _, prepStmt := range m.PreparedStatements {
-		parserStmt, err := parser.ParseOneWithInt(
-			prepStmt.SQL,
-			parser.NakedIntTypeFromDefaultIntSize(sd.DefaultIntSize),
+		stmts, err := parser.ParseWithInt(
+			prepStmt.SQL, parser.NakedIntTypeFromDefaultIntSize(sd.DefaultIntSize),
 		)
 		if err != nil {
 			return nil, err
 		}
-		id := clusterunique.GenerateID(evalCtx.ExecCfg.Clock.Now(), evalCtx.ExecCfg.NodeID.SQLInstanceID())
+		if len(stmts) > 1 {
+			// The pgwire protocol only allows at most 1 statement here.
+			return nil, pgerror.WrongNumberOfPreparedStatements(len(stmts))
+		}
+		var parserStmt parser.Statement
+		if len(stmts) == 1 {
+			parserStmt = stmts[0]
+		}
+		// len(stmts) == 0 results in a nil (empty) statement.
+		id := clusterunique.GenerateID(evalCtx.ExecCfg.Clock.Now(), evalCtx.ExecCfg.NodeInfo.NodeID.SQLInstanceID())
 		stmt := makeStatement(parserStmt, id)
 
 		var placeholderTypes tree.PlaceholderTypes
@@ -164,6 +175,19 @@ func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, erro
 					placeholderTypes[i] = nil
 					continue
 				}
+				// These special cases for json, json[] is here so we can
+				// support decoding parameters with oid=json/json[] without
+				// adding full support for these type.
+				// TODO(sql-exp): Remove this if we support JSON.
+				if t == oid.T_json {
+					// TODO(sql-exp): Remove this if we support JSON.
+					placeholderTypes[i] = types.Json
+					continue
+				}
+				if t == oid.T__json {
+					placeholderTypes[i] = types.JSONArrayForDecodingOnly
+					continue
+				}
 				v, ok := types.OidToType[t]
 				if !ok {
 					err := pgwirebase.NewProtocolViolationErrorf("unknown oid type: %v", t)
@@ -174,8 +198,11 @@ func (p *planner) DeserializeSessionState(state *tree.DBytes) (*tree.DBool, erro
 		}
 
 		_, err = evalCtx.statementPreparer.addPreparedStmt(
-			evalCtx.Ctx(),
-			prepStmt.Name, stmt, placeholderTypes, prepStmt.PlaceholderTypeHints,
+			ctx,
+			prepStmt.Name,
+			stmt,
+			placeholderTypes,
+			prepStmt.PlaceholderTypeHints,
 			PreparedStatementOriginSessionMigration,
 		)
 		if err != nil {

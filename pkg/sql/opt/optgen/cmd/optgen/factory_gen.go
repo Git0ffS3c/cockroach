@@ -53,18 +53,17 @@ func (g *factoryGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 // genConstructFuncs generates the factory Construct functions for each
 // expression type. The code is similar to this:
 //
-//   // ConstructSelect constructs an expression for the Select operator.
-//   func (_f *Factory) ConstructSelect(
-//     input memo.RelExpr,
-//     filters memo.FiltersExpr,
-//   ) memo.RelExpr {
+//	// ConstructSelect constructs an expression for the Select operator.
+//	func (_f *Factory) ConstructSelect(
+//	  input memo.RelExpr,
+//	  filters memo.FiltersExpr,
+//	) memo.RelExpr {
 //
-//     ... normalization rule code goes here ...
+//	  ... normalization rule code goes here ...
 //
-//     nd := _f.mem.MemoizeSelect(input, filters)
-//     return _f.onConstructRelational(nd)
-//   }
-//
+//	  nd := _f.mem.MemoizeSelect(input, filters)
+//	  return _f.onConstructRelational(nd)
+//	}
 func (g *factoryGen) genConstructFuncs() {
 	defines := g.compiled.Defines.
 		WithoutTag("Enforcer").
@@ -136,6 +135,13 @@ func (g *factoryGen) genConstructFuncs() {
 
 			g.w.writeIndent("SKIP_RULES:\n")
 
+			if define.Name == "Scan" {
+				// The name of the scanPrivate element
+				spName := unTitle(g.md.fieldName(fields[0]))
+				g.w.write("_tabMeta := _f.Memo().Metadata().TableMeta(%s.Table)\n", spName)
+				g.w.write("%s.Distribution.FromIndexScan(_f.ctx, _f.evalCtx, _tabMeta, %s.Index, %s.Constraint)\n",
+					spName, spName, spName)
+			}
 			g.w.writeIndent("e := _f.mem.Memoize%s(", define.Name)
 			for i, field := range fields {
 				if i != 0 {
@@ -473,18 +479,17 @@ func (g *factoryGen) genCopyAndReplaceDefault() {
 // constructs expressions from a dynamic type and arguments. The code looks
 // similar to this:
 //
-//   func (f *Factory) DynamicConstruct(op opt.Operator, args ...interface{}) opt.Node {
-//     switch op {
-//     case opt.ProjectOp:
-//       return f.ConstructProject(
-//         args[0].(memo.RelNode),
-//         *args[1].(*memo.ProjectionsExpr),
-//         *args[2].(*opt.ColSet),
-//       )
+//	func (f *Factory) DynamicConstruct(op opt.Operator, args ...interface{}) opt.Node {
+//	  switch op {
+//	  case opt.ProjectOp:
+//	    return f.ConstructProject(
+//	      args[0].(memo.RelNode),
+//	      *args[1].(*memo.ProjectionsExpr),
+//	      *args[2].(*opt.ColSet),
+//	    )
 //
-//     ... cases for other ops ...
-//   }
-//
+//	  ... cases for other ops ...
+//	}
 func (g *factoryGen) genDynamicConstruct() {
 	g.w.nestIndent("func (f *Factory) DynamicConstruct(op opt.Operator, args ...interface{}) opt.Expr {\n")
 	g.w.writeIndent("switch op {\n")

@@ -21,9 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
@@ -166,25 +169,27 @@ func (b *Builder) buildScalar(
 			OriginalExpr: s.Subquery,
 			Ordering:     s.ordering,
 			RequestedCol: inCol,
+			WithinUDF:    b.insideUDF,
 		}
 		out = b.factory.ConstructArrayFlatten(s.node, &subqueryPrivate)
 
 	case *tree.IndirectionExpr:
-		expr := b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
-
-		if len(t.Indirection) != 1 {
+		if len(t.Indirection) != 1 && t.Expr.(tree.TypedExpr).ResolvedType().Family() == types.ArrayFamily {
 			panic(unimplementedWithIssueDetailf(32552, "ind", "multidimensional indexing is not supported"))
 		}
 
-		subscript := t.Indirection[0]
-		if subscript.Slice {
-			panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
-		}
+		out = b.buildScalar(t.Expr.(tree.TypedExpr), inScope, nil, nil, colRefs)
 
-		out = b.factory.ConstructIndirection(
-			expr,
-			b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
-		)
+		for _, subscript := range t.Indirection {
+			if subscript.Slice {
+				panic(unimplementedWithIssueDetailf(32551, "", "array slicing is not supported"))
+			}
+
+			out = b.factory.ConstructIndirection(
+				out,
+				b.buildScalar(subscript.Begin.(tree.TypedExpr), inScope, nil, nil, colRefs),
+			)
+		}
 
 	case *tree.IfErrExpr:
 		cond := b.buildScalar(t.Cond.(tree.TypedExpr), inScope, nil, nil, colRefs)
@@ -217,8 +222,14 @@ func (b *Builder) buildScalar(
 		// select the right overload. The solution is to wrap any mismatched
 		// arguments with a CastExpr that preserves the static type.
 
-		left := reType(t.TypedLeft(), t.ResolvedBinOp().LeftType)
-		right := reType(t.TypedRight(), t.ResolvedBinOp().RightType)
+		left := t.TypedLeft()
+		if left.ResolvedType() == types.Unknown {
+			left = reType(left, t.ResolvedBinOp().LeftType)
+		}
+		right := t.TypedRight()
+		if right.ResolvedType() == types.Unknown {
+			right = reType(right, t.ResolvedBinOp().RightType)
+		}
 		out = b.constructBinary(
 			treebin.MakeBinaryOperator(t.Operator.Symbol),
 			b.buildScalar(left, inScope, nil, nil, colRefs),
@@ -342,6 +353,15 @@ func (b *Builder) buildScalar(
 		out = b.factory.ConstructCase(input, whens, orElse)
 
 	case *tree.IndexedVar:
+		// TODO(mgartner): Disallow ordinal column references completely in
+		// v23.2.
+		if !b.evalCtx.SessionData().AllowOrdinalColumnReferences {
+			panic(errors.WithHintf(
+				pgerror.Newf(pgcode.WarningDeprecatedFeature, "invalid syntax @%d", t.Idx+1),
+				"ordinal column references have been deprecated. "+
+					"Use `SET allow_ordinal_column_references=true` to allow them",
+			))
+		}
 		if t.Idx < 0 || t.Idx >= len(inScope.cols) {
 			panic(pgerror.Newf(pgcode.UndefinedColumn,
 				"invalid column ordinal: @%d", t.Idx+1))
@@ -395,7 +415,7 @@ func (b *Builder) buildScalar(
 		if !b.KeepPlaceholders && b.evalCtx.HasPlaceholders() {
 			b.HadPlaceholders = true
 			// Replace placeholders with their value.
-			d, err := eval.Expr(b.evalCtx, t)
+			d, err := eval.Expr(b.ctx, b.evalCtx, t)
 			if err != nil {
 				panic(err)
 			}
@@ -508,8 +528,9 @@ func (b *Builder) buildAnyScalar(
 // f        The given function expression.
 // outCol   The output column of the function being built.
 // colRefs  The set of columns referenced so far by the scalar expression
-//          being built. If not nil, it is updated with any columns seen in
-//          finishBuildScalarRef.
+//
+//	being built. If not nil, it is updated with any columns seen in
+//	finishBuildScalarRef.
 //
 // See Builder.buildStmt for a description of the remaining input and
 // return values.
@@ -522,16 +543,22 @@ func (b *Builder) buildFunction(
 		}
 	}
 
-	def, err := f.Func.Resolve(b.semaCtx.SearchPath)
+	def, err := f.Func.Resolve(b.ctx, b.semaCtx.SearchPath, b.semaCtx.FunctionResolver)
 	if err != nil {
 		panic(err)
 	}
 
-	if isAggregate(def) {
+	overload := f.ResolvedOverload()
+	if overload.HasSQLBody() {
+		return b.buildUDF(f, def, inScope, outScope, outCol, colRefs)
+	}
+	b.factory.Metadata().AddBuiltin(f.Func.ReferenceByName)
+
+	if overload.Class == tree.AggregateClass {
 		panic(errors.AssertionFailedf("aggregate function should have been replaced"))
 	}
 
-	if isWindow(def) {
+	if overload.Class == tree.WindowClass {
 		panic(errors.AssertionFailedf("window function should have been replaced"))
 	}
 
@@ -544,16 +571,16 @@ func (b *Builder) buildFunction(
 	out = b.factory.ConstructFunction(args, &memo.FunctionPrivate{
 		Name:       def.Name,
 		Typ:        f.ResolvedType(),
-		Properties: &def.FunctionProperties,
-		Overload:   f.ResolvedOverload(),
+		Properties: &overload.FunctionProperties,
+		Overload:   overload,
 	})
 
-	if isGenerator(def) {
-		return b.finishBuildGeneratorFunction(f, out, inScope, outScope, outCol)
+	if overload.Class == tree.GeneratorClass {
+		return b.finishBuildGeneratorFunction(f, overload, out, inScope, outScope, outCol)
 	}
 
 	// Add a dependency on sequences that are used as a string argument.
-	if b.trackViewDeps {
+	if b.trackSchemaDeps {
 		seqIdentifier, err := seqexpr.GetSequenceFromFunc(f)
 		if err != nil {
 			panic(err)
@@ -562,22 +589,250 @@ func (b *Builder) buildFunction(
 			var ds cat.DataSource
 			if seqIdentifier.IsByID() {
 				flags := cat.Flags{
-					AvoidDescriptorCaches: b.insideViewDef,
+					AvoidDescriptorCaches: b.insideViewDef || b.insideFuncDef,
 				}
 				ds, _, err = b.catalog.ResolveDataSourceByID(b.ctx, flags, cat.StableID(seqIdentifier.SeqID))
 				if err != nil {
 					panic(err)
 				}
 			} else {
-				tn := tree.MakeUnqualifiedTableName(tree.Name(seqIdentifier.SeqName))
-				ds, _, _ = b.resolveDataSource(&tn, privilege.SELECT)
+				tn, err := parser.ParseQualifiedTableName(seqIdentifier.SeqName)
+				if err != nil {
+					panic(err)
+				}
+				ds, _, _ = b.resolveDataSource(tn, privilege.SELECT)
 			}
-			b.viewDeps = append(b.viewDeps, opt.ViewDep{
+			b.schemaDeps = append(b.schemaDeps, opt.SchemaDep{
 				DataSource: ds,
 			})
 		}
 	}
 
+	return b.finishBuildScalar(f, out, inScope, outScope, outCol)
+}
+
+// buildUDF builds a set of memo groups that represents a user-defined function
+// invocation.
+func (b *Builder) buildUDF(
+	f *tree.FuncExpr,
+	def *tree.ResolvedFunctionDefinition,
+	inScope, outScope *scope,
+	outCol *scopeColumn,
+	colRefs *opt.ColSet,
+) (out opt.ScalarExpr) {
+	o := f.ResolvedOverload()
+	b.factory.Metadata().AddUserDefinedFunction(o, f.Func.ReferenceByName)
+
+	// Validate that the return types match the original return types defined in
+	// the function. Return types like user defined return types may change since
+	// the function was first created.
+	rtyp := f.ResolvedType()
+	if rtyp.UserDefined() {
+		funcReturnType, err := tree.ResolveType(b.ctx,
+			&tree.OIDTypeReference{OID: rtyp.Oid()}, b.semaCtx.TypeResolver)
+		if err != nil {
+			panic(err)
+		}
+		if !funcReturnType.Equivalent(rtyp) {
+			panic(pgerror.Newf(
+				pgcode.InvalidFunctionDefinition,
+				"return type mismatch in function declared to return %s", rtyp.Name()))
+		}
+	}
+
+	// Build the argument expressions.
+	var args memo.ScalarListExpr
+	if len(f.Exprs) > 0 {
+		args = make(memo.ScalarListExpr, len(f.Exprs))
+		for i, pexpr := range f.Exprs {
+			args[i] = b.buildScalar(
+				pexpr.(tree.TypedExpr),
+				inScope,
+				nil, /* outScope */
+				nil, /* outCol */
+				colRefs,
+			)
+		}
+	}
+
+	// Create a new scope for building the statements in the function body. We
+	// start with an empty scope because a statement in the function body cannot
+	// refer to anything from the outer expression. If there are function
+	// parameters, we add them as columns to the scope so that references to
+	// them can be resolved.
+	//
+	// TODO(mgartner): We may need to set bodyScope.atRoot=true to prevent
+	// CTEs that mutate and are not at the top-level.
+	bodyScope := b.allocScope()
+	var params opt.ColList
+	if o.Types.Length() > 0 {
+		paramTypes, ok := o.Types.(tree.ParamTypes)
+		if !ok {
+			panic(unimplemented.NewWithIssue(88947,
+				"variadiac user-defined functions are not yet supported"))
+		}
+		params = make(opt.ColList, len(paramTypes))
+		for i := range paramTypes {
+			paramType := &paramTypes[i]
+			argColName := funcParamColName(tree.Name(paramType.Name), i)
+			col := b.synthesizeColumn(bodyScope, argColName, paramType.Typ, nil /* expr */, nil /* scalar */)
+			col.setParamOrd(i)
+			params[i] = col.id
+		}
+	}
+
+	// Parse the function body.
+	stmts, err := parser.Parse(o.Body)
+	if err != nil {
+		panic(err)
+	}
+
+	// Build an expression for each statement in the function body.
+	rels := make(memo.RelListExpr, len(stmts))
+	isSetReturning := o.Class == tree.GeneratorClass
+	// TODO(mgartner): Once other UDFs can be referenced from within a UDF, a
+	// boolean will not be sufficient to track whether or not we are in a UDF.
+	// We'll need to track the depth of the UDFs we are building expressions
+	// within.
+	b.insideUDF = true
+	for i := range stmts {
+		stmtScope := b.buildStmt(stmts[i].AST, nil /* desiredTypes */, bodyScope)
+		expr := stmtScope.expr
+		physProps := stmtScope.makePhysicalProps()
+
+		// The last statement produces the output of the UDF.
+		if i == len(stmts)-1 {
+			// Add a LIMIT 1 to the last statement if the UDF is not
+			// set-returning. This is valid because any other rows after the
+			// first can simply be ignored. The limit could be beneficial
+			// because it could allow additional optimization.
+			if !isSetReturning {
+				b.buildLimit(&tree.Limit{Count: tree.NewDInt(1)}, b.allocScope(), stmtScope)
+				expr = stmtScope.expr
+				// The limit expression will maintain the desired ordering, if any,
+				// so the physical props ordering can be cleared. The presentation
+				// must remain.
+				physProps.Ordering = props.OrderingChoice{}
+			}
+
+			// Replace the tuple contents of RECORD return types from Any to the
+			// result columns of the last statement. If the result column is a tuple,
+			// then use its tuple contents for the return instead.
+			isSingleTupleResult := len(stmtScope.cols) == 1 && stmtScope.cols[0].typ.Family() == types.TupleFamily
+			if types.IsRecordType(f.ResolvedType()) {
+				if isSingleTupleResult {
+					f.ResolvedType().InternalType.TupleContents = stmtScope.cols[0].typ.TupleContents()
+				} else {
+					tc := make([]*types.T, len(stmtScope.cols))
+					for i, col := range stmtScope.cols {
+						tc[i] = col.typ
+					}
+					f.ResolvedType().InternalType.TupleContents = tc
+				}
+			}
+
+			// If there are multiple output columns or the output type is a record and
+			// the output column is not a tuple, we must combine them into a tuple -
+			// only a single column can be returned from a UDF.
+			cols := physProps.Presentation
+			if len(cols) > 1 || (types.IsRecordType(f.ResolvedType()) && !isSingleTupleResult) {
+				elems := make(memo.ScalarListExpr, len(cols))
+				for i := range cols {
+					elems[i] = b.factory.ConstructVariable(cols[i].ID)
+				}
+				tup := b.factory.ConstructTuple(elems, f.ResolvedType())
+				stmtScope = bodyScope.push()
+				col := b.synthesizeColumn(stmtScope, scopeColName(""), f.ResolvedType(), nil /* expr */, tup)
+				expr = b.constructProject(expr, []scopeColumn{*col})
+				physProps = stmtScope.makePhysicalProps()
+			}
+
+			// We must preserve the presentation of columns as physical
+			// properties to prevent the optimizer from pruning the output
+			// column. If necessary, we add an assignment cast to the result
+			// column so that its type matches the function return type. Record return
+			// types do not need an assignment cast, since at this point the return
+			// column is already a tuple.
+			returnCol := physProps.Presentation[0].ID
+			returnColMeta := b.factory.Metadata().ColumnMeta(returnCol)
+			if !types.IsRecordType(f.ResolvedType()) && !returnColMeta.Type.Identical(f.ResolvedType()) {
+				if !cast.ValidCast(returnColMeta.Type, f.ResolvedType(), cast.ContextAssignment) {
+					panic(sqlerrors.NewInvalidAssignmentCastError(
+						returnColMeta.Type, f.ResolvedType(), returnColMeta.Alias))
+				}
+				cast := b.factory.ConstructAssignmentCast(
+					b.factory.ConstructVariable(physProps.Presentation[0].ID),
+					f.ResolvedType(),
+				)
+				stmtScope = bodyScope.push()
+				col := b.synthesizeColumn(stmtScope, scopeColName(""), f.ResolvedType(), nil /* expr */, cast)
+				expr = b.constructProject(expr, []scopeColumn{*col})
+				physProps = stmtScope.makePhysicalProps()
+			}
+		}
+
+		rels[i] = memo.RelRequiredPropsExpr{
+			RelExpr:   expr,
+			PhysProps: physProps,
+		}
+	}
+	b.insideUDF = false
+
+	out = b.factory.ConstructUDF(
+		args,
+		&memo.UDFPrivate{
+			Name:              def.Name,
+			Params:            params,
+			Body:              rels,
+			Typ:               f.ResolvedType(),
+			SetReturning:      isSetReturning,
+			Volatility:        o.Volatility,
+			CalledOnNullInput: o.CalledOnNullInput,
+		},
+	)
+
+	// If the UDF is strict and non-set-returning, it should not be invoked when
+	// any of the arguments are NULL. To achieve this, we wrap the UDF in a CASE
+	// expression like:
+	//
+	//   CASE WHEN arg1 IS NULL OR arg2 IS NULL OR ... THEN NULL ELSE udf() END
+	//
+	// For strict, set-returning UDFs, the evaluation logic achieves this
+	// behavior.
+	if !isSetReturning && !o.CalledOnNullInput && len(args) > 0 {
+		var anyArgIsNull opt.ScalarExpr
+		for i := range args {
+			// Note: We do NOT use a TupleIsNullExpr here if the argument is a
+			// tuple because a strict UDF will be called if an argument, T, is a
+			// tuple with all NULL elements, even though T IS NULL evaluates to
+			// true. For example:
+			//
+			//   SELECT strict_fn(1, (NULL, NULL)) -- the UDF will be called
+			//   SELECT (NULL, NULL) IS NULL       -- returns true
+			//
+			argIsNull := b.factory.ConstructIs(args[i], memo.NullSingleton)
+			if anyArgIsNull == nil {
+				anyArgIsNull = argIsNull
+				continue
+			}
+			anyArgIsNull = b.factory.ConstructOr(argIsNull, anyArgIsNull)
+		}
+		out = b.factory.ConstructCase(
+			memo.TrueSingleton,
+			memo.ScalarListExpr{
+				b.factory.ConstructWhen(
+					anyArgIsNull,
+					b.factory.ConstructNull(f.ResolvedType()),
+				),
+			},
+			out,
+		)
+	}
+
+	// Synthesize an output column for set-returning UDFs.
+	if isSetReturning && outCol == nil {
+		outCol = b.synthesizeColumn(outScope, scopeColName(""), f.ResolvedType(), nil /* expr */, out)
+	}
 	return b.finishBuildScalar(f, out, inScope, outScope, outCol)
 }
 
@@ -622,12 +877,12 @@ func (b *Builder) buildRangeCond(
 // checkSubqueryOuterCols uses the subquery outer columns to update the given
 // set of column references and the set of outer columns for any enclosing
 // subuqery. It also performs the following checks:
-//   1. If aggregates are not allowed in the current context (e.g., if we
-//      are building the WHERE clause), it checks that the subquery does not
-//      reference any aggregates from this scope.
-//   2. If this is a grouping context, it checks that any outer columns from
-//      the given subquery that reference inScope are either aggregate or
-//      grouping columns in inScope.
+//  1. If aggregates are not allowed in the current context (e.g., if we
+//     are building the WHERE clause), it checks that the subquery does not
+//     reference any aggregates from this scope.
+//  2. If this is a grouping context, it checks that any outer columns from
+//     the given subquery that reference inScope are either aggregate or
+//     grouping columns in inScope.
 func (b *Builder) checkSubqueryOuterCols(
 	subqueryOuterCols opt.ColSet, inGroupingContext bool, inScope *scope, colRefs *opt.ColSet,
 ) {
@@ -753,6 +1008,8 @@ func (b *Builder) constructComparison(
 			return b.factory.ConstructBBoxIntersects(left, right)
 		}
 		return b.factory.ConstructOverlaps(left, right)
+	case treecmp.TSMatches:
+		return b.factory.ConstructTSMatches(left, right)
 	}
 	panic(errors.AssertionFailedf("unhandled comparison operator: %s", redact.Safe(cmp.Operator)))
 }
@@ -824,6 +1081,7 @@ func (b *Builder) constructUnary(
 // TypedExprs can refer to columns in the current scope using IndexedVars (@1,
 // @2, etc). When we build a scalar, we have to provide information about these
 // columns.
+// TODO(mgartner): Ordinal column references are deprecated.
 type ScalarBuilder struct {
 	Builder
 	scope scope
@@ -849,10 +1107,15 @@ func NewScalar(
 	sb.scope.cols = make([]scopeColumn, 0, md.NumColumns())
 	for colID := opt.ColumnID(1); int(colID) <= md.NumColumns(); colID++ {
 		colMeta := md.ColumnMeta(colID)
+		var alias tree.TableName
+		if colMeta.Table > 0 {
+			alias = md.TableMeta(colMeta.Table).Alias
+		}
 		sb.scope.cols = append(sb.scope.cols, scopeColumn{
-			name: scopeColName(tree.Name(colMeta.Alias)),
-			typ:  colMeta.Type,
-			id:   colID,
+			name:  scopeColName(tree.Name(colMeta.Alias)),
+			typ:   colMeta.Type,
+			id:    colID,
+			table: alias,
 		})
 	}
 

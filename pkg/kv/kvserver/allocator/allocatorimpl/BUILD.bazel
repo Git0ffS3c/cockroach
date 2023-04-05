@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -6,28 +7,30 @@ go_library(
         "allocator.go",
         "allocator_scorer.go",
         "test_helpers.go",
+        "threshold.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/clusterversion",
         "//pkg/gossip",
         "//pkg/kv/kvserver/allocator",
+        "//pkg/kv/kvserver/allocator/load",
         "//pkg/kv/kvserver/allocator/storepool",
         "//pkg/kv/kvserver/constraint",
         "//pkg/kv/kvserver/liveness/livenesspb",
-        "//pkg/kv/kvserver/replicastats",
+        "//pkg/kv/kvserver/raftutil",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
-        "//pkg/util/hlc",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/log",
         "//pkg/util/metric",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
+        "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
-        "@io_etcd_go_etcd_raft_v3//:raft",
-        "@io_etcd_go_etcd_raft_v3//tracker",
+        "@io_etcd_go_raft_v3//:raft",
+        "@io_etcd_go_raft_v3//tracker",
     ],
 )
 
@@ -37,19 +40,19 @@ go_test(
         "allocator_scorer_test.go",
         "allocator_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":allocatorimpl"],
     deps = [
-        "//pkg/base",
         "//pkg/config/zonepb",
         "//pkg/gossip",
         "//pkg/keys",
         "//pkg/kv/kvserver/allocator",
+        "//pkg/kv/kvserver/allocator/load",
         "//pkg/kv/kvserver/allocator/storepool",
         "//pkg/kv/kvserver/constraint",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/kv/kvserver/replicastats",
         "//pkg/roachpb",
-        "//pkg/rpc",
         "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/testutils/gossiputil",
@@ -65,7 +68,9 @@ go_test(
         "@com_github_olekukonko_tablewriter//:tablewriter",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
-        "@io_etcd_go_etcd_raft_v3//:raft",
-        "@io_etcd_go_etcd_raft_v3//tracker",
+        "@io_etcd_go_raft_v3//:raft",
+        "@io_etcd_go_raft_v3//tracker",
     ],
 )
+
+get_x_data(name = "get_x_data")

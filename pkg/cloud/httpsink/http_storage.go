@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -23,7 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
@@ -35,9 +34,9 @@ import (
 
 func parseHTTPURL(
 	_ cloud.ExternalStorageURIContext, uri *url.URL,
-) (roachpb.ExternalStorage, error) {
-	conf := roachpb.ExternalStorage{}
-	conf.Provider = roachpb.ExternalStorageProvider_http
+) (cloudpb.ExternalStorage, error) {
+	conf := cloudpb.ExternalStorage{}
+	conf.Provider = cloudpb.ExternalStorageProvider_http
 	conf.HttpPath.BaseUri = uri.String()
 	return conf, nil
 }
@@ -62,7 +61,7 @@ func (e *retryableHTTPError) Error() string {
 
 // MakeHTTPStorage returns an instance of HTTPStorage ExternalStorage.
 func MakeHTTPStorage(
-	ctx context.Context, args cloud.ExternalStorageContext, dest roachpb.ExternalStorage,
+	ctx context.Context, args cloud.ExternalStorageContext, dest cloudpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.http")
 	if args.IOConf.DisableHTTP {
@@ -90,10 +89,10 @@ func MakeHTTPStorage(
 	}, nil
 }
 
-func (h *httpStorage) Conf() roachpb.ExternalStorage {
-	return roachpb.ExternalStorage{
-		Provider: roachpb.ExternalStorageProvider_http,
-		HttpPath: roachpb.ExternalStorage_Http{
+func (h *httpStorage) Conf() cloudpb.ExternalStorage {
+	return cloudpb.ExternalStorage{
+		Provider: cloudpb.ExternalStorageProvider_http,
+		HttpPath: cloudpb.ExternalStorage_Http{
 			BaseUri: h.base.String(),
 		},
 	}
@@ -102,6 +101,8 @@ func (h *httpStorage) Conf() roachpb.ExternalStorage {
 func (h *httpStorage) ExternalIOConf() base.ExternalIODirConfig {
 	return h.ioConf
 }
+
+func (h *httpStorage) RequiresExternalIOAccounting() bool { return true }
 
 func (h *httpStorage) Settings() *cluster.Settings {
 	return h.settings
@@ -263,7 +264,7 @@ func (h *httpStorage) req(
 	case 200, 201, 204, 206:
 	// Pass.
 	default:
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		err := errors.Errorf("error response from server: %s %q", resp.Status, body)
 		if err != nil && resp.StatusCode == 404 {
@@ -280,6 +281,6 @@ func (h *httpStorage) req(
 }
 
 func init() {
-	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_http,
+	cloud.RegisterExternalStorageProvider(cloudpb.ExternalStorageProvider_http,
 		parseHTTPURL, MakeHTTPStorage, cloud.RedactedParams(), "http", "https")
 }

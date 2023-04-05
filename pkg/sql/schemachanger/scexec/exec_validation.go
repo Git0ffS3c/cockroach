@@ -13,16 +13,16 @@ package scexec
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
 )
 
 func executeValidateUniqueIndex(
-	ctx context.Context, deps Dependencies, op *scop.ValidateUniqueIndex,
+	ctx context.Context, deps Dependencies, op *scop.ValidateIndex,
 ) error {
 	descs, err := deps.Catalog().MustReadImmutableDescriptors(ctx, op.TableID)
 	if err != nil {
@@ -33,38 +33,113 @@ func executeValidateUniqueIndex(
 	if !ok {
 		return catalog.WrapTableDescRefErr(desc.GetID(), catalog.NewDescriptorTypeError(desc))
 	}
-	index, err := table.FindIndexWithID(op.IndexID)
+	index, err := catalog.MustFindIndexByID(table, op.IndexID)
 	if err != nil {
 		return err
 	}
 	// Execute the validation operation as a root user.
-	execOverride := sessiondata.InternalExecutorOverride{
-		User: username.RootUserName(),
-	}
+	execOverride := sessiondata.RootUserSessionDataOverride
 	if index.GetType() == descpb.IndexDescriptor_FORWARD {
-		err = deps.IndexValidator().ValidateForwardIndexes(ctx, table, []catalog.Index{index}, execOverride)
+		err = deps.Validator().ValidateForwardIndexes(ctx, deps.TransactionalJobRegistry().CurrentJob(), table, []catalog.Index{index}, execOverride)
 	} else {
-		err = deps.IndexValidator().ValidateInvertedIndexes(ctx, table, []catalog.Index{index}, execOverride)
+		err = deps.Validator().ValidateInvertedIndexes(ctx, deps.TransactionalJobRegistry().CurrentJob(), table, []catalog.Index{index}, execOverride)
 	}
-	return err
+	if err != nil {
+		return scerrors.SchemaChangerUserError(err)
+	}
+	return nil
 }
 
-func executeValidateCheckConstraint(
-	ctx context.Context, deps Dependencies, op *scop.ValidateCheckConstraint,
+func executeValidateConstraint(
+	ctx context.Context, deps Dependencies, op *scop.ValidateConstraint,
 ) error {
-	return errors.Errorf("executeValidateCheckConstraint is not implemented")
+	descs, err := deps.Catalog().MustReadImmutableDescriptors(ctx, op.TableID)
+	if err != nil {
+		return err
+	}
+	desc := descs[0]
+	table, err := catalog.AsTableDescriptor(desc)
+	if err != nil {
+		return err
+	}
+	constraint, err := catalog.MustFindConstraintByID(table, op.ConstraintID)
+	if err != nil {
+		return err
+	}
+
+	// Execute the validation operation as a root user.
+	execOverride := sessiondata.RootUserSessionDataOverride
+	err = deps.Validator().ValidateConstraint(ctx, table, constraint, op.IndexIDForValidation, execOverride)
+	if err != nil {
+		return scerrors.SchemaChangerUserError(err)
+	}
+	return nil
 }
 
-func executeValidationOps(ctx context.Context, deps Dependencies, execute []scop.Op) error {
-	for _, op := range execute {
-		switch op := op.(type) {
-		case *scop.ValidateUniqueIndex:
-			return executeValidateUniqueIndex(ctx, deps, op)
-		case *scop.ValidateCheckConstraint:
-			return executeValidateCheckConstraint(ctx, deps, op)
-		default:
-			panic("unimplemented")
+func executeValidateColumnNotNull(
+	ctx context.Context, deps Dependencies, op *scop.ValidateColumnNotNull,
+) error {
+	descs, err := deps.Catalog().MustReadImmutableDescriptors(ctx, op.TableID)
+	if err != nil {
+		return err
+	}
+	desc := descs[0]
+	table, err := catalog.AsTableDescriptor(desc)
+	if err != nil {
+		return err
+	}
+
+	var constraint catalog.Constraint
+	for _, ck := range table.CheckConstraints() {
+		if ck.IsNotNullColumnConstraint() && ck.GetReferencedColumnID(0) == op.ColumnID {
+			constraint = ck
 		}
+	}
+
+	// Execute the validation operation as a root user.
+	execOverride := sessiondata.RootUserSessionDataOverride
+	err = deps.Validator().ValidateConstraint(ctx, table, constraint, op.IndexIDForValidation, execOverride)
+	if err != nil {
+		return scerrors.SchemaChangerUserError(err)
+	}
+	return nil
+}
+
+func executeValidationOps(ctx context.Context, deps Dependencies, ops []scop.Op) (err error) {
+	for _, op := range ops {
+		if err = executeValidationOp(ctx, deps, op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func executeValidationOp(ctx context.Context, deps Dependencies, op scop.Op) (err error) {
+	switch op := op.(type) {
+	case *scop.ValidateIndex:
+		if err = executeValidateUniqueIndex(ctx, deps, op); err != nil {
+			if !scerrors.HasSchemaChangerUserError(err) {
+				return errors.Wrapf(err, "%T: %v", op, op)
+			}
+			return err
+		}
+	case *scop.ValidateConstraint:
+		if err = executeValidateConstraint(ctx, deps, op); err != nil {
+			if !scerrors.HasSchemaChangerUserError(err) {
+				return errors.Wrapf(err, "%T: %v", op, op)
+			}
+			return err
+		}
+	case *scop.ValidateColumnNotNull:
+		if err = executeValidateColumnNotNull(ctx, deps, op); err != nil {
+			if !scerrors.HasSchemaChangerUserError(err) {
+				return errors.Wrapf(err, "%T: %v", op, op)
+			}
+			return err
+		}
+
+	default:
+		panic("unimplemented")
 	}
 	return nil
 }

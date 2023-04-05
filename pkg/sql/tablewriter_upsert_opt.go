@@ -30,15 +30,15 @@ import (
 // and other upsert operations into the input query, rather than requiring the
 // upserter to do it. For example:
 //
-//   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
-//   INSERT INTO abc VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=10
+//	CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
+//	INSERT INTO abc VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=10
 //
 // The CBO will generate an input expression similar to this:
 //
-//   SELECT ins_a, ins_b, ins_c, fetch_a, fetch_b, fetch_c, 10 AS upd_b
-//   FROM (VALUES (1, 2, NULL)) AS ins(ins_a, ins_b, ins_c)
-//   LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
-//   ON ins_a = fetch_a
+//	SELECT ins_a, ins_b, ins_c, fetch_a, fetch_b, fetch_c, 10 AS upd_b
+//	FROM (VALUES (1, 2, NULL)) AS ins(ins_a, ins_b, ins_c)
+//	LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
+//	ON ins_a = fetch_a
 //
 // The other non-CBO upserters perform custom left lookup joins. However, that
 // doesn't allow sharing of optimization rules and doesn't work with correlated
@@ -101,14 +101,16 @@ var _ tableWriter = &optTableUpserter{}
 func (tu *optTableUpserter) init(
 	ctx context.Context, txn *kv.Txn, evalCtx *eval.Context, sv *settings.Values,
 ) error {
-	tu.tableWriterBase.init(txn, tu.ri.Helper.TableDesc, evalCtx, sv)
+	if err := tu.tableWriterBase.init(txn, tu.ri.Helper.TableDesc, evalCtx, sv); err != nil {
+		return err
+	}
 
-	// rowsNeeded, set upon initialization, indicates pkg/sql/backfill.gowhether or not we want
+	// rowsNeeded, set upon initialization, indicates whether or not we want
 	// rows returned from the operation.
 	if tu.rowsNeeded {
 		tu.resultRow = make(tree.Datums, len(tu.returnCols))
 		tu.rows = rowcontainer.NewRowContainer(
-			evalCtx.Mon.MakeBoundAccount(),
+			evalCtx.Planner.Mon().MakeBoundAccount(),
 			colinfo.ColTypeInfoFromColumns(tu.returnCols),
 		)
 
@@ -174,11 +176,11 @@ func (tu *optTableUpserter) row(
 	if tu.canaryOrdinal == -1 {
 		// No canary column means that existing row should be overwritten (i.e.
 		// the insert and update columns are the same, so no need to choose).
-		return tu.insertNonConflictingRow(ctx, tu.b, row[:insertEnd], pm, true /* overwrite */, traceKV)
+		return tu.insertNonConflictingRow(ctx, row[:insertEnd], pm, true /* overwrite */, traceKV)
 	}
 	if row[tu.canaryOrdinal] == tree.DNull {
 		// No conflict, so insert a new row.
-		return tu.insertNonConflictingRow(ctx, tu.b, row[:insertEnd], pm, false /* overwrite */, traceKV)
+		return tu.insertNonConflictingRow(ctx, row[:insertEnd], pm, false /* overwrite */, traceKV)
 	}
 
 	// If no columns need to be updated, then possibly collect the unchanged row.
@@ -208,13 +210,12 @@ func (tu *optTableUpserter) row(
 // inserted row is stored in the rowsUpserted collection.
 func (tu *optTableUpserter) insertNonConflictingRow(
 	ctx context.Context,
-	b *kv.Batch,
 	insertRow tree.Datums,
 	pm row.PartialIndexUpdateHelper,
 	overwrite, traceKV bool,
 ) error {
 	// Perform the insert proper.
-	if err := tu.ri.InsertRow(ctx, b, insertRow, pm, overwrite, traceKV); err != nil {
+	if err := tu.ri.InsertRow(ctx, &tu.putter, insertRow, pm, overwrite, traceKV); err != nil {
 		return err
 	}
 

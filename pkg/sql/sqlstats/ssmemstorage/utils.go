@@ -13,7 +13,7 @@ package ssmemstorage
 import (
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 )
 
 type stmtList []stmtKey
@@ -25,7 +25,7 @@ func (s stmtList) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 func (s stmtList) Less(i, j int) bool {
-	cmp := strings.Compare(s[i].anonymizedStmt, s[j].anonymizedStmt)
+	cmp := strings.Compare(s[i].stmtNoConstants, s[j].stmtNoConstants)
 	if cmp == -1 {
 		return true
 	}
@@ -36,7 +36,7 @@ func (s stmtList) Less(i, j int) bool {
 	return s[i].transactionFingerprintID < s[j].transactionFingerprintID
 }
 
-type txnList []roachpb.TransactionFingerprintID
+type txnList []appstatspb.TransactionFingerprintID
 
 func (t txnList) Len() int {
 	return len(t)

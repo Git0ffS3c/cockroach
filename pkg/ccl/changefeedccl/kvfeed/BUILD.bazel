@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -19,16 +20,19 @@ go_library(
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql/covering",
         "//pkg/storage/enginepb",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
         "//pkg/util/limit",
         "//pkg/util/log",
         "//pkg/util/mon",
+        "//pkg/util/retry",
         "//pkg/util/span",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
@@ -43,22 +47,25 @@ go_test(
         "main_test.go",
         "scanner_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":kvfeed"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
+        "//pkg/ccl",
         "//pkg/ccl/changefeedccl/changefeedbase",
         "//pkg/ccl/changefeedccl/kvevent",
         "//pkg/ccl/changefeedccl/schemafeed",
         "//pkg/ccl/changefeedccl/schemafeed/schematestutils",
         "//pkg/ccl/storageccl",
-        "//pkg/ccl/utilccl",
         "//pkg/gossip",
         "//pkg/jobs/jobspb",
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/settings/cluster",
@@ -70,6 +77,7 @@ go_test(
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
+        "//pkg/util",
         "//pkg/util/ctxgroup",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
@@ -81,3 +89,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -112,7 +113,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 			exp:  false,
 			knobs: func() (*kvserver.StoreTestingKnobs, chan chan struct{}) {
 				mergeC := make(chan chan struct{})
-				testingResponseFilter := func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+				testingResponseFilter := func(ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse) *kvpb.Error {
 					if ba.IsSingleSubsumeRequest() {
 						unblockC := make(chan struct{})
 						mergeC <- unblockC
@@ -139,7 +140,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 			knobs: func() (*kvserver.StoreTestingKnobs, chan chan struct{}) {
 				applyC := make(chan chan struct{})
 				var once sync.Once // ignore reproposals
-				testingApplyFilter := func(filterArgs kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+				testingApplyFilter := func(filterArgs kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 					if filterArgs.Req != nil && filterArgs.Req.IsSingleRequest() {
 						put := filterArgs.Req.Requests[0].GetPut()
 						if put != nil && put.Key.Equal(roachpb.Key("key_filter")) {
@@ -152,7 +153,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 					}
 					return 0, nil
 				}
-				return &kvserver.StoreTestingKnobs{TestingApplyFilter: testingApplyFilter}, applyC
+				return &kvserver.StoreTestingKnobs{TestingApplyCalledTwiceFilter: testingApplyFilter}, applyC
 			},
 			setup: func(a setupArgs) (chan struct{}, chan error, error) {
 				// Initiate a Raft proposal and pause it during application.
@@ -169,7 +170,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 			exp:  false,
 			knobs: func() (*kvserver.StoreTestingKnobs, chan chan struct{}) {
 				proposeC := make(chan chan struct{})
-				testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					if args.Req.IsSingleRequest() {
 						put := args.Req.Requests[0].GetPut()
 						if put != nil && put.Key.Equal(roachpb.Key("key_filter")) {
@@ -189,7 +190,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 					ts := a.target.Add(-1, 0)
 					putArgs := putArgs(roachpb.Key("key_filter"), []byte("val"))
 					sender := a.tc.Server(0).DB().NonTransactionalSender()
-					_, pErr := kv.SendWrappedWith(ctx, sender, roachpb.Header{Timestamp: ts}, putArgs)
+					_, pErr := kv.SendWrappedWith(ctx, sender, kvpb.Header{Timestamp: ts}, putArgs)
 					errC <- pErr.GoError()
 				})
 				unblockFilterC := <-a.filterC
@@ -201,7 +202,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 			exp:  false,
 			knobs: func() (*kvserver.StoreTestingKnobs, chan chan struct{}) {
 				proposeC := make(chan chan struct{})
-				testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					if args.Req.IsSingleRequest() {
 						put := args.Req.Requests[0].GetPut()
 						if put != nil && put.Key.Equal(roachpb.Key("key_filter")) {
@@ -221,7 +222,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 					ts := a.target
 					putArgs := putArgs(roachpb.Key("key_filter"), []byte("val"))
 					sender := a.tc.Server(0).DB().NonTransactionalSender()
-					_, pErr := kv.SendWrappedWith(ctx, sender, roachpb.Header{Timestamp: ts}, putArgs)
+					_, pErr := kv.SendWrappedWith(ctx, sender, kvpb.Header{Timestamp: ts}, putArgs)
 					errC <- pErr.GoError()
 				})
 				unblockFilterC := <-a.filterC
@@ -233,7 +234,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 			exp:  true,
 			knobs: func() (*kvserver.StoreTestingKnobs, chan chan struct{}) {
 				proposeC := make(chan chan struct{})
-				testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+				testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 					if args.Req.IsSingleRequest() {
 						put := args.Req.Requests[0].GetPut()
 						if put != nil && put.Key.Equal(roachpb.Key("key_filter")) {
@@ -253,7 +254,7 @@ func TestBumpSideTransportClosed(t *testing.T) {
 					ts := a.target.Add(1, 0)
 					putArgs := putArgs(roachpb.Key("key_filter"), []byte("val"))
 					sender := a.tc.Server(0).DB().NonTransactionalSender()
-					_, pErr := kv.SendWrappedWith(ctx, sender, roachpb.Header{Timestamp: ts}, putArgs)
+					_, pErr := kv.SendWrappedWith(ctx, sender, kvpb.Header{Timestamp: ts}, putArgs)
 					errC <- pErr.GoError()
 				})
 				unblockFilterC := <-a.filterC
@@ -433,31 +434,31 @@ func TestBumpSideTransportClosed(t *testing.T) {
 //
 // The tricky scenario tested is the following:
 //
-// 1. A lease held by rep1 is getting close to its expiration.
-// 2. Rep1 begins the process of transferring its lease to rep2 with a start
-//    time of 100.
-// 3. The transfer goes slowly. From the perspective of rep2, the original lease
-//    expires, so it begins acquiring a new lease with a start time of 200. The
-//    lease acquisition is slow to propose.
-// 4. The lease transfer finally applies. Rep2 is the new leaseholder and bumps
-//    its tscache to 100.
-// 5. Two writes start evaluating on rep2 under the new lease. They bump their
-//    write timestamp to 100,1.
-// 6. Rep2's lease acquisition from step 3 is proposed. Here's where the
-//    regression that this test is protecting against comes in: if rep2 was to
-//    mechanically bump its assignedClosedTimestamp to 200, that'd be incorrect
-//    because there are in-flight writes at 100. If those writes get proposed
-//    after the lease acquisition request, the second of them to get proposed
-//    would violate the closed time carried by the first (see below).
-// 7. The lease acquisition gets rejected below Raft because the previous lease
-//    it asserts doesn't correspond to the lease that it applies under.
-// 8. The two writes from step 5 are proposed. The closed timestamp that they
-//    each carry has a lower bound of rep2.assignedClosedTimestmap. If this was
-//    200, then the second one would violate the closed timestamp carried by the
-//    first one - the first one says that 200 is closed, but then the second
-//    tries to write at 100. Note that the first write is OK writing at 100 even
-//    though it carries a closed timestamp of 200 - the closed timestamp carried
-//    by a command only binds future commands.
+//  1. A lease held by rep1 is getting close to its expiration.
+//  2. Rep1 begins the process of transferring its lease to rep2 with a start
+//     time of 100.
+//  3. The transfer goes slowly. From the perspective of rep2, the original lease
+//     expires, so it begins acquiring a new lease with a start time of 200. The
+//     lease acquisition is slow to propose.
+//  4. The lease transfer finally applies. Rep2 is the new leaseholder and bumps
+//     its tscache to 100.
+//  5. Two writes start evaluating on rep2 under the new lease. They bump their
+//     write timestamp to 100,1.
+//  6. Rep2's lease acquisition from step 3 is proposed. Here's where the
+//     regression that this test is protecting against comes in: if rep2 was to
+//     mechanically bump its assignedClosedTimestamp to 200, that'd be incorrect
+//     because there are in-flight writes at 100. If those writes get proposed
+//     after the lease acquisition request, the second of them to get proposed
+//     would violate the closed time carried by the first (see below).
+//  7. The lease acquisition gets rejected below Raft because the previous lease
+//     it asserts doesn't correspond to the lease that it applies under.
+//  8. The two writes from step 5 are proposed. The closed timestamp that they
+//     each carry has a lower bound of rep2.assignedClosedTimestmap. If this was
+//     200, then the second one would violate the closed timestamp carried by the
+//     first one - the first one says that 200 is closed, but then the second
+//     tries to write at 100. Note that the first write is OK writing at 100 even
+//     though it carries a closed timestamp of 200 - the closed timestamp carried
+//     by a command only binds future commands.
 //
 // The test simulates the scenario and verifies that we don't crash with a
 // closed timestamp violation assertion. We avoid the violation because, in step
@@ -493,7 +494,7 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 
 	blockLeaseAcquisition := func(args kvserverbase.FilterArgs) {
 		blockedRID := roachpb.RangeID(atomic.LoadInt64(&blockedRangeID))
-		leaseReq, ok := args.Req.(*roachpb.RequestLeaseRequest)
+		leaseReq, ok := args.Req.(*kvpb.RequestLeaseRequest)
 		if !ok || args.Hdr.RangeID != blockedRID || leaseReq.Lease.Replica.NodeID != 2 {
 			return
 		}
@@ -506,7 +507,7 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 	blockWrites := func(args kvserverbase.FilterArgs) {
 		wk1 := writeKey1.Load().(roachpb.Key)
 		wk2 := writeKey2.Load().(roachpb.Key)
-		if put, ok := args.Req.(*roachpb.PutRequest); ok && (put.Key.Equal(wk1) || put.Key.Equal(wk2)) {
+		if put, ok := args.Req.(*kvpb.PutRequest); ok && (put.Key.Equal(wk1) || put.Key.Equal(wk2)) {
 			writeCh <- struct{}{}
 			<-unblockWritesCh
 		}
@@ -518,7 +519,7 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 		if ba.RangeID != blockedRID {
 			return
 		}
-		_, ok := p.Request.GetArg(roachpb.TransferLease)
+		_, ok := p.Request.GetArg(kvpb.TransferLease)
 		if !ok {
 			return
 		}
@@ -538,16 +539,16 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 				RangeLeaseRenewalFraction: -1,
 				// Also make expiration-based leases last for a long time, as the test
 				// wants a valid lease after cluster start.
-				RaftElectionTimeoutTicks: 1000,
+				RangeLeaseDuration: time.Minute,
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					ClockSource: manual.UnixNano,
+					WallClock: manual,
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					DisableConsistencyQueue: true,
 					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-						TestingPostEvalFilter: func(args kvserverbase.FilterArgs) *roachpb.Error {
+						TestingPostEvalFilter: func(args kvserverbase.FilterArgs) *kvpb.Error {
 							blockWrites(args)
 							blockLeaseAcquisition(args)
 							return nil
@@ -646,7 +647,7 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 		writeKey1.Store(key)
 		sender := n2.DB().NonTransactionalSender()
 		pArgs := putArgs(key, []byte("test val"))
-		_, pErr := kv.SendWrappedWith(ctx, sender, roachpb.Header{Timestamp: lease.Start.ToTimestamp()}, pArgs)
+		_, pErr := kv.SendWrappedWith(ctx, sender, kvpb.Header{Timestamp: lease.Start.ToTimestamp()}, pArgs)
 		err1 <- pErr.GoError()
 	}()
 	go func() {
@@ -654,7 +655,7 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 		writeKey2.Store(k)
 		sender := n2.DB().NonTransactionalSender()
 		pArgs := putArgs(k, []byte("test val2"))
-		_, pErr := kv.SendWrappedWith(ctx, sender, roachpb.Header{Timestamp: lease.Start.ToTimestamp()}, pArgs)
+		_, pErr := kv.SendWrappedWith(ctx, sender, kvpb.Header{Timestamp: lease.Start.ToTimestamp()}, pArgs)
 		err2 <- pErr.GoError()
 	}()
 	// Wait for the writes to evaluate and block before proposal.
@@ -700,7 +701,7 @@ func BenchmarkBumpSideTransportClosed(b *testing.B) {
 	s, _, _ := serverutils.StartServer(b, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
-				ClockSource: manual.UnixNano,
+				WallClock: manual,
 			},
 		},
 	})
@@ -747,12 +748,12 @@ func TestNonBlockingReadsAtResolvedTimestamp(t *testing.T) {
 		var lastResTS hlc.Timestamp
 		return func(ctx context.Context) error {
 			// Query the key span's resolved timestamp.
-			queryResTS := roachpb.QueryResolvedTimestampRequest{
-				RequestHeader: roachpb.RequestHeaderFromSpan(keySpan),
+			queryResTS := kvpb.QueryResolvedTimestampRequest{
+				RequestHeader: kvpb.RequestHeaderFromSpan(keySpan),
 			}
-			queryResTSHeader := roachpb.Header{
+			queryResTSHeader := kvpb.Header{
 				RangeID:         rangeID,
-				ReadConsistency: roachpb.INCONSISTENT,
+				ReadConsistency: kvpb.INCONSISTENT,
 			}
 			resp, pErr := kv.SendWrappedWith(ctx, store, queryResTSHeader, &queryResTS)
 			if pErr != nil {
@@ -760,7 +761,7 @@ func TestNonBlockingReadsAtResolvedTimestamp(t *testing.T) {
 			}
 
 			// Validate that the resolved timestamp increases monotonically.
-			resTS := resp.(*roachpb.QueryResolvedTimestampResponse).ResolvedTS
+			resTS := resp.(*kvpb.QueryResolvedTimestampResponse).ResolvedTS
 			if resTS.IsEmpty() {
 				return errors.Errorf("empty resolved timestamp")
 			}
@@ -775,13 +776,13 @@ func TestNonBlockingReadsAtResolvedTimestamp(t *testing.T) {
 			// block on an intent. Send to a specific store instead of through a
 			// DistSender so that we'll hear an error (NotLeaseholderError) if the
 			// request would otherwise be redirected to the leaseholder.
-			scan := roachpb.ScanRequest{
-				RequestHeader: roachpb.RequestHeaderFromSpan(keySpan),
+			scan := kvpb.ScanRequest{
+				RequestHeader: kvpb.RequestHeaderFromSpan(keySpan),
 			}
-			txn := roachpb.MakeTransaction("test", keySpan.Key, 0, resTS, 0, 0)
-			scanHeader := roachpb.Header{
+			txn := roachpb.MakeTransaction("test", keySpan.Key, 0, 0, resTS, 0, 0)
+			scanHeader := kvpb.Header{
 				RangeID:         rangeID,
-				ReadConsistency: roachpb.CONSISTENT,
+				ReadConsistency: kvpb.CONSISTENT,
 				Txn:             &txn,
 				WaitPolicy:      lock.WaitPolicy_Error,
 			}
@@ -817,15 +818,15 @@ func TestNonBlockingReadsWithServerSideBoundedStalenessNegotiation(t *testing.T)
 			// to block on an intent. Send to a specific store instead of through
 			// a DistSender so that we'll hear an error (NotLeaseholderError) if
 			// the request would otherwise be redirected to the leaseholder.
-			var ba roachpb.BatchRequest
+			ba := &kvpb.BatchRequest{}
 			ba.RangeID = rangeID
-			ba.BoundedStaleness = &roachpb.BoundedStalenessHeader{
+			ba.BoundedStaleness = &kvpb.BoundedStalenessHeader{
 				MinTimestampBound:       minTSBound,
 				MinTimestampBoundStrict: true,
 			}
 			ba.WaitPolicy = lock.WaitPolicy_Error
-			ba.Add(&roachpb.ScanRequest{
-				RequestHeader: roachpb.RequestHeaderFromSpan(keySpan),
+			ba.Add(&kvpb.ScanRequest{
+				RequestHeader: kvpb.RequestHeaderFromSpan(keySpan),
 			})
 			br, pErr := store.Send(ctx, ba)
 			if pErr != nil {

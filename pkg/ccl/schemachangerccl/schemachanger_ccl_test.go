@@ -13,76 +13,62 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/sctest"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-func newCluster(t *testing.T, knobs *scrun.TestingKnobs) (*gosql.DB, func()) {
-	_, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
+func newCluster(
+	t *testing.T, knobs *scexec.TestingKnobs,
+) (serverutils.TestServerInterface, *gosql.DB, func()) {
+	c, sqlDB, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
 		t, 3 /* numServers */, base.TestingKnobs{
 			SQLDeclarativeSchemaChanger: knobs,
 			JobsTestingKnobs:            jobs.NewTestingKnobsWithShortIntervals(),
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				StatementFilter:                 nil,
+				UseTransactionalDescIDGenerator: true,
+			},
 		},
 	)
-	return sqlDB, cleanup
+	return c.Server(0), sqlDB, cleanup
 }
 
-func sharedTestdata(t *testing.T) string {
-	testdataDir := "../../sql/schemachanger/testdata/"
-	if bazel.BuiltWithBazel() {
-		runfile, err := bazel.Runfile("pkg/sql/schemachanger/testdata/")
-		if err != nil {
-			t.Fatal(err)
-		}
-		testdataDir = runfile
+func newClusterMixed(
+	t *testing.T, knobs *scexec.TestingKnobs, downlevelVersion bool,
+) (serverutils.TestServerInterface, *gosql.DB, func()) {
+	targetVersion := clusterversion.TestingBinaryVersion
+	if downlevelVersion {
+		targetVersion = clusterversion.ByKey(clusterversion.V23_1_SchemaChangerDeprecatedIndexPredicates - 1)
 	}
-	return testdataDir
-}
+	c, db, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(t,
+		3, /* numServers */
+		base.TestingKnobs{
+			Server: &server.TestingKnobs{
+				BinaryVersionOverride:          targetVersion,
+				DisableAutomaticVersionUpgrade: make(chan struct{}),
+			},
+			SQLDeclarativeSchemaChanger: knobs,
+			JobsTestingKnobs:            jobs.NewTestingKnobsWithShortIntervals(),
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				UseTransactionalDescIDGenerator: true,
+			},
+		})
 
-func endToEndPath(t *testing.T) string {
-	return testutils.TestDataPath(t, "end_to_end")
-}
-
-func TestSchemaChangerSideEffects(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	sctest.EndToEndSideEffects(t, endToEndPath(t), newCluster)
-}
-
-func TestBackupRestore(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	t.Run("ccl", func(t *testing.T) {
-		sctest.Backup(t, endToEndPath(t), newCluster)
-	})
-	t.Run("non-ccl", func(t *testing.T) {
-		sctest.Backup(t, sharedTestdata(t), sctest.SingleNodeCluster)
-	})
-}
-
-func TestRollback(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	sctest.Rollback(t, endToEndPath(t), newCluster)
-}
-
-func TestPause(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	sctest.Pause(t, endToEndPath(t), newCluster)
+	return c.Server(0), db, cleanup
 }
 
 func TestDecomposeToElements(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	sctest.DecomposeToElements(t, testutils.TestDataPath(t, "decomp"), newCluster)
+	sctest.DecomposeToElements(t, datapathutils.TestDataPath(t, "decomp"), newCluster)
 }

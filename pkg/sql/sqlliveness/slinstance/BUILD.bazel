@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -8,7 +9,10 @@ go_library(
     deps = [
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/enum",
         "//pkg/sql/sqlliveness",
+        "//pkg/sql/sqlliveness/slstorage",
+        "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/retry",
@@ -16,26 +20,32 @@ go_library(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_logtags//:logtags",
     ],
 )
 
 go_test(
     name = "slinstance_test",
     size = "small",
-    srcs = [
-        "helpers_test.go",
-        "slinstance_test.go",
-    ],
-    embed = [":slinstance"],
+    srcs = ["slinstance_test.go"],
+    args = ["-test.timeout=55s"],
     deps = [
+        ":slinstance",
         "//pkg/clusterversion",
         "//pkg/settings/cluster",
+        "//pkg/sql/enum",
         "//pkg/sql/sqlliveness",
         "//pkg/sql/sqlliveness/slstorage",
+        "//pkg/testutils",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/stop",
+        "//pkg/util/timeutil",
+        "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

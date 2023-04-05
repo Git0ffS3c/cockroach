@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -55,7 +56,7 @@ func TestStorePurgeOutdatedReplicas(t *testing.T) {
 		t.Run(fmt.Sprintf("with-initial-version=%t", withInitialVersion), func(t *testing.T) {
 			const numStores = 3
 			ctx := context.Background()
-			migrationVersion := roachpb.Version{Major: 42}
+			migrationVersion := roachpb.Version{Major: 1000042}
 
 			storeKnobs := &kvserver.StoreTestingKnobs{
 				DisableEagerReplicaRemoval: true,
@@ -180,7 +181,7 @@ func TestMigrateWithInflightSnapshot(t *testing.T) {
 	repl, err := store.GetReplica(desc.RangeID)
 	require.NoError(t, err)
 	testutils.SucceedsSoon(t, func() error {
-		trace, processErr, err := store.ManuallyEnqueue(ctx, "raftsnapshot", repl, true /* skipShouldQueue */)
+		trace, processErr, err := store.Enqueue(ctx, "raftsnapshot", repl, true /* skipShouldQueue */, false /* async */)
 		if err != nil {
 			return err
 		}
@@ -240,8 +241,8 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 	blockApplicationCh := make(chan struct{})
 
 	// We're going to be migrating from startV to endV.
-	startV := roachpb.Version{Major: 41}
-	endV := roachpb.Version{Major: 42}
+	startV := roachpb.Version{Major: 1000041}
+	endV := roachpb.Version{Major: 1000042}
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
@@ -254,7 +255,7 @@ func TestMigrateWaitsForApplication(t *testing.T) {
 					DisableAutomaticVersionUpgrade: make(chan struct{}),
 				},
 				Store: &kvserver.StoreTestingKnobs{
-					TestingApplyFilter: func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+					TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 						if args.StoreID == roachpb.StoreID(n3) && args.State != nil && args.State.Version != nil {
 							<-blockApplicationCh
 						}

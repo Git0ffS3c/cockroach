@@ -16,22 +16,26 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMetadata(t *testing.T) {
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	var f norm.Factory
-	f.Init(&evalCtx, nil /* catalog */)
+	f.Init(context.Background(), &evalCtx, nil /* catalog */)
 	md := f.Metadata()
 
 	schID := md.AddSchema(&testcat.Schema{})
@@ -40,11 +44,15 @@ func TestMetadata(t *testing.T) {
 	tabID := md.AddTable(&testcat.Table{}, &tree.TableName{})
 	seqID := md.AddSequence(&testcat.Sequence{})
 	md.AddView(&testcat.View{})
-	md.AddUserDefinedType(types.MakeEnum(152100, 154180))
+	md.AddUserDefinedType(types.MakeEnum(152100, 154180), nil /* name */)
 
 	// Call Init and add objects from catalog, verifying that IDs have been reset.
 	testCat := testcat.New()
-	tab := &testcat.Table{Revoked: true}
+	tabName := tree.MakeTableNameWithSchema("t", "public", "tab")
+	tab := &testcat.Table{
+		TabName: tabName,
+		Revoked: true,
+	}
 	testCat.AddTable(tab)
 
 	// Create a (col = 1) scalar expression.
@@ -85,17 +93,23 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("unexpected views")
 	}
 
-	md.AddUserDefinedType(types.MakeEnum(151500, 152510))
+	md.AddUserDefinedType(types.MakeEnum(151500, 152510), nil /* name */)
 	if len(md.AllUserDefinedTypes()) != 1 {
 		fmt.Println(md)
 		t.Fatalf("unexpected types")
 	}
 
 	md.AddDependency(opt.DepByName(&tab.TabName), tab, privilege.CREATE)
-	depsUpToDate, err := md.CheckDependencies(context.Background(), testCat)
+	depsUpToDate, err := md.CheckDependencies(context.Background(), &evalCtx, testCat)
 	if err == nil || depsUpToDate {
 		t.Fatalf("expected table privilege to be revoked")
 	}
+
+	udfName := tree.MakeQualifiedFunctionName("t", "public", "udf")
+	md.AddUserDefinedFunction(
+		&tree.Overload{Oid: catid.FuncIDToOID(1111)},
+		udfName.ToUnresolvedObjectName(),
+	)
 
 	// Call CopyFrom and verify that same objects are present in new metadata.
 	expr := &memo.ProjectExpr{}
@@ -151,7 +165,38 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("unexpected type")
 	}
 
-	depsUpToDate, err = md.CheckDependencies(context.Background(), testCat)
+	newDSDeps, oldDSDeps := mdNew.TestingDataSourceDeps(), md.TestingDataSourceDeps()
+	for id, dataSource := range oldDSDeps {
+		if newDSDeps[id] != dataSource {
+			t.Fatalf("expected data source dependency to be copied")
+		}
+	}
+
+	newUDFDeps, oldUDFDeps := mdNew.TestingUDFDeps(), md.TestingUDFDeps()
+	for id, overload := range oldUDFDeps {
+		if newUDFDeps[id] != overload {
+			t.Fatalf("expected UDF dependency to be copied")
+		}
+	}
+
+	newNamesByID, oldNamesByID := mdNew.TestingObjectRefsByName(), md.TestingObjectRefsByName()
+	for id, names := range oldNamesByID {
+		newNames := newNamesByID[id]
+		for i, name := range names {
+			if newNames[i] != name {
+				t.Fatalf("expected object name to be copied")
+			}
+		}
+	}
+
+	newPrivileges, oldPrivileges := mdNew.TestingPrivileges(), md.TestingPrivileges()
+	for id, privileges := range oldPrivileges {
+		if newPrivileges[id] != privileges {
+			t.Fatalf("expected privileges to be copied")
+		}
+	}
+
+	depsUpToDate, err = md.CheckDependencies(context.Background(), &evalCtx, testCat)
 	if err == nil || depsUpToDate {
 		t.Fatalf("expected table privilege to be revoked in metadata copy")
 	}
@@ -408,4 +453,66 @@ func TestDuplicateTable(t *testing.T) {
 	if col == b {
 		t.Errorf("expected partial index predicate to reference new column ID %d, got %d", dupB, col)
 	}
+}
+
+// TestTableMeta_GetRegionsInDatabases exercises the multiregion.RegionConfig
+// annotation.
+func TestTableMeta_GetRegionsInDatabase(t *testing.T) {
+	cat := testcat.New()
+	_, err := cat.ExecuteDDL("CREATE TABLE a (b BOOL, b2 BOOL, INDEX (b2) WHERE b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var md opt.Metadata
+	tn := tree.NewUnqualifiedTableName("a")
+	tab := cat.Table(tn)
+	tab.DatabaseID = 1 // must be non-zero to trigger the region lookup
+	a := md.AddTable(tab, tn)
+	tabMeta := md.TableMeta(a)
+	tab.SetMultiRegion(true)
+
+	p := &fakeGetMultiregionConfigPlanner{}
+	// Call the function once, make sure our planner method gets invoked.
+	{
+		_, exists := tabMeta.GetRegionsInDatabase(context.Background(), p)
+		require.False(t, exists)
+		require.Equal(t, 1, p.getMultiregionConfigCalled)
+	}
+	// Call the function again, make sure that our planner method doesn't
+	// get invoked again.
+	{
+		_, exists := tabMeta.GetRegionsInDatabase(context.Background(), p)
+		require.False(t, exists)
+		require.Equal(t, 1, p.getMultiregionConfigCalled)
+	}
+}
+
+type fakeGetMultiregionConfigPlanner struct {
+	eval.Planner
+	getMultiregionConfigCalled int
+}
+
+func (f *fakeGetMultiregionConfigPlanner) GetMultiregionConfig(
+	ctx context.Context, databaseID descpb.ID,
+) (interface{}, bool) {
+	f.getMultiregionConfigCalled++
+	return nil, false
+}
+
+// IsANSIDML is part of the eval.Planner interface.
+func (f *fakeGetMultiregionConfigPlanner) IsANSIDML() bool {
+	return false
+}
+
+// EnforceHomeRegion is part of the eval.Planner interface.
+func (f *fakeGetMultiregionConfigPlanner) EnforceHomeRegion() bool {
+	return false
+}
+
+// GetRangeDescByID is part of the eval.Planner interface.
+func (ep *fakeGetMultiregionConfigPlanner) GetRangeDescByID(
+	context.Context, roachpb.RangeID,
+) (rangeDesc roachpb.RangeDescriptor, err error) {
+	return
 }

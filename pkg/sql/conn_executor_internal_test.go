@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -263,10 +264,10 @@ func startConnExecutor(
 ) (*StmtBuf, <-chan []resWithPos, <-chan error, *stop.Stopper, ieResultReader, error) {
 	// A lot of boilerplate for creating a connExecutor.
 	stopper := stop.NewStopper()
-	clock := hlc.NewClock(hlc.UnixNano, 0 /* maxOffset */)
+	clock := hlc.NewClockForTesting(nil)
 	factory := kv.MakeMockTxnSenderFactory(
-		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+		func(context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			return nil, nil
 		})
 	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
@@ -315,21 +316,22 @@ func startConnExecutor(
 					TempFS:            tempFS,
 					ParentDiskMonitor: execinfra.NewTestDiskMonitor(ctx, st),
 				},
-				flowinfra.NewFlowScheduler(ambientCtx, stopper, st),
+				flowinfra.NewRemoteFlowRunner(ambientCtx, stopper, nil /* acc */),
 			),
 			nil, /* distSender */
 			nil, /* nodeDescs */
 			gw,
 			stopper,
 			func(base.SQLInstanceID) bool { return true }, // everybody is available
-			nil, /* nodeDialer */
+			nil, /* connHealthCheckerSystem */
 			nil, /* podNodeDialer */
 			keys.SystemSQLCodec,
-			nil, /* sqlInstanceProvider */
+			nil, /* sqlAddressResolver */
+			clock,
 		),
 		QueryCache:              querycache.New(0),
 		TestingKnobs:            ExecutorTestingKnobs{},
-		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, nil, gw, st),
+		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, st),
 		HistogramWindowInterval: base.DefaultHistogramWindowInterval(),
 		CollectionFactory:       descs.NewBareBonesCollectionFactory(st, keys.SystemSQLCodec),
 	}
@@ -357,7 +359,7 @@ func startConnExecutor(
 	// routine, we're going to push commands into the StmtBuf and, from time to
 	// time, collect and check their results.
 	go func() {
-		finished <- s.ServeConn(ctx, conn, mon.BoundAccount{}, nil /* cancel */)
+		finished <- s.ServeConn(ctx, conn, &mon.BoundAccount{}, nil /* cancel */)
 	}()
 	return buf, syncResults, finished, stopper, resultChannel, nil
 }
@@ -401,7 +403,7 @@ CREATE TEMPORARY TABLE foo();
 
 	done := make(chan error)
 	go func() {
-		done <- srv.ServeConn(ctx, connHandler, mon.BoundAccount{}, nil /* cancel */)
+		done <- srv.ServeConn(ctx, connHandler, &mon.BoundAccount{}, nil /* cancel */)
 	}()
 	results := <-flushed
 	require.Len(t, results, 6) // We expect results for 5 statements + sync.

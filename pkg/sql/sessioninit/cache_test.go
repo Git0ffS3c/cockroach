@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -62,12 +61,10 @@ func TestCacheInvalidation(t *testing.T) {
 		settings, err := execCfg.SessionInitCache.GetDefaultSettings(
 			ctx,
 			s.ClusterSettings(),
-			s.InternalExecutor().(sqlutil.InternalExecutor),
-			s.DB(),
-			s.CollectionFactory().(*descs.CollectionFactory),
+			s.InternalDB().(descs.DB),
 			username.TestUserName(),
 			"defaultdb",
-			func(ctx context.Context, ie sqlutil.InternalExecutor, userName username.SQLUsername, databaseID descpb.ID) ([]sessioninit.SettingsCacheEntry, error) {
+			func(ctx context.Context, ief descs.DB, userName username.SQLUsername, databaseID descpb.ID) ([]sessioninit.SettingsCacheEntry, error) {
 				didReadFromSystemTable = true
 				return nil, nil
 			})
@@ -75,14 +72,13 @@ func TestCacheInvalidation(t *testing.T) {
 	}
 	getAuthInfoFromCache := func() (sessioninit.AuthInfo, bool, error) {
 		didReadFromSystemTable := false
+		settings := s.ClusterSettings()
 		aInfo, err := execCfg.SessionInitCache.GetAuthInfo(
 			ctx,
-			s.ClusterSettings(),
-			s.InternalExecutor().(sqlutil.InternalExecutor),
-			s.DB(),
-			s.CollectionFactory().(*descs.CollectionFactory),
+			settings,
+			s.InternalDB().(descs.DB),
 			username.TestUserName(),
-			func(ctx context.Context, ie sqlutil.InternalExecutor, userName username.SQLUsername) (sessioninit.AuthInfo, error) {
+			func(ctx context.Context, f descs.DB, userName username.SQLUsername) (sessioninit.AuthInfo, error) {
 				didReadFromSystemTable = true
 				return sessioninit.AuthInfo{}, nil
 			})
@@ -163,7 +159,7 @@ func TestCacheInvalidation(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, didReadFromSystemTable)
 		require.True(t, aInfo.UserExists)
-		require.True(t, aInfo.CanLoginSQL)
+		require.True(t, aInfo.CanLoginSQLRoleOpt)
 
 		// Verify that creating a different user invalidates the cache.
 		_, err = db.ExecContext(ctx, "CREATE USER testuser2")
@@ -202,8 +198,8 @@ func TestCacheSingleFlight(t *testing.T) {
 	ctx := context.Background()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 	settings := s.ExecutorConfig().(sql.ExecutorConfig).Settings
-	ie := s.InternalExecutor().(sqlutil.InternalExecutor)
 	c := s.ExecutorConfig().(sql.ExecutorConfig).SessionInitCache
 
 	testuser := username.MakeSQLUsernameFromPreNormalizedString("test")
@@ -221,16 +217,20 @@ func TestCacheSingleFlight(t *testing.T) {
 
 	go func() {
 		didReadFromSystemTable := false
-		_, err := c.GetAuthInfo(ctx, settings, ie, s.DB(), s.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory, testuser, func(
-			ctx context.Context,
-			ie sqlutil.InternalExecutor,
-			userName username.SQLUsername,
-		) (sessioninit.AuthInfo, error) {
-			wgFirstGetAuthInfoCallInProgress.Done()
-			wgForConcurrentReadWrite.Wait()
-			didReadFromSystemTable = true
-			return sessioninit.AuthInfo{}, nil
-		})
+		_, err := c.GetAuthInfo(
+			ctx, settings,
+			execCfg.InternalDB,
+			testuser, func(
+				ctx context.Context,
+				f descs.DB,
+				userName username.SQLUsername,
+			) (sessioninit.AuthInfo, error) {
+				wgFirstGetAuthInfoCallInProgress.Done()
+				wgForConcurrentReadWrite.Wait()
+				didReadFromSystemTable = true
+				return sessioninit.AuthInfo{}, nil
+			},
+		)
 		require.NoError(t, err)
 		require.True(t, didReadFromSystemTable)
 		wgForTestComplete.Done()
@@ -245,14 +245,20 @@ func TestCacheSingleFlight(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			didReadFromSystemTable := false
-			_, err := c.GetAuthInfo(ctx, settings, ie, s.DB(), s.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory, testuser, func(
-				ctx context.Context,
-				ie sqlutil.InternalExecutor,
-				userName username.SQLUsername,
-			) (sessioninit.AuthInfo, error) {
-				didReadFromSystemTable = true
-				return sessioninit.AuthInfo{}, nil
-			})
+			_, err := c.GetAuthInfo(
+				ctx,
+				settings,
+				execCfg.InternalDB,
+				testuser,
+				func(
+					ctx context.Context,
+					f descs.DB,
+					userName username.SQLUsername,
+				) (sessioninit.AuthInfo, error) {
+					didReadFromSystemTable = true
+					return sessioninit.AuthInfo{}, nil
+				},
+			)
 			require.NoError(t, err)
 			require.False(t, didReadFromSystemTable)
 			wgForTestComplete.Done()
@@ -266,14 +272,20 @@ func TestCacheSingleFlight(t *testing.T) {
 
 	// GetAuthInfo should not be using the cache since it is outdated.
 	didReadFromSystemTable := false
-	_, err = c.GetAuthInfo(ctx, settings, ie, s.DB(), s.ExecutorConfig().(sql.ExecutorConfig).CollectionFactory, testuser, func(
-		ctx context.Context,
-		ie sqlutil.InternalExecutor,
-		userName username.SQLUsername,
-	) (sessioninit.AuthInfo, error) {
-		didReadFromSystemTable = true
-		return sessioninit.AuthInfo{}, nil
-	})
+	_, err = c.GetAuthInfo(
+		ctx,
+		settings,
+		execCfg.InternalDB,
+		testuser,
+		func(
+			ctx context.Context,
+			f descs.DB,
+			userName username.SQLUsername,
+		) (sessioninit.AuthInfo, error) {
+			didReadFromSystemTable = true
+			return sessioninit.AuthInfo{}, nil
+		},
+	)
 
 	require.NoError(t, err)
 	require.True(t, didReadFromSystemTable)

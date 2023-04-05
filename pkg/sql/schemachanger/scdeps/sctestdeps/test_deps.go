@@ -12,7 +12,9 @@ package sctestdeps
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -22,8 +24,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -35,12 +41,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -100,6 +109,18 @@ func (s *TestState) IncrementSchemaChangeDropCounter(counterType string) {
 	s.LogSideEffectf("increment telemetry for sql.schema.drop_%s", counterType)
 }
 
+// IncrementSchemaChangeAddColumnTypeCounter  implements the scbuild.Dependencies
+// interface.
+func (s *TestState) IncrementSchemaChangeAddColumnTypeCounter(typeName string) {
+	s.LogSideEffectf("increment telemetry for sql.schema.new_column_type.%s", typeName)
+}
+
+// IncrementSchemaChangeAddColumnQualificationCounter  implements the scbuild.Dependencies
+// interface.
+func (s *TestState) IncrementSchemaChangeAddColumnQualificationCounter(qualification string) {
+	s.LogSideEffectf("increment telemetry for sql.schema.qualifcation.%s", qualification)
+}
+
 // IncrementUserDefinedSchemaCounter implements the scbuild.Dependencies
 // interface.
 func (s *TestState) IncrementUserDefinedSchemaCounter(
@@ -113,11 +134,21 @@ func (s *TestState) IncrementEnumCounter(counterType sqltelemetry.EnumTelemetryT
 	s.LogSideEffectf("increment telemetry for sql.udts.%s", counterType)
 }
 
+// IncrementDropOwnedByCounter implements the scbuild.Dependencies interface.
+func (s *TestState) IncrementDropOwnedByCounter() {
+	s.LogSideEffectf("increment telemetry for sql.drop_owned_by")
+}
+
+// IncrementSchemaChangeIndexCounter implements the scbuild.Dependencies interface.
+func (s *TestState) IncrementSchemaChangeIndexCounter(counterType string) {
+	s.LogSideEffectf("increment telemetry for sql.schema.%s_index", counterType)
+}
+
 var _ scbuild.AuthorizationAccessor = (*TestState)(nil)
 
 // CheckPrivilege implements the scbuild.AuthorizationAccessor interface.
 func (s *TestState) CheckPrivilege(
-	ctx context.Context, descriptor catalog.Descriptor, privilege privilege.Kind,
+	ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind,
 ) error {
 	return nil
 }
@@ -128,18 +159,44 @@ func (s *TestState) HasAdminRole(ctx context.Context) (bool, error) {
 }
 
 // HasOwnership implements the scbuild.AuthorizationAccessor interface.
-func (s *TestState) HasOwnership(ctx context.Context, descriptor catalog.Descriptor) (bool, error) {
+func (s *TestState) HasOwnership(
+	ctx context.Context, privilegeObject privilege.Object,
+) (bool, error) {
+	return true, nil
+}
+
+// HasPrivilege implements the scbuild.AuthorizationAccessor interface.
+func (s *TestState) HasPrivilege(
+	ctx context.Context,
+	privilegeObject privilege.Object,
+	privilege privilege.Kind,
+	user username.SQLUsername,
+) (bool, error) {
+	return true, nil
+}
+
+// HasAnyPrivilege implements the scbuild.AuthorizationAccessor interface.
+func (s *TestState) HasAnyPrivilege(
+	ctx context.Context, privilegeObject privilege.Object,
+) (bool, error) {
 	return true, nil
 }
 
 // CheckPrivilegeForUser implements the scbuild.AuthorizationAccessor interface.
 func (s *TestState) CheckPrivilegeForUser(
 	ctx context.Context,
-	descriptor catalog.Descriptor,
+	privilegeObject privilege.Object,
 	privilege privilege.Kind,
 	user username.SQLUsername,
 ) error {
 	return nil
+}
+
+// MemberOfWithAdminOption implements the scbuild.AuthorizationAccessor interface.
+func (s *TestState) MemberOfWithAdminOption(
+	ctx context.Context, member username.SQLUsername,
+) (map[username.SQLUsername]bool, error) {
+	return nil, nil
 }
 
 // IndexPartitioningCCLCallback implements the scbuild.Dependencies interface.
@@ -222,6 +279,16 @@ func (s *TestState) MayResolveSchema(
 	return db, sc
 }
 
+func (s *TestState) MustResolvePrefix(
+	ctx context.Context, name tree.ObjectNamePrefix,
+) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor) {
+	db, sc := s.mayResolvePrefix(name)
+	if sc == nil {
+		panic(errors.AssertionFailedf("prefix %s does not exist", name.String()))
+	}
+	return db.(catalog.DatabaseDescriptor), sc.(catalog.SchemaDescriptor)
+}
+
 // MayResolveTable implements the scbuild.CatalogReader interface.
 func (s *TestState) MayResolveTable(
 	ctx context.Context, name tree.UnresolvedObjectName,
@@ -268,30 +335,51 @@ func (s *TestState) MayResolveIndex(
 	idx catalog.Index,
 ) {
 	if tableIndexName.Table.Object() != "" {
-		prefix, tbl := s.MayResolveTable(ctx, *tableIndexName.Table.ToUnresolvedObjectName())
+		prefix, tbl = s.MayResolveTable(ctx, *tableIndexName.Table.ToUnresolvedObjectName())
 		if tbl == nil {
 			return false, catalog.ResolvedObjectPrefix{}, nil, nil
 		}
-		idx, err := tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
-		if err != nil {
-			return false, catalog.ResolvedObjectPrefix{}, nil, nil
+		idx = catalog.FindIndex(
+			tbl,
+			catalog.IndexOpts{AddMutations: true},
+			func(idx catalog.Index) bool {
+				return idx.GetName() == string(tableIndexName.Index)
+			},
+		)
+	} else {
+		db, schema := s.mayResolvePrefix(tableIndexName.Table.ObjectNamePrefix)
+		prefix = catalog.ResolvedObjectPrefix{
+			ExplicitDatabase: true,
+			ExplicitSchema:   true,
+			Database:         db.(catalog.DatabaseDescriptor),
+			Schema:           schema.(catalog.SchemaDescriptor),
 		}
+		var objects nstree.Catalog
+		if db != nil && schema != nil {
+			objects = s.GetAllObjectsInSchema(ctx, prefix.Database, prefix.Schema)
+		}
+		_ = objects.ForEachDescriptor(func(desc catalog.Descriptor) error {
+			var ok bool
+			tbl, ok = desc.(catalog.TableDescriptor)
+			if !ok {
+				return nil
+			}
+			idx = catalog.FindIndex(
+				tbl,
+				catalog.IndexOpts{AddMutations: true},
+				func(idx catalog.Index) bool {
+					return idx.GetName() == string(tableIndexName.Index)
+				},
+			)
+			if idx != nil {
+				return iterutil.StopIteration()
+			}
+			return nil
+		})
+	}
+	if idx != nil {
 		return true, prefix, tbl, idx
 	}
-
-	db, schema := s.mayResolvePrefix(tableIndexName.Table.ObjectNamePrefix)
-	dsNames, _ := s.ReadObjectNamesAndIDs(ctx, db.(catalog.DatabaseDescriptor), schema.(catalog.SchemaDescriptor))
-	for _, dsName := range dsNames {
-		prefix, tbl := s.MayResolveTable(ctx, *dsName.ToUnresolvedObjectName())
-		if tbl == nil {
-			continue
-		}
-		idx, err := tbl.FindNonDropIndexWithName(string(tableIndexName.Index))
-		if err == nil {
-			return true, prefix, tbl, idx
-		}
-	}
-
 	return false, catalog.ResolvedObjectPrefix{}, nil, nil
 }
 
@@ -382,7 +470,7 @@ func (s *TestState) mayGetByName(
 		ParentSchemaID: parentSchemaID,
 		Name:           name,
 	}
-	ne := s.catalog.LookupNamespaceEntry(key)
+	ne := s.uncommittedInMemory.LookupNamespaceEntry(key)
 	if ne == nil {
 		return nil
 	}
@@ -393,36 +481,23 @@ func (s *TestState) mayGetByName(
 	if id == keys.PublicSchemaID {
 		return schemadesc.GetPublicSchema()
 	}
-	b := s.descBuilder(id)
-	if b == nil {
-		return nil
-	}
-	return b.BuildImmutable()
+	desc, _ := s.mustReadImmutableDescriptor(id)
+	return desc
 }
 
-// ReadObjectNamesAndIDs implements the scbuild.CatalogReader interface.
-func (s *TestState) ReadObjectNamesAndIDs(
+// GetAllObjectsInSchema implements the scbuild.CatalogReader interface.
+func (s *TestState) GetAllObjectsInSchema(
 	ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor,
-) (names tree.TableNames, ids descpb.IDs) {
-	m := make(map[string]descpb.ID)
-	_ = s.catalog.ForEachNamespaceEntry(func(e catalog.NameEntry) error {
-		if e.GetParentID() == db.GetID() && e.GetParentSchemaID() == schema.GetID() {
-			m[e.GetName()] = e.GetID()
-			names = append(names, tree.MakeTableNameWithSchema(
-				tree.Name(db.GetName()),
-				tree.Name(schema.GetName()),
-				tree.Name(e.GetName()),
-			))
+) nstree.Catalog {
+	s.LogSideEffectf("getting all objects in schema: %d", schema.GetID())
+	var ret nstree.MutableCatalog
+	_ = s.uncommittedInMemory.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if desc.GetParentSchemaID() == schema.GetID() {
+			ret.UpsertDescriptor(desc)
 		}
 		return nil
 	})
-	sort.Slice(names, func(i, j int) bool {
-		return names[i].Object() < names[j].Object()
-	})
-	for _, name := range names {
-		ids = append(ids, m[name.Object()])
-	}
-	return names, ids
+	return ret.Catalog
 }
 
 // ResolveType implements the scbuild.CatalogReader interface.
@@ -441,20 +516,12 @@ func (s *TestState) ResolveType(
 		return nil, err
 	}
 	tn := tree.MakeQualifiedTypeName(prefix.Database.GetName(), prefix.Schema.GetName(), typ.GetName())
-	return typ.MakeTypesT(ctx, &tn, s)
+	return typedesc.HydratedTFromDesc(ctx, &tn, typ, s)
 }
 
 // ResolveTypeByOID implements the scbuild.CatalogReader interface.
 func (s *TestState) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T, error) {
-	id, err := typedesc.UserDefinedTypeOIDToID(oid)
-	if err != nil {
-		return nil, err
-	}
-	name, typ, err := s.GetTypeDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return typ.MakeTypesT(ctx, &name, s)
+	return typedesc.ResolveHydratedTByOID(ctx, oid, s)
 }
 
 var _ catalog.TypeDescriptorResolver = (*TestState)(nil)
@@ -486,19 +553,45 @@ func (s *TestState) GetQualifiedTableNameByID(
 }
 
 func (s *TestState) getQualifiedObjectNameByID(id descpb.ID) (*tree.TableName, error) {
-	obj, err := s.mustReadImmutableDescriptor(id)
+	prefix, obj, err := s.getQualifiedNameComponentsByID(id)
 	if err != nil {
 		return nil, err
 	}
+	return tree.NewTableNameWithSchema(prefix.CatalogName, prefix.SchemaName, obj), nil
+}
+
+func (s *TestState) GetQualifiedFunctionNameByID(
+	ctx context.Context, id int64,
+) (*tree.FunctionName, error) {
+	prefix, obj, err := s.getQualifiedNameComponentsByID(descpb.ID(id))
+	if err != nil {
+		return nil, err
+	}
+	fn := tree.MakeQualifiedFunctionName(string(prefix.CatalogName), string(prefix.SchemaName), string(obj))
+	return &fn, nil
+}
+
+func (s *TestState) getQualifiedNameComponentsByID(
+	id descpb.ID,
+) (prefix tree.ObjectNamePrefix, objName tree.Name, err error) {
+	obj, err := s.mustReadImmutableDescriptor(id)
+	if err != nil {
+		return tree.ObjectNamePrefix{}, "", err
+	}
 	db, err := s.mustReadImmutableDescriptor(obj.GetParentID())
 	if err != nil {
-		return nil, errors.Wrapf(err, "parent database for object #%d", id)
+		return tree.ObjectNamePrefix{}, "", errors.Wrapf(err, "parent database for object #%d", id)
 	}
 	sc, err := s.mustReadImmutableDescriptor(obj.GetParentSchemaID())
 	if err != nil {
-		return nil, errors.Wrapf(err, "parent schema for object #%d", id)
+		return tree.ObjectNamePrefix{}, "", errors.Wrapf(err, "parent schema for object #%d", id)
 	}
-	return tree.NewTableNameWithSchema(tree.Name(db.GetName()), tree.Name(sc.GetName()), tree.Name(obj.GetName())), nil
+	return tree.ObjectNamePrefix{
+		CatalogName:     tree.Name(db.GetName()),
+		SchemaName:      tree.Name(sc.GetName()),
+		ExplicitCatalog: true,
+		ExplicitSchema:  true,
+	}, tree.Name(obj.GetName()), nil
 }
 
 // CurrentDatabase implements the scbuild.CatalogReader interface.
@@ -506,19 +599,18 @@ func (s *TestState) CurrentDatabase() string {
 	return s.currentDatabase
 }
 
-// MustGetSchemasForDatabase implements the scbuild.CatalogReader interface.
-func (s *TestState) MustGetSchemasForDatabase(
-	ctx context.Context, database catalog.DatabaseDescriptor,
-) map[descpb.ID]string {
-	schemas := make(map[descpb.ID]string)
-	err := database.ForEachNonDroppedSchema(func(id descpb.ID, name string) error {
-		schemas[id] = name
+// GetAllSchemasInDatabase implements the scbuild.CatalogReader interface.
+func (s *TestState) GetAllSchemasInDatabase(
+	_ context.Context, database catalog.DatabaseDescriptor,
+) nstree.Catalog {
+	var ret nstree.MutableCatalog
+	_ = s.uncommittedInMemory.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if desc.GetParentID() == database.GetID() && desc.GetParentSchemaID() == descpb.InvalidID {
+			ret.UpsertDescriptor(desc)
+		}
 		return nil
 	})
-	if err != nil {
-		panic(err)
-	}
-	return schemas
+	return ret.Catalog
 }
 
 // MustReadDescriptor implements the scbuild.CatalogReader interface.
@@ -530,39 +622,28 @@ func (s *TestState) MustReadDescriptor(ctx context.Context, id descpb.ID) catalo
 	return desc
 }
 
-func (s *TestState) mustReadMutableDescriptor(id descpb.ID) (catalog.MutableDescriptor, error) {
-	if s.synthetic.LookupDescriptorEntry(id) != nil {
-		return nil, errors.AssertionFailedf("attempted mutable access of synthetic descriptor %d", id)
+// mustReadImmutableDescriptor looks up a descriptor and returns a immutable
+// deep copy.
+func (s *TestState) mustReadImmutableDescriptor(id descpb.ID) (catalog.Descriptor, error) {
+	mut, err := s.mustReadMutableDescriptor(id)
+	if err != nil {
+		if errors.Is(err, catalog.ErrDescriptorNotFound) {
+			return nil, errors.Wrapf(catalog.ErrDescriptorNotFound, "reading immutable descriptor #%d", id)
+		}
+		return nil, err
 	}
-	b := s.descBuilder(id)
-	if b == nil {
+	return mut.ImmutableCopy(), nil
+}
+
+// mustReadMutableDescriptor looks up a descriptor and returns a mutable
+// deep copy.
+func (s *TestState) mustReadMutableDescriptor(id descpb.ID) (catalog.MutableDescriptor, error) {
+	u := s.uncommittedInMemory.LookupDescriptor(id)
+	if u == nil {
 		return nil, errors.Wrapf(catalog.ErrDescriptorNotFound, "reading mutable descriptor #%d", id)
 	}
-	return b.BuildExistingMutable(), nil
-}
-
-func (s *TestState) mustReadImmutableDescriptor(id descpb.ID) (catalog.Descriptor, error) {
-	b := s.descBuilderWithSynthetic(id)
-	if b == nil {
-		return nil, errors.Wrapf(catalog.ErrDescriptorNotFound, "reading immutable descriptor #%d", id)
-	}
-	return b.BuildImmutable(), nil
-}
-
-// descBuilder is used to ensure that the contents of descs are copied on read.
-func (s *TestState) descBuilder(id descpb.ID) catalog.DescriptorBuilder {
-	if desc := s.catalog.LookupDescriptorEntry(id); desc != nil {
-		return desc.NewBuilder()
-	}
-	return nil
-}
-
-// descBuilder is used to ensure that the contents of descs are copied on read.
-func (s *TestState) descBuilderWithSynthetic(id descpb.ID) catalog.DescriptorBuilder {
-	if desc := s.synthetic.LookupDescriptorEntry(id); desc != nil {
-		return desc.NewBuilder()
-	}
-	return s.descBuilder(id)
+	c := s.committed.LookupDescriptor(id)
+	return descbuilder.BuildMutable(c, u.DescriptorProto(), s.mvccTimestamp())
 }
 
 var _ scexec.Dependencies = (*TestState)(nil)
@@ -597,16 +678,6 @@ func (s *TestState) MustReadImmutableDescriptors(
 		out = append(out, d)
 	}
 	return out, nil
-}
-
-// AddSyntheticDescriptor implements the scmutationexec.CatalogReader interface.
-func (s *TestState) AddSyntheticDescriptor(desc catalog.Descriptor) {
-	s.synthetic.UpsertDescriptorEntry(desc)
-}
-
-// RemoveSyntheticDescriptor implements the scmutationexec.CatalogReader interface.
-func (s *TestState) RemoveSyntheticDescriptor(id descpb.ID) {
-	s.synthetic.DeleteDescriptorEntry(id)
 }
 
 // MustReadMutableDescriptor implements the scexec.Catalog interface.
@@ -664,64 +735,67 @@ func (s *TestState) GetFullyQualifiedName(ctx context.Context, id descpb.ID) (st
 	return tree.NewTableNameWithSchema(tree.Name(dbName), tree.Name(scName), tree.Name(obj.GetName())).FQString(), nil
 }
 
-// NewCatalogChangeBatcher implements the scexec.Catalog interface.
-func (s *TestState) NewCatalogChangeBatcher() scexec.CatalogChangeBatcher {
-	return &testCatalogChangeBatcher{
-		s:             s,
-		namesToDelete: make(map[descpb.NameInfo]descpb.ID),
-	}
-}
-
-type testCatalogChangeBatcher struct {
-	s                   *TestState
-	descs               []catalog.Descriptor
-	namesToDelete       map[descpb.NameInfo]descpb.ID
-	descriptorsToDelete catalog.DescriptorIDSet
-	zoneConfigsToDelete catalog.DescriptorIDSet
-}
-
-var _ scexec.CatalogChangeBatcher = (*testCatalogChangeBatcher)(nil)
-
-// CreateOrUpdateDescriptor implements the scexec.CatalogChangeBatcher interface.
-func (b *testCatalogChangeBatcher) CreateOrUpdateDescriptor(
+// CreateOrUpdateDescriptor implements the scexec.Catalog interface.
+func (s *TestState) CreateOrUpdateDescriptor(
 	ctx context.Context, desc catalog.MutableDescriptor,
 ) error {
-	b.descs = append(b.descs, desc)
+	s.catalogChanges.descs = append(s.catalogChanges.descs, desc)
 	return nil
 }
 
-// DeleteName implements the scexec.CatalogChangeBatcher interface.
-func (b *testCatalogChangeBatcher) DeleteName(
-	ctx context.Context, nameInfo descpb.NameInfo, id descpb.ID,
+// DeleteName implements the scexec.Catalog interface.
+func (s *TestState) DeleteName(ctx context.Context, nameInfo descpb.NameInfo, id descpb.ID) error {
+	if s.catalogChanges.namesToDelete == nil {
+		s.catalogChanges.namesToDelete = make(map[descpb.NameInfo]descpb.ID)
+	}
+	s.catalogChanges.namesToDelete[nameInfo] = id
+	return nil
+}
+
+// DeleteDescriptor implements the scexec.Catalog interface.
+func (s *TestState) DeleteDescriptor(ctx context.Context, id descpb.ID) error {
+	s.catalogChanges.descriptorsToDelete.Add(id)
+	return nil
+}
+
+// DeleteZoneConfig implements the scexec.Catalog interface.
+func (s *TestState) DeleteZoneConfig(ctx context.Context, id descpb.ID) error {
+	s.catalogChanges.zoneConfigsToDelete.Add(id)
+	return nil
+}
+
+// UpdateComment implements the scexec.Catalog interface.
+func (s *TestState) UpdateComment(
+	ctx context.Context, key catalogkeys.CommentKey, cmt string,
 ) error {
-	b.namesToDelete[nameInfo] = id
+	if s.catalogChanges.commentsToUpdate == nil {
+		s.catalogChanges.commentsToUpdate = make(map[catalogkeys.CommentKey]string)
+	}
+	s.catalogChanges.commentsToUpdate[key] = cmt
 	return nil
 }
 
-// DeleteDescriptor implements the scexec.CatalogChangeBatcher interface.
-func (b *testCatalogChangeBatcher) DeleteDescriptor(ctx context.Context, id descpb.ID) error {
-	b.descriptorsToDelete.Add(id)
+// DeleteComment implements the scexec.Catalog interface.
+func (s *TestState) DeleteComment(ctx context.Context, key catalogkeys.CommentKey) error {
+	if s.catalogChanges.commentsToUpdate == nil {
+		s.catalogChanges.commentsToUpdate = make(map[catalogkeys.CommentKey]string)
+	}
+	s.catalogChanges.commentsToUpdate[key] = ""
 	return nil
 }
 
-// DeleteZoneConfig implements the scexec.CatalogChangeBatcher interface.
-func (b *testCatalogChangeBatcher) DeleteZoneConfig(ctx context.Context, id descpb.ID) error {
-	b.zoneConfigsToDelete.Add(id)
-	return nil
-}
-
-// ValidateAndRun implements the scexec.CatalogChangeBatcher interface.
-func (b *testCatalogChangeBatcher) ValidateAndRun(ctx context.Context) error {
-	names := make([]descpb.NameInfo, 0, len(b.namesToDelete))
-	for nameInfo := range b.namesToDelete {
+// Validate implements the scexec.Catalog interface.
+func (s *TestState) Validate(ctx context.Context) error {
+	names := make([]descpb.NameInfo, 0, len(s.catalogChanges.namesToDelete))
+	for nameInfo := range s.catalogChanges.namesToDelete {
 		names = append(names, nameInfo)
 	}
 	sort.Slice(names, func(i, j int) bool {
-		return b.namesToDelete[names[i]] < b.namesToDelete[names[j]]
+		return s.catalogChanges.namesToDelete[names[i]] < s.catalogChanges.namesToDelete[names[j]]
 	})
 	for _, nameInfo := range names {
-		expectedID := b.namesToDelete[nameInfo]
-		ne := b.s.catalog.LookupNamespaceEntry(nameInfo)
+		expectedID := s.catalogChanges.namesToDelete[nameInfo]
+		ne := s.uncommittedInMemory.LookupNamespaceEntry(nameInfo)
 		if ne == nil {
 			return errors.AssertionFailedf(
 				"cannot delete missing namespace entry %v", nameInfo)
@@ -739,30 +813,75 @@ func (b *testCatalogChangeBatcher) ValidateAndRun(ctx context.Context) error {
 				nameType = "schema"
 			}
 		}
-		b.s.LogSideEffectf("delete %s namespace entry %v -> %d", nameType, nameInfo, expectedID)
-		b.s.catalog.DeleteNamespaceEntry(nameInfo)
+		s.LogSideEffectf("delete %s namespace entry %v -> %d", nameType, nameInfo, expectedID)
+		s.uncommittedInMemory.DeleteByName(nameInfo)
 	}
-	for _, desc := range b.descs {
-		var old protoutil.Message
-		if b := b.s.descBuilder(desc.GetID()); b != nil {
-			old = b.BuildImmutable().DescriptorProto()
+	for _, desc := range s.catalogChanges.descs {
+		mut := desc.NewBuilder().BuildCreatedMutable()
+		mut.ResetModificationTime()
+		desc = mut.ImmutableCopy()
+		s.LogSideEffectf("upsert descriptor #%d\n%s", desc.GetID(), s.descriptorDiff(desc))
+		s.uncommittedInMemory.UpsertDescriptor(desc)
+	}
+	for _, deletedID := range s.catalogChanges.descriptorsToDelete.Ordered() {
+		s.LogSideEffectf("delete descriptor #%d", deletedID)
+		s.uncommittedInMemory.DeleteByID(deletedID)
+	}
+	for _, deletedID := range s.catalogChanges.zoneConfigsToDelete.Ordered() {
+		s.LogSideEffectf("deleting zone config for #%d", deletedID)
+		s.uncommittedInMemory.DeleteZoneConfig(deletedID)
+	}
+	commentKeys := make([]catalogkeys.CommentKey, 0, len(s.catalogChanges.commentsToUpdate))
+	for key := range s.catalogChanges.commentsToUpdate {
+		commentKeys = append(commentKeys, key)
+	}
+	sort.Slice(commentKeys, func(i, j int) bool {
+		if d := int(commentKeys[i].CommentType) - int(commentKeys[j].CommentType); d != 0 {
+			return d < 0
 		}
-		diff := sctestutils.ProtoDiff(old, desc.DescriptorProto(), sctestutils.DiffArgs{
-			Indent:       "  ",
-			CompactLevel: 3,
-		})
-		b.s.LogSideEffectf("upsert descriptor #%d\n%s", desc.GetID(), diff)
-		b.s.catalog.UpsertDescriptorEntry(desc)
+		if d := int(commentKeys[i].ObjectID) - int(commentKeys[j].ObjectID); d != 0 {
+			return d < 0
+		}
+		return int(commentKeys[i].SubID)-int(commentKeys[j].SubID) < 0
+	})
+	for _, key := range commentKeys {
+		if cmt := s.catalogChanges.commentsToUpdate[key]; cmt == "" {
+			s.LogSideEffectf("delete comment %s(objID: %d, subID: %d)",
+				key.CommentType, key.ObjectID, key.SubID)
+			s.uncommittedInMemory.DeleteComment(key)
+		} else {
+			s.LogSideEffectf("upsert comment %s(objID: %d, subID: %d) -> %q",
+				key.CommentType, key.ObjectID, key.SubID, cmt)
+			if err := s.uncommittedInMemory.UpsertComment(key, cmt); err != nil {
+				return err
+			}
+		}
 	}
-	for _, deletedID := range b.descriptorsToDelete.Ordered() {
-		b.s.LogSideEffectf("delete descriptor #%d", deletedID)
-		b.s.catalog.DeleteDescriptorEntry(deletedID)
-	}
-	for _, deletedID := range b.zoneConfigsToDelete.Ordered() {
-		b.s.LogSideEffectf("deleting zone config for #%d", deletedID)
-	}
-	ve := b.s.catalog.Validate(ctx, clusterversion.TestingClusterVersion, catalog.NoValidationTelemetry, catalog.ValidationLevelAllPreTxnCommit, b.descs...)
+	ve := s.uncommittedInMemory.Validate(
+		ctx,
+		clusterversion.TestingClusterVersion,
+		catalog.NoValidationTelemetry,
+		catalog.ValidationLevelAllPreTxnCommit,
+		s.catalogChanges.descs...,
+	)
+	s.catalogChanges = catalogChanges{}
 	return ve.CombinedError()
+}
+
+// Run implements the scexec.Catalog interface.
+func (s *TestState) Run(ctx context.Context) error {
+	s.LogSideEffectf("persist all catalog changes to storage")
+	s.uncommittedInStorage = catalogDeepCopy(s.uncommittedInMemory.Catalog)
+	s.catalogChanges = catalogChanges{}
+	return nil
+}
+
+// Reset implements the scexec.Catalog interface.
+func (s *TestState) Reset(ctx context.Context) error {
+	s.LogSideEffectf("undo all catalog changes within txn #%d", s.txnCounter)
+	s.uncommittedInMemory = catalogDeepCopy(s.committed.Catalog)
+	s.catalogChanges = catalogChanges{}
+	return nil
 }
 
 // IndexSpanSplitter implements the scexec.Dependencies interface.
@@ -773,6 +892,11 @@ func (s *TestState) IndexSpanSplitter() scexec.IndexSpanSplitter {
 // IndexBackfiller implements the scexec.Dependencies interface.
 func (s *TestState) IndexBackfiller() scexec.Backfiller {
 	return s.backfiller
+}
+
+// IndexMerger implements the scexec.Dependencies interface.
+func (s *TestState) IndexMerger() scexec.Merger {
+	return s.merger
 }
 
 // PeriodicProgressFlusher implements the scexec.Dependencies interface.
@@ -814,6 +938,11 @@ func (s *TestState) CheckPausepoint(name string) error {
 	return nil
 }
 
+// UseLegacyGCJob is false.
+func (s *TestState) UseLegacyGCJob(ctx context.Context) bool {
+	return false
+}
+
 // UpdateSchemaChangeJob implements the scexec.TransactionalJobRegistry interface.
 func (s *TestState) UpdateSchemaChangeJob(
 	ctx context.Context, id jobspb.JobID, fn scexec.JobUpdateCallback,
@@ -827,14 +956,14 @@ func (s *TestState) UpdateSchemaChangeJob(
 	if scJob == nil {
 		return errors.AssertionFailedf("schema change job not found")
 	}
-	progress := jobspb.Progress{
+	oldProgress := jobspb.Progress{
 		Progress:       nil,
 		ModifiedMicros: 0,
 		RunningStatus:  "",
 		Details:        jobspb.WrapProgressDetails(scJob.Progress),
 		TraceID:        0,
 	}
-	payload := jobspb.Payload{
+	oldPayload := jobspb.Payload{
 		Description:                  scJob.Description,
 		Statement:                    scJob.Statements,
 		UsernameProto:                scJob.Username.EncodeProto(),
@@ -850,22 +979,28 @@ func (s *TestState) UpdateSchemaChangeJob(
 		PauseReason:                  "",
 		RetriableExecutionFailureLog: nil,
 	}
-	updateProgress := func(progress *jobspb.Progress) {
-		scJob.Progress = *progress.GetNewSchemaChange()
-		s.LogSideEffectf("update progress of schema change job #%d: %q", scJob.JobID, progress.RunningStatus)
-	}
-	setNonCancelable := func() {
-		scJob.NonCancelable = true
-		s.LogSideEffectf("set schema change job #%d to non-cancellable", scJob.JobID)
-	}
-	md := jobs.JobMetadata{
+	oldJobMetadata := jobs.JobMetadata{
 		ID:       scJob.JobID,
 		Status:   jobs.StatusRunning,
-		Payload:  &payload,
-		Progress: &progress,
+		Payload:  &oldPayload,
+		Progress: &oldProgress,
 		RunStats: nil,
 	}
-	return fn(md, updateProgress, setNonCancelable)
+	updateProgress := func(newProgress *jobspb.Progress) {
+		scJob.Progress = *newProgress.GetNewSchemaChange()
+		s.LogSideEffectf("update progress of schema change job #%d: %q", scJob.JobID, newProgress.RunningStatus)
+	}
+	updatePayload := func(newPayload *jobspb.Payload) {
+		if newPayload.Noncancelable {
+			scJob.NonCancelable = true
+			s.LogSideEffectf("set schema change job #%d to non-cancellable", scJob.JobID)
+		}
+		newIDs := fmt.Sprintf("%v", newPayload.DescriptorIDs)
+		if oldIDs := fmt.Sprintf("%v", oldPayload.DescriptorIDs); oldIDs != newIDs {
+			s.LogSideEffectf("updated schema change job #%d descriptor IDs to %s", scJob.JobID, newIDs)
+		}
+	}
+	return fn(oldJobMetadata, updateProgress, updatePayload)
 }
 
 // MakeJobID implements the scexec.TransactionalJobRegistry interface.
@@ -884,8 +1019,16 @@ func (s *TestState) SchemaChangerJobID() jobspb.JobID {
 	return 1
 }
 
+// CurrentJob implements the scexec.TransactionalJobRegistry
+// interface.
+func (s *TestState) CurrentJob() *jobs.Job {
+	// Not implemented and only used for validation, which will never
+	// use this object.
+	return nil
+}
+
 // TestingKnobs exposes the testing knobs.
-func (s *TestState) TestingKnobs() *scrun.TestingKnobs {
+func (s *TestState) TestingKnobs() *scexec.TestingKnobs {
 	return s.testingKnobs
 }
 
@@ -903,13 +1046,14 @@ var _ scrun.JobRunDependencies = (*TestState)(nil)
 
 // WithTxnInJob implements the scrun.JobRunDependencies interface.
 func (s *TestState) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc) (err error) {
-	s.WithTxn(func(s *TestState) { err = fn(ctx, s) })
+	s.WithTxn(func(s *TestState) { err = fn(ctx, s, s) })
 	return err
 }
 
-// ValidateForwardIndexes implements the index validator interface.
+// ValidateForwardIndexes implements the validator interface.
 func (s *TestState) ValidateForwardIndexes(
 	_ context.Context,
+	_ *jobs.Job,
 	tbl catalog.TableDescriptor,
 	indexes []catalog.Index,
 	_ sessiondata.InternalExecutorOverride,
@@ -922,9 +1066,10 @@ func (s *TestState) ValidateForwardIndexes(
 	return nil
 }
 
-// ValidateInvertedIndexes implements the index validator interface.
+// ValidateInvertedIndexes implements the validator interface.
 func (s *TestState) ValidateInvertedIndexes(
 	_ context.Context,
+	_ *jobs.Job,
 	tbl catalog.TableDescriptor,
 	indexes []catalog.Index,
 	_ sessiondata.InternalExecutorOverride,
@@ -937,68 +1082,82 @@ func (s *TestState) ValidateInvertedIndexes(
 	return nil
 }
 
-// IndexValidator implements the scexec.Dependencies interface.
-func (s *TestState) IndexValidator() scexec.IndexValidator {
+// Validator implements the scexec.Dependencies interface.
+func (s *TestState) Validator() scexec.Validator {
 	return s
 }
 
-// LogEvent implements scexec.EventLogger.
+// ValidateConstraint implements the validator interface.
+func (s *TestState) ValidateConstraint(
+	ctx context.Context,
+	tbl catalog.TableDescriptor,
+	constraint catalog.Constraint,
+	indexIDForValidation descpb.IndexID,
+	override sessiondata.InternalExecutorOverride,
+) error {
+	s.LogSideEffectf("validate %v constraint %v in table #%d",
+		catalog.GetConstraintType(constraint), constraint.GetName(), tbl.GetID())
+	return nil
+}
+
+func (s *TestState) ValidateForeignKeyConstraint(
+	ctx context.Context,
+	out catalog.TableDescriptor,
+	in catalog.TableDescriptor,
+	constraint catalog.Constraint,
+	override sessiondata.InternalExecutorOverride,
+) error {
+	s.LogSideEffectf("validate foreign key constraint %v from table #%d to table #%d",
+		constraint.GetName(), out.GetID(), in.GetID())
+	return nil
+}
+
+// EventLogger implements scbuild.Dependencies.
+func (s *TestState) EventLogger() scbuild.EventLogger {
+	return s
+}
+
+var _ scbuild.EventLogger = (*TestState)(nil)
+
+// LogEvent implements scbuild.EventLogger.
 func (s *TestState) LogEvent(
-	_ context.Context,
-	descID descpb.ID,
-	details eventpb.CommonSQLEventDetails,
-	event eventpb.EventPayload,
+	_ context.Context, details eventpb.CommonSQLEventDetails, event logpb.EventPayload,
 ) error {
-	s.LogSideEffectf("write %T to event log for descriptor #%d: %s",
-		event, descID, details.Statement)
-	return nil
+	sqlCommon, ok := event.(eventpb.EventWithCommonSQLPayload)
+	if !ok {
+		return errors.AssertionFailedf("invalid event type, missing SQL payload: %T", event)
+	}
+	*sqlCommon.CommonSQLDetails() = details
+	return s.logEvent(event)
 }
 
-// EventLogger implements scexec.Dependencies.
-func (s *TestState) EventLogger() scexec.EventLogger {
-	return s
+// LogEventForSchemaChange implements scrun.EventLogger
+func (s *TestState) LogEventForSchemaChange(_ context.Context, event logpb.EventPayload) error {
+	_, ok := event.(eventpb.EventWithCommonSchemaChangePayload)
+	if !ok {
+		return errors.AssertionFailedf("invalid event type, missing schema change payload: %T", event)
+	}
+	return s.logEvent(event)
 }
 
-// UpsertDescriptorComment implements scexec.DescriptorMetadataUpdater.
-func (s *TestState) UpsertDescriptorComment(
-	id int64, subID int64, commentType keys.CommentType, comment string,
-) error {
-	s.LogSideEffectf("upsert %s comment for descriptor #%d of type %s",
-		comment, id, commentType)
-	return nil
-}
-
-// DeleteAllCommentsForTables implements scexec.DescriptorMetadataUpdater.
-func (s *TestState) DeleteAllCommentsForTables(ids catalog.DescriptorIDSet) error {
-	s.LogSideEffectf("delete all comments for table descriptors %v", ids.Ordered())
-	return nil
-}
-
-// DeleteDescriptorComment implements scexec.DescriptorMetadataUpdater.
-func (s *TestState) DeleteDescriptorComment(
-	id int64, subID int64, commentType keys.CommentType,
-) error {
-	s.LogSideEffectf("delete comment for descriptor #%d of type %s",
-		id, commentType)
-	return nil
-}
-
-//UpsertConstraintComment implements scexec.DescriptorMetadataUpdater.
-func (s *TestState) UpsertConstraintComment(
-	tableID descpb.ID, constraintID descpb.ConstraintID, comment string,
-) error {
-	s.LogSideEffectf("upsert comment %s for constraint on #%d, constraint id: %d"+
-		comment, tableID, constraintID)
-	return nil
-}
-
-//DeleteConstraintComment implements scexec.DescriptorMetadataUpdater.
-func (s *TestState) DeleteConstraintComment(
-	tableID descpb.ID, constraintID descpb.ConstraintID,
-) error {
-	s.LogSideEffectf("delete comment for constraint on #%d, constraint id: %d",
-		tableID, constraintID)
-	return nil
+func (s *TestState) logEvent(event logpb.EventPayload) error {
+	pb, ok := event.(protoutil.Message)
+	if !ok {
+		return errors.AssertionFailedf("invalid type, not a protobuf message: %T", event)
+	}
+	const emitDefaults = false
+	yaml, err := sctestutils.ProtoToYAML(pb, emitDefaults, func(in interface{}) {
+		// Remove common details from text output, they're never decorated.
+		if inM, ok := in.(map[string]interface{}); ok {
+			delete(inM, "common")
+		}
+	})
+	if err != nil {
+		return err
+	}
+	indented := strings.TrimSpace(strings.ReplaceAll(yaml, "\n", "\n  "))
+	s.LogSideEffectf("write %T to event log:\n  %s", event, indented)
+	return err
 }
 
 // DeleteDatabaseRoleSettings implements scexec.DescriptorMetadataUpdater.
@@ -1007,22 +1166,9 @@ func (s *TestState) DeleteDatabaseRoleSettings(_ context.Context, dbID descpb.ID
 	return nil
 }
 
-// SwapDescriptorSubComment implements scexec.DescriptorMetadataUpdater.
-func (s *TestState) SwapDescriptorSubComment(
-	id int64, oldSubID int64, newSubID int64, commentType keys.CommentType,
-) error {
-	s.LogSideEffectf("swapping sub comments on descriptor %d from "+
-		"%d to %d of type %s",
-		id,
-		oldSubID,
-		newSubID,
-		commentType)
-	return nil
-}
-
 // DeleteSchedule implements scexec.DescriptorMetadataUpdater
 func (s *TestState) DeleteSchedule(ctx context.Context, id int64) error {
-	s.LogSideEffectf("delete scheduleId: %d", id)
+	s.LogSideEffectf("delete job schedule #%d", id)
 	return nil
 }
 
@@ -1031,4 +1177,161 @@ func (s *TestState) DescriptorMetadataUpdater(
 	ctx context.Context,
 ) scexec.DescriptorMetadataUpdater {
 	return s
+}
+
+// IsTableEmpty implement scbuild.TableReader.
+func (s *TestState) IsTableEmpty(
+	ctx context.Context, id descpb.ID, primaryIndexID descpb.IndexID,
+) bool {
+	return true
+}
+
+// TableReader implement scexec.Dependencies.
+func (s *TestState) TableReader() scbuild.TableReader {
+	return s
+}
+
+// StatsRefresher implement scexec.Dependencies.
+func (s *TestState) StatsRefresher() scexec.StatsRefreshQueue {
+	return s
+}
+
+// Telemetry implement scexec.Dependencies.
+func (s *TestState) Telemetry() scexec.Telemetry {
+	return s
+}
+
+// IncrementSchemaChangeErrorType implements scexec.Telemetry
+func (s *TestState) IncrementSchemaChangeErrorType(typ string) {
+	s.LogSideEffectf("incrementing schema change error type metric %s", typ)
+}
+
+// GetTestingKnobs implement scexec.Dependencies.
+func (s *TestState) GetTestingKnobs() *scexec.TestingKnobs {
+	return &scexec.TestingKnobs{}
+}
+
+// AddTableForStatsRefresh implements scexec.StatsRefreshQueue
+func (s *TestState) AddTableForStatsRefresh(id descpb.ID) {
+	s.LogSideEffectf("adding table for stats refresh: %d", id)
+}
+
+// ResolveFunction implements the scbuild.CatalogReader interface.
+func (s *TestState) ResolveFunction(
+	ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
+) (*tree.ResolvedFunctionDefinition, error) {
+	fnName, err := name.ToFunctionName()
+	if err != nil {
+		return nil, err
+	}
+	fd, err := tree.GetBuiltinFuncDefinition(fnName, path)
+	if err != nil {
+		return nil, err
+	}
+	if fd != nil {
+		return fd, nil
+	}
+
+	_, sc := s.mayResolvePrefix(fnName.ObjectNamePrefix)
+	scDesc, err := catalog.AsSchemaDescriptor(sc)
+	if err != nil {
+		return nil, err
+	}
+	fd, found := scDesc.GetResolvedFuncDefinition(fnName.Object())
+	if !found {
+		return nil, tree.ErrFunctionUndefined
+	}
+	return fd, nil
+}
+
+// ResolveFunctionByOID implements the scbuild.CatalogReader interface.
+func (s *TestState) ResolveFunctionByOID(
+	ctx context.Context, oid oid.Oid,
+) (*tree.FunctionName, *tree.Overload, error) {
+	if !funcdesc.IsOIDUserDefinedFunc(oid) {
+		qol, ok := tree.OidToQualifiedBuiltinOverload[oid]
+		if !ok {
+			return nil, nil, errors.Newf("function %d not found", oid)
+		}
+		name := tree.MakeQualifiedFunctionName(s.CurrentDatabase(), qol.Schema, tree.OidToBuiltinName[oid])
+		return &name, qol.Overload, nil
+	}
+
+	fnID := funcdesc.UserDefinedFunctionOIDToID(oid)
+	desc, err := s.mustReadImmutableDescriptor(fnID)
+	if err != nil {
+		return nil, nil, err
+	}
+	fnDesc, err := catalog.AsFunctionDescriptor(desc)
+	if err != nil {
+		return nil, nil, err
+	}
+	dbDesc, err := s.mustReadImmutableDescriptor(fnDesc.GetParentID())
+	if err != nil {
+		return nil, nil, err
+	}
+	scDesc, err := s.mustReadImmutableDescriptor(fnDesc.GetParentSchemaID())
+	if err != nil {
+		return nil, nil, err
+	}
+	ol, err := fnDesc.ToOverload()
+	if err != nil {
+		return nil, nil, err
+	}
+	name := tree.MakeQualifiedFunctionName(dbDesc.GetName(), scDesc.GetName(), fnDesc.GetName())
+	return &name, ol, nil
+}
+
+// ZoneConfigGetter implements scexec.Dependencies.
+func (s *TestState) ZoneConfigGetter() scbuild.ZoneConfigGetter {
+	return s
+}
+
+// GetZoneConfig implements scexec.Dependencies.
+func (s *TestState) GetZoneConfig(ctx context.Context, id descpb.ID) (catalog.ZoneConfig, error) {
+	return s.uncommittedInMemory.LookupZoneConfig(id), nil
+}
+
+func (s *TestState) get(
+	objID catid.DescID, subID uint32, commentType catalogkeys.CommentType,
+) (comment string, ok bool) {
+	commentKey := catalogkeys.MakeCommentKey(uint32(objID), subID, commentType)
+	comment, ok = s.uncommittedInMemory.LookupComment(commentKey)
+	return comment, ok
+}
+
+// GetDatabaseComment implements the scdecomp.CommentGetter interface.
+func (s *TestState) GetDatabaseComment(dbID catid.DescID) (comment string, ok bool) {
+	return s.get(dbID, 0, catalogkeys.DatabaseCommentType)
+}
+
+// GetSchemaComment implements the scdecomp.CommentGetter interface.
+func (s *TestState) GetSchemaComment(schemaID catid.DescID) (comment string, ok bool) {
+	return s.get(schemaID, 0, catalogkeys.SchemaCommentType)
+}
+
+// GetTableComment implements the scdecomp.CommentGetter interface.
+func (s *TestState) GetTableComment(tableID catid.DescID) (comment string, ok bool) {
+	return s.get(tableID, 0, catalogkeys.TableCommentType)
+}
+
+// GetColumnComment implements the scdecomp.CommentGetter interface.
+func (s *TestState) GetColumnComment(
+	tableID catid.DescID, pgAttrNum catid.PGAttributeNum,
+) (comment string, ok bool) {
+	return s.get(tableID, uint32(pgAttrNum), catalogkeys.ColumnCommentType)
+}
+
+// GetIndexComment implements the scdecomp.CommentGetter interface.
+func (s *TestState) GetIndexComment(
+	tableID catid.DescID, indexID catid.IndexID,
+) (comment string, ok bool) {
+	return s.get(tableID, uint32(indexID), catalogkeys.IndexCommentType)
+}
+
+// GetConstraintComment implements the scdecomp.CommentGetter interface.
+func (s *TestState) GetConstraintComment(
+	tableID catid.DescID, constraintID catid.ConstraintID,
+) (comment string, ok bool) {
+	return s.get(tableID, uint32(constraintID), catalogkeys.ConstraintCommentType)
 }

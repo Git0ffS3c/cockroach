@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -15,12 +16,13 @@ go_library(
         "//pkg/base",
         "//pkg/ccl/multitenantccl/tenantcostserver/tenanttokenbucket",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/multitenant",
         "//pkg/roachpb",
         "//pkg/server",
         "//pkg/settings",
         "//pkg/settings/cluster",
-        "//pkg/sql",
+        "//pkg/sql/isql",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sem/tree",
@@ -42,23 +44,27 @@ go_test(
         "main_test.go",
         "server_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":tenantcostserver"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/multitenant",
         "//pkg/roachpb",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
-        "//pkg/sql",
+        "//pkg/sql/isql",
         "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/metrictestutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
-        "//pkg/util",
+        "//pkg/util/intsets",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/metric",
@@ -69,3 +75,5 @@ go_test(
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
+
+get_x_data(name = "get_x_data")

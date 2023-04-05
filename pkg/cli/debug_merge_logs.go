@@ -40,7 +40,12 @@ type logStream interface {
 // writeLogStream pops messages off of s and writes them to out prepending
 // prefix per message and filtering messages which match filter.
 func writeLogStream(
-	s logStream, out io.Writer, filter *regexp.Regexp, keepRedactable bool, cp ttycolor.Profile,
+	s logStream,
+	out io.Writer,
+	filter *regexp.Regexp,
+	keepRedactable bool,
+	cp ttycolor.Profile,
+	tenantIDsFilter []string,
 ) error {
 	const chanSize = 1 << 16        // 64k
 	const maxWriteBufSize = 1 << 18 // 256kB
@@ -48,6 +53,10 @@ func writeLogStream(
 	type entryInfo struct {
 		logpb.Entry
 		*fileInfo
+	}
+	tenantIDFilterSet := make(map[string]struct{}, len(tenantIDsFilter))
+	for _, tID := range tenantIDsFilter {
+		tenantIDFilterSet[tID] = struct{}{}
 	}
 	render := func(ei entryInfo, w io.Writer) (err error) {
 		// TODO(postamar): add support for other output formats
@@ -95,6 +104,11 @@ func writeLogStream(
 				if !open {
 					entryChan = nil
 					break
+				}
+				if len(tenantIDsFilter) != 0 {
+					if _, ok := tenantIDFilterSet[ei.TenantID]; !ok {
+						break
+					}
 				}
 				startLen := pending.Len()
 				if err := render(ei, pending); err != nil {
@@ -171,8 +185,9 @@ func newMergedStreamFromPatterns(
 	if err != nil {
 		return nil, err
 	}
-	files, err := findLogFiles(paths, filePattern, programFilter,
-		groupIndex(filePattern, "program"), to)
+	files, err := findLogFiles(
+		paths, filePattern, programFilter, groupIndex(filePattern, "program"),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -332,12 +347,11 @@ type fileInfo struct {
 }
 
 func findLogFiles(
-	paths []string, filePattern, programFilter *regexp.Regexp, programGroup int, to time.Time,
+	paths []string, filePattern, programFilter *regexp.Regexp, programGroup int,
 ) ([]fileInfo, error) {
 	if programGroup == 0 || programFilter == nil {
 		programGroup = 0
 	}
-	to = to.Truncate(time.Second) // log files only have second resolution
 	var files []fileInfo
 	for _, p := range paths {
 		// NB: come go1.16, we should use WalkDir here as it is more efficient.
@@ -365,7 +379,6 @@ func findLogFiles(
 		}); err != nil {
 			return nil, err
 		}
-
 	}
 	return files, nil
 }

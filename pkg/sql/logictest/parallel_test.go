@@ -22,8 +22,8 @@ import (
 	gosql "database/sql"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	logictest "github.com/cockroachdb/cockroach/pkg/sql/logictest/logictestbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -81,7 +82,7 @@ func (t *parallelTest) processTestFile(path string, nodeIdx int, db *gosql.DB, c
 		verbose: testing.Verbose() || log.V(1),
 		rng:     rng,
 	}
-	if err := l.processTestFile(path, testClusterConfig{}); err != nil {
+	if err := l.processTestFile(path, logictest.TestClusterConfig{}); err != nil {
 		log.Errorf(context.Background(), "error processing %s: %s", path, err)
 		t.Error(err)
 	}
@@ -130,7 +131,7 @@ type parTestSpec struct {
 func (t *parallelTest) run(dir string) {
 	// Process the spec file.
 	mainFile := filepath.Join(dir, "test.yaml")
-	yamlData, err := ioutil.ReadFile(mainFile)
+	yamlData, err := os.ReadFile(mainFile)
 	if err != nil {
 		t.Fatalf("%s: %s", mainFile, err)
 	}
@@ -216,6 +217,11 @@ func (t *parallelTest) setup(ctx context.Context, spec *parTestSpec) {
 		objID := keys.RootNamespaceID
 		r0.Exec(t, `UPDATE system.zones SET config = $2 WHERE id = $1`, objID, buf)
 	}
+
+	// Disable the circuit breakers on this cluster because they can lead to
+	// rare test flakes since the machine is likely to be overloaded when
+	// running TestParallel.
+	r0.Exec(t, `SET CLUSTER SETTING kv.replica_circuit_breaker.slow_replication_threshold = '0s'`)
 
 	if testing.Verbose() || log.V(1) {
 		log.Infof(t.ctx, "Creating database")

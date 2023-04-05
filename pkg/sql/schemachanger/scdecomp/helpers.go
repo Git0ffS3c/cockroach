@@ -11,9 +11,11 @@
 package scdecomp
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -25,20 +27,20 @@ import (
 )
 
 // descriptorStatus tries to map a descriptor to an element status for its
-// top-level element on a best-effort basis. This is necessary incomplete as
-// we can't distinguish between TXN_DROPPED and DROPPED for dropped descriptors.
-//
-// TODO(postamar): handle offline descriptors?
+// top-level element on a best-effort basis.
 func descriptorStatus(desc catalog.Descriptor) scpb.Status {
 	if desc.Dropped() {
 		return scpb.Status_DROPPED
+	}
+	if desc.Offline() {
+		return scpb.Status_OFFLINE
 	}
 	return scpb.Status_PUBLIC
 }
 
 // maybeMutationStatus tries to map a table mutation to an element status
 // on a best-effort basis. This is necessary incomplete, for instance we can't
-// distinguish between DELETE_AND_WRITE_ONLY, BACKFILLED and VALIDATED for
+// distinguish between WRITE_ONLY, BACKFILLED and VALIDATED for
 // write-only indexes.
 //
 // TODO(postamar): handle constraint mutation statuses
@@ -86,46 +88,51 @@ func (w *walkCtx) newExpression(expr string) (*scpb.Expression, error) {
 			if !types.IsOIDUserDefinedType(oid) {
 				continue
 			}
-			id, err := typedesc.UserDefinedTypeOIDToID(oid)
-			if err != nil {
-				// This should never happen.
-				return nil, err
-			}
+			id := typedesc.UserDefinedTypeOIDToID(oid)
 			if _, found := w.cachedTypeIDClosures[id]; !found {
 				desc := w.lookupFn(id)
 				typ, err := catalog.AsTypeDescriptor(desc)
 				if err != nil {
 					return nil, err
 				}
-				w.cachedTypeIDClosures[id], err = typ.GetIDClosure()
-				if err != nil {
-					return nil, err
-				}
+				w.cachedTypeIDClosures[id] = typ.GetIDClosure()
 			}
-			for id = range w.cachedTypeIDClosures[id] {
-				typIDs.Add(id)
-			}
+			w.cachedTypeIDClosures[id].ForEach(typIDs.Add)
 		}
 	}
-	return &scpb.Expression{
-		Expr:            catpb.Expression(expr),
-		UsesTypeIDs:     typIDs.Ordered(),
-		UsesSequenceIDs: seqIDs.Ordered(),
-	}, nil
-}
 
-func newTypeT(t *types.T) (*scpb.TypeT, error) {
-	ids, err := typedesc.GetTypeDescriptorClosure(t)
+	referencedColumns, err := schemaexpr.ExtractColumnIDs(
+		w.desc.(catalog.TableDescriptor), e,
+	)
 	if err != nil {
 		return nil, err
 	}
-	var ret catalog.DescriptorIDSet
-	for id := range ids {
-		ret.Add(id)
+	referencedFnIDs, err := schemaexpr.GetUDFIDs(e)
+	if err != nil {
+		return nil, err
 	}
-	ret.Remove(descpb.InvalidID)
+	return &scpb.Expression{
+		Expr:                catpb.Expression(expr),
+		UsesTypeIDs:         typIDs.Ordered(),
+		UsesSequenceIDs:     seqIDs.Ordered(),
+		UsesFunctionIDs:     referencedFnIDs.Ordered(),
+		ReferencedColumnIDs: referencedColumns.Ordered(),
+	}, nil
+}
+
+func newTypeT(t *types.T) *scpb.TypeT {
 	return &scpb.TypeT{
 		Type:          t,
-		ClosedTypeIDs: ret.Ordered(),
-	}, nil
+		ClosedTypeIDs: typedesc.GetTypeDescriptorClosure(t).Ordered(),
+	}
+}
+
+// NewElementCreationMetadata construct a `*scpb.ElementCreationMetadata`
+// based on `clusterVersion`.
+func NewElementCreationMetadata(
+	clusterVersion clusterversion.ClusterVersion,
+) *scpb.ElementCreationMetadata {
+	return &scpb.ElementCreationMetadata{
+		In_23_1OrLater: clusterVersion.IsActive(clusterversion.V23_1),
+	}
 }

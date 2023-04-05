@@ -27,7 +27,6 @@ import (
 
 	apd "github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	// Imported to allow locality-related table mutations
@@ -36,16 +35,23 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -53,11 +59,18 @@ import (
 
 var testSinkFlushFrequency = 100 * time.Millisecond
 
+// disableDeclarativeSchemaChangesForTest tests that are disabled due to differences
+// in changefeed behaviour and are tracked by issue #80545.
+func disableDeclarativeSchemaChangesForTest(t testing.TB, sqlDB *sqlutils.SQLRunner) {
+	sqlDB.Exec(t, "SET use_declarative_schema_changer='off'")
+	sqlDB.Exec(t, "SET CLUSTER SETTING  sql.defaults.use_declarative_schema_changer='off'")
+}
+
 func waitForSchemaChange(
 	t testing.TB, sqlDB *sqlutils.SQLRunner, stmt string, arguments ...interface{},
 ) {
 	sqlDB.Exec(t, stmt, arguments...)
-	row := sqlDB.QueryRow(t, "SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE' ORDER BY created DESC LIMIT 1")
+	row := sqlDB.QueryRow(t, "SELECT job_id FROM [SHOW JOBS] WHERE job_type = 'NEW SCHEMA CHANGE' OR job_type ='SCHEMA CHANGE' ORDER BY created DESC LIMIT 1")
 	var jobID string
 	row.Scan(&jobID)
 
@@ -72,17 +85,29 @@ func waitForSchemaChange(
 	})
 }
 
-func readNextMessages(f cdctest.TestFeed, numMessages int) ([]cdctest.TestFeedMessage, error) {
+func readNextMessages(
+	ctx context.Context, f cdctest.TestFeed, numMessages int,
+) ([]cdctest.TestFeedMessage, error) {
 	var actual []cdctest.TestFeedMessage
+	lastMessage := timeutil.Now()
 	for len(actual) < numMessages {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if log.V(1) {
+			log.Infof(context.Background(), "About to read a message (%d out of %d) from %v (%T)",
+				len(actual), numMessages, f, f)
+		}
 		m, err := f.Next()
 		if log.V(1) {
 			if m != nil {
-				log.Infof(context.Background(), `msg %s: %s->%s (%s)`, m.Topic, m.Key, m.Value, m.Resolved)
+				log.Infof(context.Background(), `msg %s: %s->%s (%s) (%s)`,
+					m.Topic, m.Key, m.Value, m.Resolved, timeutil.Since(lastMessage))
 			} else {
 				log.Infof(context.Background(), `err %v`, err)
 			}
 		}
+		lastMessage = timeutil.Now()
 		if err != nil {
 			return nil, err
 		}
@@ -161,13 +186,24 @@ func assertPayloadsBase(
 	t testing.TB, f cdctest.TestFeed, expected []string, stripTs bool, perKeyOrdered bool,
 ) {
 	t.Helper()
-	require.NoError(t, assertPayloadsBaseErr(f, expected, stripTs, perKeyOrdered))
+	timeout := assertPayloadsTimeout()
+	if len(expected) > 100 {
+		// Webhook sink is very slow; We have few tests that read 1000 messages.
+		timeout += time.Duration(math.Log(float64(len(expected)))) * time.Minute
+	}
+
+	require.NoError(t,
+		withTimeout(f, timeout,
+			func(ctx context.Context) (err error) {
+				return assertPayloadsBaseErr(ctx, f, expected, stripTs, perKeyOrdered)
+			},
+		))
 }
 
 func assertPayloadsBaseErr(
-	f cdctest.TestFeed, expected []string, stripTs bool, perKeyOrdered bool,
+	ctx context.Context, f cdctest.TestFeed, expected []string, stripTs bool, perKeyOrdered bool,
 ) error {
-	actual, err := readNextMessages(f, len(expected))
+	actual, err := readNextMessages(ctx, f, len(expected))
 	if err != nil {
 		return err
 	}
@@ -204,6 +240,29 @@ func assertPayloadsBaseErr(
 			strings.Join(expected, "\n  "), strings.Join(actualFormatted, "\n  "))
 	}
 	return nil
+}
+
+func assertPayloadsTimeout() time.Duration {
+	if util.RaceEnabled {
+		return 5 * time.Minute
+	}
+	return 30 * time.Second
+}
+
+func withTimeout(
+	f cdctest.TestFeed, timeout time.Duration, fn func(ctx context.Context) error,
+) error {
+	var jobID jobspb.JobID
+	if jobFeed, ok := f.(cdctest.EnterpriseTestFeed); ok {
+		jobID = jobFeed.JobID()
+	}
+	return contextutil.RunWithTimeout(context.Background(),
+		fmt.Sprintf("withTimeout-%d", jobID), timeout,
+		func(ctx context.Context) error {
+			defer stopFeedWhenDone(ctx, f)()
+			return fn(ctx)
+		},
+	)
 }
 
 func assertPayloads(t testing.TB, f cdctest.TestFeed, expected []string) {
@@ -318,15 +377,6 @@ SET CLUSTER SETTING sql.defaults.vectorize=on;
 CREATE DATABASE d;
 `
 
-func startTestServer(
-	t testing.TB, options feedTestOptions,
-) (serverutils.TestServerInterface, *gosql.DB, func()) {
-	if options.useTenant {
-		return startTestTenant(t, options)
-	}
-	return startTestFullServer(t, options)
-}
-
 func startTestFullServer(
 	t testing.TB, options feedTestOptions,
 ) (serverutils.TestServerInterface, *gosql.DB, func()) {
@@ -339,22 +389,27 @@ func startTestFullServer(
 		options.knobsFn(&knobs)
 	}
 	args := base.TestServerArgs{
-		Knobs:         knobs,
-		UseDatabase:   `d`,
-		ExternalIODir: options.externalIODir,
+		Knobs: knobs,
+		// This test suite is already probabilistically running with
+		// tenants. No need for the test tenant.
+		DefaultTestTenant: base.TestTenantDisabled,
+		UseDatabase:       `d`,
+		ExternalIODir:     options.externalIODir,
+		Settings:          options.settings,
 	}
 
 	if options.argsFn != nil {
 		options.argsFn(&args)
 	}
-
-	ctx := context.Background()
+	resetRetry := testingUseFastRetry()
 	resetFlushFrequency := changefeedbase.TestingSetDefaultMinCheckpointFrequency(testSinkFlushFrequency)
 	s, db, _ := serverutils.StartServer(t, args)
 
+	ctx := context.Background()
 	cleanup := func() {
 		s.Stopper().Stop(ctx)
 		resetFlushFrequency()
+		resetRetry()
 	}
 	var err error
 	defer func() {
@@ -381,12 +436,14 @@ func startTestFullServer(
 // need to be applied to each of the servers in the test cluster
 // returned from this function.
 func startTestCluster(t testing.TB) (serverutils.TestClusterInterface, *gosql.DB, func()) {
+	skip.UnderStressRace(t, "multinode setup doesn't work under testrace")
 	ctx := context.Background()
 	knobs := base.TestingKnobs{
 		DistSQL:          &execinfra.TestingKnobs{Changefeed: &TestingKnobs{}},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 	}
 
+	resetRetry := testingUseFastRetry()
 	resetFlushFrequency := changefeedbase.TestingSetDefaultMinCheckpointFrequency(testSinkFlushFrequency)
 	cluster, db, cleanup := multiregionccltestutils.TestingCreateMultiRegionCluster(
 		t, 3 /* numServers */, knobs,
@@ -395,6 +452,7 @@ func startTestCluster(t testing.TB) (serverutils.TestClusterInterface, *gosql.DB
 	cleanupAndReset := func() {
 		cleanup()
 		resetFlushFrequency()
+		resetRetry()
 	}
 
 	var err error
@@ -411,10 +469,26 @@ func startTestCluster(t testing.TB) (serverutils.TestClusterInterface, *gosql.DB
 	return cluster, db, cleanupAndReset
 }
 
+func waitForTenantPodsActive(
+	t testing.TB, tenantServer serverutils.TestTenantInterface, numPods int,
+) {
+	testutils.SucceedsWithin(t, func() error {
+		status := tenantServer.StatusServer().(serverpb.SQLStatusServer)
+		var nodes *serverpb.NodesListResponse
+		var err error
+		for nodes == nil || len(nodes.Nodes) != numPods {
+			nodes, err = status.NodesList(context.Background(), nil)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}, 10*time.Second)
+}
+
 func startTestTenant(
-	t testing.TB, options feedTestOptions,
-) (serverutils.TestServerInterface, *gosql.DB, func()) {
-	kvServer, _, cleanupCluster := startTestFullServer(t, options)
+	t testing.TB, systemServer serverutils.TestServerInterface, options feedTestOptions,
+) (roachpb.TenantID, serverutils.TestTenantInterface, *gosql.DB, func()) {
 	knobs := base.TestingKnobs{
 		DistSQL:          &execinfra.TestingKnobs{Changefeed: &TestingKnobs{}},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
@@ -431,34 +505,37 @@ func startTestTenant(
 		UseDatabase:   `d`,
 		TestingKnobs:  knobs,
 		ExternalIODir: options.externalIODir,
+		Settings:      options.settings,
 	}
 
-	tenantServer, tenantDB := serverutils.StartTenant(t, kvServer, tenantArgs)
+	tenantServer, tenantDB := serverutils.StartTenant(t, systemServer, tenantArgs)
 	// Re-run setup on the tenant as well
 	tenantRunner := sqlutils.MakeSQLRunner(tenantDB)
 	tenantRunner.ExecMultiple(t, strings.Split(serverSetupStatements, ";")...)
 
-	server := &testServerShim{tenantServer, kvServer}
-	// Log so that it is clear if a failed test happened
-	// to run on a tenant.
-	t.Logf("Running test using tenant %s", tenantID)
-	return server, tenantDB, func() {
+	waitForTenantPodsActive(t, tenantServer, 1)
+	resetRetry := testingUseFastRetry()
+	return tenantID, tenantServer, tenantDB, func() {
 		tenantServer.Stopper().Stop(context.Background())
-		log.Infof(context.Background(), "tenant server stopped")
-		cleanupCluster()
-		log.Infof(context.Background(), "cluster shut down")
+		resetRetry()
 	}
 }
 
-type cdcTestFn func(*testing.T, *gosql.DB, cdctest.TestFeedFactory)
+type cdcTestFn func(*testing.T, TestServer, cdctest.TestFeedFactory)
+type cdcTestWithSystemFn func(*testing.T, TestServerWithSystem, cdctest.TestFeedFactory)
 type updateArgsFn func(args *base.TestServerArgs)
 type updateKnobsFn func(knobs *base.TestingKnobs)
 
 type feedTestOptions struct {
-	useTenant     bool
-	argsFn        updateArgsFn
-	knobsFn       updateKnobsFn
-	externalIODir string
+	useTenant                    bool
+	forceNoExternalConnectionURI bool
+	argsFn                       updateArgsFn
+	knobsFn                      updateKnobsFn
+	externalIODir                string
+	allowedSinkTypes             []string
+	disabledSinkTypes            []string
+	disableSyntheticTimestamps   bool
+	settings                     *cluster.Settings
 }
 
 type feedTestOption func(opts *feedTestOptions)
@@ -467,12 +544,53 @@ type feedTestOption func(opts *feedTestOptions)
 // from randomly running on a tenant.
 var feedTestNoTenants = func(opts *feedTestOptions) { opts.useTenant = false }
 
+// feedTestNoExternalConnection is a feedTestOption that will prohibit this test
+// from randomly creating an external connection URI and providing that as the sink
+// rather than directly specifying it. (Feed tests never actually connect to anything external.)
+var feedTestNoExternalConnection = func(opts *feedTestOptions) { opts.forceNoExternalConnectionURI = true }
+
+// feedTestNoForcedSyntheticTimestamps is a feedTestOption that will prevent
+// the test from randomly forcing timestamps to be synthetic and offset five seconds into the future from
+// what they would otherwise be. It doesn't prevent synthetic timestamps but they're otherwise unlikely to
+// occur in tests.
+var feedTestNoForcedSyntheticTimestamps = func(opts *feedTestOptions) { opts.disableSyntheticTimestamps = true }
+
+var feedTestForceSink = func(sinkType string) feedTestOption {
+	return feedTestRestrictSinks(sinkType)
+}
+
+var feedTestRestrictSinks = func(sinkTypes ...string) feedTestOption {
+	return func(opts *feedTestOptions) { opts.allowedSinkTypes = append(opts.allowedSinkTypes, sinkTypes...) }
+}
+
+var feedTestEnterpriseSinks = func(opts *feedTestOptions) {
+	feedTestOmitSinks("sinkless")(opts)
+}
+
+var feedTestOmitSinks = func(sinkTypes ...string) feedTestOption {
+	return func(opts *feedTestOptions) { opts.disabledSinkTypes = append(opts.disabledSinkTypes, sinkTypes...) }
+}
+
+func (opts feedTestOptions) omitSinks(sinks ...string) feedTestOptions {
+	res := opts
+	res.disabledSinkTypes = append(opts.disabledSinkTypes, sinks...)
+	return res
+}
+
 // withArgsFn is a feedTestOption that allow the caller to modify the
 // TestServerArgs before they are used to create the test server. Note
 // that in multi-tenant tests, these will only apply to the kvServer
 // and not the sqlServer.
 func withArgsFn(fn updateArgsFn) feedTestOption {
 	return func(opts *feedTestOptions) { opts.argsFn = fn }
+}
+
+// withSettingsFn arranges for a feed option to set the settings for
+// both system and test tenant.
+func withSettings(st *cluster.Settings) feedTestOption {
+	return func(opts *feedTestOptions) {
+		opts.settings = st
+	}
 }
 
 // withKnobsFn is a feedTestOption that allows the caller to modify
@@ -486,10 +604,10 @@ func withKnobsFn(fn updateKnobsFn) feedTestOption {
 var _ = withKnobsFn(nil /* fn */)
 
 func newTestOptions() feedTestOptions {
-	// percentTenant is the percentange of tests that will be run against
+	// percentTenant is the percentage of tests that will be run against
 	// a SQL-node in a multi-tenant server. 1 for all tests to be run on a
 	// tenant.
-	const percentTenant = 0.25
+	const percentTenant = 0.5
 	return feedTestOptions{
 		useTenant: rand.Float32() < percentTenant,
 	}
@@ -500,129 +618,24 @@ func makeOptions(opts ...feedTestOption) feedTestOptions {
 	for _, o := range opts {
 		o(&options)
 	}
-	return options
-}
-
-func sinklessTest(testFn cdcTestFn, testOpts ...feedTestOption) func(*testing.T) {
-	return sinklessTestWithOptions(testFn, makeOptions(testOpts...))
-}
-
-func sinklessTestWithOptions(testFn cdcTestFn, opts feedTestOptions) func(*testing.T) {
-	return func(t *testing.T) {
-		s, db, stopServer := startTestServer(t, opts)
-		defer stopServer()
-
-		sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
-		defer cleanup()
-		f := makeSinklessFeedFactory(s, sink)
-		testFn(t, db, f)
-	}
-}
-
-// RunRandomSink runs the testFn against one of a number of possible
-// sinks. Sinkless is not included in the possible sinks.
-func RunRandomSinkTest(t *testing.T, desc string, testFn cdcTestFn, testOpts ...feedTestOption) {
-	// TODO(ssd): It would be nice if explicitly selecting a test
-	// via -run/TESTS= would force it to always run.
-	switch p := rand.Float32(); {
-	case p < 0.20:
-		t.Run(fmt.Sprintf("enterprise/%s", desc), enterpriseTest(testFn, testOpts...))
-	case p < 0.40:
-		t.Run(fmt.Sprintf("cloudstorage/%s", desc), cloudStorageTest(testFn, testOpts...))
-	case p < 0.60:
-		t.Run(fmt.Sprintf("webhook/%s", desc), webhookTest(testFn, testOpts...))
-	default: // Run kafka a bit more often
-		t.Run(fmt.Sprintf("kafka/%s", desc), kafkaTest(testFn, testOpts...))
-	}
-}
-
-func enterpriseTest(testFn cdcTestFn, testOpts ...feedTestOption) func(*testing.T) {
-	return enterpriseTestWithOptions(testFn, makeOptions(testOpts...))
-}
-
-func enterpriseTestWithOptions(testFn cdcTestFn, options feedTestOptions) func(*testing.T) {
-	return func(t *testing.T) {
-		s, db, stopServer := startTestServer(t, options)
-		defer stopServer()
-
-		sink, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
-		defer cleanup()
-		f := makeTableFeedFactory(s, db, sink)
-
-		testFn(t, db, f)
-	}
-}
-
-func cloudStorageTest(testFn cdcTestFn, testOpts ...feedTestOption) func(*testing.T) {
-	return cloudStorageTestWithOptions(testFn, makeOptions(testOpts...))
-}
-
-func cloudStorageTestWithOptions(testFn cdcTestFn, options feedTestOptions) func(*testing.T) {
-	return func(t *testing.T) {
-		if options.externalIODir == "" {
-			dir, dirCleanupFn := testutils.TempDir(t)
-			defer dirCleanupFn()
-			options.externalIODir = dir
-		}
+	if !options.disableSyntheticTimestamps && rand.Intn(2) == 0 {
+		// Offset all timestamps a random (but consistent per test) amount into the
+		// future to ensure we can handle that. Always chooses an integer number of
+		// seconds for easier debugging and so that 0 is a possibility.
+		offset := int64(rand.Intn(6)) * time.Second.Nanoseconds()
 		oldKnobsFn := options.knobsFn
 		options.knobsFn = func(knobs *base.TestingKnobs) {
 			if oldKnobsFn != nil {
 				oldKnobsFn(knobs)
 			}
-			blobClientFactory := blobs.NewLocalOnlyBlobClientFactory(options.externalIODir)
-			if serverKnobs, ok := knobs.Server.(*server.TestingKnobs); ok {
-				serverKnobs.BlobClientFactory = blobClientFactory
-			} else {
-				knobs.Server = &server.TestingKnobs{
-					BlobClientFactory: blobClientFactory,
-				}
+			knobs.DistSQL.(*execinfra.TestingKnobs).
+				Changefeed.(*TestingKnobs).FeedKnobs.ModifyTimestamps = func(t *hlc.Timestamp) {
+				t.Add(offset, 0)
+				t.Synthetic = true
 			}
 		}
-		s, db, stopServer := startTestServer(t, options)
-		defer stopServer()
-
-		f := makeCloudFeedFactory(s, db, options.externalIODir)
-		testFn(t, db, f)
 	}
-}
-
-func kafkaTest(testFn cdcTestFn, testOpts ...feedTestOption) func(t *testing.T) {
-	return kafkaTestWithOptions(testFn, makeOptions(testOpts...))
-}
-
-func kafkaTestWithOptions(testFn cdcTestFn, options feedTestOptions) func(*testing.T) {
-	return func(t *testing.T) {
-		s, db, stopServer := startTestServer(t, options)
-		defer stopServer()
-		f := makeKafkaFeedFactory(s, db)
-		testFn(t, db, f)
-	}
-}
-
-func webhookTest(testFn cdcTestFn, testOpts ...feedTestOption) func(t *testing.T) {
-	return webhookTestWithOptions(testFn, makeOptions(testOpts...))
-}
-
-func webhookTestWithOptions(testFn cdcTestFn, options feedTestOptions) func(*testing.T) {
-	return func(t *testing.T) {
-		s, db, stopServer := startTestServer(t, options)
-		defer stopServer()
-		f := makeWebhookFeedFactory(s, db)
-		testFn(t, db, f)
-	}
-}
-
-func pubsubTest(testFn cdcTestFn, testOpts ...feedTestOption) func(t *testing.T) {
-	return pubsubTestWithOptions(testFn, makeOptions(testOpts...))
-}
-
-func pubsubTestWithOptions(testFn cdcTestFn, options feedTestOptions) func(*testing.T) {
-	return func(t *testing.T) {
-		s, db, stopServer := startTestServer(t, options)
-		defer stopServer()
-		f := makePubsubFeedFactory(s, db)
-		testFn(t, db, f)
-	}
+	return options
 }
 
 func serverArgsRegion(args base.TestServerArgs) string {
@@ -637,8 +650,8 @@ func serverArgsRegion(args base.TestServerArgs) string {
 // expectNotice creates a pretty crude database connection that doesn't involve
 // a lot of cdc test framework, use with caution. Driver-agnostic tools don't
 // have clean ways of inspecting incoming notices.
-func expectNotice(t *testing.T, s serverutils.TestServerInterface, sql string, expected string) {
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+func expectNotice(t *testing.T, s serverutils.TestTenantInterface, sql string, expected string) {
+	url, cleanup := sqlutils.PGUrl(t, s.SQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 	base, err := pq.NewConnector(url.String())
 	if err != nil {
@@ -669,10 +682,339 @@ func feed(
 	return feed
 }
 
+func asUser(
+	t testing.TB, f cdctest.TestFeedFactory, user string, fn func(runner *sqlutils.SQLRunner),
+) {
+	t.Helper()
+	require.NoError(t, f.AsUser(user, fn))
+}
+
+func expectErrCreatingFeed(
+	t testing.TB, f cdctest.TestFeedFactory, create string, errSubstring string,
+) {
+	t.Helper()
+	t.Logf("expecting %s to error", create)
+	feed, err := f.Feed(create)
+	if feed != nil {
+		defer func() { _ = feed.Close() }()
+	}
+	if err == nil {
+		// Sinkless test feeds don't error until you try to read the first row.
+		if _, sinkless := feed.(*sinklessFeed); sinkless {
+			_, err = feed.Next()
+		}
+	}
+	if err == nil {
+		t.Errorf("No error from %s", create)
+	} else {
+		require.Contains(t, err.Error(), errSubstring)
+	}
+}
+
 func closeFeed(t testing.TB, f cdctest.TestFeed) {
 	t.Helper()
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func closeFeedIgnoreError(t testing.TB, f cdctest.TestFeed) {
+	defer func() {
+		if e := recover(); e != nil {
+			t.Log(e)
+		}
+	}()
+	t.Helper()
+	if err := f.Close(); err != nil {
+		t.Log(err)
+	}
+}
+
+// TestServer is a struct to allow tests to operate on a shared API regardless
+// of a test running as the system tenant or a secondary tenant
+type TestServer struct {
+	DB           *gosql.DB
+	Server       serverutils.TestTenantInterface
+	Codec        keys.SQLCodec
+	TestingKnobs base.TestingKnobs
+}
+
+// TestServerWithSystem provides access to the system db and server for a
+// TestServer.  This is useful for some tests that explicitly require access to
+// the system tenant, for example if
+// desctestutils.TestingGetPublicTableDescriptor is being called.
+type TestServerWithSystem struct {
+	TestServer
+	SystemDB     *gosql.DB
+	SystemServer serverutils.TestServerInterface
+}
+
+func makeSystemServer(
+	t *testing.T, opts ...feedTestOption,
+) (testServer TestServerWithSystem, cleanup func()) {
+	options := makeOptions(opts...)
+	return makeSystemServerWithOptions(t, options)
+}
+
+var _ = makeSystemServer // silence unused warning
+
+func makeSystemServerWithOptions(
+	t *testing.T, options feedTestOptions,
+) (testServer TestServerWithSystem, cleanup func()) {
+	systemServer, systemDB, clusterCleanup := startTestFullServer(t, options)
+	return TestServerWithSystem{
+			TestServer: TestServer{
+				DB:           systemDB,
+				Server:       systemServer,
+				TestingKnobs: systemServer.(*server.TestServer).Cfg.TestingKnobs,
+				Codec:        keys.SystemSQLCodec,
+			},
+			SystemServer: systemServer,
+			SystemDB:     systemDB,
+		}, func() {
+			clusterCleanup()
+		}
+}
+
+func makeTenantServer(
+	t *testing.T, opts ...feedTestOption,
+) (testServer TestServerWithSystem, cleanup func()) {
+	options := makeOptions(opts...)
+	return makeTenantServerWithOptions(t, options)
+}
+func makeTenantServerWithOptions(
+	t *testing.T, options feedTestOptions,
+) (testServer TestServerWithSystem, cleanup func()) {
+	systemServer, systemDB, clusterCleanup := startTestFullServer(t, options)
+	tenantID, tenantServer, tenantDB, tenantCleanup := startTestTenant(t, systemServer, options)
+
+	return TestServerWithSystem{
+			TestServer: TestServer{
+				DB:           tenantDB,
+				Server:       tenantServer,
+				TestingKnobs: tenantServer.(*server.TestTenant).Cfg.TestingKnobs,
+				Codec:        keys.MakeSQLCodec(tenantID),
+			},
+			SystemDB:     systemDB,
+			SystemServer: systemServer,
+		}, func() {
+			tenantCleanup()
+			clusterCleanup()
+		}
+}
+
+func makeServer(
+	t *testing.T, opts ...feedTestOption,
+) (testServer TestServerWithSystem, cleanup func()) {
+	options := makeOptions(opts...)
+	return makeServerWithOptions(t, options)
+}
+
+func makeServerWithOptions(
+	t *testing.T, options feedTestOptions,
+) (server TestServerWithSystem, cleanup func()) {
+	if options.useTenant {
+		t.Logf("making server as secondary tenant")
+		return makeTenantServerWithOptions(t, options)
+	}
+	t.Logf("making server as system tenant")
+	return makeSystemServerWithOptions(t, options)
+}
+
+func randomSinkType(opts ...feedTestOption) string {
+	options := makeOptions(opts...)
+	return randomSinkTypeWithOptions(options)
+}
+
+func randomSinkTypeWithOptions(options feedTestOptions) string {
+	sinkWeights := map[string]int{
+		"kafka":        3,
+		"enterprise":   1,
+		"webhook":      1,
+		"pubsub":       1,
+		"sinkless":     2,
+		"cloudstorage": 0,
+	}
+	if options.externalIODir != "" {
+		sinkWeights["cloudstorage"] = 3
+	}
+	if options.allowedSinkTypes != nil {
+		sinkWeights = map[string]int{}
+		for _, sinkType := range options.allowedSinkTypes {
+			sinkWeights[sinkType] = 1
+		}
+	}
+	if options.disabledSinkTypes != nil {
+		for _, sinkType := range options.disabledSinkTypes {
+			sinkWeights[sinkType] = 0
+		}
+	}
+	weightTotal := 0
+	for _, weight := range sinkWeights {
+		weightTotal += weight
+	}
+	if weightTotal == 0 {
+		// This exists for testing purposes, where one may want to run all tests on
+		// the same sink and set sinkWeights to be 1 only for that sink, but some
+		// tests explicitly disallow that sink and therefore have no valid sinks.
+		return "skip"
+	}
+	p := rand.Float32() * float32(weightTotal)
+	var sum float32 = 0
+	for sink, weight := range sinkWeights {
+		sum += float32(weight)
+		if p <= sum {
+			return sink
+		}
+	}
+	return "skip" // unreachable
+}
+
+// addCloudStorageOptions adds the options necessary to enable a server to run a
+// cloudstorage changefeed on it
+func addCloudStorageOptions(t *testing.T, options *feedTestOptions) (cleanup func()) {
+	dir, dirCleanupFn := testutils.TempDir(t)
+	options.externalIODir = dir
+	return dirCleanupFn
+}
+
+func makeFeedFactory(
+	t *testing.T,
+	sinkType string,
+	s serverutils.TestTenantInterface,
+	db *gosql.DB,
+	testOpts ...feedTestOption,
+) (factory cdctest.TestFeedFactory, sinkCleanup func()) {
+	options := makeOptions(testOpts...)
+	return makeFeedFactoryWithOptions(t, sinkType, s, db, options)
+}
+
+func makeFeedFactoryWithOptions(
+	t *testing.T, sinkType string, srvOrCluster interface{}, db *gosql.DB, options feedTestOptions,
+) (factory cdctest.TestFeedFactory, sinkCleanup func()) {
+	t.Logf("making %s feed factory", sinkType)
+	s := func() serverutils.TestTenantInterface {
+		switch s := srvOrCluster.(type) {
+		case serverutils.TestTenantInterface:
+			return s
+		case serverutils.TestClusterInterface:
+			return s.Server(0)
+		default:
+			t.Fatalf("unexpected argument type %T", s)
+			return nil
+		}
+	}()
+
+	pgURLForUser := func(u string, pass ...string) (url.URL, func()) {
+		t.Logf("pgURL %s %s", sinkType, u)
+		if len(pass) < 1 {
+			return sqlutils.PGUrl(t, s.SQLAddr(), t.Name(), url.User(u))
+		}
+		return url.URL{
+			Scheme: "postgres",
+			User:   url.UserPassword(u, pass[0]),
+			Host:   s.SQLAddr()}, func() {}
+	}
+	switch sinkType {
+	case "kafka":
+		f := makeKafkaFeedFactory(srvOrCluster, db)
+		return f, func() {}
+	case "cloudstorage":
+		if options.externalIODir == "" {
+			t.Fatalf("expected externalIODir option to be set")
+		}
+		f := makeCloudFeedFactory(srvOrCluster, db, options.externalIODir)
+		return f, func() {
+			TestingSetIncludeParquetMetadata()()
+		}
+	case "enterprise":
+		sink, cleanup := pgURLForUser(username.RootUser)
+		f := makeTableFeedFactory(srvOrCluster, db, sink)
+		return f, cleanup
+	case "webhook":
+		f := makeWebhookFeedFactory(srvOrCluster, db)
+		return f, func() {}
+	case "pubsub":
+		f := makePubsubFeedFactory(srvOrCluster, db)
+		return f, func() {}
+	case "sinkless":
+		sink, cleanup := pgURLForUser(username.RootUser)
+		f := makeSinklessFeedFactory(s, sink, pgURLForUser)
+		f.(*sinklessFeedFactory).currentDB = func(currentDB *string) error {
+			r := db.QueryRow("SELECT current_database()")
+			return r.Scan(currentDB)
+		}
+		return f, cleanup
+	}
+	t.Fatalf("unhandled sink type %s", sinkType)
+	return nil, nil
+}
+
+func cdcTest(t *testing.T, testFn cdcTestFn, testOpts ...feedTestOption) {
+	cdcTestNamed(t, "", testFn, testOpts...)
+}
+
+func cdcTestNamed(t *testing.T, name string, testFn cdcTestFn, testOpts ...feedTestOption) {
+	testFnWithSystem := func(t *testing.T, s TestServerWithSystem, f cdctest.TestFeedFactory) {
+		testFn(t, s.TestServer, f)
+	}
+	cdcTestNamedWithSystem(t, "", testFnWithSystem, testOpts...)
+}
+
+func cdcTestWithSystem(t *testing.T, testFn cdcTestWithSystemFn, testOpts ...feedTestOption) {
+	cdcTestNamedWithSystem(t, "", testFn, testOpts...)
+}
+
+func cdcTestNamedWithSystem(
+	t *testing.T, name string, testFn cdcTestWithSystemFn, testOpts ...feedTestOption,
+) {
+	t.Helper()
+	options := makeOptions(testOpts...)
+	cleanupCloudStorage := addCloudStorageOptions(t, &options)
+
+	sinkType := randomSinkTypeWithOptions(options)
+	if sinkType == "skip" {
+		return
+	}
+	testLabel := sinkType
+	if name != "" {
+		testLabel = fmt.Sprintf("%s/%s", sinkType, name)
+	}
+	t.Run(testLabel, func(t *testing.T) {
+		testServer, cleanupServer := makeServerWithOptions(t, options)
+		feedFactory, cleanupSink := makeFeedFactoryWithOptions(t, sinkType, testServer.Server, testServer.DB, options)
+		feedFactory = maybeUseExternalConnection(feedFactory, testServer.DB, sinkType, options, t)
+		defer cleanupServer()
+		defer cleanupSink()
+		defer cleanupCloudStorage()
+		testFn(t, testServer, feedFactory)
+	})
+}
+
+// TODO (zinger): These sometimes error when using external connections,
+// with either an ordering constraint violation or an unexpected null -> null message.
+// This is likely due to the notifyFlushSink being set up in a subtly wrong way.
+// Fix and remove this constant.
+const flakyWhenExternalConnection = `webhook, pubsub`
+
+func maybeUseExternalConnection(
+	factory cdctest.TestFeedFactory,
+	db *gosql.DB,
+	sinkType string,
+	options feedTestOptions,
+	logger *testing.T,
+) cdctest.TestFeedFactory {
+	// percentExternal is the chance of randomly running a test using an `external://` uri.
+	// Set to 1 to always do this.
+	const percentExternal = 0.5
+	if sinkType == `sinkless` || sinkType == `enterprise` || strings.Contains(flakyWhenExternalConnection, sinkType) ||
+		options.forceNoExternalConnectionURI || rand.Float32() > percentExternal {
+		return factory
+	}
+	return &externalConnectionFeedFactory{
+		TestFeedFactory: factory,
+		db:              db,
+		logger:          logger,
 	}
 }
 
@@ -723,6 +1065,55 @@ func checkStructuredLogs(t *testing.T, eventType string, startTime int64) []stri
 	})
 
 	return matchingEntries
+}
+
+func checkContinuousChangefeedLogs(t *testing.T, startTime int64) []eventpb.ChangefeedEmittedBytes {
+	logs := checkStructuredLogs(t, "changefeed_emitted_bytes", startTime)
+	matchingEntries := make([]eventpb.ChangefeedEmittedBytes, len(logs))
+
+	for i, m := range logs {
+		jsonPayload := []byte(m)
+		var event eventpb.ChangefeedEmittedBytes
+		if err := gojson.Unmarshal(jsonPayload, &event); err != nil {
+			t.Errorf("unmarshalling %q: %v", m, err)
+		}
+		matchingEntries[i] = event
+	}
+
+	return matchingEntries
+}
+
+// verifyLogsWithEmittedBytes fetches changefeed_emitted_bytes telemetry logs produced
+// after startTime for a particular job and asserts that at least one message has positive emitted bytes.
+// This function also asserts the LoggingInterval and Closing fields of
+// each message.
+func verifyLogsWithEmittedBytes(
+	t *testing.T, jobID jobspb.JobID, startTime int64, interval int64, closing bool,
+) {
+	testutils.SucceedsSoon(t, func() error {
+		emittedBytesLogs := checkContinuousChangefeedLogs(t, startTime)
+		if len(emittedBytesLogs) == 0 {
+			return errors.New("no logs found")
+		}
+		emittedBytes := false
+		for _, msg := range emittedBytesLogs {
+			if msg.JobId != int64(jobID) {
+				continue
+			}
+
+			if msg.EmittedBytes > 0 {
+				emittedBytes = true
+			}
+			require.Equal(t, interval, msg.LoggingInterval)
+			if closing {
+				require.Equal(t, true, msg.Closing)
+			}
+		}
+		if !emittedBytes {
+			return errors.New("expected emitted bytes in log messages, but found 0")
+		}
+		return nil
+	})
 }
 
 func checkCreateChangefeedLogs(t *testing.T, startTime int64) []eventpb.CreateChangefeed {
@@ -784,4 +1175,58 @@ func waitForJobStatus(
 		}
 		return nil
 	})
+}
+
+// TestingSetIncludeParquetMetadata adds the option to turn on adding metadata
+// (primary key column names) to the parquet file which is used to convert parquet
+// data to JSON format
+func TestingSetIncludeParquetMetadata() func() {
+	includeParquetTestMetadata = true
+	return func() {
+		includeParquetTestMetadata = false
+	}
+}
+
+// ChangefeedJobPermissionsTestSetup creates entities and users with various permissions
+// for tests which test access control for changefeed jobs.
+//
+// This helper creates the following:
+//
+//	UDT type_a
+//	TABLE table_a (with column type_a)
+//	TABLE table_b (with column type_a)
+//	USER adminUser (with admin privs)
+//	USER feedCreator (with CHANGEFEED priv on table_a and table_b)
+//	USER jobController (with the CONTROLJOB role option)
+//	USER userWithAllGrants (with CHANGEFEED on table_a and table b)
+//	USER userWithSomeGrants (with CHANGEFEED on table_a only)
+//	USER regularUser (with no privs)
+func ChangefeedJobPermissionsTestSetup(t *testing.T, s TestServer) {
+	rootDB := sqlutils.MakeSQLRunner(s.DB)
+
+	rootDB.ExecMultiple(t,
+		`CREATE TYPE type_a as enum ('a')`,
+		`CREATE TABLE table_a (id int, type type_a)`,
+		`CREATE TABLE table_b (id int, type type_a)`,
+		`INSERT INTO table_a(id) values (0)`,
+		`INSERT INTO table_b(id) values (0)`,
+
+		`CREATE USER adminUser`,
+		`GRANT ADMIN TO adminUser`,
+
+		`CREATE USER feedCreator`,
+		`GRANT CHANGEFEED ON table_a TO feedCreator`,
+		`GRANT CHANGEFEED ON table_b TO feedCreator`,
+
+		`CREATE USER jobController with CONTROLJOB`,
+
+		`CREATE USER userWithAllGrants`,
+		`GRANT CHANGEFEED ON table_a TO userWithAllGrants`,
+		`GRANT CHANGEFEED ON table_b TO userWithAllGrants`,
+
+		`CREATE USER userWithSomeGrants`,
+		`GRANT CHANGEFEED ON table_a TO userWithSomeGrants`,
+
+		`CREATE USER regularUser`,
+	)
 }

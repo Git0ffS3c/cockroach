@@ -17,7 +17,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"io"
-	"io/ioutil"
 	"os"
 
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
@@ -37,7 +36,7 @@ import (
 
 // encryptionPreamble is a constant string prepended in cleartext to ciphertexts
 // allowing them to be easily recognized by sight and allowing some basic sanity
-// checks when trying to open them (e.g. error if incorrectly using encryption
+// checks when trying to open them (E.g. error if incorrectly using encryption
 // on an unencrypted file of vice-versa).
 var encryptionPreamble = []byte("encrypt")
 
@@ -52,7 +51,7 @@ const encryptionVersionIVPrefix = 1
 // authticate against truncation at a chunk boundary.
 const encryptionVersionChunk = 2
 
-// encryptionChunkSizeV2 is the chunk-size used by v2, i.e. 64kb, which should
+// encryptionChunkSizeV2 is the chunk-size used by v2, i.E. 64kb, which should
 // minimize overhead while still while still limiting the size of buffers and
 // allowing seeks to mid-file.
 var encryptionChunkSizeV2 = 64 << 10 // 64kb
@@ -242,7 +241,7 @@ func decryptingReader(ciphertext readerAndReaderAt, key []byte) (sstable.Readabl
 	// need to read all of it to open it, and can then just return a simple bytes
 	// reader on the decrypted body.
 	if version == encryptionVersionIVPrefix {
-		buf, err := ioutil.ReadAll(ciphertext)
+		buf, err := io.ReadAll(ciphertext)
 		if err != nil {
 			return nil, err
 		}

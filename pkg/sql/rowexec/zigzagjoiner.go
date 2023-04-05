@@ -13,10 +13,10 @@ package rowexec
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
@@ -44,7 +44,6 @@ import (
 // and the query:
 //
 // SELECT * FROM abcd@c_idx WHERE c = 2 AND d = 3;
-//
 //
 // Without a zigzag joiner, this query would previously execute: index scan on
 // `c_idx`, followed by an index join on the primary index, then filter out rows
@@ -80,23 +79,28 @@ import (
 //
 // The actual execution can be visualized below :
 //
-//   c_idx         d_idx
+//	c_idx         d_idx
+//
 // c | a, b       d | a, b
 // ============= ============
 // --> 2   1  1 ----> 3   1  1 ---+ X
-//                                |
+//
+//	|
+//
 // +----------------- 3   4  2 <--+
 // |                  3   4  3
 // |                  3   5  6
 // |                  3   7  2
 // +--> 2  8  2 -------------------+
-//                                 |
+//
+//	|
+//
 // +----------------- 3   8  3 ----+
 // |
 // +-> 2  9  3 -----> 3   9  3 --+ X
-//                               |
-//                 nil (Done) <--+
 //
+//	              |
+//	nil (Done) <--+
 //
 // - The execution starts by fetching the (2, 1, 1) row from c_idx. This is the
 // first row fetched when an index lookup in `c_idx` where `c = 2`. Let this be
@@ -128,7 +132,6 @@ import (
 // - We are done when the index lookup returns `nil`. There were no more rows in
 // this index that could satisfy the join.
 //
-//
 // When Can a Zigzag Join Be Planned:
 //
 // Every side of a zigzag join has fixed columns, equality columns, and index
@@ -152,7 +155,7 @@ import (
 //
 // For a description of index columns, refer to Appendix A.
 //
-// Additional Cases
+// # Additional Cases
 //
 // Normal Joins
 // This algorithm can also be applied to normal joins such as:
@@ -174,7 +177,7 @@ import (
 // - Index: `abcd@primary`
 // - Equality columns: (a)
 // - Fixed columns: None
-//- Fixed values: None
+// - Fixed values: None
 //
 // Note: If the query were to `SELECT *` instead of `SELECT a, b` a further
 // index join would be needed, but this index join would only be applied on the
@@ -192,7 +195,6 @@ import (
 // the sides until a match is found on all sides of the join. It is expected
 // that a zigzag join’s utility will increase as the number of sides increases
 // because more rows will be able to be skipped.
-//
 //
 // Appendix A: Indexes
 //
@@ -249,7 +251,9 @@ type zigzagJoiner struct {
 	rowAlloc           rowenc.EncDatumRowAlloc
 	fetchedInititalRow bool
 
-	scanStats execstats.ScanStats
+	contentionEventsListener  execstats.ContentionEventsListener
+	scanStatsListener         execstats.ScanStatsListener
+	tenantConsumptionListener execstats.TenantConsumptionListener
 }
 
 // zigzagJoinerBatchSize is a parameter which determines how many rows should
@@ -271,12 +275,12 @@ const zigzagJoinerProcName = "zigzagJoiner"
 // newZigzagJoiner creates a new zigzag joiner given a spec and an EncDatumRow
 // holding the values of the prefix columns of the index specified in the spec.
 func newZigzagJoiner(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.ZigzagJoinerSpec,
 	fixedValues []rowenc.EncDatumRow,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*zigzagJoiner, error) {
 	if len(spec.Sides) != 2 {
 		return nil, errors.AssertionFailedf("zigzag joins only of two tables (or indexes) are supported, %d requested", len(spec.Sides))
@@ -289,10 +293,10 @@ func newZigzagJoiner(
 	// Make sure the key column types are hydrated. The fetched column types
 	// will be hydrated in ProcessorBase.Init (via joinerBase.init below).
 	resolver := flowCtx.NewTypeResolver(flowCtx.Txn)
-	for _, fetchSpec := range []descpb.IndexFetchSpec{spec.Sides[0].FetchSpec, spec.Sides[1].FetchSpec} {
+	for _, fetchSpec := range []fetchpb.IndexFetchSpec{spec.Sides[0].FetchSpec, spec.Sides[1].FetchSpec} {
 		for i := range fetchSpec.KeyAndSuffixColumns {
 			if err := typedesc.EnsureTypeIsHydrated(
-				flowCtx.EvalCtx.Ctx(), fetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
+				ctx, fetchSpec.KeyAndSuffixColumns[i].Type, &resolver,
 			); err != nil {
 				return nil, err
 			}
@@ -302,6 +306,7 @@ func newZigzagJoiner(
 	leftColumnTypes := spec.Sides[0].FetchSpec.FetchedColumnTypes()
 	rightColumnTypes := spec.Sides[1].FetchSpec.FetchedColumnTypes()
 	err := z.joinerBase.init(
+		ctx,
 		z, /* self */
 		flowCtx,
 		processorID,
@@ -311,7 +316,6 @@ func newZigzagJoiner(
 		spec.OnExpr,
 		false, /* outputContinuationColumn */
 		post,
-		output,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				// We need to generate metadata before closing the processor
@@ -331,7 +335,7 @@ func newZigzagJoiner(
 	z.infos = make([]zigzagJoinerInfo, z.numTables)
 
 	collectingStats := false
-	if execstats.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx.CollectStats) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		collectingStats = true
 		z.ExecStatsForTrace = z.execStatsForTrace
 	}
@@ -343,12 +347,16 @@ func newZigzagJoiner(
 			// the spec itself.
 			z.infos[i].fixedValues = fixedValues[i]
 		} else {
-			z.infos[i].fixedValues, err = valuesSpecToEncDatum(&spec.Sides[i].FixedValues)
+			fv := &spec.Sides[i].FixedValues
+			if err = execinfra.HydrateTypesInDatumInfo(ctx, &resolver, fv.Columns); err != nil {
+				return nil, err
+			}
+			z.infos[i].fixedValues, err = valuesSpecToEncDatum(fv)
 			if err != nil {
 				return nil, err
 			}
 		}
-		if err := z.setupInfo(flowCtx, &spec.Sides[i], &z.infos[i], collectingStats); err != nil {
+		if err := z.setupInfo(ctx, flowCtx, &spec.Sides[i], &z.infos[i], collectingStats); err != nil {
 			return nil, err
 		}
 	}
@@ -375,8 +383,11 @@ func valuesSpecToEncDatum(
 
 // Start is part of the RowSource interface.
 func (z *zigzagJoiner) Start(ctx context.Context) {
-	ctx = z.StartInternal(ctx, zigzagJoinerProcName)
-	z.cancelChecker.Reset(ctx)
+	ctx = z.StartInternal(
+		ctx, zigzagJoinerProcName, &z.contentionEventsListener,
+		&z.scanStatsListener, &z.tenantConsumptionListener,
+	)
+	z.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 	log.VEventf(ctx, 2, "starting zigzag joiner run")
 }
 
@@ -388,7 +399,7 @@ type zigzagJoinerInfo struct {
 	// rowsRead is the total number of rows that this fetcher read from disk.
 	rowsRead  int64
 	alloc     tree.DatumAlloc
-	fetchSpec descpb.IndexFetchSpec
+	fetchSpec fetchpb.IndexFetchSpec
 
 	// Stores one batch of matches at a time. When all the rows are collected
 	// the cartesian product of the containers will be emitted.
@@ -415,6 +426,7 @@ type zigzagJoinerInfo struct {
 // number of the curInfo to set up.
 // Side specifies which the spec is associated with.
 func (z *zigzagJoiner) setupInfo(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	spec *execinfrapb.ZigzagJoinerSpec_Side,
 	info *zigzagJoinerInfo,
@@ -451,18 +463,19 @@ func (z *zigzagJoiner) setupInfo(
 	info.spanBuilder.InitWithFetchSpec(flowCtx.EvalCtx, flowCtx.Codec(), &info.fetchSpec)
 
 	// Setup the Fetcher.
-	// NB: zigzag joins are disabled when a row-level locking clause is
-	// supplied, so there is no locking strength on ZigzagJoinerSpec.
 	var fetcher row.Fetcher
 	if err := fetcher.Init(
-		flowCtx.EvalCtx.Context,
+		ctx,
 		row.FetcherInitArgs{
-			LockStrength:   spec.LockingStrength,
-			LockWaitPolicy: spec.LockingWaitPolicy,
-			LockTimeout:    flowCtx.EvalCtx.SessionData().LockTimeout,
-			Alloc:          &info.alloc,
-			MemMonitor:     flowCtx.EvalCtx.Mon,
-			Spec:           &spec.FetchSpec,
+			Txn:                        flowCtx.Txn,
+			LockStrength:               spec.LockingStrength,
+			LockWaitPolicy:             spec.LockingWaitPolicy,
+			LockTimeout:                flowCtx.EvalCtx.SessionData().LockTimeout,
+			Alloc:                      &info.alloc,
+			MemMonitor:                 flowCtx.Mon,
+			Spec:                       &spec.FetchSpec,
+			TraceKV:                    flowCtx.TraceKV,
+			ForceProductionKVBatchSize: flowCtx.EvalCtx.TestingKnobs.ForceProductionValues,
 		},
 	); err != nil {
 		return err
@@ -487,9 +500,9 @@ func (z *zigzagJoiner) setupInfo(
 func (z *zigzagJoiner) close() {
 	if z.InternalClose() {
 		for i := range z.infos {
-			z.infos[i].fetcher.Close(z.Ctx)
+			z.infos[i].fetcher.Close(z.Ctx())
 		}
-		log.VEventf(z.Ctx, 2, "exiting zigzag joiner run")
+		log.VEventf(z.Ctx(), 2, "exiting zigzag joiner run")
 	}
 }
 
@@ -564,8 +577,7 @@ func (z *zigzagJoiner) matchBase(curRow rowenc.EncDatumRow, side int) (bool, err
 	ordering := z.infos[side].eqColOrdering
 
 	// Compare the equality columns of the baseRow to that of the curRow.
-	da := &tree.DatumAlloc{}
-	cmp, err := prevEqDatums.Compare(eqColTypes, da, ordering, z.FlowCtx.EvalCtx, curEqDatums)
+	cmp, err := prevEqDatums.Compare(eqColTypes, &z.infos[side].alloc, ordering, z.FlowCtx.EvalCtx, curEqDatums)
 	if err != nil {
 		return false, err
 	}
@@ -612,7 +624,7 @@ func (z *zigzagJoiner) emitFromContainers() (rowenc.EncDatumRow, error) {
 // nextRow fetches the nextRow to emit from the join. It iterates through all
 // sides until a match is found then emits the results of the match one result
 // at a time.
-func (z *zigzagJoiner) nextRow(ctx context.Context, txn *kv.Txn) (rowenc.EncDatumRow, error) {
+func (z *zigzagJoiner) nextRow(ctx context.Context) (rowenc.EncDatumRow, error) {
 	for {
 		if err := z.cancelChecker.Check(); err != nil {
 			return nil, err
@@ -645,13 +657,10 @@ func (z *zigzagJoiner) nextRow(ctx context.Context, txn *kv.Txn) (rowenc.EncDatu
 
 		err = curInfo.fetcher.StartScan(
 			ctx,
-			txn,
 			roachpb.Spans{roachpb.Span{Key: curInfo.key, EndKey: curInfo.endKey}},
 			nil, /* spanIDs */
 			rowinfra.GetDefaultBatchBytesLimit(z.EvalCtx.TestingKnobs.ForceProductionValues),
 			zigzagJoinerBatchSize,
-			z.FlowCtx.TraceKV,
-			z.EvalCtx.TestingKnobs.ForceProductionValues,
 		)
 		if err != nil {
 			return nil, err
@@ -710,8 +719,7 @@ func (z *zigzagJoiner) nextRow(ctx context.Context, txn *kv.Txn) (rowenc.EncDatu
 			currentEqCols := z.extractEqDatums(curNext, z.side)
 			eqColTypes := curInfo.eqColTypes
 			ordering := curInfo.eqColOrdering
-			da := &tree.DatumAlloc{}
-			cmp, err := prevEqCols.Compare(eqColTypes, da, ordering, z.FlowCtx.EvalCtx, currentEqCols)
+			cmp, err := prevEqCols.Compare(eqColTypes, &z.infos[z.side].alloc, ordering, z.FlowCtx.EvalCtx, currentEqCols)
 			if err != nil {
 				return nil, err
 			}
@@ -787,20 +795,17 @@ func (z *zigzagJoiner) maybeFetchInitialRow() error {
 
 		curInfo := &z.infos[z.side]
 		err := curInfo.fetcher.StartScan(
-			z.Ctx,
-			z.FlowCtx.Txn,
+			z.Ctx(),
 			roachpb.Spans{roachpb.Span{Key: curInfo.key, EndKey: curInfo.endKey}},
 			nil, /* spanIDs */
 			rowinfra.GetDefaultBatchBytesLimit(z.EvalCtx.TestingKnobs.ForceProductionValues),
 			zigzagJoinerBatchSize,
-			z.FlowCtx.TraceKV,
-			z.EvalCtx.TestingKnobs.ForceProductionValues,
 		)
 		if err != nil {
-			log.Errorf(z.Ctx, "scan error: %s", err)
+			log.Errorf(z.Ctx(), "scan error: %s", err)
 			return err
 		}
-		fetchedRow, err := z.fetchRow(z.Ctx)
+		fetchedRow, err := z.fetchRow(z.Ctx())
 		if err != nil {
 			return scrub.UnwrapScrubError(err)
 		}
@@ -818,7 +823,7 @@ func (z *zigzagJoiner) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 			z.MoveToDraining(err)
 			break
 		}
-		row, err := z.nextRow(z.Ctx, z.FlowCtx.Txn)
+		row, err := z.nextRow(z.Ctx())
 		if err != nil {
 			z.MoveToDraining(err)
 			break
@@ -843,13 +848,12 @@ func (z *zigzagJoiner) ConsumerClosed() {
 
 // execStatsForTrace implements ProcessorBase.ExecStatsForTrace.
 func (z *zigzagJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
-	z.scanStats = execstats.GetScanStats(z.Ctx)
-
 	kvStats := execinfrapb.KVStats{
-		BytesRead:      optional.MakeUint(uint64(z.getBytesRead())),
-		ContentionTime: optional.MakeTimeValue(execstats.GetCumulativeContentionTime(z.Ctx)),
+		BytesRead:           optional.MakeUint(uint64(z.getBytesRead())),
+		ContentionTime:      optional.MakeTimeValue(z.contentionEventsListener.CumulativeContentionTime),
+		BatchRequestsIssued: optional.MakeUint(uint64(z.getBatchRequestsIssued())),
 	}
-	execstats.PopulateKVMVCCStats(&kvStats, &z.scanStats)
+	execstats.PopulateKVMVCCStats(&kvStats, &z.scanStatsListener.ScanStats)
 	for i := range z.infos {
 		fis, ok := getFetcherInputStats(z.infos[i].fetcher)
 		if !ok {
@@ -857,11 +861,14 @@ func (z *zigzagJoiner) execStatsForTrace() *execinfrapb.ComponentStats {
 		}
 		kvStats.TuplesRead.MaybeAdd(fis.NumTuples)
 		kvStats.KVTime.MaybeAdd(fis.WaitTime)
+		kvStats.KVCPUTime.MaybeAdd(optional.MakeTimeValue(fis.kvCPUTime))
 	}
-	return &execinfrapb.ComponentStats{
+	ret := &execinfrapb.ComponentStats{
 		KV:     kvStats,
 		Output: z.OutputHelper.Stats(),
 	}
+	ret.Exec.ConsumedRU = optional.MakeUint(z.tenantConsumptionListener.ConsumedRU)
+	return ret
 }
 
 func (z *zigzagJoiner) getBytesRead() int64 {
@@ -880,13 +887,21 @@ func (z *zigzagJoiner) getRowsRead() int64 {
 	return rowsRead
 }
 
+func (z *zigzagJoiner) getBatchRequestsIssued() int64 {
+	var batchRequestsIssued int64
+	for i := range z.infos {
+		batchRequestsIssued += z.infos[i].fetcher.GetBatchRequestsIssued()
+	}
+	return batchRequestsIssued
+}
+
 func (z *zigzagJoiner) generateMeta() []execinfrapb.ProducerMetadata {
 	trailingMeta := make([]execinfrapb.ProducerMetadata, 1, 2)
 	meta := &trailingMeta[0]
 	meta.Metrics = execinfrapb.GetMetricsMeta()
 	meta.Metrics.BytesRead = z.getBytesRead()
 	meta.Metrics.RowsRead = z.getRowsRead()
-	if tfs := execinfra.GetLeafTxnFinalState(z.Ctx, z.FlowCtx.Txn); tfs != nil {
+	if tfs := execinfra.GetLeafTxnFinalState(z.Ctx(), z.FlowCtx.Txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 	return trailingMeta

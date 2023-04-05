@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
@@ -26,24 +26,27 @@ import (
 
 // TestNormRules tests the various Optgen normalization rules found in the rules
 // directory. The tests are data-driven cases of the form:
-//   <command>
-//   <SQL statement>
-//   ----
-//   <expected results>
+//
+//	<command>
+//	<SQL statement>
+//	----
+//	<expected results>
 //
 // See OptTester.Handle for supported commands.
 //
 // Rules files can be run separately like this:
-//   make test PKG=./pkg/sql/opt/norm TESTS="TestNormRules/bool"
-//   make test PKG=./pkg/sql/opt/norm TESTS="TestNormRules/comp"
-//   ...
+//
+//	./dev test pkg/sql/opt/norm -f TestNormRules/bool
+//	./dev test pkg/sql/opt/norm -f TestNormRules/comp
+//	...
 func TestNormRules(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	const fmtFlags = memo.ExprFmtHideStats | memo.ExprFmtHideCost | memo.ExprFmtHideRuleProps |
-		memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
-	datadriven.Walk(t, testutils.TestDataPath(t, "rules"), func(t *testing.T, path string) {
+		memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes |
+		memo.ExprFmtHideNotVisibleIndexInfo
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "rules"), func(t *testing.T, path string) {
 		catalog := testcat.New()
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			tester := opttester.New(catalog, d.Input)
@@ -54,15 +57,17 @@ func TestNormRules(t *testing.T) {
 }
 
 // TestRuleProps files can be run separately like this:
-//   make test PKG=./pkg/sql/opt/norm TESTS="TestNormRuleProps/orderings"
-//   ...
+//
+//	./dev test pkg/sql/opt/norm -f TestNormRuleProps/orderings
+//	...
 func TestNormRuleProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	const fmtFlags = memo.ExprFmtHideStats | memo.ExprFmtHideCost |
-		memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes
-	datadriven.Walk(t, testutils.TestDataPath(t, "ruleprops"), func(t *testing.T, path string) {
+		memo.ExprFmtHideQualifications | memo.ExprFmtHideScalars | memo.ExprFmtHideTypes |
+		memo.ExprFmtHideNotVisibleIndexInfo
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "ruleprops"), func(t *testing.T, path string) {
 		catalog := testcat.New()
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			tester := opttester.New(catalog, d.Input)
@@ -76,12 +81,12 @@ func TestNormRuleProps(t *testing.T) {
 // switched. Patterns like CommuteConst rely on this being possible.
 func TestRuleBinaryAssumption(t *testing.T) {
 	fn := func(op opt.Operator) {
-		for _, overload := range tree.BinOps[opt.BinaryOpReverseMap[op]] {
-			binOp := overload.(*tree.BinOp)
+		_ = tree.BinOps[opt.BinaryOpReverseMap[op]].ForEachBinOp(func(binOp *tree.BinOp) error {
 			if !memo.BinaryOverloadExists(op, binOp.RightType, binOp.LeftType) {
 				t.Errorf("could not find inverse for overload: %+v", op)
 			}
-		}
+			return nil
+		})
 	}
 
 	// Only include commutative binary operators.

@@ -10,10 +10,9 @@
 
 syntax = "proto3";
 package cockroach.kv.kvserver;
-option go_package = "kvserver";
+option go_package = "github.com/cockroachdb/cockroach/pkg/kv/kvserver";
 
 import "roachpb/data.proto";
-import "roachpb/internal_raft.proto";
 import "storage/enginepb/mvcc.proto";
 import "storage/enginepb/mvcc3.proto";
 import "gogoproto/gogo.proto";
@@ -36,19 +35,14 @@ message CollectChecksumRequest {
   bytes checksum_id = 3 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "ChecksumID",
       (gogoproto.customtype) = "github.com/cockroachdb/cockroach/pkg/util/uuid.UUID"];
-  bytes checksum = 4;
+  reserved 4, 5;
 }
 
 message CollectChecksumResponse {
   // The checksum is the sha512 hash of the requested computation. It is empty
   // if the computation failed.
   bytes checksum = 1;
-  // snapshot is set if the roachpb.ComputeChecksumRequest had snapshot = true
-  // and the response checksum is different from the request checksum.
-  //
-  // TODO(tschottdorf): with larger ranges, this is no longer tenable.
-  // See https://github.com/cockroachdb/cockroach/issues/21128.
-  roachpb.RaftSnapshotData snapshot = 2;
+  reserved 2;
   // delta carries the stats of the range minus the recomputed stats.
   storage.enginepb.MVCCStatsDelta delta = 3 [(gogoproto.nullable) = false];
   // persisted carries the persisted stats of the replica.
@@ -84,4 +78,14 @@ message CompactEngineSpanRequest {
 }
 
 message CompactEngineSpanResponse {
+}
+
+// CompactionConcurrencyRequest increases the compaction concurrency of the store
+// until the request is cancelled.
+message CompactionConcurrencyRequest {
+  StoreRequestHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  uint64 compaction_concurrency = 2;
+}
+
+message CompactionConcurrencyResponse {
 }

@@ -15,6 +15,8 @@ import (
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
@@ -67,13 +69,13 @@ type ServerConfig struct {
 // The server attempts to constrain the total amount of memory it uses for
 // processing incoming queries. This is accomplished with a multi-pronged
 // strategy:
-// + The server has a worker memory limit, which is a quota for the amount of
-//   memory that can be used across all currently executing queries.
-// + The server also has a pre-set limit on the number of parallel workers that
-//   can be executing at one time. Each worker is given an even share of the
-//   server's total memory limit, which it should not exceed.
-// + Each worker breaks its task into chunks which it will process sequentially;
-//   the size of each chunk is calculated to avoid exceeding the memory limit.
+//   - The server has a worker memory limit, which is a quota for the amount of
+//     memory that can be used across all currently executing queries.
+//   - The server also has a pre-set limit on the number of parallel workers that
+//     can be executing at one time. Each worker is given an even share of the
+//     server's total memory limit, which it should not exceed.
+//   - Each worker breaks its task into chunks which it will process sequentially;
+//     the size of each chunk is calculated to avoid exceeding the memory limit.
 //
 // In addition to this strategy, the server uses a memory monitor to track the
 // amount of memory being used in reality by worker tasks. This is intended to
@@ -95,6 +97,57 @@ type Server struct {
 	workerMemMonitor *mon.BytesMonitor
 	resultMemMonitor *mon.BytesMonitor
 	workerSem        *quotapool.IntPool
+}
+
+var _ tspb.TimeSeriesServer = &Server{}
+
+type TenantServer struct {
+	// NB: TenantServer only implements Query from tspb.TimeSeriesServer
+	tspb.UnimplementedTimeSeriesServer
+
+	log.AmbientContext
+	tenantID      roachpb.TenantID
+	tenantConnect kvtenant.Connector
+}
+
+var _ tspb.TenantTimeSeriesServer = &TenantServer{}
+
+// Query delegates to the tenant connector to query
+// the tsdb on the system tenant. The only authorization
+// necessary is the tenant capability check on the
+// connector.
+func (t *TenantServer) Query(
+	ctx context.Context, req *tspb.TimeSeriesQueryRequest,
+) (*tspb.TimeSeriesQueryResponse, error) {
+	ctx = t.AnnotateCtx(ctx)
+	// Currently, secondary tenants are only able to view their own metrics.
+	for i := range req.Queries {
+		req.Queries[i].TenantID = t.tenantID
+	}
+	return t.tenantConnect.Query(ctx, req)
+}
+
+// RegisterService registers the GRPC service.
+func (s *TenantServer) RegisterService(g *grpc.Server) {
+	tspb.RegisterTimeSeriesServer(g, s)
+}
+
+// RegisterGateway starts the gateway (i.e. reverse proxy) that proxies HTTP requests
+// to the appropriate gRPC endpoints.
+func (s *TenantServer) RegisterGateway(
+	ctx context.Context, mux *gwruntime.ServeMux, conn *grpc.ClientConn,
+) error {
+	return tspb.RegisterTimeSeriesHandler(ctx, mux, conn)
+}
+
+func MakeTenantServer(
+	ambient log.AmbientContext, tenantConnect kvtenant.Connector, tenantID roachpb.TenantID,
+) *TenantServer {
+	return &TenantServer{
+		AmbientContext: ambient,
+		tenantConnect:  tenantConnect,
+		tenantID:       tenantID,
+	}
 }
 
 // MakeServer instantiates a new Server which services requests with data from
@@ -141,12 +194,12 @@ func MakeServer(
 		workerSem:      workerSem,
 	}
 
-	s.workerMemMonitor.Start(ctx, memoryMonitor, mon.BoundAccount{})
+	s.workerMemMonitor.StartNoReserved(ctx, memoryMonitor)
 	stopper.AddCloser(stop.CloserFn(func() {
 		s.workerMemMonitor.Stop(ctx)
 	}))
 
-	s.resultMemMonitor.Start(ambient.AnnotateCtx(context.Background()), memoryMonitor, mon.BoundAccount{})
+	s.resultMemMonitor.StartNoReserved(ambient.AnnotateCtx(context.Background()), memoryMonitor)
 	stopper.AddCloser(stop.CloserFn(func() {
 		s.resultMemMonitor.Stop(ctx)
 	}))
@@ -433,7 +486,7 @@ func dumpTimeseriesAllSources(
 
 	for span != nil {
 		b := &kv.Batch{}
-		scan := roachpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
+		scan := kvpb.NewScan(span.Key, span.EndKey, false /* forUpdate */)
 		b.AddRawRequest(scan)
 		b.Header.MaxSpanRequestKeys = dumpBatchSize
 		err := db.Run(ctx, b)

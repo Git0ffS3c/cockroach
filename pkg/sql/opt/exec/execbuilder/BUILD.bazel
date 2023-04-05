@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,15 +15,16 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/opt/exec/execbuilder",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/clusterversion",
         "//pkg/server/telemetry",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/execinfra",
         "//pkg/sql/lexbase",
         "//pkg/sql/mutations",
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
         "//pkg/sql/opt/constraint",
+        "//pkg/sql/opt/distribution",
         "//pkg/sql/opt/exec",
         "//pkg/sql/opt/exec/explain",
         "//pkg/sql/opt/memo",
@@ -34,12 +36,14 @@ go_library(
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/row",
-        "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/builtins/builtinsregistry",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treebin",
         "//pkg/sql/sem/tree/treecmp",
         "//pkg/sql/sem/tree/treewindow",
+        "//pkg/sql/sem/volatility",
+        "//pkg/sql/sqlerrors",
         "//pkg/sql/sqltelemetry",
         "//pkg/sql/types",
         "//pkg/util",
@@ -47,6 +51,9 @@ go_library(
         "//pkg/util/encoding",
         "//pkg/util/errorutil",
         "//pkg/util/errorutil/unimplemented",
+        "//pkg/util/intsets",
+        "//pkg/util/log",
+        "//pkg/util/timeutil",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
@@ -55,28 +62,46 @@ go_library(
 
 go_test(
     name = "execbuilder_test",
-    size = "large",
+    size = "small",
     srcs = [
-        "builder_test.go",
         "main_test.go",
         "mutation_test.go",
     ],
-    data = glob(["testdata/**"]) + ["//c-deps:libgeos"],
+    args = ["-test.timeout=55s"],
+    data = [
+        ":testdata",
+        "//c-deps:libgeos",
+    ],
     embed = [":execbuilder"],
-    shard_count = 16,
     deps = [
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
-        "//pkg/sql",
-        "//pkg/sql/logictest",
         "//pkg/sql/opt",
         "//pkg/sql/sem/tree",
-        "//pkg/testutils",
         "//pkg/testutils/serverutils",
-        "//pkg/testutils/skip",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
     ],
 )
+
+filegroup(
+    name = "testdata",
+    srcs = glob(
+        ["testdata/**"],
+        exclude = [
+            "**/*~",
+            "**/#*#",
+            "**/.*.swp",
+            "**/.#*",
+        ],
+    ),
+    visibility = [
+        "//pkg/ccl/logictestccl:__subpackages__",
+        "//pkg/cmd/generate-logictest:__pkg__",
+        "//pkg/sql/opt/exec/execbuilder:__subpackages__",
+    ],
+)
+
+get_x_data(name = "get_x_data")

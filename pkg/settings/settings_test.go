@@ -26,7 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// dummyVersion mocks out the dependency on the ClusterVersion type. It has a
+// dummyVersion mocks out the dependency on the clusterVersion type. It has a
 // msg1 prefix, and a growsbyone component that grows by one character on each
 // update (which is internally validated and asserted against). They're
 // separated by a '.' in string form. Neither component can contain a '.'
@@ -181,13 +181,7 @@ var strVal = settings.RegisterValidatedStringSetting(settings.SystemOnly,
 	})
 var dVal = settings.RegisterDurationSetting(settings.SystemOnly, "dVal", "desc", time.Second, settings.NonNegativeDuration)
 var fVal = settings.RegisterFloatSetting(settings.SystemOnly, "fVal", "desc", 5.4, settings.NonNegativeFloat)
-var byteSizeVal = settings.RegisterByteSizeSetting(settings.SystemOnly,
-	"byteSize.Val", "desc", mb, func(v int64) error {
-		if v < 0 {
-			return errors.Errorf("bytesize cannot be negative")
-		}
-		return nil
-	})
+var byteSizeVal = settings.RegisterByteSizeSetting(settings.SystemOnly, "byteSize.Val", "desc", mb)
 var iVal = settings.RegisterIntSetting(settings.SystemOnly,
 	"i.Val", "desc", 0, func(v int64) error {
 		if v < 0 {
@@ -195,6 +189,14 @@ var iVal = settings.RegisterIntSetting(settings.SystemOnly,
 		}
 		return nil
 	})
+
+func TestNonNegativeDurationWithMinimum(t *testing.T) {
+	validator := settings.NonNegativeDurationWithMinimum(time.Minute)
+	require.NoError(t, validator(time.Minute))
+	require.NoError(t, validator(2*time.Minute))
+	require.Error(t, validator(59*time.Second))
+	require.Error(t, validator(-1*time.Second))
+}
 
 func TestValidation(t *testing.T) {
 	ctx := context.Background()
@@ -349,7 +351,7 @@ func TestCache(t *testing.T) {
 
 	t.Run("lookup-system", func(t *testing.T) {
 		for _, s := range []settings.Setting{i1A, iVal, fA, fVal, dA, dVal, eA, mA, duA} {
-			result, ok := settings.Lookup(s.Key(), settings.LookupForLocalAccess, settings.ForSystemTenant)
+			result, ok := settings.LookupForLocalAccess(s.Key(), settings.ForSystemTenant)
 			if !ok {
 				t.Fatalf("lookup(%s) failed", s.Key())
 			}
@@ -360,7 +362,7 @@ func TestCache(t *testing.T) {
 	})
 	t.Run("lookup-tenant", func(t *testing.T) {
 		for _, s := range []settings.Setting{i1A, fA, dA, duA} {
-			result, ok := settings.Lookup(s.Key(), settings.LookupForLocalAccess, false /* forSystemTenant */)
+			result, ok := settings.LookupForLocalAccess(s.Key(), false /* forSystemTenant */)
 			if !ok {
 				t.Fatalf("lookup(%s) failed", s.Key())
 			}
@@ -371,7 +373,7 @@ func TestCache(t *testing.T) {
 	})
 	t.Run("lookup-tenant-fail", func(t *testing.T) {
 		for _, s := range []settings.Setting{iVal, fVal, dVal, eA, mA} {
-			_, ok := settings.Lookup(s.Key(), settings.LookupForLocalAccess, false /* forSystemTenant */)
+			_, ok := settings.LookupForLocalAccess(s.Key(), false /* forSystemTenant */)
 			if ok {
 				t.Fatalf("lookup(%s) should have failed", s.Key())
 			}
@@ -644,7 +646,7 @@ func TestCache(t *testing.T) {
 		{
 			u := settings.NewUpdater(sv)
 			if err := u.Set(ctx, "byteSize.Val", v(settings.EncodeInt(-mb), "z")); !testutils.IsError(err,
-				"bytesize cannot be negative",
+				"cannot be set to a negative value",
 			) {
 				t.Fatal(err)
 			}
@@ -686,13 +688,13 @@ func TestCache(t *testing.T) {
 }
 
 func TestIsReportable(t *testing.T) {
-	if v, ok := settings.Lookup(
-		"bool.t", settings.LookupForLocalAccess, settings.ForSystemTenant,
+	if v, ok := settings.LookupForLocalAccess(
+		"bool.t", settings.ForSystemTenant,
 	); !ok || !settings.TestingIsReportable(v) {
 		t.Errorf("expected 'bool.t' to be marked as isReportable() = true")
 	}
-	if v, ok := settings.Lookup(
-		"sekretz", settings.LookupForLocalAccess, settings.ForSystemTenant,
+	if v, ok := settings.LookupForLocalAccess(
+		"sekretz", settings.ForSystemTenant,
 	); !ok || settings.TestingIsReportable(v) {
 		t.Errorf("expected 'sekretz' to be marked as isReportable() = false")
 	}
@@ -710,7 +712,7 @@ func TestOnChangeWithMaxSettings(t *testing.T) {
 	sv := &settings.Values{}
 	sv.Init(ctx, settings.TestOpaque)
 	var changes int
-	s, ok := settings.Lookup(maxName, settings.LookupForLocalAccess, settings.ForSystemTenant)
+	s, ok := settings.LookupForLocalAccess(maxName, settings.ForSystemTenant)
 	if !ok {
 		t.Fatalf("expected lookup of %s to succeed", maxName)
 	}

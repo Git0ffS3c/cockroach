@@ -117,7 +117,7 @@ outer:
 	for len(input) > 0 {
 		if entries != nil {
 			for _, v := range entries {
-				if strings.HasPrefix(input, v.Name) {
+				if strings.HasPrefix(input, string(v.Name)) {
 					input = input[len(v.Name):]
 					if v.PSFunc == nil {
 						return mkErr(nil)
@@ -133,15 +133,15 @@ outer:
 				Wrapped: errors.New("known key, but unsupported subtype"),
 			}
 		}
-		for _, v := range keys.ConstKeyDict {
-			if strings.HasPrefix(input, v.Name) {
+		for _, v := range keys.ConstKeyOverrides {
+			if strings.HasPrefix(input, string(v.Name)) {
 				output = append(output, v.Value...)
 				input = input[len(v.Name):]
 				continue outer
 			}
 		}
 		for _, v := range s.keyComprehension {
-			if strings.HasPrefix(input, v.Name) {
+			if strings.HasPrefix(input, string(v.Name)) {
 				// No appending to output yet, the dictionary will take care of
 				// it.
 				input = input[len(v.Name):]

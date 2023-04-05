@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -49,14 +49,15 @@ func aggregations(aggTestSpecs []aggTestSpec) []execinfrapb.AggregatorSpec_Aggre
 }
 
 // TODO(irfansharif): Add tests to verify the following aggregation functions:
-//      AVG
-//      BOOL_AND
-//      BOOL_OR
-//      CONCAT_AGG
-//      JSON_AGG
-//      JSONB_AGG
-//      STDDEV
-//      VARIANCE
+//
+//	AVG
+//	BOOL_AND
+//	BOOL_OR
+//	CONCAT_AGG
+//	JSON_AGG
+//	JSONB_AGG
+//	STDDEV
+//	VARIANCE
 func TestAggregator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -393,8 +394,8 @@ func TestAggregator(t *testing.T) {
 
 	ctx := context.Background()
 	test := MakeProcessorTest(DefaultProcessorTestConfig())
+	defer test.Close(ctx)
 	test.RunTestCases(ctx, t, testCases)
-	test.Close(ctx)
 }
 
 func BenchmarkAggregation(b *testing.B) {
@@ -425,6 +426,7 @@ func BenchmarkAggregation(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	for _, aggFunc := range aggFuncs {
@@ -444,11 +446,11 @@ func BenchmarkAggregation(b *testing.B) {
 			b.SetBytes(int64(8 * numRows * numCols))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+				d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post)
 				if err != nil {
 					b.Fatal(err)
 				}
-				d.Run(context.Background())
+				d.Run(context.Background(), disposer)
 				input.Reset()
 			}
 			b.StopTimer()
@@ -479,16 +481,17 @@ func BenchmarkCountRows(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	b.SetBytes(int64(8 * numRows * numCols))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+		d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post)
 		if err != nil {
 			b.Fatal(err)
 		}
-		d.Run(context.Background())
+		d.Run(context.Background(), disposer)
 		input.Reset()
 	}
 }
@@ -506,6 +509,7 @@ func BenchmarkGrouping(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	spec := &execinfrapb.AggregatorSpec{
 		GroupCols: []uint32{0},
@@ -517,11 +521,11 @@ func BenchmarkGrouping(b *testing.B) {
 	b.SetBytes(int64(8 * numRows * numCols))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+		d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post)
 		if err != nil {
 			b.Fatal(err)
 		}
-		d.Run(context.Background())
+		d.Run(context.Background(), disposer)
 		input.Reset()
 	}
 	b.StopTimer()
@@ -557,6 +561,7 @@ func benchmarkAggregationWithGrouping(b *testing.B, numOrderedCols int) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	for _, aggFunc := range aggFuncs {
@@ -578,11 +583,11 @@ func benchmarkAggregationWithGrouping(b *testing.B, numOrderedCols int) {
 			b.SetBytes(int64(8 * intPow(groupSize, len(groupedCols)+1) * numCols))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+				d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post)
 				if err != nil {
 					b.Fatal(err)
 				}
-				d.Run(context.Background())
+				d.Run(context.Background(), disposer)
 				input.Reset()
 			}
 			b.StopTimer()
@@ -627,7 +632,7 @@ func makeGroupedIntRows(groupSize, numCols int, groupedCols []int) rowenc.EncDat
 	numRows := intPow(groupSize, len(groupedCols)+1)
 	rows := make(rowenc.EncDatumRows, numRows)
 
-	groupColSet := util.MakeFastIntSet(groupedCols...)
+	groupColSet := intsets.MakeFast(groupedCols...)
 	getGroupedColVal := func(rowIdx, colIdx int) int {
 		rank := -1
 		for i, c := range groupedCols {

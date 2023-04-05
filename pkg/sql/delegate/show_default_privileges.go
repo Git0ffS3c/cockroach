@@ -35,7 +35,8 @@ func (d *delegator) delegateShowDefaultPrivileges(
 	}
 
 	query := fmt.Sprintf(
-		"SELECT role, for_all_roles, object_type, grantee, privilege_type FROM crdb_internal.default_privileges WHERE database_name = %s%s",
+		"SELECT role, for_all_roles, object_type, grantee, privilege_type, is_grantable "+
+			"FROM crdb_internal.default_privileges WHERE database_name = %s%s",
 		lexbase.EscapeSQLString(currentDatabase.Normalize()),
 		schemaClause,
 	)
@@ -65,5 +66,5 @@ func (d *delegator) delegateShowDefaultPrivileges(
 			query, d.evalCtx.SessionData().User())
 	}
 	query += " ORDER BY 1,2,3,4,5"
-	return parse(query)
+	return d.parse(query)
 }

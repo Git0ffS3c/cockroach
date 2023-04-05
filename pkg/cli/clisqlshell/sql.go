@@ -41,9 +41,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/scanner"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlfsm"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
-	readline "github.com/knz/go-libedit"
+	"github.com/knz/bubbline/editline"
+	"github.com/knz/bubbline/history"
 )
 
 const (
@@ -65,24 +66,40 @@ Query Buffer
   \| CMD            run an external command and run its output as SQL statements.
 
 Connection
+  \info             display server details including connection strings.
   \c, \connect {[DB] [USER] [HOST] [PORT] | [URL]}
                     connect to a server or print the current connection URL.
                     (Omitted values reuse previous parameters. Use '-' to skip a field.)
-  \password [USERNAME]   
+  \password [USERNAME]
                     securely change the password for a user
 
 Input/Output
   \echo [STRING]    write the provided string to standard output.
   \i                execute commands from the specified file.
   \ir               as \i, but relative to the location of the current script.
+  \o [FILE]         send all query results to the specified file.
+  \qecho [STRING]   write the provided string to the query output stream (see \o).
 
 Informational
-  \l                list all databases in the CockroachDB cluster.
-  \dt               show the tables of the current schema in the current database.
-  \dT               show the user defined types of the current database.
-  \du [USER]        list the specified user, or list the users for all databases if no user is specified.
-  \d [TABLE]        show details about columns in the specified table, or alias for '\dt' if no table is specified.
-  \dd TABLE         show details about constraints on the specified table.
+  \d[tivms][S+] [PATTERN] list stored objects [only tables/indexes/views/matviews/sequences].
+  \dC[S+] [PATTERN] list casts.
+  \dd[S+] [PATTERN] list object descriptions not displayed elsewhere.
+  \df[anptw][S+] [PATTERN] list [only agg/normal/procedures/trigger/window] functions.
+  \dg[S+] [PATTERN] list users and roles.
+  \di[S+] [PATTERN] list only indexes.
+  \dm[S+] [PATTERN] list only materialized views.
+  \dn[S+] [PATTERN] list schemas.
+  \dp [PATTERN]     list table, view, and sequence access privileges.
+  \ds[S+] [PATTERN] list only sequences.
+  \dt[S+] [PATTERN] list only tables.
+  \dT[S+] [PATTERN] list data types.
+  \du[S+] [PATTERN] same as \dg.
+  \dv[S+] [PATTERN] list only views.
+  \l[+] [PATTERN]   list databases.
+  \s                list command history.
+  \sf[+] FUNCNAME   show a function's definition.
+  \sv[+] VIEWNAME   show a view's definition.
+  \z [PATTERN]      same as \dp.
 
 Formatting
   \x [on|off]       toggle records display format.
@@ -134,10 +151,8 @@ type cliState struct {
 	iCtx       *internalContext
 
 	conn clisqlclient.Conn
-	// ins is used to read lines if isInteractive is true.
-	ins readline.EditLine
-	// buf is used to read lines if isInteractive is false.
-	buf *bufio.Reader
+	// ins is used to read lines.
+	ins editor
 	// singleStatement is set to true when this state level
 	// is currently processing for runString(). In that mode:
 	// - a missing semicolon at the end of input is ignored:
@@ -266,24 +281,41 @@ func (c *cliState) printCliHelp() {
 	fmt.Fprintln(c.iCtx.stdout)
 }
 
-const noLineEditor readline.EditLine = -1
+// printCommandHistory prints the recorded command history.
+func (c *cliState) printCommandHistory() {
+	// As long as we preserve compatibility with go-libedit, we cannot
+	// ask the line editor directly for a copy of the history; instead
+	// we need to load it from file.
 
-func (c *cliState) hasEditor() bool {
-	return c.ins != noLineEditor
+	// To do so, first we must save it to file: by default, it is
+	// not saved on every input.
+	if err := c.ins.saveHistory(); err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot save history: %v", err)
+		return
+	}
+
+	// Then, we load it back from file. We can use the bubbline loader,
+	// because both bubbline and libedit use the same file format.
+	h, err := history.LoadHistory(c.iCtx.histFile)
+	if err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot load history: %v", err)
+		return
+	}
+
+	// Finally, we can print the entries.
+	for _, entry := range h {
+		fmt.Fprintln(c.iCtx.stdout, entry)
+	}
 }
 
 // addHistory persists a line of input to the readline history file.
 func (c *cliState) addHistory(line string) {
-	if !c.hasEditor() || len(line) == 0 {
+	if len(line) == 0 {
 		return
 	}
 
-	// ins.AddHistory will push command into memory and try to
-	// persist to disk (if ins's history file is set). err can
-	// be not nil only if it got a IO error while trying to persist.
-	if err := c.ins.AddHistory(line); err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "warning: cannot save command-line history: %v\n", err)
-		c.ins.SetAutoSaveHistory("", false)
+	if err := c.ins.addHistory(line); err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: cannot add entry to history: %v\n", err)
 	}
 }
 
@@ -291,6 +323,7 @@ func (c *cliState) invalidSyntax(nextState cliStateEnum) cliStateEnum {
 	return c.invalidSyntaxf(nextState, `%s. Try \? for help.`, c.lastInputLine)
 }
 
+// inCopy implements the sqlShell interface (to support the editor).
 func (c *cliState) inCopy() bool {
 	return c.copyFromState != nil
 }
@@ -415,6 +448,54 @@ var options = map[string]struct {
 		reset:                     func(c *cliState) error { c.iCtx.checkSyntax = false; return nil },
 		display:                   func(c *cliState) string { return strconv.FormatBool(c.iCtx.checkSyntax) },
 	},
+	`reflow_max_width`: {
+		description: "maximum output width when reflowing input statements",
+		set: func(c *cliState, v string) error {
+			i, err := strconv.Atoi(v)
+			if err != nil {
+				return err
+			}
+			if i <= 0 {
+				return errors.New("maximum width must be positive")
+			}
+			c.iCtx.reflowMaxWidth = i
+			return nil
+		},
+		reset:   func(c *cliState) error { c.iCtx.reflowMaxWidth = defaultReflowMaxWidth; return nil },
+		display: func(c *cliState) string { return strconv.Itoa(c.iCtx.reflowMaxWidth) },
+	},
+	`reflow_align_mode`: {
+		description: "how to reflow SQL syntax (0 = no, 1 = partial, 2 = full, 3 = extra)",
+		set: func(c *cliState, v string) error {
+			i, err := strconv.Atoi(v)
+			if err != nil {
+				return err
+			}
+			if i < 0 || i > 3 {
+				return errors.New("possible values: 0 = no, 1 = partial, 2 = full, 3 = extra")
+			}
+			c.iCtx.reflowAlignMode = i
+			return nil
+		},
+		reset:   func(c *cliState) error { c.iCtx.reflowAlignMode = defaultReflowAlignMode; return nil },
+		display: func(c *cliState) string { return strconv.Itoa(c.iCtx.reflowAlignMode) },
+	},
+	`reflow_case_mode`: {
+		description: "how to change case during reflow (0 = lowercase, 1 = uppercase)",
+		set: func(c *cliState, v string) error {
+			i, err := strconv.Atoi(v)
+			if err != nil {
+				return err
+			}
+			if i < 0 || i > 1 {
+				return errors.New("value must be 0 (lowercase) or 1 (uppercase)")
+			}
+			c.iCtx.reflowCaseMode = i
+			return nil
+		},
+		reset:   func(c *cliState) error { c.iCtx.reflowCaseMode = defaultReflowCaseMode; return nil },
+		display: func(c *cliState) string { return strconv.Itoa(c.iCtx.reflowCaseMode) },
+	},
 	`show_times`: {
 		description:               "display the execution time after each query",
 		isBoolean:                 true,
@@ -475,6 +556,30 @@ var optionNames = func() []string {
 	return names
 }()
 
+var setArgsRe = regexp.MustCompile(`^\s*` + // zero or more leading space.
+	`(?P<option>(?:[a-zA-Z_.0-9]|-)+)` + // 1 or more non-space option characters.
+	`(?:` +
+	`\s*(?:=\s*|\s+)` + // separator: either some spaces, or an equal sign surrounded by optional spaces.
+	`(?P<value>` +
+	`"(?:[^"]|\\.)*"` + // value is either a double-quoted string, which might be empty; or
+	`|` +
+	`[^\s"]+` + // value may be a string of non-space, non-quote characters.
+	`))?` + // value, as a whole, is optional.
+	`\s*$`, // either a standalone option or the value can be followed by optional spaces.
+)
+
+func getSetArgs(sargs string) (ok bool, option string, hasValue bool, value string) {
+	m := setArgsRe.FindStringSubmatch(sargs)
+	if m == nil {
+		return false, "", false, ""
+	}
+	option = m[1]
+	if len(m) == 2 || m[2] == "" {
+		return true, option, false, ""
+	}
+	return true, option, true, m[2]
+}
+
 // handleSet supports the \set client-side command.
 func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cliStateEnum {
 	if len(args) == 0 {
@@ -495,32 +600,38 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 		return nextState
 	}
 
-	if len(args) == 1 {
-		// Try harder to find a value.
-		args = strings.SplitN(args[0], "=", 2)
+	// For \set, we're not trusting the default field separator which
+	// simply splits at spaces, because it doesn't help us handle
+	// "a=b", "a = b", "a b" and "a =b" effectively.
+	// Regular expressions to the rescue.
+	sargs := strings.Join(args, " ")
+
+	ok, optName, hasValue, val := getSetArgs(sargs)
+	if !ok {
+		return c.invalidSyntax(errState)
 	}
 
-	opt, ok := options[args[0]]
+	opt, ok := options[optName]
 	if !ok {
 		return c.invalidSyntax(errState)
 	}
 	if len(c.partialLines) > 0 && !opt.validDuringMultilineEntry {
-		return c.invalidOptionChange(errState, args[0])
+		return c.invalidOptionChange(errState, optName)
 	}
 
+	var err error
+
 	// Determine which value to use.
-	var val string
-	switch len(args) {
-	case 1:
+	if !hasValue {
 		val = "true"
-	case 2:
-		val = args[1]
-	default:
-		return c.invalidSyntax(errState)
+	} else if len(val) > 0 && val[0] == '"' {
+		val, err = strconv.Unquote(val)
+		if err != nil {
+			return c.invalidSyntax(errState)
+		}
 	}
 
 	// Run the command.
-	var err error
 	if !opt.isBoolean {
 		err = opt.set(c, val)
 	} else if b, e := clisqlclient.ParseBool(val); e != nil {
@@ -532,7 +643,7 @@ func (c *cliState) handleSet(args []string, nextState, errState cliStateEnum) cl
 	}
 
 	if err != nil {
-		fmt.Fprintf(c.iCtx.stderr, "\\set %s: %v\n", strings.Join(args, " "), err)
+		fmt.Fprintf(c.iCtx.stderr, "\\set %s: %v\n", sargs, err)
 		c.exitErr = err
 		return errState
 	}
@@ -580,7 +691,7 @@ func (c *cliState) handleDemo(cmd []string, nextState, errState cliStateEnum) cl
 	//
 	// We parse these commands separately, in the following blocks.
 	if len(cmd) == 1 && cmd[0] == "ls" {
-		c.sqlCtx.DemoCluster.ListDemoNodes(c.iCtx.stdout, c.iCtx.stderr, false /* justOne */)
+		c.sqlCtx.DemoCluster.ListDemoNodes(c.iCtx.stdout, c.iCtx.stderr, false /* justOne */, true /* verbose */)
 		return nextState
 	}
 
@@ -609,6 +720,39 @@ func (c *cliState) handleDemoAddNode(cmd []string, nextState, errState cliStateE
 	}
 	fmt.Fprintf(c.iCtx.stdout, "node %v has been added with locality \"%s\"\n",
 		addedNodeID, c.sqlCtx.DemoCluster.GetLocality(addedNodeID))
+	return nextState
+}
+
+func (c *cliState) handleInfo(nextState cliStateEnum) (resState cliStateEnum) {
+	w := c.iCtx.stdout
+	si := c.conn.GetServerInfo()
+	if si.ServerExecutableVersion != "" {
+		fmt.Fprintf(w, "Server version: %s\n", si.ServerExecutableVersion)
+	}
+	if si.ClusterID != "" {
+		fmt.Fprintf(w, "Cluster ID: %s\n", si.ClusterID)
+	}
+	if si.Organization != "" {
+		fmt.Fprintf(w, "Organization: %s\n", si.Organization)
+	}
+	fmt.Fprintln(w)
+
+	// Print the current connection URL, database string and username.
+	// We hide the connection string in the demo case because we print it again below.
+	if err := c.handleConnectInternal(nil, c.sqlCtx.DemoCluster != nil); err != nil {
+		fmt.Fprintln(c.iCtx.stderr, err)
+	}
+	fmt.Fprintln(w)
+
+	// If running a demo shell, also print out the server details.
+	if c.sqlCtx.DemoCluster != nil {
+		fmt.Fprintf(w, "You are connected to a demo cluster with %d node(s).\n", c.sqlCtx.DemoCluster.NumNodes())
+		fmt.Fprintf(w, "Connection parameters (simplified):\n")
+		c.sqlCtx.DemoCluster.ListDemoNodes(w, w, true /* justOne */, false /* verbose */)
+		fmt.Fprintf(w, "Use the command '\\demo ls' to list nodes and detailed connection parameters to each.\n")
+		fmt.Fprintln(w)
+	}
+
 	return nextState
 }
 
@@ -767,7 +911,7 @@ const unknownTxnStatus = " ?"
 // doRefreshPrompts refreshes the prompts of the client depending on the
 // status of the current transaction.
 func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
-	if !c.hasEditor() {
+	if !c.ins.canPrompt() {
 		return nextState
 	}
 
@@ -781,7 +925,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 			c.continuePrompt = strings.Repeat(" ", len(c.fullPrompt)-3) + "-> "
 		}
 
-		c.ins.SetLeftPrompt(c.continuePrompt)
+		c.ins.setPrompt(c.continuePrompt)
 		return nextState
 	}
 
@@ -847,7 +991,7 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 	c.currentPrompt = c.fullPrompt
 
 	// Configure the editor to use the new prompt.
-	c.ins.SetLeftPrompt(c.currentPrompt)
+	c.ins.setPrompt(c.currentPrompt)
 
 	return nextState
 }
@@ -856,15 +1000,16 @@ func (c *cliState) doRefreshPrompts(nextState cliStateEnum) cliStateEnum {
 func (c *cliState) refreshTransactionStatus() {
 	c.lastKnownTxnStatus = unknownTxnStatus
 
-	dbVal, dbColType, hasVal := c.conn.GetServerValue(
+	dbVal, hasVal := c.conn.GetServerValue(
 		context.Background(),
 		"transaction status", `SHOW TRANSACTION STATUS`)
 	if !hasVal {
 		return
 	}
 
-	txnString := clisqlexec.FormatVal(dbVal, dbColType,
-		false /* showPrintableUnicode */, false /* shownewLinesAndTabs */)
+	txnString := clisqlexec.FormatVal(
+		dbVal, false /* showPrintableUnicode */, false, /* shownewLinesAndTabs */
+	)
 
 	// Change the prompt based on the response from the server.
 	switch txnString {
@@ -891,7 +1036,7 @@ func (c *cliState) refreshDatabaseName() string {
 		return unknownDbName
 	}
 
-	dbVal, dbColType, hasVal := c.conn.GetServerValue(
+	dbVal, hasVal := c.conn.GetServerValue(
 		context.Background(),
 		"database name", `SHOW DATABASE`)
 	if !hasVal {
@@ -904,8 +1049,9 @@ func (c *cliState) refreshDatabaseName() string {
 			" Use SET database = <dbname> to change, CREATE DATABASE to make a new database.")
 	}
 
-	dbName := clisqlexec.FormatVal(dbVal, dbColType,
-		false /* showPrintableUnicode */, false /* shownewLinesAndTabs */)
+	dbName := clisqlexec.FormatVal(
+		dbVal, false /* showPrintableUnicode */, false, /* shownewLinesAndTabs */
+	)
 
 	// Preserve the current database name in case of reconnects.
 	c.conn.SetCurrentDatabase(dbName)
@@ -916,50 +1062,15 @@ func (c *cliState) refreshDatabaseName() string {
 
 var cmdHistFile = envutil.EnvOrDefaultString("COCKROACH_SQL_CLI_HISTORY", ".cockroachsql_history")
 
-// GetCompletions implements the readline.CompletionGenerator interface.
-func (c *cliState) GetCompletions(s string) []string {
-	sql, _ := c.ins.GetLineInfo()
-
-	// In COPY mode, just add a tab character.
-	if c.inCopy() {
-		return []string{s + "\t"}
-	}
-
-	if !strings.HasSuffix(sql, "??") {
-		query := fmt.Sprintf(`SHOW COMPLETIONS AT OFFSET %d FOR %s`, len(sql), lexbase.EscapeSQLString(sql))
-		var rows [][]string
+// runShowCompletions implements the sqlShell interface (to support the editor).
+func (c *cliState) runShowCompletions(sql string, offset int) (rows [][]string, err error) {
+	query := fmt.Sprintf(`SHOW COMPLETIONS AT OFFSET %d FOR %s`, offset, lexbase.EscapeSQLString(sql))
+	err = c.runWithInterruptableCtx(func(ctx context.Context) error {
 		var err error
-		err = c.runWithInterruptableCtx(func(ctx context.Context) error {
-			_, rows, err = c.sqlExecCtx.RunQuery(ctx, c.conn,
-				clisqlclient.MakeQuery(query), true)
-			return err
-		})
-
-		if err != nil {
-			clierror.OutputError(c.iCtx.stdout, err, true /*showSeverity*/, false /*verbose*/)
-		}
-
-		var completions []string
-		for _, row := range rows {
-			completions = append(completions, row[0])
-		}
-
-		return completions
-	}
-
-	helpText, err := c.serverSideParse(sql)
-	if helpText != "" {
-		// We have a completion suggestion. Use that.
-		fmt.Fprintf(c.iCtx.stdout, "\nSuggestion:\n%s\n", helpText)
-	} else if err != nil {
-		// Some other error. Display it.
-		fmt.Fprintln(c.iCtx.stdout)
-		clierror.OutputError(c.iCtx.stdout, err, true /*showSeverity*/, false /*verbose*/)
-	}
-
-	// After the suggestion or error, re-display the prompt and current entry.
-	fmt.Fprint(c.iCtx.stdout, c.currentPrompt, sql)
-	return nil
+		_, rows, err = c.sqlExecCtx.RunQuery(ctx, c.conn, clisqlclient.MakeQuery(query), true /* showMoreChars */)
+		return err
+	})
+	return rows, err
 }
 
 func (c *cliState) doStart(nextState cliStateEnum) cliStateEnum {
@@ -978,6 +1089,7 @@ func (c *cliState) doStartLine(nextState cliStateEnum) cliStateEnum {
 	c.atEOF = false
 	c.partialLines = c.partialLines[:0]
 	c.partialStmtsLen = 0
+	c.concatLines = ""
 
 	c.useContinuePrompt = false
 
@@ -1004,35 +1116,9 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		return nextState
 	}
 
-	var l string
-	var err error
-	if c.buf == nil {
-		l, err = c.ins.GetLine()
-		if len(l) > 0 && l[len(l)-1] == '\n' {
-			// Strip the final newline.
-			l = l[:len(l)-1]
-		} else {
-			// There was no newline at the end of the input
-			// (e.g. Ctrl+C was entered). Force one.
-			fmt.Fprintln(c.iCtx.stdout)
-		}
-	} else {
-		l, err = c.buf.ReadString('\n')
-		// bufio.ReadString() differs from readline.Readline in the handling of
-		// EOF. Readline only returns EOF when there is nothing left to read and
-		// there is no partial line while bufio.ReadString() returns EOF when the
-		// end of input has been reached but will return the non-empty partial line
-		// as well. We workaround this by converting the bufio behavior to match
-		// the Readline behavior.
-		if err == io.EOF && len(l) != 0 {
-			err = nil
-		} else if err == nil {
-			// From the bufio.ReadString docs: ReadString returns err != nil if and
-			// only if the returned data does not end in delim. To match the behavior
-			// of readline.Readline, we strip off the trailing delimiter.
-			l = l[:len(l)-1]
-		}
-	}
+	// TODO(knz): Re-load the previous lines of input, so the user
+	// gets a chance to modify them.
+	l, err := c.ins.getLine()
 
 	switch {
 	case err == nil:
@@ -1046,7 +1132,7 @@ func (c *cliState) doReadLine(nextState cliStateEnum) cliStateEnum {
 		}
 		// In any case, process one line.
 
-	case errors.Is(err, readline.ErrInterrupted):
+	case errors.Is(err, c.ins.errInterrupted()):
 		if !c.cliCtx.IsInteractive {
 			// Ctrl+C terminates non-interactive shells in all cases.
 			c.exitErr = err
@@ -1143,6 +1229,116 @@ func (c *cliState) doProcessFirstLine(startState, nextState cliStateEnum) cliSta
 	return nextState
 }
 
+func (c *cliState) setupChangefeedOutput() (undo func(), err error) {
+	prevTableFmt := c.sqlExecCtx.TableDisplayFormat
+	prevByteaOutput, err := c.getSessionVarValue("bytea_output")
+	if err != nil {
+		return nil, err
+	}
+	var undoSteps []func()
+	undo = func() {
+		for _, s := range undoSteps {
+			s()
+		}
+	}
+	// The table display format, default for interactive shells,
+	// doesn't work well with changefeeds as it buffers indefinitely.
+	// Newline-delimited JSON doesn't need to buffer and can display
+	// variably-structured data.
+	if prevTableFmt == clisqlexec.TableDisplayTable {
+		c.sqlExecCtx.TableDisplayFormat = clisqlexec.TableDisplayNDJSON
+		undoSteps = append(undoSteps, func() { c.sqlExecCtx.TableDisplayFormat = prevTableFmt })
+	}
+
+	// bytea_output is defined and enforced server-side. Changefeed
+	// record values are output as bytea datums, and escaped output
+	// is much more readable than the default hex.
+	if prevByteaOutput == `hex` {
+		err := c.conn.Exec(context.Background(), `SET SESSION bytea_output=escape`)
+		if err != nil {
+			undo()
+			return nil, err
+		}
+		undoSteps = append(undoSteps, func() {
+			c.exitErr = errors.CombineErrors(
+				c.exitErr, c.conn.Exec(context.Background(), `SET SESSION bytea_output=hex`),
+			)
+		})
+	}
+
+	return undo, nil
+
+}
+
+func (c *cliState) handleDescribe(cmd []string, loopState, errState cliStateEnum) cliStateEnum {
+	var title, sql string
+	var qargs []interface{}
+	var foreach func([]string) []describeStage
+	title, sql, qargs, foreach, c.exitErr = pgInspect(cmd)
+	if c.exitErr != nil {
+		clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+		return errState
+	}
+
+	if title != "" {
+		fmt.Fprintf(c.iCtx.stdout, "%s:\n", title)
+	}
+	var toRun []describeStage
+
+	if foreach == nil {
+		// A single stage.
+		toRun = []describeStage{{sql: sql, qargs: qargs}}
+	} else {
+		// There's N stages, each produced by the foreach function
+		// applied on the result of the original SQL. Used mainly by \d.
+		var rows [][]string
+		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+			q := clisqlclient.MakeQuery(fmt.Sprintf(sql, qargs...))
+			var err error
+			_, rows, err = c.sqlExecCtx.RunQuery(
+				ctx, c.conn, q,
+				true, /* showMoreChars */
+			)
+			return err
+		})
+		if c.exitErr != nil {
+			if !c.singleStatement {
+				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+			}
+			return errState
+		}
+
+		for _, row := range rows {
+			extraStages := foreach(row)
+			toRun = append(toRun, extraStages...)
+		}
+	}
+
+	for _, st := range toRun {
+		if st.title != "" {
+			fmt.Fprintln(c.iCtx.queryOutput, st.title)
+		}
+		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
+			q := clisqlclient.MakeQuery(fmt.Sprintf(st.sql, st.qargs...))
+			return c.sqlExecCtx.RunQueryAndFormatResults(
+				ctx,
+				c.conn,
+				c.iCtx.queryOutput, // query output.
+				io.Discard,         // we hide timings for describe commands.
+				c.iCtx.stderr,
+				q,
+			)
+		})
+		if c.exitErr != nil {
+			if !c.singleStatement {
+				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+			}
+			return errState
+		}
+	}
+	return loopState
+}
+
 func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnum {
 	if len(c.lastInputLine) == 0 || c.lastInputLine[0] != '\\' {
 		return nextState
@@ -1164,6 +1360,17 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	line := strings.TrimRight(c.lastInputLine, "; ")
 
 	cmd := strings.Fields(line)
+	if cmd[0] == `\z` {
+		// psql compatibility.
+		cmd[0] = `\dp`
+	}
+	if cmd[0] == `\sf` || cmd[0] == `\sf+` ||
+		cmd[0] == `\sv` || cmd[0] == `\sv+` ||
+		cmd[0] == `\l` || cmd[0] == `\l+` ||
+		(strings.HasPrefix(cmd[0], `\d`) && cmd[0] != `\demo`) {
+		return c.handleDescribe(cmd, loopState, errState)
+	}
+
 	switch cmd[0] {
 	case `\q`, `\quit`, `\exit`:
 		return cliStop
@@ -1173,6 +1380,10 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 
 	case `\echo`:
 		fmt.Fprintln(c.iCtx.stdout, strings.Join(cmd[1:], " "))
+
+	case `\qecho`:
+		fmt.Fprintln(c.iCtx.queryOutput, strings.Join(cmd[1:], " "))
+		c.maybeFlushOutput()
 
 	case `\set`:
 		return c.handleSet(cmd[1:], loopState, errState)
@@ -1189,17 +1400,35 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 	case `\ir`:
 		return c.runInclude(cmd[1:], loopState, errState, true /* relative */)
 
+	case `\o`:
+		return c.runOpen(cmd[1:], loopState, errState)
+
 	case `\p`:
+		if c.ins.multilineEdit() {
+			fmt.Fprintln(c.iCtx.stderr, `warning: \p is ineffective with this editor`)
+			break
+		}
 		// This is analogous to \show but does not need a special case.
 		// Implemented for compatibility with psql.
 		fmt.Fprintln(c.iCtx.stdout, strings.Join(c.partialLines, "\n"))
 
 	case `\r`:
+		if c.ins.multilineEdit() {
+			fmt.Fprintln(c.iCtx.stderr, `warning: \r is ineffective with this editor`)
+			break
+		}
 		// Reset the input buffer so far. This is useful when e.g. a user
 		// got confused with string delimiters and multi-line input.
 		return cliStartLine
 
+	case `\s`:
+		c.printCommandHistory()
+
 	case `\show`:
+		if c.ins.multilineEdit() {
+			fmt.Fprintln(c.iCtx.stderr, `warning: \show is ineffective with this editor`)
+			break
+		}
 		fmt.Fprintln(c.iCtx.stderr, `warning: \show is deprecated. Use \p.`)
 		if len(c.partialLines) == 0 {
 			fmt.Fprintf(c.iCtx.stderr, "No input so far. Did you mean SHOW?\n")
@@ -1220,69 +1449,54 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 
 	case `\hf`:
 		if len(cmd) == 1 {
-			c.concatLines = `SELECT DISTINCT proname AS function FROM pg_proc ORDER BY 1`
+			// The following query lists all functions. It prefixes
+			// functions with their schema but only if the schema is not in
+			// the search path. This ensures that "common" functions
+			// are not prefixed by "pg_catalog", but crdb_internal functions
+			// get prefixed with "crdb_internal."
+			//
+			// TODO(knz): Replace this by the \df logic when that is implemented;
+			// see: https://github.com/cockroachdb/cockroach/pull/88061
+			c.concatLines = `
+SELECT DISTINCT
+       IF(n.nspname = ANY current_schemas(TRUE), '',
+          pg_catalog.quote_ident(n.nspname) || '.') ||
+       pg_catalog.quote_ident(p.proname) AS function
+  FROM pg_catalog.pg_proc p
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+ORDER BY 1`
 			return cliRunStatement
 		}
 		return c.handleFunctionHelp(cmd[1:], loopState, errState)
 
-	case `\l`:
-		c.concatLines = `SHOW DATABASES`
-		return cliRunStatement
-
-	case `\dt`:
-		c.concatLines = `SHOW TABLES`
-		return cliRunStatement
-
 	case `\copy`:
 		c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
-			return c.beginCopyFrom(ctx, c.concatLines)
+			// Strip out the starting \ in \copy.
+			return c.beginCopyFrom(ctx, line[1:])
 		})
-		if !c.singleStatement {
-			clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
-		}
-		if c.exitErr != nil && c.iCtx.errExit {
-			return cliStop
+		if c.exitErr != nil {
+			if !c.singleStatement {
+				clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+			}
+			if c.iCtx.errExit {
+				return cliStop
+			}
 		}
 		return cliStartLine
 
 	case `\.`:
 		if c.inCopy() {
-			c.concatLines += "\n" + `\.`
+			c.partialLines = append(c.partialLines, `\.`)
+			c.partialStmtsLen++
 			return cliRunStatement
 		}
 		return c.invalidSyntax(errState)
 
-	case `\dT`:
-		c.concatLines = `SHOW TYPES`
-		return cliRunStatement
-
-	case `\du`:
-		if len(cmd) == 1 {
-			c.concatLines = `SHOW USERS`
-			return cliRunStatement
-		} else if len(cmd) == 2 {
-			c.concatLines = fmt.Sprintf(`SELECT * FROM [SHOW USERS] WHERE username = %s`, lexbase.EscapeSQLString(cmd[1]))
-			return cliRunStatement
-		}
-		return c.invalidSyntax(errState)
-
-	case `\d`:
-		if len(cmd) == 1 {
-			c.concatLines = `SHOW TABLES`
-			return cliRunStatement
-		} else if len(cmd) == 2 {
-			c.concatLines = `SHOW COLUMNS FROM ` + cmd[1]
-			return cliRunStatement
-		}
-		return c.invalidSyntax(errState)
-	case `\dd`:
-		if len(cmd) == 2 {
-			c.concatLines = `SHOW CONSTRAINTS FROM ` + cmd[1] + ` WITH COMMENT`
-			return cliRunStatement
-		}
-		return c.invalidSyntax(errState)
 	case `\connect`, `\c`:
 		return c.handleConnect(cmd[1:], loopState, errState)
+
+	case `\info`:
+		return c.handleInfo(loopState)
 
 	case `\x`:
 		format := clisqlexec.TableDisplayRecords
@@ -1313,10 +1527,6 @@ func (c *cliState) doHandleCliCmd(loopState, nextState cliStateEnum) cliStateEnu
 		return c.handleStatementDiag(cmd[1:], loopState, errState)
 
 	default:
-		if strings.HasPrefix(cmd[0], `\d`) {
-			// Unrecognized command for now, but we want to be helpful.
-			fmt.Fprint(c.iCtx.stderr, "Suggestion: use the SQL SHOW statement to inspect your schema.\n")
-		}
 		return c.invalidSyntax(errState)
 	}
 
@@ -1399,7 +1609,7 @@ func (c *cliState) handlePassword(
 func (c *cliState) handleConnect(
 	cmd []string, loopState, errState cliStateEnum,
 ) (resState cliStateEnum) {
-	if err := c.handleConnectInternal(cmd); err != nil {
+	if err := c.handleConnectInternal(cmd, false /*omitConnString*/); err != nil {
 		fmt.Fprintln(c.iCtx.stderr, err)
 		c.exitErr = err
 		return errState
@@ -1407,7 +1617,7 @@ func (c *cliState) handleConnect(
 	return loopState
 }
 
-func (c *cliState) handleConnectInternal(cmd []string) error {
+func (c *cliState) handleConnectInternal(cmd []string, omitConnString bool) error {
 	firstArgIsURL := len(cmd) > 0 &&
 		(strings.HasPrefix(cmd[0], "postgres://") ||
 			strings.HasPrefix(cmd[0], "postgresql://"))
@@ -1495,11 +1705,9 @@ func (c *cliState) handleConnectInternal(cmd []string) error {
 		}
 	case 0:
 		// Just print the current connection settings.
-		dbName := c.iCtx.dbName
-		if dbName == "" {
-			dbName = currURL.GetDatabase()
+		if !omitConnString {
+			fmt.Fprintf(c.iCtx.stdout, "Connection string: %s\n", currURL.ToPQRedacted())
 		}
-		fmt.Fprintf(c.iCtx.stdout, "Connection string: %s\n", currURL.ToPQ())
 		fmt.Fprintf(c.iCtx.stdout, "You are connected to database %q as user %q.\n", dbName, currURL.GetUsername())
 		return nil
 
@@ -1549,7 +1757,7 @@ func (c *cliState) switchToURL(newURL *pgurl.URL) error {
 	}
 	c.conn.SetURL(newURL.ToPQ().String())
 	c.conn.SetMissingPassword(!usePw || !pwSet)
-	return nil
+	return c.conn.EnsureConn(context.Background())
 }
 
 const maxRecursionLevels = 10
@@ -1629,11 +1837,9 @@ func (c *cliState) runIncludeInternal(
 		sqlExecCtx: c.sqlExecCtx,
 		sqlCtx:     c.sqlCtx,
 		iCtx:       c.iCtx,
-
+		ins:        &bufioReader{wout: c.iCtx.stdout, buf: input},
 		conn:       c.conn,
 		includeDir: filepath.Dir(filename),
-		ins:        noLineEditor,
-		buf:        input,
 		levels:     level,
 
 		singleStatement: singleStatement,
@@ -1679,7 +1885,7 @@ func (c *cliState) doPrepareStatementLine(
 		(c.inCopy() && (strings.HasSuffix(c.concatLines, "\n"+`\.`) || c.atEOF)) ||
 		// We're always at the end of a statement if EOF is reached in the
 		// single statement mode.
-		c.singleStatement && c.atEOF
+		(c.singleStatement && c.atEOF)
 	if c.atEOF {
 		// Definitely no more input expected.
 		if !endOfStmt {
@@ -1707,6 +1913,51 @@ func (c *cliState) doPrepareStatementLine(
 	}
 
 	return checkState
+}
+
+// reflow implements the sqlShell interface (to support the editor).
+func (c *cliState) reflow(
+	allText bool, currentText string, targetWidth int,
+) (changed bool, newText string, info string) {
+	if targetWidth > c.iCtx.reflowMaxWidth {
+		targetWidth = c.iCtx.reflowMaxWidth
+	}
+
+	var rows [][]string
+	err := c.runWithInterruptableCtx(func(ctx context.Context) error {
+		var err error
+		_, rows, err = c.sqlExecCtx.RunQuery(ctx, c.conn,
+			clisqlclient.MakeQuery(
+				`SELECT prettify_statement($1, $2, $3, $4)`,
+				currentText, targetWidth,
+				c.iCtx.reflowAlignMode,
+				c.iCtx.reflowCaseMode,
+			), true /* showMoreChars */)
+		return err
+	})
+	if err != nil {
+		if pgerror.GetPGCode(err) == pgcode.Syntax {
+			// SQL not recognized. That's all right. Just reflow using
+			// a simple algorithm.
+			return editline.DefaultReflow(allText, currentText, targetWidth)
+		}
+		// Some other error. Display it.
+		var buf strings.Builder
+		clierror.OutputError(&buf, err, true /*showSeverity*/, false /*verbose*/)
+		return false, currentText, buf.String()
+	}
+	if len(rows) < 1 || len(rows[0]) < 1 {
+		return false, currentText, "incomplete result from prettify_statement"
+	}
+	newText = rows[0][0]
+	// NB: prettify uses tabs. The editor doesn't like them.
+	// https://github.com/knz/bubbline/issues/5
+	newText = strings.ReplaceAll(newText, "\t", strings.Repeat(" ", c.iCtx.reflowTabWidth))
+	// Strip final spaces.
+	newText = strings.TrimRight(newText, " \n")
+	// NB: prettify removes the final semicolon. Re-add it.
+	newText += ";"
+	return true, newText, ""
 }
 
 func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnum) cliStateEnum {
@@ -1752,9 +2003,26 @@ func (c *cliState) doCheckStatement(startState, contState, execState cliStateEnu
 	return nextState
 }
 
+var copyToRe = regexp.MustCompile(`(?i)COPY.*TO\s+STDOUT`)
+
 // doRunStatements runs all the statements that have been accumulated by
 // concatLines.
 func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
+	if err := c.iCtx.maybeWrapStatement(context.Background(), c.concatLines, c); err != nil {
+		c.exitErr = err
+		if !c.singleStatement {
+			clierror.OutputError(c.iCtx.stderr, c.exitErr, true /*showSeverity*/, false /*verbose*/)
+		}
+		if c.iCtx.errExit {
+			return cliStop
+		}
+		return nextState
+	}
+	if c.iCtx.afterRun != nil {
+		defer c.iCtx.afterRun()
+		c.iCtx.afterRun = nil
+	}
+
 	// Once we send something to the server, the txn status may change arbitrarily.
 	// Clear the known state so that further entries do not assume anything.
 	c.lastKnownTxnStatus = " ?"
@@ -1780,6 +2048,16 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 	// Now run the statement/query.
 	c.exitErr = c.runWithInterruptableCtx(func(ctx context.Context) error {
 		if scanner.FirstLexicalToken(c.concatLines) == lexbase.COPY {
+			// Ideally this is parsed using the parser, but we've avoided doing so
+			// for clisqlshell to be small.
+			if copyToRe.MatchString(c.concatLines) {
+				defer c.maybeFlushOutput()
+				// We don't print the tag, following psql.
+				if _, err := clisqlclient.BeginCopyTo(ctx, c.conn, c.iCtx.queryOutput, c.concatLines); err != nil {
+					return err
+				}
+				return nil
+			}
 			return c.beginCopyFrom(ctx, c.concatLines)
 		}
 		q := clisqlclient.MakeQuery(c.concatLines)
@@ -1790,10 +2068,12 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 				c.concatLines,
 			)
 		}
+		defer c.maybeFlushOutput()
 		return c.sqlExecCtx.RunQueryAndFormatResults(
 			ctx,
 			c.conn,
-			c.iCtx.stdout,
+			c.iCtx.queryOutput, // query output.
+			c.iCtx.stdout,      // timings.
 			c.iCtx.stderr,
 			q,
 		)
@@ -1828,8 +2108,12 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 				traceType = "kv"
 			}
 			if err := c.runWithInterruptableCtx(func(ctx context.Context) error {
+				defer c.maybeFlushOutput()
 				return c.sqlExecCtx.RunQueryAndFormatResults(ctx,
-					c.conn, c.iCtx.stdout, c.iCtx.stderr,
+					c.conn,
+					c.iCtx.queryOutput, // query output
+					c.iCtx.stdout,      // timings
+					c.iCtx.stderr,      // errors
 					clisqlclient.MakeQuery(fmt.Sprintf("SHOW %s TRACE FOR SESSION", traceType)))
 			}); err != nil {
 				clierror.OutputError(c.iCtx.stderr, err, true /*showSeverity*/, false /*verbose*/)
@@ -1854,13 +2138,6 @@ func (c *cliState) doRunStatements(nextState cliStateEnum) cliStateEnum {
 }
 
 func (c *cliState) beginCopyFrom(ctx context.Context, sql string) error {
-	c.refreshTransactionStatus()
-	if c.lastKnownTxnStatus != "" {
-		return unimplemented.Newf(
-			"cli_copy_in_txn",
-			"cannot use COPY inside a transaction",
-		)
-	}
 	copyFromState, err := clisqlclient.BeginCopyFrom(ctx, c.conn, sql)
 	if err != nil {
 		return err
@@ -1926,6 +2203,11 @@ func (c *cliState) doRunShell(state cliStateEnum, cmdIn, cmdOut, cmdErr *os.File
 		}
 		switch state {
 		case cliStart:
+			defer func() {
+				if err := c.closeOutputFile(); err != nil {
+					fmt.Fprintf(cmdErr, "warning: closing output file: %v\n", err)
+				}
+			}()
 			cleanupFn, err := c.configurePreShellDefaults(cmdIn, cmdOut, cmdErr)
 			defer cleanupFn()
 			if err != nil {
@@ -1983,6 +2265,11 @@ func (c *cliState) doRunShell(state cliStateEnum, cmdIn, cmdOut, cmdErr *os.File
 	return c.exitErr
 }
 
+const defaultReflowMaxWidth = 60
+const defaultReflowAlignMode = 3
+const defaultReflowCaseMode = 1
+const defaultReflowTabWidth = 4 // the value used internally by prettify_statement
+
 // configurePreShellDefaults should be called after command-line flags
 // have been loaded into the cliCtx/sqlCtx and .isInteractive /
 // .terminalOutput have been initialized, but before the SQL shell or
@@ -1994,7 +2281,13 @@ func (c *cliState) configurePreShellDefaults(
 	cmdIn, cmdOut, cmdErr *os.File,
 ) (cleanupFn func(), err error) {
 	c.iCtx.stdout = cmdOut
+	c.iCtx.queryOutputFile = cmdOut
+	c.iCtx.queryOutput = cmdOut
 	c.iCtx.stderr = cmdErr
+	c.iCtx.reflowMaxWidth = defaultReflowMaxWidth
+	c.iCtx.reflowAlignMode = defaultReflowAlignMode
+	c.iCtx.reflowCaseMode = defaultReflowCaseMode
+	c.iCtx.reflowTabWidth = defaultReflowTabWidth
 
 	if c.sqlExecCtx.TerminalOutput {
 		// If results are shown on a terminal also enable printing of
@@ -2023,65 +2316,42 @@ func (c *cliState) configurePreShellDefaults(
 	// An interactive readline prompter is comparatively slow at
 	// reading input, so we only use it in interactive mode and when
 	// there is also a terminal on stdout.
-	if c.cliCtx.IsInteractive && c.sqlExecCtx.TerminalOutput {
-		// The readline initialization is not placed in
-		// the doStart() method because of the defer.
-		c.ins, c.exitErr = readline.InitFiles("cockroach",
-			true, /* wideChars */
-			cmdIn, c.iCtx.stdout, c.iCtx.stderr)
-		if errors.Is(c.exitErr, readline.ErrWidecharNotSupported) {
-			fmt.Fprintln(c.iCtx.stderr, "warning: wide character support disabled")
-			c.ins, c.exitErr = readline.InitFiles("cockroach",
-				false, cmdIn, c.iCtx.stdout, c.iCtx.stderr)
-		}
-		if c.exitErr != nil {
-			return cleanupFn, c.exitErr
-		}
-		// The readline library may have a custom file descriptor for stdout.
-		// Use that for further output.
-		c.iCtx.stdout = c.ins.Stdout()
+	canUseEditor := c.cliCtx.IsInteractive && c.sqlExecCtx.TerminalOutput
+	useEditor := canUseEditor && !c.sqlCtx.DisableLineEditor
+	c.ins = getEditor(useEditor, canUseEditor)
 
-		// If the user has used bind -v or bind -l in their ~/.editrc,
-		// this will reset the standard bindings. However we really
-		// want in this shell that Ctrl+C, tab, Ctrl+Z and Ctrl+R
-		// always have the same meaning.  So reload these bindings
-		// explicitly no matter what ~/.editrc may have changed.
-		c.ins.RebindControlKeys()
-		cleanupFn = func() { c.ins.Close() }
-	} else {
-		c.ins = noLineEditor
-		c.buf = bufio.NewReader(cmdIn)
-		cleanupFn = func() {}
+	// maxHistEntries is the maximum number of entries to
+	// preserve. Note that libedit de-duplicates entries under the
+	// hood. We expect that folk entering SQL in a shell will often
+	// reuse the same queries over time, so we don't expect this limit
+	// to ever be reached in practice, or to be an annoyance to
+	// anyone. We do prefer a limit however (as opposed to no limit at
+	// all), to prevent abnormal situation where a history runs into
+	// megabytes and starts slowing down the shell.
+	const maxHistEntries = 10000
+	if useEditor {
+		homeDir, err := envutil.HomeDir()
+		if err != nil {
+			fmt.Fprintf(c.iCtx.stderr, "warning: cannot retrieve user information: %v\nwarning: history will not be saved\n", err)
+		} else {
+			c.iCtx.histFile = filepath.Join(homeDir, cmdHistFile)
+		}
 	}
 
-	if c.hasEditor() {
-		// We only enable prompt and history management when the
-		// interactive input prompter is enabled. This saves on churn and
-		// memory when e.g. piping a large SQL script through the
-		// command-line client.
+	cleanupFn, c.exitErr = c.ins.init(cmdIn, c.iCtx.stdout, c.iCtx.stderr, c, maxHistEntries, c.iCtx.histFile)
+	if c.exitErr != nil {
+		return cleanupFn, c.exitErr
+	}
+	// The readline library may have a custom file descriptor for stdout.
+	// Use that for further output.
+	c.iCtx.stdout = c.ins.getOutputStream()
+	c.iCtx.queryOutputFile = c.ins.getOutputStream()
 
+	if canUseEditor {
 		// Default prompt is part of the connection URL. eg: "marc@localhost:26257>".
 		c.iCtx.customPromptPattern = defaultPromptPattern
 		if c.sqlConnCtx.DebugMode {
 			c.iCtx.customPromptPattern = debugPromptPattern
-		}
-
-		c.ins.SetCompleter(c)
-		if err := c.ins.UseHistory(-1 /*maxEntries*/, true /*dedup*/); err != nil {
-			fmt.Fprintf(c.iCtx.stderr, "warning: cannot enable history: %v\n ", err)
-		} else {
-			homeDir, err := envutil.HomeDir()
-			if err != nil {
-				fmt.Fprintf(c.iCtx.stderr, "warning: cannot retrieve user information: %v\nwarning: history will not be saved\n", err)
-			} else {
-				histFile := filepath.Join(homeDir, cmdHistFile)
-				err = c.ins.LoadHistory(histFile)
-				if err != nil {
-					fmt.Fprintf(c.iCtx.stderr, "warning: cannot load the command-line history (file corrupted?): %v\n", err)
-					fmt.Fprintf(c.iCtx.stderr, "note: the history file will be cleared upon first entry\n")
-				}
-				c.ins.SetAutoSaveHistory(histFile, true)
-			}
 		}
 	}
 
@@ -2095,6 +2365,20 @@ func (c *cliState) configurePreShellDefaults(
 		}
 		c.sqlCtx.SetStmts = nil
 		c.sqlCtx.ExecStmts = append(setStmts, c.sqlCtx.ExecStmts...)
+	}
+
+	if c.sqlExecCtx.TerminalOutput {
+		c.iCtx.addStatementWrapper(statementWrapper{
+			Pattern: createSinklessChangefeed,
+			Wrapper: func(ctx context.Context, statement string, state *cliState) error {
+				undo, err := c.setupChangefeedOutput()
+				if err != nil {
+					return err
+				}
+				c.iCtx.afterRun = undo
+				return nil
+			},
+		})
 	}
 
 	return cleanupFn, nil
@@ -2134,7 +2418,13 @@ func (c *cliState) runStatements(stmts []string) error {
 	return c.exitErr
 }
 
-// serverSideParse uses the SHOW SYNTAX statement to analyze the given string.
+// enableDebug implements the sqlShell interface (to support the editor).
+func (c *cliState) enableDebug() bool {
+	return c.sqlConnCtx.DebugMode
+}
+
+// serverSideParse implements the sqlShell interface (to support the editor).
+// It uses the SHOW SYNTAX statement to analyze the given string.
 // If the syntax is correct, the function returns the statement
 // decomposition in the first return value. If it is not, the function
 // extracts a help string if available.
@@ -2143,7 +2433,8 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 		context.Background(),
 		c.conn,
 		clisqlclient.MakeQuery("SHOW SYNTAX "+lexbase.EscapeSQLString(sql)),
-		true)
+		true, /* showMoreChars */
+	)
 	if err != nil {
 		// The query failed with some error. This is not a syntax error
 		// detected by SHOW SYNTAX (those show up as valid rows) but
@@ -2198,14 +2489,6 @@ func (c *cliState) serverSideParse(sql string) (helpText string, err error) {
 	return "", nil
 }
 
-// At this time, lib/pq contains a bug whereby a query cancellation
-// results in the driver dropping the connection. This results in poor
-// user UX. Instead of suffering the UX drawback, we choose to disable
-// query cancellation for a little while more until we switch the shell
-// to use pgx instead.
-// See: https://github.com/cockroachdb/cockroach/issues/76483
-const queryCancelEnabled = false
-
 func (c *cliState) maybeHandleInterrupt() func() {
 	if !c.cliCtx.IsInteractive {
 		return func() {}
@@ -2214,65 +2497,59 @@ func (c *cliState) maybeHandleInterrupt() func() {
 	signal.Notify(intCh, os.Interrupt)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	if !queryCancelEnabled {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					// Shell is terminating.
-					return
-				case <-intCh:
-				}
-				fmt.Fprintln(c.iCtx.stderr,
-					"query cancellation disabled in this client; a second interrupt will stop the shell.")
-				signal.Reset(os.Interrupt)
-			}
-		}()
-	} else {
-		go func() {
-			for {
-				select {
-				case <-intCh:
-					c.iCtx.mu.Lock()
-					cancelFn, doneCh := c.iCtx.mu.cancelFn, c.iCtx.mu.doneCh
-					c.iCtx.mu.Unlock()
-					if cancelFn == nil {
-						// No query currently executing; nothing to do.
+	go func() {
+		for {
+			select {
+			case <-intCh:
+				c.iCtx.mu.Lock()
+				cancelFn, doneCh := c.iCtx.mu.cancelFn, c.iCtx.mu.doneCh
+				c.iCtx.mu.Unlock()
+				if cancelFn == nil {
+					// No query currently executing.
+					// Are we doing interactive input? If so, do nothing.
+					if c.cliCtx.IsInteractive {
 						continue
 					}
-
-					fmt.Fprintf(c.iCtx.stderr, "\nattempting to cancel query...\n")
-					// Cancel the query's context, which should make the driver
-					// send a cancellation message.
-					cancelFn()
-
-					// Now wait for the shell to process the cancellation.
-					//
-					// If it takes too long (e.g. server has become unresponsive,
-					// or we're connected to a pre-22.1 server which does not
-					// support cancellation), fall back to the previous behavior
-					// which is to interrupt the shell altogether.
-					tooLongTimer := time.After(3 * time.Second)
-				wait:
-					for {
-						select {
-						case <-doneCh:
-							break wait
-						case <-tooLongTimer:
-							fmt.Fprintln(c.iCtx.stderr, "server does not respond to query cancellation; a second interrupt will stop the shell.")
-							signal.Reset(os.Interrupt)
-						}
-					}
-					// Re-arm the signal handler.
-					signal.Notify(intCh, os.Interrupt)
-
-				case <-ctx.Done():
-					// Shell is terminating.
+					// Otherwise, ctrl+c interrupts the shell. We do this
+					// by re-throwing the signal after stopping the signal capture.
+					signal.Reset(os.Interrupt)
+					_ = sysutil.InterruptSelf()
 					return
 				}
+
+				fmt.Fprintf(c.iCtx.stderr, "\nattempting to cancel query...\n")
+				// Cancel the query's context, which should make the driver
+				// send a cancellation message.
+				if err := cancelFn(ctx); err != nil {
+					fmt.Fprintf(c.iCtx.stderr, "\nerror while cancelling query: %v\n", err)
+				}
+
+				// Now wait for the shell to process the cancellation.
+				//
+				// If it takes too long (e.g. server has become unresponsive,
+				// or we're connected to a pre-22.1 server which does not
+				// support cancellation), fall back to the previous behavior
+				// which is to interrupt the shell altogether.
+				tooLongTimer := time.After(3 * time.Second)
+			wait:
+				for {
+					select {
+					case <-doneCh:
+						break wait
+					case <-tooLongTimer:
+						fmt.Fprintln(c.iCtx.stderr, "server does not respond to query cancellation; a second interrupt will stop the shell.")
+						signal.Reset(os.Interrupt)
+					}
+				}
+				// Re-arm the signal handler.
+				signal.Notify(intCh, os.Interrupt)
+
+			case <-ctx.Done():
+				// Shell is terminating.
+				return
 			}
-		}()
-	}
+		}
+	}()
 	return cancel
 }
 
@@ -2290,11 +2567,12 @@ func (c *cliState) runWithInterruptableCtx(fn func(ctx context.Context) error) e
 
 	// Inform the Ctrl+C handler that this query is executing.
 	c.iCtx.mu.Lock()
-	c.iCtx.mu.cancelFn = cancel
+	c.iCtx.mu.cancelFn = c.conn.Cancel
 	c.iCtx.mu.doneCh = doneCh
 	c.iCtx.mu.Unlock()
 	defer func() {
 		c.iCtx.mu.Lock()
+		cancel()
 		c.iCtx.mu.cancelFn = nil
 		c.iCtx.mu.doneCh = nil
 		c.iCtx.mu.Unlock()
@@ -2326,8 +2604,7 @@ func (c *cliState) getSessionVarValue(sessionVar string) (string, error) {
 	var rows [][]string
 	var err error
 	err = c.runWithInterruptableCtx(func(ctx context.Context) error {
-		_, rows, err = c.sqlExecCtx.RunQuery(ctx, c.conn,
-			clisqlclient.MakeQuery(query), true)
+		_, rows, err = c.sqlExecCtx.RunQuery(ctx, c.conn, clisqlclient.MakeQuery(query), true /* showMoreChars */)
 		return err
 	})
 
@@ -2341,4 +2618,78 @@ func (c *cliState) getSessionVarValue(sessionVar string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func (c *cliState) runOpen(cmd []string, contState, errState cliStateEnum) (resState cliStateEnum) {
+	if len(cmd) > 1 {
+		return c.invalidSyntax(errState)
+	}
+
+	outputFile := "" // no file: reset to stdout
+	if len(cmd) == 1 {
+		outputFile = cmd[0]
+	}
+	if err := c.openOutputFile(outputFile); err != nil {
+		c.exitErr = err
+		fmt.Fprintf(c.iCtx.stderr, "%v\n", c.exitErr)
+		return errState
+	}
+	return contState
+}
+
+func (c *cliState) openOutputFile(file string) error {
+	var f *os.File
+	if file != "" {
+		// First check whether the new file can be opened.
+		// (We keep the previous one otherwise.)
+		// NB: permission 0666 mimics what psql does: fopen(file, "w").
+		var err error
+		f, err = os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+		if err != nil {
+			return err
+		}
+	}
+	// Close the previous file.
+	if err := c.closeOutputFile(); err != nil {
+		return err
+	}
+	if f != nil {
+		c.iCtx.queryOutputFile = f
+		c.iCtx.queryOutputBuf = bufio.NewWriter(f)
+		c.iCtx.queryOutput = c.iCtx.queryOutputBuf
+	}
+	return nil
+}
+
+func (c *cliState) maybeFlushOutput() {
+	if err := c.maybeFlushOutputInternal(); err != nil {
+		fmt.Fprintf(c.iCtx.stderr, "warning: flushing output file: %v", err)
+	}
+}
+
+func (c *cliState) maybeFlushOutputInternal() error {
+	if c.iCtx.queryOutputBuf == nil {
+		return nil
+	}
+	return c.iCtx.queryOutputBuf.Flush()
+}
+
+func (c *cliState) closeOutputFile() error {
+	if c.iCtx.queryOutputBuf == nil {
+		return nil
+	}
+	if err := c.maybeFlushOutputInternal(); err != nil {
+		return err
+	}
+	if c.iCtx.queryOutputFile == c.iCtx.stdout {
+		// Nothing to do.
+		return nil
+	}
+
+	// Close file and reset.
+	err := c.iCtx.queryOutputFile.Close()
+	c.iCtx.queryOutputFile = c.iCtx.stdout
+	c.iCtx.queryOutput = c.iCtx.stdout
+	c.iCtx.queryOutputBuf = nil
+	return err
 }

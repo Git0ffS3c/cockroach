@@ -64,7 +64,7 @@ func (a avgTmplInfo) AssignDivInt64(targetElem, leftElem, rightElem, _, _, _ str
 		return fmt.Sprintf(`
 			%s.SetInt64(%s)
 			if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
-				colexecerror.InternalError(err)
+				colexecerror.ExpectedError(err)
 			}`,
 			targetElem, rightElem, targetElem, leftElem, targetElem,
 		)
@@ -145,7 +145,7 @@ func genAvgAgg(inputFileContents string, wr io.Writer) error {
 	// canonical representatives, so we can operate with their type family
 	// directly.
 	for _, inputTypeFamily := range []types.Family{types.IntFamily, types.DecimalFamily, types.FloatFamily, types.IntervalFamily} {
-		tmplInfo := avgAggTypeTmplInfo{TypeFamily: toString(inputTypeFamily)}
+		tmplInfo := avgAggTypeTmplInfo{TypeFamily: familyToString(inputTypeFamily)}
 		for _, inputTypeWidth := range supportedWidthsByCanonicalTypeFamily[inputTypeFamily] {
 			// Note that we don't use execinfrapb.GetAggregateInfo because we don't
 			// want to bring in a dependency on that package to reduce the burden

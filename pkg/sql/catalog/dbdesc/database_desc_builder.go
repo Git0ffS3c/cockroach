@@ -11,6 +11,7 @@
 package dbdesc
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -19,8 +20,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 )
 
 // DatabaseDescriptorBuilder is an extension of catalog.DescriptorBuilder
@@ -33,29 +37,48 @@ type DatabaseDescriptorBuilder interface {
 }
 
 type databaseDescriptorBuilder struct {
-	original      *descpb.DatabaseDescriptor
-	maybeModified *descpb.DatabaseDescriptor
-
+	original             *descpb.DatabaseDescriptor
+	maybeModified        *descpb.DatabaseDescriptor
+	mvccTimestamp        hlc.Timestamp
 	isUncommittedVersion bool
 	changes              catalog.PostDeserializationChanges
+	// This is the raw bytes (tag + data) of the database descriptor in storage.
+	rawBytesInStorage []byte
 }
 
 var _ DatabaseDescriptorBuilder = &databaseDescriptorBuilder{}
 
-// NewBuilder creates a new catalog.DescriptorBuilder object for building
-// database descriptors.
+// NewBuilder returns a new DatabaseDescriptorBuilder instance by delegating to
+// NewBuilderWithMVCCTimestamp with an empty MVCC timestamp.
+//
+// Callers must assume that the given protobuf has already been treated with the
+// MVCC timestamp beforehand.
 func NewBuilder(desc *descpb.DatabaseDescriptor) DatabaseDescriptorBuilder {
-	return newBuilder(desc, false, /* isUncommittedVersion */
-		catalog.PostDeserializationChanges{})
+	return NewBuilderWithMVCCTimestamp(desc, hlc.Timestamp{})
+}
+
+// NewBuilderWithMVCCTimestamp creates a new DatabaseDescriptorBuilder instance
+// for building table descriptors.
+func NewBuilderWithMVCCTimestamp(
+	desc *descpb.DatabaseDescriptor, mvccTimestamp hlc.Timestamp,
+) DatabaseDescriptorBuilder {
+	return newBuilder(
+		desc,
+		mvccTimestamp,
+		false, /* isUncommittedVersion */
+		catalog.PostDeserializationChanges{},
+	)
 }
 
 func newBuilder(
 	desc *descpb.DatabaseDescriptor,
+	mvccTimestamp hlc.Timestamp,
 	isUncommittedVersion bool,
 	changes catalog.PostDeserializationChanges,
 ) DatabaseDescriptorBuilder {
 	return &databaseDescriptorBuilder{
 		original:             protoutil.Clone(desc).(*descpb.DatabaseDescriptor),
+		mvccTimestamp:        mvccTimestamp,
 		isUncommittedVersion: isUncommittedVersion,
 		changes:              changes,
 	}
@@ -68,8 +91,36 @@ func (ddb *databaseDescriptorBuilder) DescriptorType() catalog.DescriptorType {
 
 // RunPostDeserializationChanges implements the catalog.DescriptorBuilder
 // interface.
-func (ddb *databaseDescriptorBuilder) RunPostDeserializationChanges() error {
+func (ddb *databaseDescriptorBuilder) RunPostDeserializationChanges() (err error) {
+	defer func() {
+		err = errors.Wrapf(err, "database %q (%d)", ddb.original.Name, ddb.original.ID)
+	}()
+	// Set the ModificationTime field before doing anything else.
+	// Other changes may depend on it.
+	mustSetModTime, err := descpb.MustSetModificationTime(
+		ddb.original.ModificationTime, ddb.mvccTimestamp, ddb.original.Version,
+	)
+	if err != nil {
+		return err
+	}
 	ddb.maybeModified = protoutil.Clone(ddb.original).(*descpb.DatabaseDescriptor)
+	if mustSetModTime {
+		ddb.maybeModified.ModificationTime = ddb.mvccTimestamp
+		ddb.changes.Add(catalog.SetModTimeToMVCCTimestamp)
+	}
+
+	// This should only every happen to the system database. Unlike many other
+	// post-deserialization changes, this does not need to last forever to
+	// support restores. It can be removed after a migration performing such a
+	// migration occurs.
+	//
+	// TODO(ajwerner): Write or piggy-back off some other migration to rewrite
+	// the descriptor, and then remove this in a release that is no longer
+	// compatible with the predecessor of the version with the migration.
+	if ddb.maybeModified.Version == 0 {
+		ddb.maybeModified.Version = 1
+		ddb.changes.Add(catalog.SetSystemDatabaseDescriptorVersion)
+	}
 
 	createdDefaultPrivileges := false
 	removedIncompatibleDatabasePrivs := false
@@ -88,15 +139,16 @@ func (ddb *databaseDescriptorBuilder) RunPostDeserializationChanges() error {
 		)
 	}
 
-	privsChanged := catprivilege.MaybeFixPrivileges(
+	privsChanged, err := catprivilege.MaybeFixPrivileges(
 		&ddb.maybeModified.Privileges,
 		descpb.InvalidID,
 		descpb.InvalidID,
 		privilege.Database,
 		ddb.maybeModified.GetName())
-	addedGrantOptions := catprivilege.MaybeUpdateGrantOptions(ddb.maybeModified.Privileges)
-
-	if privsChanged || addedGrantOptions || removedIncompatibleDatabasePrivs || createdDefaultPrivileges {
+	if err != nil {
+		return err
+	}
+	if privsChanged || removedIncompatibleDatabasePrivs || createdDefaultPrivileges {
 		ddb.changes.Add(catalog.UpgradedPrivileges)
 	}
 	if maybeRemoveDroppedSelfEntryFromSchemas(ddb.maybeModified) {
@@ -107,9 +159,18 @@ func (ddb *databaseDescriptorBuilder) RunPostDeserializationChanges() error {
 
 // RunRestoreChanges implements the catalog.DescriptorBuilder interface.
 func (ddb *databaseDescriptorBuilder) RunRestoreChanges(
-	_ func(id descpb.ID) catalog.Descriptor,
+	version clusterversion.ClusterVersion, descLookupFn func(id descpb.ID) catalog.Descriptor,
 ) error {
+	// Upgrade the declarative schema changer state.
+	if scpb.MigrateDescriptorState(version, ddb.maybeModified.DeclarativeSchemaChangerState) {
+		ddb.changes.Add(catalog.UpgradedDeclarativeSchemaChangerState)
+	}
 	return nil
+}
+
+// SetRawBytesInStorage implements the catalog.DescriptorBuilder interface.
+func (ddb *databaseDescriptorBuilder) SetRawBytesInStorage(rawBytes []byte) {
+	ddb.rawBytesInStorage = append([]byte(nil), rawBytes...) // deep-copy
 }
 
 func maybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(
@@ -141,12 +202,12 @@ func maybeConvertIncompatibleDBPrivilegesToDefaultPrivileges(
 
 		// Convert the incompatible privileges to default privileges.
 		role := defaultPrivileges.FindOrCreateUser(catpb.DefaultPrivilegesRole{ForAllRoles: true})
-		tableDefaultPrivilegesForAllRoles := role.DefaultPrivilegesPerObject[tree.Tables]
+		tableDefaultPrivilegesForAllRoles := role.DefaultPrivilegesPerObject[privilege.Tables]
 
 		defaultPrivilegesForUser := tableDefaultPrivilegesForAllRoles.FindOrCreateUser(user.User())
 		defaultPrivilegesForUser.Privileges |= incompatiblePrivileges
 
-		role.DefaultPrivilegesPerObject[tree.Tables] = tableDefaultPrivilegesForAllRoles
+		role.DefaultPrivilegesPerObject[privilege.Tables] = tableDefaultPrivilegesForAllRoles
 	}
 
 	return hasChanged
@@ -167,6 +228,7 @@ func (ddb *databaseDescriptorBuilder) BuildImmutableDatabase() catalog.DatabaseD
 		DatabaseDescriptor:   *desc,
 		isUncommittedVersion: ddb.isUncommittedVersion,
 		changes:              ddb.changes,
+		rawBytesInStorage:    append([]byte(nil), ddb.rawBytesInStorage...), // deep-copy
 	}
 }
 
@@ -186,6 +248,7 @@ func (ddb *databaseDescriptorBuilder) BuildExistingMutableDatabase() *Mutable {
 			DatabaseDescriptor:   *ddb.maybeModified,
 			changes:              ddb.changes,
 			isUncommittedVersion: ddb.isUncommittedVersion,
+			rawBytesInStorage:    append([]byte(nil), ddb.rawBytesInStorage...), // deep-copy
 		},
 		ClusterVersion: &immutable{DatabaseDescriptor: *ddb.original},
 	}
@@ -208,6 +271,7 @@ func (ddb *databaseDescriptorBuilder) BuildCreatedMutableDatabase() *Mutable {
 			DatabaseDescriptor:   *desc,
 			changes:              ddb.changes,
 			isUncommittedVersion: ddb.isUncommittedVersion,
+			rawBytesInStorage:    append([]byte(nil), ddb.rawBytesInStorage...), // deep-copy
 		},
 	}
 }
@@ -224,10 +288,11 @@ func MaybeWithDatabaseRegionConfig(regionConfig *multiregion.RegionConfig) NewIn
 			return
 		}
 		desc.RegionConfig = &descpb.DatabaseDescriptor_RegionConfig{
-			SurvivalGoal:  regionConfig.SurvivalGoal(),
-			PrimaryRegion: regionConfig.PrimaryRegion(),
-			RegionEnumID:  regionConfig.RegionEnumID(),
-			Placement:     regionConfig.Placement(),
+			SurvivalGoal:    regionConfig.SurvivalGoal(),
+			PrimaryRegion:   regionConfig.PrimaryRegion(),
+			RegionEnumID:    regionConfig.RegionEnumID(),
+			Placement:       regionConfig.Placement(),
+			SecondaryRegion: regionConfig.SecondaryRegion(),
 		}
 	}
 }
@@ -241,10 +306,7 @@ func WithPublicSchemaID(publicSchemaID descpb.ID) NewInitialOption {
 		// not have a descriptor.
 		if publicSchemaID != keys.PublicSchemaID {
 			desc.Schemas = map[string]descpb.DatabaseDescriptor_SchemaInfo{
-				tree.PublicSchema: {
-					ID:      publicSchemaID,
-					Dropped: false,
-				},
+				tree.PublicSchema: {ID: publicSchemaID},
 			}
 		}
 	}

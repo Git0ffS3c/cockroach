@@ -11,7 +11,6 @@
 package tracingui
 
 import (
-	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -27,7 +26,7 @@ func ProcessSnapshot(
 	snapshot tracing.SpansSnapshot, registry *tracing.SpanRegistry,
 ) *ProcessedSnapshot {
 	// Build a map of current spans.
-	currentSpans := make(map[tracingpb.SpanID]tracing.RecordingType, 1000)
+	currentSpans := make(map[tracingpb.SpanID]tracingpb.RecordingType, 1000)
 	registry.VisitSpans(func(sp tracing.RegistrySpan) {
 		currentSpans[sp.SpanID()] = sp.RecordingType()
 	})
@@ -99,12 +98,18 @@ type ProcessedSnapshot struct {
 	Stacks map[int]string // GoroutineID to stack trace
 }
 
+const (
+	hiddenTagGroupName = "..."
+)
+
 var hiddenTags = map[string]struct{}{
-	"_unfinished": {},
-	"_verbose":    {},
-	"_dropped":    {},
-	"node":        {},
-	"store":       {},
+	"_unfinished":                {},
+	"_verbose":                   {},
+	"_dropped_logs":              {},
+	"_dropped_children":          {},
+	"_dropped_indirect_children": {},
+	"node":                       {},
+	"store":                      {},
 }
 
 type processedSpan struct {
@@ -118,7 +123,8 @@ type processedSpan struct {
 	Current bool
 	// CurrentRecordingMode indicates the spans's current recording mode. The
 	// field is not set if Current == false.
-	CurrentRecordingMode tracing.RecordingType
+	CurrentRecordingMode tracingpb.RecordingType
+	ChildrenMetadata     map[string]tracingpb.OperationMetadata
 }
 
 // ProcessedTag is a span tag that was processed and expanded by processTag.
@@ -141,6 +147,21 @@ type ProcessedTag struct {
 	// copiedFromChild is set if this tag did not originate on the owner span, but
 	// instead was propagated upwards from a child span.
 	CopiedFromChild bool
+	Children        []ProcessedChildTag
+}
+
+// ProcessedChildTag is a span tag that is embedded as a lazy tag in a parent tag.
+type ProcessedChildTag struct {
+	Key, Val string
+}
+
+func appendRespectingHiddenGroup(tags []ProcessedTag, tag ProcessedTag) []ProcessedTag {
+	tags = append(tags, tag)
+	endIndex := len(tags) - 1
+	if tags[endIndex-1].Key == hiddenTagGroupName {
+		tags[endIndex], tags[endIndex-1] = tags[endIndex-1], tags[endIndex]
+	}
+	return tags
 }
 
 // propagateTagUpwards copies tag from sp to all of sp's ancestors.
@@ -153,7 +174,7 @@ func propagateTagUpwards(tag ProcessedTag, sp *processedSpan, spans map[uint64]*
 		if !ok {
 			return
 		}
-		p.Tags = append(p.Tags, tag)
+		p.Tags = appendRespectingHiddenGroup(p.Tags, tag)
 		parentID = p.ParentSpanID
 	}
 }
@@ -165,7 +186,7 @@ func propagateInheritTagDownwards(
 	tag.Inherited = true
 	tag.Hidden = true
 	for _, child := range children[sp.SpanID] {
-		child.Tags = append(child.Tags, tag)
+		child.Tags = appendRespectingHiddenGroup(child.Tags, tag)
 		propagateInheritTagDownwards(tag, child, children)
 	}
 }
@@ -174,38 +195,74 @@ func propagateInheritTagDownwards(
 // expanded.
 func processSpan(s tracingpb.RecordedSpan, snap tracing.SpansSnapshot) processedSpan {
 	p := processedSpan{
-		Operation:    s.Operation,
-		TraceID:      uint64(s.TraceID),
-		SpanID:       uint64(s.SpanID),
-		ParentSpanID: uint64(s.ParentSpanID),
-		Start:        s.StartTime,
-		GoroutineID:  s.GoroutineID,
+		Operation:        s.Operation,
+		TraceID:          uint64(s.TraceID),
+		SpanID:           uint64(s.SpanID),
+		ParentSpanID:     uint64(s.ParentSpanID),
+		Start:            s.StartTime,
+		GoroutineID:      s.GoroutineID,
+		ChildrenMetadata: s.ChildrenMetadata,
 	}
 
-	// Sort the tags.
-	tagKeys := make([]string, 0, len(s.Tags))
-	for k := range s.Tags {
-		tagKeys = append(tagKeys, k)
-	}
-	sort.Strings(tagKeys)
+	p.Tags = make([]ProcessedTag, 0)
 
-	p.Tags = make([]ProcessedTag, len(s.Tags))
-	for i, k := range tagKeys {
-		p.Tags[i] = processTag(k, s.Tags[k], snap)
+	// Added to p.Tags if iteration populates the Children.
+	hiddenTag := ProcessedTag{
+		Key:      hiddenTagGroupName,
+		Hidden:   true,
+		Children: make([]ProcessedChildTag, 0),
+	}
+
+	for _, tagGroup := range s.TagGroups {
+		key := tagGroup.Name
+
+		if key == tracingpb.AnonymousTagGroupName {
+			// The anonymous tag group.
+			// Non-hidden should be treated as top-level.
+			// Hidden tags should be moved to the hidden tag group.
+			for _, tagKV := range tagGroup.Tags {
+				if _, hidden := hiddenTags[tagKV.Key]; hidden {
+					hiddenTag.Children = append(hiddenTag.Children, ProcessedChildTag{
+						Key: tagKV.Key,
+						Val: tagKV.Value,
+					})
+				} else {
+					p.Tags = append(p.Tags, processTag(tagKV.Key, tagKV.Value, snap))
+				}
+			}
+		} else {
+			// A named tag group. Each tag should be treated as a child of this parent.
+			processedParentTag := ProcessedTag{
+				// Don't actually need to call processTag() here, none of the checks
+				// will apply to a tag group.
+				Key:    key,
+				Val:    "",
+				Hidden: false,
+			}
+			processedParentTag.Children = make([]ProcessedChildTag, len(tagGroup.Tags))
+			for i, tag := range tagGroup.Tags {
+				processedParentTag.Children[i] = ProcessedChildTag{
+					Key: tag.Key,
+					Val: tag.Value,
+				}
+			}
+			p.Tags = append(p.Tags, processedParentTag)
+		}
+	}
+	if len(hiddenTag.Children) != 0 {
+		p.Tags = append(p.Tags, hiddenTag)
 	}
 	return p
 }
 
-// processTag massages span tags for presentation in the UI. It marks some tags
-// as hidden, it marks some tags to be inherited by child spans, and it expands
-// lock contention tags with information about the lock holder txn.
+// processTag massages span tags for presentation in the UI. It marks some
+// tags to be inherited by child spans, and it expands lock contention tags
+// with information about the lock holder txn.
 func processTag(k, v string, snap tracing.SpansSnapshot) ProcessedTag {
 	p := ProcessedTag{
 		Key: k,
 		Val: v,
 	}
-	_, hidden := hiddenTags[k]
-	p.Hidden = hidden
 
 	switch k {
 	case "lock_holder_txn":
@@ -248,15 +305,31 @@ func findTxnState(txnID string, snap tracing.SpansSnapshot) txnState {
 	// respective transaction.
 	for _, t := range snap.Traces {
 		for _, s := range t {
-			if s.Operation != "sql txn" || s.Tags["txn"] != txnID {
+			if s.Operation != "sql txn" {
+				continue
+			}
+			txnTagGroup := s.FindTagGroup("txn")
+			if txnTagGroup == nil {
+				continue
+			}
+			txnTag, ok := txnTagGroup.FindTag("txn")
+			if !ok {
+				continue
+			}
+			if txnTag != txnID {
 				continue
 			}
 			// I've found the transaction. Look through its children and find a SQL query.
 			for _, s2 := range t {
 				if s2.Operation == "sql query" {
+					stmt := ""
+					stmtTag := s2.FindTagGroup("statement")
+					if stmtTag != nil {
+						stmt, _ = stmtTag.FindTag("statement")
+					}
 					return txnState{
 						found:    true,
-						curQuery: s2.Tags["statement"],
+						curQuery: stmt,
 					}
 				}
 			}

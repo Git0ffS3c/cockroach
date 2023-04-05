@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -29,32 +30,31 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 )
 
-func initProbeRangesBuiltins() {
+func init() {
 	// Add all windows to the Builtins map after a few sanity checks.
 	for k, v := range probeRangesGenerators {
-		if _, exists := builtins[k]; exists {
-			panic("duplicate builtin: " + k)
+		for _, g := range v.overloads {
+			if g.Class != tree.GeneratorClass {
+				panic(errors.AssertionFailedf("generator functions should be marked with the tree.GeneratorClass "+
+					"function class, found %v", v))
+			}
 		}
-
-		if v.props.Class != tree.GeneratorClass {
-			panic(errors.AssertionFailedf("generator functions should be marked with the tree.GeneratorClass "+
-				"function class, found %v", v))
-		}
-
-		builtins[k] = v
+		registerBuiltin(k, v)
 	}
 }
 
 var probeRangesGenerators = map[string]builtinDefinition{
 	"crdb_internal.probe_ranges": makeBuiltin(
 		tree.FunctionProperties{
-			Class: tree.GeneratorClass,
+			Category:     builtinconstants.CategorySystemInfo,
+			Undocumented: true,
 		},
 		makeGeneratorOverload(
-			tree.ArgTypes{
+			tree.ParamTypes{
 				{Name: "timeout", Typ: types.Interval},
 				{Name: "probe_type", Typ: makeEnum()},
 			},
@@ -122,9 +122,11 @@ type probeRangeGenerator struct {
 	ranges []kv.KeyValue
 }
 
-func makeProbeRangeGenerator(ctx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeProbeRangeGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	// The user must be an admin to use this builtin.
-	isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -134,21 +136,34 @@ func makeProbeRangeGenerator(ctx *eval.Context, args tree.Datums) (eval.ValueGen
 			"only users with the admin role are allowed to use crdb_internal.probe_range",
 		)
 	}
-	// Handle args passed in.
+	// Trace the query to meta2. Return it as part of the error string if the query fails.
+	// This improves observability into a meta2 outage. We expect crdb_internal.probe_range
+	// to be available, unless meta2 is down.
+	var ranges []kv.KeyValue
+	{
+		ctx, sp := tracing.EnsureChildSpan(
+			ctx, evalCtx.Tracer, "meta2scan",
+			tracing.WithRecording(tracingpb.RecordingVerbose),
+		)
+		defer sp.Finish()
+		// Handle args passed in.
+		ranges, err = kvclient.ScanMetaKVs(ctx, evalCtx.Txn, roachpb.Span{
+			Key:    keys.MinKey,
+			EndKey: keys.MaxKey,
+		})
+		if err != nil {
+			return nil, errors.WithDetailf(
+				errors.Wrapf(err, "error scanning meta ranges"),
+				"trace:\n%s", sp.GetConfiguredRecording())
+		}
+	}
 	timeout := time.Duration(tree.MustBeDInterval(args[0]).Duration.Nanos())
 	isWrite := args[1].(*tree.DEnum).LogicalRep
-	ranges, err := kvclient.ScanMetaKVs(ctx.Context, ctx.Txn, roachpb.Span{
-		Key:    keys.MinKey,
-		EndKey: keys.MaxKey,
-	})
-	if err != nil {
-		return nil, err
-	}
 	return &probeRangeGenerator{
-		rangeProber: ctx.RangeProber,
+		rangeProber: evalCtx.RangeProber,
 		timeout:     timeout,
 		isWrite:     isWrite == "write",
-		tracer:      ctx.Tracer,
+		tracer:      evalCtx.Tracer,
 		ranges:      ranges,
 	}, nil
 }
@@ -180,9 +195,8 @@ func (p *probeRangeGenerator) Next(ctx context.Context) (bool, error) {
 	}
 	ctx, sp := tracing.EnsureChildSpan(
 		ctx, p.tracer, opName,
-		tracing.WithForceRealSpan(),
+		tracing.WithRecording(tracingpb.RecordingVerbose),
 	)
-	sp.SetRecordingType(tracing.RecordingVerbose)
 	defer func() {
 		p.curr.verboseTrace = sp.FinishAndGetConfiguredRecording().String()
 	}()

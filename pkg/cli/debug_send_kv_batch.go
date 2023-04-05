@@ -14,13 +14,14 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -56,7 +57,7 @@ Requires the admin role. The request is logged to the system event log.
 This command can modify internal system state. Incorrect use can cause severe
 irreversible damage including permanent data loss.
 
-For more information on requests, see roachpb/api.proto. Unknown or invalid
+For more information on requests, see kv/kvpb/api.proto. Unknown or invalid
 fields will error. Binary fields ([]byte) are base64-encoded. Requests spanning
 multiple ranges are wrapped in a transaction.
 
@@ -88,9 +89,9 @@ This would yield the following response:
 To generate JSON requests with Go (see also debug_send_kv_batch_test.go):
 
 func TestSendKVBatchExample(t *testing.T) {
-	var ba roachpb.BatchRequest
-	ba.Add(roachpb.NewPut(roachpb.Key("foo"), roachpb.MakeValueFromString("bar")))
-	ba.Add(roachpb.NewGet(roachpb.Key("foo"), false /* forUpdate */))
+	var ba kvpb.BatchRequest
+	ba.Add(kvpb.NewPut(roachpb.Key("foo"), roachpb.MakeValueFromString("bar")))
+	ba.Add(kvpb.NewGet(roachpb.Key("foo"), false /* forUpdate */))
 
 	jsonpb := protoutil.JSONPb{}
 	jsonProto, err := jsonpb.Marshal(&ba)
@@ -150,15 +151,15 @@ func runSendKVBatch(cmd *cobra.Command, args []string) error {
 	var baJSON []byte
 	var err error
 	if len(args) > 0 {
-		baJSON, err = ioutil.ReadFile(args[0])
+		baJSON, err = os.ReadFile(args[0])
 	} else {
-		baJSON, err = ioutil.ReadAll(os.Stdin)
+		baJSON, err = io.ReadAll(os.Stdin)
 	}
 	if err != nil {
 		return errors.Wrapf(err, "failed to read input")
 	}
 
-	var ba roachpb.BatchRequest
+	var ba kvpb.BatchRequest
 	if err := jsonpb.Unmarshal(baJSON, &ba); err != nil {
 		return errors.Wrap(err, "invalid JSON")
 	}
@@ -225,8 +226,8 @@ func runSendKVBatch(cmd *cobra.Command, args []string) error {
 }
 
 func sendKVBatchRequestWithTracingOption(
-	ctx context.Context, verboseTrace bool, admin serverpb.AdminClient, ba *roachpb.BatchRequest,
-) (br *roachpb.BatchResponse, rec tracing.Recording, err error) {
+	ctx context.Context, verboseTrace bool, admin serverpb.AdminClient, ba *kvpb.BatchRequest,
+) (br *kvpb.BatchResponse, rec tracingpb.Recording, err error) {
 	var sp *tracing.Span
 	if verboseTrace {
 		// Set up a tracing span and enable verbose tracing if requested by
@@ -237,7 +238,7 @@ func sendKVBatchRequestWithTracingOption(
 		// because otherwise the unit test TestSendKVBatch becomes non-deterministic
 		// on the contents of the traceInfo JSON field in the request.
 		_, sp = tracing.NewTracer().StartSpanCtx(ctx, "debug-send-kv-batch",
-			tracing.WithRecording(tracing.RecordingVerbose))
+			tracing.WithRecording(tracingpb.RecordingVerbose))
 		defer sp.Finish()
 
 		// Inject the span metadata into the KV request.
@@ -249,10 +250,10 @@ func sendKVBatchRequestWithTracingOption(
 
 	if sp != nil {
 		// Import the remotely collected spans, if any.
-		sp.ImportRemoteSpans(br.CollectedSpans)
+		sp.ImportRemoteRecording(br.CollectedSpans)
 
 		// Extract the recording.
-		rec = sp.GetRecording(tracing.RecordingVerbose)
+		rec = sp.GetRecording(tracingpb.RecordingVerbose)
 	}
 
 	return br, rec, errors.Wrap(err, "request failed")

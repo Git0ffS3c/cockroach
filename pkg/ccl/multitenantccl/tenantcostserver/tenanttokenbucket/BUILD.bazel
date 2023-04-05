@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -6,6 +7,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl/tenantcostserver/tenanttokenbucket",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/util/log",
     ],
@@ -14,13 +16,17 @@ go_library(
 go_test(
     name = "tenanttokenbucket_test",
     srcs = ["tenant_token_bucket_test.go"],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":tenanttokenbucket"],
+    tags = ["ccl_test"],
     deps = [
-        "//pkg/roachpb",
-        "//pkg/testutils",
+        "//pkg/kv/kvpb",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/leaktest",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
+
+get_x_data(name = "get_x_data")

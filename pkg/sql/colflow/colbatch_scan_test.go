@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -43,6 +44,7 @@ import (
 // about the spans that have been read.
 func TestColBatchScanMeta(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
@@ -62,10 +64,14 @@ func TestColBatchScanMeta(t *testing.T) {
 	defer monitorRegistry.Close(ctx)
 
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -73,7 +79,7 @@ func TestColBatchScanMeta(t *testing.T) {
 		Local:  true,
 		NodeID: evalCtx.NodeID,
 	}
-	var fetchSpec descpb.IndexFetchSpec
+	var fetchSpec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
 		&fetchSpec, keys.SystemSQLCodec, td, td.GetPrimaryIndex(),
 		[]descpb.ColumnID{td.PublicColumns()[0].GetID()},
@@ -137,7 +143,7 @@ func BenchmarkColBatchScan(b *testing.B) {
 		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", tableName)
 		b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 			span := tableDesc.PrimaryIndexSpan(keys.SystemSQLCodec)
-			var fetchSpec descpb.IndexFetchSpec
+			var fetchSpec fetchpb.IndexFetchSpec
 			if err := rowenc.InitIndexFetchSpec(
 				&fetchSpec, keys.SystemSQLCodec, tableDesc, tableDesc.GetPrimaryIndex(),
 				[]descpb.ColumnID{tableDesc.PublicColumns()[0].GetID(), tableDesc.PublicColumns()[1].GetID()},
@@ -160,6 +166,7 @@ func BenchmarkColBatchScan(b *testing.B) {
 
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 				Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 				Txn:     kv.NewTxn(ctx, s.DB(), s.NodeID()),
 				NodeID:  evalCtx.NodeID,

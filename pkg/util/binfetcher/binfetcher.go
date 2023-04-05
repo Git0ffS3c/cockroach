@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -87,7 +86,11 @@ func (opts *Options) init() error {
 
 			goos := opts.GOOS
 			if opts.GOOS == "darwin" {
-				goos += "-10.9"
+				if opts.GOARCH == "arm64" {
+					goos += "-11.0"
+				} else {
+					goos += "-10.9"
+				}
 			} else if opts.GOOS == "windows" {
 				goos += "-6.2"
 			}
@@ -147,9 +150,9 @@ var httpClient = httputil.NewClientWithTimeout(300 * time.Second)
 //
 // `version` can be:
 //
-// - a SHA from the master branch, e.g. bd828feaa309578142fe7ad2d89ee1b70adbd52d
-// - the string "LATEST" for the most recent SHA from the master branch. Note that
-//   caching is disabled in that case.
+//   - a SHA from the master branch, e.g. bd828feaa309578142fe7ad2d89ee1b70adbd52d
+//   - the string "LATEST" for the most recent SHA from the master branch. Note that
+//     caching is disabled in that case.
 //
 // Returns the path to the (executable) binary.
 func Download(ctx context.Context, opts Options) (string, error) {
@@ -175,7 +178,7 @@ func Download(ctx context.Context, opts Options) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		return "", errors.Errorf("unexpected HTTP response from %s: %d\n%s", opts.URL.String(), resp.StatusCode, body)
 	}
 	if opts.Version == "LATEST" {
@@ -194,12 +197,16 @@ func Download(ctx context.Context, opts Options) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err := untar(r, destFile); err != nil {
+		if err := untar(r, destFile, opts.Binary); err != nil {
 			_ = destFile.Truncate(0)
 			return "", err
 		}
 	case strings.HasSuffix(opts.URL.Path, ".zip"):
-		if err := unzip(resp.Body, destFile); err != nil {
+		binary := opts.Binary
+		if opts.GOOS == "windows" {
+			binary += ".exe"
+		}
+		if err := unzip(resp.Body, destFile, binary); err != nil {
 			_ = destFile.Truncate(0)
 			return "", err
 		}

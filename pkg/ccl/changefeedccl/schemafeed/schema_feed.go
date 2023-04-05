@@ -15,9 +15,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedvalidators"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -28,9 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -80,22 +78,20 @@ func New(
 	ctx context.Context,
 	cfg *execinfra.ServerConfig,
 	events changefeedbase.SchemaChangeEventClass,
-	targets []jobspb.ChangefeedTargetSpecification,
+	targets changefeedbase.Targets,
 	initialHighwater hlc.Timestamp,
 	metrics *Metrics,
-	changefeedOpts map[string]string,
+	tolerances changefeedbase.CanHandle,
 ) SchemaFeed {
 	m := &schemaFeed{
-		filter:            schemaChangeEventFilters[events],
-		db:                cfg.DB,
-		clock:             cfg.DB.Clock(),
-		settings:          cfg.Settings,
-		targets:           targets,
-		leaseMgr:          cfg.LeaseManager.(*lease.Manager),
-		ie:                cfg.SessionBoundInternalExecutorFactory(ctx, &sessiondata.SessionData{}),
-		collectionFactory: cfg.CollectionFactory,
-		metrics:           metrics,
-		changefeedOpts:    changefeedOpts,
+		filter:     schemaChangeEventFilters[events],
+		db:         cfg.DB,
+		clock:      cfg.DB.KV().Clock(),
+		settings:   cfg.Settings,
+		targets:    targets,
+		leaseMgr:   cfg.LeaseManager.(*lease.Manager),
+		metrics:    metrics,
+		tolerances: tolerances,
 	}
 	m.mu.previousTableVersion = make(map[descpb.ID]catalog.TableDescriptor)
 	m.mu.highWater = initialHighwater
@@ -114,20 +110,18 @@ func New(
 // invariant (via `validateFn`). An error timestamp is also kept, which is the
 // lowest timestamp where at least one table doesn't meet the invariant.
 type schemaFeed struct {
-	filter         tableEventFilter
-	db             *kv.DB
-	clock          *hlc.Clock
-	settings       *cluster.Settings
-	targets        []jobspb.ChangefeedTargetSpecification
-	ie             sqlutil.InternalExecutor
-	metrics        *Metrics
-	changefeedOpts map[string]string
+	filter     tableEventFilter
+	db         descs.DB
+	clock      *hlc.Clock
+	settings   *cluster.Settings
+	targets    changefeedbase.Targets
+	metrics    *Metrics
+	tolerances changefeedbase.CanHandle
 
 	// TODO(ajwerner): Should this live underneath the FilterFunc?
 	// Should there be another function to decide whether to update the
 	// lease manager?
-	leaseMgr          *lease.Manager
-	collectionFactory *descs.CollectionFactory
+	leaseMgr *lease.Manager
 
 	mu struct {
 		syncutil.Mutex
@@ -199,27 +193,18 @@ func (t *typeDependencyTracker) removeDependency(typeID, tableID descpb.ID) {
 	}
 }
 
-func (t *typeDependencyTracker) purgeTable(tbl catalog.TableDescriptor) error {
+func (t *typeDependencyTracker) purgeTable(tbl catalog.TableDescriptor) {
 	for _, col := range tbl.UserDefinedTypeColumns() {
-		id, err := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
-		if err != nil {
-			return err
-		}
+		id := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
 		t.removeDependency(id, tbl.GetID())
 	}
-
-	return nil
 }
 
-func (t *typeDependencyTracker) ingestTable(tbl catalog.TableDescriptor) error {
+func (t *typeDependencyTracker) ingestTable(tbl catalog.TableDescriptor) {
 	for _, col := range tbl.UserDefinedTypeColumns() {
-		id, err := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
-		if err != nil {
-			return err
-		}
+		id := typedesc.UserDefinedTypeOIDToID(col.GetType().Oid())
 		t.addDependency(id, tbl.GetID())
 	}
-	return nil
 }
 
 func (t *typeDependencyTracker) containsType(id descpb.ID) bool {
@@ -276,33 +261,25 @@ func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
 	tf.mu.Unlock()
 	var initialDescs []catalog.Descriptor
 	initialTableDescsFn := func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn descs.Txn,
 	) error {
-		seen := make(map[descpb.ID]struct{}, len(tf.targets))
+		descriptors := txn.Descriptors()
 		initialDescs = initialDescs[:0]
-		if err := txn.SetFixedTimestamp(ctx, initialTableDescTs); err != nil {
+		if err := txn.KV().SetFixedTimestamp(ctx, initialTableDescTs); err != nil {
 			return err
 		}
 		// Note that all targets are currently guaranteed to be tables.
-		for _, table := range tf.targets {
-			if _, dup := seen[table.TableID]; dup {
-				continue
-			}
-			seen[table.TableID] = struct{}{}
-			flags := tree.ObjectLookupFlagsWithRequired()
-			flags.AvoidLeased = true
-			tableDesc, err := descriptors.GetImmutableTableByID(ctx, txn, table.TableID, flags)
+		return tf.targets.EachTableID(func(id descpb.ID) error {
+			tableDesc, err := descriptors.ByID(txn.KV()).WithoutNonPublic().Get().Table(ctx, id)
 			if err != nil {
 				return err
 			}
 			initialDescs = append(initialDescs, tableDesc)
-		}
-		return nil
+			return nil
+		})
 	}
 
-	if err := tf.collectionFactory.Txn(
-		ctx, tf.ie, tf.db, initialTableDescsFn,
-	); err != nil {
+	if err := tf.db.DescsTxn(ctx, initialTableDescsFn); err != nil {
 		return err
 	}
 
@@ -310,10 +287,7 @@ func (tf *schemaFeed) primeInitialTableDescs(ctx context.Context) error {
 	// Register all types used by the initial set of tables.
 	for _, desc := range initialDescs {
 		tbl := desc.(catalog.TableDescriptor)
-		if err := tf.mu.typeDeps.ingestTable(tbl); err != nil {
-			tf.mu.Unlock()
-			return err
-		}
+		tf.mu.typeDeps.ingestTable(tbl)
 	}
 	tf.mu.Unlock()
 
@@ -535,7 +509,7 @@ func (tf *schemaFeed) validateDescriptor(
 		// manager to acquire the freshest version of the type.
 		return tf.leaseMgr.AcquireFreshestFromStore(ctx, desc.GetID())
 	case catalog.TableDescriptor:
-		if err := changefeedbase.ValidateTable(tf.targets, desc, tf.changefeedOpts); err != nil {
+		if err := changefeedvalidators.ValidateTable(tf.targets, desc, tf.tolerances); err != nil {
 			return err
 		}
 		log.VEventf(ctx, 1, "validate %v", formatDesc(desc))
@@ -557,18 +531,16 @@ func (tf *schemaFeed) validateDescriptor(
 			}
 
 			// Purge the old version of the table from the type mapping.
-			if err := tf.mu.typeDeps.purgeTable(lastVersion); err != nil {
-				return err
-			}
+			tf.mu.typeDeps.purgeTable(lastVersion)
 
 			e := TableEvent{
 				Before: lastVersion,
 				After:  desc,
 			}
-			shouldFilter, err := tf.filter.shouldFilter(ctx, e)
+			shouldFilter, err := tf.filter.shouldFilter(ctx, e, tf.targets)
 			log.VEventf(ctx, 1, "validate shouldFilter %v %v", formatEvent(e), shouldFilter)
 			if err != nil {
-				return err
+				return changefeedbase.WithTerminalError(err)
 			}
 			if !shouldFilter {
 				// Only sort the tail of the events from earliestTsBeingIngested.
@@ -585,9 +557,7 @@ func (tf *schemaFeed) validateDescriptor(
 			}
 		}
 		// Add the types used by the table into the dependency tracker.
-		if err := tf.mu.typeDeps.ingestTable(desc); err != nil {
-			return err
-		}
+		tf.mu.typeDeps.ingestTable(desc)
 		tf.mu.previousTableVersion[desc.GetID()] = desc
 		return nil
 	default:
@@ -602,24 +572,24 @@ var highPriorityAfter = settings.RegisterDurationSetting(
 	time.Minute,
 ).WithPublic()
 
-func fetchDescriptorsWithPriorityOverride(
+func sendExportRequestWithPriorityOverride(
 	ctx context.Context,
 	st *cluster.Settings,
 	sender kv.Sender,
-	codec keys.SQLCodec,
+	span roachpb.Span,
 	startTS, endTS hlc.Timestamp,
-) (roachpb.Response, error) {
-	span := roachpb.Span{Key: codec.TablePrefix(keys.DescriptorTableID)}
-	span.EndKey = span.Key.PrefixEnd()
-	header := roachpb.Header{Timestamp: endTS}
-	req := &roachpb.ExportRequest{
-		RequestHeader: roachpb.RequestHeaderFromSpan(span),
+) (kvpb.Response, error) {
+	header := kvpb.Header{
+		Timestamp:                   endTS,
+		ReturnElasticCPUResumeSpans: true,
+	}
+	req := &kvpb.ExportRequest{
+		RequestHeader: kvpb.RequestHeaderFromSpan(span),
 		StartTime:     startTS,
-		MVCCFilter:    roachpb.MVCCFilter_All,
-		ReturnSST:     true,
+		MVCCFilter:    kvpb.MVCCFilter_All,
 	}
 
-	fetchDescriptors := func(ctx context.Context) (roachpb.Response, error) {
+	sendRequest := func(ctx context.Context) (kvpb.Response, error) {
 		resp, pErr := kv.SendWrappedWith(ctx, sender, header, req)
 		if pErr != nil {
 			err := pErr.GoError()
@@ -630,15 +600,15 @@ func fetchDescriptorsWithPriorityOverride(
 
 	priorityAfter := highPriorityAfter.Get(&st.SV)
 	if priorityAfter == 0 {
-		return fetchDescriptors(ctx)
+		return sendRequest(ctx)
 	}
 
-	var resp roachpb.Response
+	var resp kvpb.Response
 	err := contextutil.RunWithTimeout(
 		ctx, "schema-feed", priorityAfter,
 		func(ctx context.Context) error {
 			var err error
-			resp, err = fetchDescriptors(ctx)
+			resp, err = sendRequest(ctx)
 			return err
 		},
 	)
@@ -647,7 +617,7 @@ func fetchDescriptorsWithPriorityOverride(
 	}
 	if errors.HasType(err, (*contextutil.TimeoutError)(nil)) {
 		header.UserPriority = roachpb.MaxUserPriority
-		return fetchDescriptors(ctx)
+		return sendRequest(ctx)
 	}
 	return nil, err
 }
@@ -660,82 +630,97 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 	}
 	codec := tf.leaseMgr.Codec()
 	start := timeutil.Now()
-	res, err := fetchDescriptorsWithPriorityOverride(
-		ctx, tf.settings, tf.db.NonTransactionalSender(), codec, startTS, endTS)
-	if log.ExpensiveLogEnabled(ctx, 2) {
-		log.Infof(ctx, `fetched table descs (%s,%s] took %s err=%s`, startTS, endTS, timeutil.Since(start), err)
-	}
-	if err != nil {
-		return nil, err
-	}
+	span := roachpb.Span{Key: codec.TablePrefix(keys.DescriptorTableID)}
+	span.EndKey = span.Key.PrefixEnd()
 
 	tf.mu.Lock()
 	defer tf.mu.Unlock()
 
 	var descriptors []catalog.Descriptor
-	for _, file := range res.(*roachpb.ExportResponse).Files {
-		if err := func() error {
-			it, err := storage.NewMemSSTIterator(file.SST, false /* verify */)
-			if err != nil {
-				return err
-			}
-			defer it.Close()
-			for it.SeekGE(storage.NilKey); ; it.Next() {
-				if ok, err := it.Valid(); err != nil {
-					return err
-				} else if !ok {
-					return nil
-				}
-				k := it.UnsafeKey()
-				remaining, _, _, err := codec.DecodeIndexPrefix(k.Key)
-				if err != nil {
-					return err
-				}
-				_, id, err := encoding.DecodeUvarintAscending(remaining)
-				if err != nil {
-					return err
-				}
-				var origName string
-				var isTable bool
-				for _, cts := range tf.targets {
-					if cts.TableID == descpb.ID(id) {
-						origName = cts.StatementTimeName
-						isTable = true
-						break
-					}
-				}
-				isType := tf.mu.typeDeps.containsType(descpb.ID(id))
-				// Check if the descriptor is an interesting table or type.
-				if !(isTable || isType) {
-					// Uninteresting descriptor.
-					continue
-				}
-
-				unsafeValue := it.UnsafeValue()
-				if unsafeValue == nil {
-					name := origName
-					if name == "" {
-						name = fmt.Sprintf("desc(%d)", id)
-					}
-					return errors.Errorf(`"%v" was dropped or truncated`, name)
-				}
-
-				// Unmarshal the descriptor.
-				value := roachpb.Value{RawBytes: unsafeValue}
-				var desc descpb.Descriptor
-				if err := value.GetProto(&desc); err != nil {
-					return err
-				}
-
-				b := descbuilder.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
-				if b != nil && (b.DescriptorType() == catalog.Table || b.DescriptorType() == catalog.Type) {
-					descriptors = append(descriptors, b.BuildImmutable())
-				}
-			}
-		}(); err != nil {
+	for {
+		res, err := sendExportRequestWithPriorityOverride(
+			ctx, tf.settings, tf.db.KV().NonTransactionalSender(), span, startTS, endTS)
+		if log.ExpensiveLogEnabled(ctx, 2) {
+			log.Infof(ctx, `fetched table descs (%s,%s] took %s err=%s`, startTS, endTS, timeutil.Since(start), err)
+		}
+		if err != nil {
 			return nil, err
 		}
+
+		found := errors.New(``)
+		exportResp := res.(*kvpb.ExportResponse)
+		for _, file := range exportResp.Files {
+			if err := func() error {
+				it, err := storage.NewMemSSTIterator(file.SST, false /* verify */, storage.IterOptions{
+					// NB: We assume there will be no MVCC range tombstones here.
+					KeyTypes:   storage.IterKeyTypePointsOnly,
+					LowerBound: keys.MinKey,
+					UpperBound: keys.MaxKey,
+				})
+				if err != nil {
+					return err
+				}
+				defer it.Close()
+				for it.SeekGE(storage.NilKey); ; it.Next() {
+					if ok, err := it.Valid(); err != nil {
+						return err
+					} else if !ok {
+						return nil
+					}
+					k := it.UnsafeKey()
+					remaining, _, _, err := codec.DecodeIndexPrefix(k.Key)
+					if err != nil {
+						return err
+					}
+					_, id, err := encoding.DecodeUvarintAscending(remaining)
+					if err != nil {
+						return err
+					}
+					var origName changefeedbase.StatementTimeName
+					isTable, _ := tf.targets.EachHavingTableID(descpb.ID(id), func(t changefeedbase.Target) error {
+						origName = t.StatementTimeName
+						return found // sentinel error to break the loop
+					})
+					isType := tf.mu.typeDeps.containsType(descpb.ID(id))
+					// Check if the descriptor is an interesting table or type.
+					if !(isTable || isType) {
+						// Uninteresting descriptor.
+						continue
+					}
+
+					unsafeValue, err := it.UnsafeValue()
+					if err != nil {
+						return err
+					}
+					if unsafeValue == nil {
+						name := origName
+						if name == "" {
+							name = changefeedbase.StatementTimeName(fmt.Sprintf("desc(%d)", id))
+						}
+						return errors.Errorf(`"%v" was dropped or truncated`, name)
+					}
+
+					// Unmarshal the descriptor.
+					value := roachpb.Value{RawBytes: unsafeValue, Timestamp: k.Timestamp}
+					b, err := descbuilder.FromSerializedValue(&value)
+					if err != nil {
+						return err
+					}
+					if b != nil && (b.DescriptorType() == catalog.Table || b.DescriptorType() == catalog.Type) {
+						descriptors = append(descriptors, b.BuildImmutable())
+					}
+				}
+			}(); err != nil {
+				return nil, err
+			}
+		}
+
+		if exportResp.ResumeSpan == nil {
+			break
+		}
+		span.Key = exportResp.ResumeSpan.Key
 	}
+
 	return descriptors, nil
 }
 

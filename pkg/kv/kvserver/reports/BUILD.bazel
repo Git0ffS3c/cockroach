@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -17,18 +18,20 @@ go_library(
         "//pkg/config/zonepb",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/allocator/storepool",
         "//pkg/kv/kvserver/liveness",
         "//pkg/roachpb",
-        "//pkg/security/username",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog",
         "//pkg/sql/catalog/catalogkeys",
+        "//pkg/sql/catalog/descbuilder",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/isql",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
-        "//pkg/sql/sqlutil",
         "//pkg/util/log",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
@@ -49,15 +52,17 @@ go_test(
         "replication_stats_report_test.go",
         "reporter_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":reports"],
     deps = [
         "//pkg/base",
         "//pkg/config",
         "//pkg/config/zonepb",
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/roachpb",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
@@ -66,11 +71,13 @@ go_test(
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/bootstrap",
         "//pkg/sql/catalog/catalogkeys",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/dbdesc",
+        "//pkg/sql/catalog/descbuilder",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/tabledesc",
-        "//pkg/sql/sqlutil",
+        "//pkg/sql/isql",
         "//pkg/sql/types",
         "//pkg/testutils",
         "//pkg/testutils/keysutils",
@@ -92,3 +99,5 @@ go_test(
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
+
+get_x_data(name = "get_x_data")

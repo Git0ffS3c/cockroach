@@ -27,6 +27,7 @@ import (
 
 func registerTPCE(r registry.Registry) {
 	type tpceOptions struct {
+		owner     registry.Owner // defaults to test-eng
 		customers int
 		nodes     int
 		cpus      int
@@ -107,14 +108,18 @@ func registerTPCE(r registry.Registry) {
 
 	for _, opts := range []tpceOptions{
 		// Nightly, small scale configurations.
-		{customers: 5_000, nodes: 3, cpus: 4, ssds: 1},
+		{customers: 5_000, nodes: 3, cpus: 4, ssds: 1, timeout: 4 * time.Hour},
 		// Weekly, large scale configurations.
 		{customers: 100_000, nodes: 5, cpus: 32, ssds: 2, tags: []string{"weekly"}, timeout: 36 * time.Hour},
 	} {
 		opts := opts
+		owner := registry.OwnerTestEng
+		if opts.owner != "" {
+			owner = opts.owner
+		}
 		r.Add(registry.TestSpec{
 			Name:    fmt.Sprintf("tpce/c=%d/nodes=%d", opts.customers, opts.nodes),
-			Owner:   registry.OwnerKV,
+			Owner:   owner,
 			Tags:    opts.tags,
 			Timeout: opts.timeout,
 			Cluster: r.MakeClusterSpec(opts.nodes+1, spec.CPU(opts.cpus), spec.SSD(opts.ssds)),

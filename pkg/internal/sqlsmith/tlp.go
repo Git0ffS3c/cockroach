@@ -21,16 +21,16 @@ import (
 // CombinedTLP returns a single SQL query that compares the results of the two
 // TLP queries:
 //
-//   WITH unpart AS MATERIALIZED (
-//     <unpartitioned query>
-//   ), part AS MATERIALIZED (
-//     <partitioned query>
-//   ), undiff AS (
-//     TABLE unpart EXCEPT ALL TABLE part
-//   ), diff AS (
-//     TABLE part EXCEPT ALL TABLE unpart
-//   )
-//   SELECT (SELECT count(*) FROM undiff), (SELECT count(*) FROM diff)
+//	WITH unpart AS MATERIALIZED (
+//	  <unpartitioned query>
+//	), part AS MATERIALIZED (
+//	  <partitioned query>
+//	), undiff AS (
+//	  TABLE unpart EXCEPT ALL TABLE part
+//	), diff AS (
+//	  TABLE part EXCEPT ALL TABLE unpart
+//	)
+//	SELECT (SELECT count(*) FROM undiff), (SELECT count(*) FROM diff)
 //
 // This combined query can be used to check TLP equality with SQL comparison,
 // which will sometimes differ from TLP equality checked with string comparison.
@@ -59,13 +59,6 @@ SELECT (SELECT count(*) FROM undiff), (SELECT count(*) FROM diff)`,
 // have all been implemented in SQLancer. See:
 // https://github.com/sqlancer/sqlancer/tree/1.1.0/src/sqlancer/cockroachdb/oracle/tlp.
 func (s *Smither) GenerateTLP() (unpartitioned, partitioned string, args []interface{}) {
-	// Set disableImpureFns to true so that generated predicates are immutable.
-	originalDisableImpureFns := s.disableImpureFns
-	s.disableImpureFns = true
-	defer func() {
-		s.disableImpureFns = originalDisableImpureFns
-	}()
-
 	switch tlpType := s.rnd.Intn(5); tlpType {
 	case 0:
 		partitioned, unpartitioned, args = s.generateWhereTLP()
@@ -89,15 +82,15 @@ func (s *Smither) GenerateTLP() (unpartitioned, partitioned string, args []inter
 //
 // The first query returned is an unpartitioned query of the form:
 //
-//   SELECT *, p, NOT (p), (p) IS NULL, true, false, false FROM table
+//	SELECT *, p, NOT (p), (p) IS NULL, true, false, false FROM table
 //
 // The second query returned is a partitioned query of the form:
 //
-//   SELECT *, p, NOT (p), (p) IS NULL, p, NOT (p), (p) IS NULL FROM table WHERE (p)
-//   UNION ALL
-//   SELECT *, p, NOT (p), (p) IS NULL, NOT(p), p, (p) IS NULL FROM table WHERE NOT (p)
-//   UNION ALL
-//   SELECT *, p, NOT (p), (p) IS NULL, (p) IS NULL, (p) IS NOT NULL, (NOT(p)) IS NOT NULL FROM table WHERE (p) IS NULL
+//	SELECT *, p, NOT (p), (p) IS NULL, p, NOT (p), (p) IS NULL FROM table WHERE (p)
+//	UNION ALL
+//	SELECT *, p, NOT (p), (p) IS NULL, NOT(p), p, (p) IS NULL FROM table WHERE NOT (p)
+//	UNION ALL
+//	SELECT *, p, NOT (p), (p) IS NULL, (p) IS NULL, (p) IS NOT NULL, (NOT(p)) IS NOT NULL FROM table WHERE (p) IS NULL
 //
 // The last 3 boolean columns serve as a correctness check. The unpartitioned
 // query projects true, false, false at the end so that the partitioned queries
@@ -124,6 +117,7 @@ func (s *Smither) generateWhereTLP() (unpartitioned, partitioned string, args []
 	} else {
 		pred, args = makeBoolExprWithPlaceholders(s, cols)
 	}
+	f = tree.NewFmtCtx(tree.FmtParsable)
 	pred.Format(f)
 	predicate := f.CloseAndGetString()
 
@@ -208,6 +202,7 @@ func (s *Smither) generateOuterJoinTLP() (unpartitioned, partitioned string) {
 	}
 	table1.Format(f)
 	tableName1 := f.CloseAndGetString()
+	f = tree.NewFmtCtx(tree.FmtParsable)
 	table2.Format(f)
 	tableName2 := f.CloseAndGetString()
 
@@ -225,6 +220,7 @@ func (s *Smither) generateOuterJoinTLP() (unpartitioned, partitioned string) {
 		leftJoinTrue, leftJoinFalse, leftJoinFalse,
 	)
 
+	f = tree.NewFmtCtx(tree.FmtParsable)
 	pred := makeBoolExpr(s, cols1)
 	pred.Format(f)
 	predicate := f.CloseAndGetString()
@@ -257,15 +253,15 @@ func (s *Smither) generateOuterJoinTLP() (unpartitioned, partitioned string) {
 //
 // The first query returned is an unpartitioned query of the form:
 //
-//   SELECT * FROM table1 JOIN table2 ON TRUE
+//	SELECT * FROM table1 JOIN table2 ON TRUE
 //
 // The second query returned is a partitioned query of the form:
 //
-//   SELECT * FROM table1 JOIN table2 ON (p)
-//   UNION ALL
-//   SELECT * FROM table1 JOIN table2 ON NOT (p)
-//   UNION ALL
-//   SELECT * FROM table1 JOIN table2 ON (p) IS NULL
+//	SELECT * FROM table1 JOIN table2 ON (p)
+//	UNION ALL
+//	SELECT * FROM table1 JOIN table2 ON NOT (p)
+//	UNION ALL
+//	SELECT * FROM table1 JOIN table2 ON (p) IS NULL
 //
 // From the first query, we have a CROSS JOIN of the two tables (JOIN ON TRUE).
 // Recall our TLP logical guarantee that a given predicate p always evaluates to
@@ -286,6 +282,7 @@ func (s *Smither) generateInnerJoinTLP() (unpartitioned, partitioned string) {
 	}
 	table1.Format(f)
 	tableName1 := f.CloseAndGetString()
+	f = tree.NewFmtCtx(tree.FmtParsable)
 	table2.Format(f)
 	tableName2 := f.CloseAndGetString()
 
@@ -296,6 +293,7 @@ func (s *Smither) generateInnerJoinTLP() (unpartitioned, partitioned string) {
 
 	cols := cols1.extend(cols2...)
 	pred := makeBoolExpr(s, cols)
+	f = tree.NewFmtCtx(tree.FmtParsable)
 	pred.Format(f)
 	predicate := f.CloseAndGetString()
 
@@ -328,23 +326,23 @@ func (s *Smither) generateInnerJoinTLP() (unpartitioned, partitioned string) {
 //
 // The first query returned is an unpartitioned query of the form:
 //
-//   SELECT MAX(first) FROM (SELECT * FROM table) table(first)
+//	SELECT MAX(first) FROM (SELECT * FROM table) table(first)
 //
 // The second query returned is a partitioned query of the form:
 //
-//   SELECT MAX(agg) FROM (
-//     SELECT MAX(first) AS agg FROM (
-//       SELECT * FROM table WHERE p
-//     ) table(first)
-//     UNION ALL
-//     SELECT MAX(first) AS agg FROM (
-//       SELECT * FROM table WHERE NOT (p)
-//     ) table(first)
-//     UNION ALL
-//     SELECT MAX(first) AS agg FROM (
-//       SELECT * FROM table WHERE (p) IS NULL
-//     ) table(first)
-//   )
+//	SELECT MAX(agg) FROM (
+//	  SELECT MAX(first) AS agg FROM (
+//	    SELECT * FROM table WHERE p
+//	  ) table(first)
+//	  UNION ALL
+//	  SELECT MAX(first) AS agg FROM (
+//	    SELECT * FROM table WHERE NOT (p)
+//	  ) table(first)
+//	  UNION ALL
+//	  SELECT MAX(first) AS agg FROM (
+//	    SELECT * FROM table WHERE (p) IS NULL
+//	  ) table(first)
+//	)
 //
 // Note that all instances of MAX can be replaced with MIN to get the
 // corresponding MIN version of the queries. For the COUNT version, we
@@ -380,6 +378,7 @@ func (s *Smither) generateAggregationTLP() (unpartitioned, partitioned string) {
 		innerAgg, tableName, tableNameAlias,
 	)
 
+	f = tree.NewFmtCtx(tree.FmtParsable)
 	pred := makeBoolExpr(s, cols)
 	pred.Format(f)
 	predicate := f.CloseAndGetString()
@@ -411,13 +410,13 @@ func (s *Smither) generateAggregationTLP() (unpartitioned, partitioned string) {
 //
 // The first query returned is an unpartitioned query of the form:
 //
-//   SELECT DISTINCT {cols...} FROM table
+//	SELECT DISTINCT {cols...} FROM table
 //
 // The second query returned is a partitioned query of the form:
 //
-//   SELECT DISTINCT {cols...} FROM table WHERE (p) UNION
-//   SELECT DISTINCT {cols...} FROM table WHERE NOT (p) UNION
-//   SELECT DISTINCT {cols...} FROM table WHERE (p) IS NULL
+//	SELECT DISTINCT {cols...} FROM table WHERE (p) UNION
+//	SELECT DISTINCT {cols...} FROM table WHERE NOT (p) UNION
+//	SELECT DISTINCT {cols...} FROM table WHERE (p) IS NULL
 //
 // If the resulting values of the two queries are not equal, there is a logical
 // bug.
@@ -443,6 +442,7 @@ func (s *Smither) generateDistinctTLP() (unpartitioned, partitioned string) {
 	distinctCols := strings.Join(colStrs, ",")
 	unpartitioned = fmt.Sprintf("SELECT DISTINCT %s FROM %s", distinctCols, tableName)
 
+	f = tree.NewFmtCtx(tree.FmtParsable)
 	pred := makeBoolExpr(s, cols)
 	pred.Format(f)
 	predicate := f.CloseAndGetString()

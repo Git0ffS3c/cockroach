@@ -12,19 +12,20 @@ package tenantsettingswatcher
 
 import (
 	"context"
-	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedbuffer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 )
@@ -34,20 +35,20 @@ import (
 //
 // Sample usage:
 //
-//   w := tenantsettingswatcher.New(...)
-//   if err := w.Start(ctx); err != nil { ... }
+//	w := tenantsettingswatcher.New(...)
+//	if err := w.Start(ctx); err != nil { ... }
 //
-//   // Get overrides and keep them up to date.
-//   all, allCh := w.AllTenantOverrides()
-//   tenant, tenantCh := w.TenantOverrides(tenantID)
-//   select {
-//   case <-allCh:
-//     all, allCh = w.AllTenantOverrides()
-//   case <-tenantCh:
-//     tenant, tenantCh = w.TenantOverrides(tenantID)
-//   case <-ctx.Done():
-//     ...
-//   }
+//	// Get overrides and keep them up to date.
+//	all, allCh := w.AllTenantOverrides()
+//	tenant, tenantCh := w.TenantOverrides(tenantID)
+//	select {
+//	case <-allCh:
+//	  all, allCh = w.AllTenantOverrides()
+//	case <-tenantCh:
+//	  tenant, tenantCh = w.TenantOverrides(tenantID)
+//	case <-ctx.Done():
+//	  ...
+//	}
 type Watcher struct {
 	clock   *hlc.Clock
 	f       *rangefeed.Factory
@@ -78,56 +79,14 @@ func New(
 
 // Start will start the Watcher.
 //
-// If the current cluster version indicates that we have a tenant settings
-// table, this function sets up the rangefeed and waits for the initial scan. An
-// error will be returned if the initial table scan hits an error, the context
-// is canceled or the stopper is stopped prior to the initial data being
-// retrieved.
-//
-// Otherwise, Start sets up a background task that waits for the right version
-// and starts the rangefeed when appropriate. WaitUntilStarted can be used to
-// wait for the rangefeed setup.
+// This function sets up the rangefeed and waits for the initial scan. An error
+// will be returned if the initial table scan hits an error, the context is
+// canceled or the stopper is stopped prior to the initial data being retrieved.
 func (w *Watcher) Start(ctx context.Context, sysTableResolver catalog.SystemTableIDResolver) error {
 	w.startCh = make(chan struct{})
-	if w.st.Version.IsActive(ctx, clusterversion.TenantSettingsTable) {
-		// We are not in a mixed-version scenario; start the rangefeed now.
-		w.startErr = w.startRangeFeed(ctx, sysTableResolver)
-		close(w.startCh)
-		return w.startErr
-	}
-	// Set up an on-change callback that closes this channel once the version
-	// supports tenant settings.
-	versionOkCh := make(chan struct{})
-	var once sync.Once
-	w.st.Version.SetOnChange(func(ctx context.Context, newVersion clusterversion.ClusterVersion) {
-		if newVersion.IsActive(clusterversion.TenantSettingsTable) {
-			once.Do(func() {
-				close(versionOkCh)
-			})
-		}
-	})
-	// Now check the version again, in case the version changed just before
-	// SetOnChange.
-	if w.st.Version.IsActive(ctx, clusterversion.TenantSettingsTable) {
-		w.startErr = w.startRangeFeed(ctx, sysTableResolver)
-		close(w.startCh)
-		return w.startErr
-	}
-	return w.stopper.RunAsyncTask(ctx, "tenantsettingswatcher-start", func(ctx context.Context) {
-		log.Infof(ctx, "tenantsettingswatcher waiting for the appropriate version")
-		select {
-		case <-versionOkCh:
-		case <-w.stopper.ShouldQuiesce():
-			return
-		}
-		log.Infof(ctx, "tenantsettingswatcher can now start")
-		w.startErr = w.startRangeFeed(ctx, sysTableResolver)
-		if w.startErr != nil {
-			// We are not equipped to handle this error asynchronously.
-			log.Warningf(ctx, "error starting tenantsettingswatcher rangefeed: %v", w.startErr)
-		}
-		close(w.startCh)
-	})
+	w.startErr = w.startRangeFeed(ctx, sysTableResolver)
+	close(w.startCh)
+	return w.startErr
 }
 
 // startRangeFeed starts the range feed and waits for the initial table scan. An
@@ -137,7 +96,14 @@ func (w *Watcher) Start(ctx context.Context, sysTableResolver catalog.SystemTabl
 func (w *Watcher) startRangeFeed(
 	ctx context.Context, sysTableResolver catalog.SystemTableIDResolver,
 ) error {
-	tableID, err := sysTableResolver.LookupSystemTableID(ctx, systemschema.TenantSettingsTable.GetName())
+	// We need to retry unavailable replicas here. This is only meant to be called
+	// at server startup.
+	tableID, err := startup.RunIdempotentWithRetryEx(ctx,
+		w.stopper.ShouldQuiesce(),
+		"tenant start setting rangefeed",
+		func(ctx context.Context) (descpb.ID, error) {
+			return sysTableResolver.LookupSystemTableID(ctx, systemschema.TenantSettingsTable.GetName())
+		})
 	if err != nil {
 		return err
 	}
@@ -155,9 +121,9 @@ func (w *Watcher) startRangeFeed(
 		ch: make(chan struct{}),
 	}
 
-	allOverrides := make(map[roachpb.TenantID][]roachpb.TenantSetting)
+	allOverrides := make(map[roachpb.TenantID][]kvpb.TenantSetting)
 
-	translateEvent := func(ctx context.Context, kv *roachpb.RangeFeedValue) rangefeedbuffer.Event {
+	translateEvent := func(ctx context.Context, kv *kvpb.RangeFeedValue) rangefeedbuffer.Event {
 		tenantID, setting, tombstone, err := w.dec.DecodeRow(roachpb.KeyValue{
 			Key:   kv.Key,
 			Value: kv.Value,
@@ -202,7 +168,7 @@ func (w *Watcher) startRangeFeed(
 			close(initialScan.ch)
 		} else {
 			// The rangefeed will be restarted and will scan the table anew.
-			allOverrides = make(map[roachpb.TenantID][]roachpb.TenantSetting)
+			allOverrides = make(map[roachpb.TenantID][]kvpb.TenantSetting)
 		}
 	}
 
@@ -237,11 +203,6 @@ func (w *Watcher) startRangeFeed(
 
 // WaitForStart waits until the rangefeed is set up. Returns an error if the
 // rangefeed setup failed.
-//
-// If the cluster version does not support tenant settings, returns immediately
-// with no error. Note that it is still legal to call GetTenantOverrides and
-// GetAllTenantOverrides in this state. When the cluster version is upgraded,
-// the settings will start being updated.
 func (w *Watcher) WaitForStart(ctx context.Context) error {
 	// Fast path check.
 	select {
@@ -251,12 +212,6 @@ func (w *Watcher) WaitForStart(ctx context.Context) error {
 	}
 	if w.startCh == nil {
 		return errors.AssertionFailedf("Start() was not yet called")
-	}
-	if !w.st.Version.IsActive(ctx, clusterversion.TenantSettingsTable) {
-		// If this happens, then we are running new tenant code against a host
-		// cluster that was not fully upgraded.
-		log.Warningf(ctx, "tenant requested settings before host cluster version upgrade")
-		return nil
 	}
 	select {
 	case <-w.startCh:
@@ -272,7 +227,7 @@ func (w *Watcher) WaitForStart(ctx context.Context) error {
 // The caller must not modify the returned overrides slice.
 func (w *Watcher) GetTenantOverrides(
 	tenantID roachpb.TenantID,
-) (overrides []roachpb.TenantSetting, changeCh <-chan struct{}) {
+) (overrides []kvpb.TenantSetting, changeCh <-chan struct{}) {
 	o := w.store.GetTenantOverrides(tenantID)
 	return o.overrides, o.changeCh
 }
@@ -283,7 +238,7 @@ func (w *Watcher) GetTenantOverrides(
 //
 // The caller must not modify the returned overrides slice.
 func (w *Watcher) GetAllTenantOverrides() (
-	overrides []roachpb.TenantSetting,
+	overrides []kvpb.TenantSetting,
 	changeCh <-chan struct{},
 ) {
 	return w.GetTenantOverrides(allTenantOverridesID)

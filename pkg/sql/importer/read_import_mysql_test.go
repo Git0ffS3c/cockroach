@@ -15,7 +15,6 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strings"
@@ -37,7 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -115,7 +114,7 @@ func TestMysqldumpDataReader(t *testing.T) {
 }
 
 func readFile(t *testing.T, name string) string {
-	body, err := ioutil.ReadFile(testutils.TestDataPath(t, "mysqldump", name))
+	body, err := os.ReadFile(datapathutils.TestDataPath(t, "mysqldump", name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +133,10 @@ func readMysqlCreateFrom(
 	walltime := testEvalCtx.StmtTimestamp.UnixNano()
 
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		Settings: cluster.MakeTestingClusterSettings(),
+		// Test relies on descriptor validation, which doesn't seem to be
+		// supported within secondary tenants. Tracked with #76378.
+		DefaultTestTenant: base.TestTenantDisabled,
+		Settings:          cluster.MakeTestingClusterSettings(),
 	})
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
@@ -368,7 +370,7 @@ func TestMysqlValueToDatum(t *testing.T) {
 	evalContext := eval.NewTestingEvalContext(st)
 	for _, tc := range tests {
 		t.Run(fmt.Sprintf("%v", tc.raw), func(t *testing.T) {
-			got, err := mysqlValueToDatum(tc.raw, tc.typ, evalContext)
+			got, err := mysqlValueToDatum(context.Background(), tc.raw, tc.typ, evalContext)
 			if err != nil {
 				t.Fatal(err)
 			}

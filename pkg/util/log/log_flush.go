@@ -52,7 +52,7 @@ const syncInterval = 30
 // In practice, even a fraction of that would indicate a problem. This metric's
 // default should ideally match its sister metric in the storage engine, set by
 // COCKROACH_ENGINE_MAX_SYNC_DURATION.
-var maxSyncDuration = envutil.EnvOrDefaultDuration("COCKROACH_LOG_MAX_SYNC_DURATION", 60*time.Second)
+var maxSyncDuration = envutil.EnvOrDefaultDuration("COCKROACH_LOG_MAX_SYNC_DURATION", 20*time.Second)
 
 // syncWarnDuration is the threshold after which a slow disk warning is written
 // to the log and to stderr.
@@ -69,12 +69,12 @@ const syncWarnDuration = 10 * time.Second
 // Syncs ensure that the OS commits the data to disk. Syncs are less
 // frequent because they can incur more significant I/O costs.
 func flushDaemon() {
-	syncCounter := 1
+	syncCounter := 0
 
 	// This doesn't need to be Stop()'d as the loop never escapes.
 	for range time.Tick(flushInterval) {
-		doSync := syncCounter == syncInterval
 		syncCounter = (syncCounter + 1) % syncInterval
+		doSync := syncCounter == 0
 
 		// Is flushing disabled?
 		logging.mu.Lock()

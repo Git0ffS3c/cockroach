@@ -14,20 +14,24 @@ import (
 	"context"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-func (s *statusServer) ProblemRanges(
+func (s *systemStatusServer) ProblemRanges(
 	ctx context.Context, req *serverpb.ProblemRangesRequest,
 ) (*serverpb.ProblemRangesResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
+	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
+		return nil, err
+	}
+
 	response := &serverpb.ProblemRangesResponse{
-		NodeID:           s.gossip.NodeID.Get(),
+		NodeID:           roachpb.NodeID(s.serverIterator.getID()),
 		ProblemsByNodeID: make(map[roachpb.NodeID]serverpb.ProblemRangesResponse_NodeProblems),
 	}
 
@@ -39,8 +43,8 @@ func (s *statusServer) ProblemRanges(
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, err.Error())
 		}
-		isLiveMap = liveness.IsLiveMap{
-			requestedNodeID: liveness.IsLiveMapEntry{IsLive: true},
+		isLiveMap = livenesspb.IsLiveMap{
+			requestedNodeID: livenesspb.IsLiveMapEntry{IsLive: true},
 		}
 	}
 
@@ -133,6 +137,10 @@ func (s *statusServer) ProblemRanges(
 					problems.CircuitBreakerErrorRangeIDs =
 						append(problems.CircuitBreakerErrorRangeIDs, info.State.Desc.RangeID)
 				}
+				if info.Problems.PausedFollowers {
+					problems.PausedReplicaIDs =
+						append(problems.PausedReplicaIDs, info.State.Desc.RangeID)
+				}
 			}
 			sort.Sort(roachpb.RangeIDSlice(problems.UnavailableRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.RaftLeaderNotLeaseHolderRangeIDs))
@@ -143,6 +151,7 @@ func (s *statusServer) ProblemRanges(
 			sort.Sort(roachpb.RangeIDSlice(problems.QuiescentEqualsTickingRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.RaftLogTooLargeRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.CircuitBreakerErrorRangeIDs))
+			sort.Sort(roachpb.RangeIDSlice(problems.PausedReplicaIDs))
 			response.ProblemsByNodeID[resp.nodeID] = problems
 		case <-ctx.Done():
 			return nil, status.Errorf(codes.DeadlineExceeded, ctx.Err().Error())

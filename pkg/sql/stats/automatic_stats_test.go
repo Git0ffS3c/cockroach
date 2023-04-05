@@ -24,15 +24,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMaybeRefreshStats(t *testing.T) {
@@ -47,7 +48,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sqlDB.Close()
 	defer s.Stopper().Stop(ctx)
 
@@ -65,18 +66,14 @@ func TestMaybeRefreshStats(t *testing.T) {
 		INSERT INTO t.a VALUES (1);
 		CREATE VIEW t.vw AS SELECT k, k+1 FROM t.a;`)
 
-	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
+	executor := s.InternalExecutor().(isql.Executor)
 	descA := desctestutils.TestingGetPublicTableDescriptor(s.DB(), keys.SystemSQLCodec, "t", "a")
 	cache := NewTableStatisticsCache(
-		ctx,
 		10, /* cacheSize */
-		kvDB,
-		executor,
-		keys.SystemSQLCodec,
 		s.ClusterSettings(),
-		s.RangeFeedFactory().(*rangefeed.Factory),
-		s.CollectionFactory().(*descs.CollectionFactory),
+		s.InternalDB().(descs.DB),
 	)
+	require.NoError(t, cache.Start(ctx, keys.SystemSQLCodec, s.RangeFeedFactory().(*rangefeed.Factory)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// There should not be any stats yet.
@@ -87,7 +84,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// There are no stats yet, so this must refresh the statistics on table t
 	// even though rowsAffected=0.
 	refresher.maybeRefreshStats(
-		ctx, descA.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descA.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expected */); err != nil {
 		t.Fatal(err)
@@ -96,7 +93,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// Try to refresh again. With rowsAffected=0, the probability of a refresh
 	// is 0, so refreshing will not succeed.
 	refresher.maybeRefreshStats(
-		ctx, descA.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descA.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expected */); err != nil {
 		t.Fatal(err)
@@ -106,7 +103,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	minStaleRows := int64(100000000)
 	explicitSettings := catpb.AutoStatsSettings{MinStaleRows: &minStaleRows}
 	refresher.maybeRefreshStats(
-		ctx, descA.GetID(), &explicitSettings, 10 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descA.GetID(), &explicitSettings, 10 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expected */); err != nil {
 		t.Fatal(err)
@@ -117,7 +114,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	fractionStaleRows := float64(100000000)
 	explicitSettings = catpb.AutoStatsSettings{FractionStaleRows: &fractionStaleRows}
 	refresher.maybeRefreshStats(
-		ctx, descA.GetID(), &explicitSettings, 10 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descA.GetID(), &explicitSettings, 10 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 1 /* expected */); err != nil {
 		t.Fatal(err)
@@ -126,7 +123,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// With rowsAffected=10, refreshing should work. Since there are more rows
 	// updated than exist in the table, the probability of a refresh is 100%.
 	refresher.maybeRefreshStats(
-		ctx, descA.GetID(), nil /* explicitSettings */, 10 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descA.GetID(), nil /* explicitSettings */, 10 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descA, 2 /* expected */); err != nil {
 		t.Fatal(err)
@@ -137,9 +134,9 @@ func TestMaybeRefreshStats(t *testing.T) {
 	descRoleOptions :=
 		desctestutils.TestingGetPublicTableDescriptor(s.DB(), keys.SystemSQLCodec, "system", "role_options")
 	refresher.maybeRefreshStats(
-		ctx, descRoleOptions.GetID(), nil /* explicitSettings */, 10000 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descRoleOptions.GetID(), nil /* explicitSettings */, 10000 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
-	if err := checkStatsCount(ctx, cache, descRoleOptions, 4 /* expected */); err != nil {
+	if err := checkStatsCount(ctx, cache, descRoleOptions, 5 /* expected */); err != nil {
 		t.Fatal(err)
 	}
 
@@ -147,7 +144,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	descLease :=
 		desctestutils.TestingGetPublicTableDescriptor(s.DB(), keys.SystemSQLCodec, "system", "lease")
 	refresher.maybeRefreshStats(
-		ctx, descLease.GetID(), nil /* explicitSettings */, 10000 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descLease.GetID(), nil /* explicitSettings */, 10000 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descLease, 0 /* expected */); err != nil {
 		t.Fatal(err)
@@ -157,7 +154,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	descTableStats :=
 		desctestutils.TestingGetPublicTableDescriptor(s.DB(), keys.SystemSQLCodec, "system", "table_statistics")
 	refresher.maybeRefreshStats(
-		ctx, descTableStats.GetID(), nil /* explicitSettings */, 10000 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descTableStats.GetID(), nil /* explicitSettings */, 10000 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, descTableStats, 0 /* expected */); err != nil {
 		t.Fatal(err)
@@ -168,7 +165,7 @@ func TestMaybeRefreshStats(t *testing.T) {
 	// TODO(rytaft): Should not enqueue views to begin with.
 	descVW := desctestutils.TestingGetPublicTableDescriptor(s.DB(), keys.SystemSQLCodec, "t", "vw")
 	refresher.maybeRefreshStats(
-		ctx, descVW.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), descVW.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	select {
 	case <-refresher.mutations:
@@ -182,7 +179,7 @@ func TestEnsureAllTablesQueries(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sqlDB.Close()
 	defer s.Stopper().Stop(ctx)
 
@@ -195,20 +192,21 @@ func TestEnsureAllTablesQueries(t *testing.T) {
 
 	sqlRun.Exec(t, `CREATE TABLE t.b (k INT PRIMARY KEY);`)
 
-	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
+	executor := s.InternalExecutor().(isql.Executor)
 	cache := NewTableStatisticsCache(
-		ctx,
 		10, /* cacheSize */
-		kvDB,
-		executor,
-		keys.SystemSQLCodec,
 		s.ClusterSettings(),
-		s.RangeFeedFactory().(*rangefeed.Factory),
-		s.CollectionFactory().(*descs.CollectionFactory),
+		s.InternalDB().(descs.DB),
 	)
+	require.NoError(t, cache.Start(ctx, keys.SystemSQLCodec, s.RangeFeedFactory().(*rangefeed.Factory)))
 	r := MakeRefresher(s.AmbientCtx(), st, executor, cache, time.Microsecond /* asOfTime */)
 
-	if err := checkAllTablesCount(ctx, 2, r); err != nil {
+	// Exclude the 4 system tables which don't use autostats.
+	systemTablesWithStats := bootstrap.NumSystemTablesForSystemTenant - 4
+	numUserTablesWithStats := 2
+
+	// This now includes 36 system tables as well as the 2 created above.
+	if err := checkAllTablesCount(ctx, systemTablesWithStats+numUserTablesWithStats, r); err != nil {
 		t.Fatal(err)
 	}
 	if err := checkExplicitlyEnabledTablesCount(ctx, 0, r); err != nil {
@@ -216,7 +214,7 @@ func TestEnsureAllTablesQueries(t *testing.T) {
 	}
 	sqlRun.Exec(t,
 		`ALTER TABLE t.a SET (sql_stats_automatic_collection_enabled = true)`)
-	if err := checkAllTablesCount(ctx, 2, r); err != nil {
+	if err := checkAllTablesCount(ctx, systemTablesWithStats+numUserTablesWithStats, r); err != nil {
 		t.Fatal(err)
 	}
 	if err := checkExplicitlyEnabledTablesCount(ctx, 1, r); err != nil {
@@ -224,7 +222,8 @@ func TestEnsureAllTablesQueries(t *testing.T) {
 	}
 	sqlRun.Exec(t,
 		`ALTER TABLE t.b SET (sql_stats_automatic_collection_enabled = false)`)
-	if err := checkAllTablesCount(ctx, 1, r); err != nil {
+	numUserTablesWithStats--
+	if err := checkAllTablesCount(ctx, systemTablesWithStats+numUserTablesWithStats, r); err != nil {
 		t.Fatal(err)
 	}
 	if err := checkExplicitlyEnabledTablesCount(ctx, 1, r); err != nil {
@@ -232,10 +231,11 @@ func TestEnsureAllTablesQueries(t *testing.T) {
 	}
 	sqlRun.Exec(t,
 		`ALTER TABLE t.a SET (sql_stats_automatic_collection_enabled = false)`)
-	if err := checkAllTablesCount(ctx, 0, r); err != nil {
+	numUserTablesWithStats--
+	if err := checkAllTablesCount(ctx, systemTablesWithStats+numUserTablesWithStats, r); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkExplicitlyEnabledTablesCount(ctx, 0, r); err != nil {
+	if err := checkExplicitlyEnabledTablesCount(ctx, numUserTablesWithStats, r); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -245,7 +245,7 @@ func checkAllTablesCount(ctx context.Context, expected int, r *Refresher) error 
 	getAllTablesQuery := fmt.Sprintf(
 		getAllTablesTemplateSQL,
 		collectionDelay,
-		systemschema.SystemDatabaseName,
+		keys.TableStatisticsTableID, keys.LeaseTableID, keys.JobsTableID, keys.ScheduledJobsTableID,
 		autoStatsEnabledOrNotSpecifiedPredicate,
 	)
 	r.getApplicableTables(ctx, getAllTablesQuery,
@@ -262,7 +262,7 @@ func checkExplicitlyEnabledTablesCount(ctx context.Context, expected int, r *Ref
 	getTablesWithAutoStatsExplicitlyEnabledQuery := fmt.Sprintf(
 		getAllTablesTemplateSQL,
 		collectionDelay,
-		systemschema.SystemDatabaseName,
+		keys.TableStatisticsTableID, keys.LeaseTableID, keys.JobsTableID, keys.ScheduledJobsTableID,
 		explicitlyEnabledTablesPredicate,
 	)
 	r.getApplicableTables(ctx, getTablesWithAutoStatsExplicitlyEnabledQuery,
@@ -279,7 +279,7 @@ func TestAverageRefreshTime(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sqlDB.Close()
 	defer s.Stopper().Stop(ctx)
 
@@ -295,18 +295,14 @@ func TestAverageRefreshTime(t *testing.T) {
 		CREATE TABLE t.a (k INT PRIMARY KEY);
 		INSERT INTO t.a VALUES (1);`)
 
-	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
+	executor := s.InternalExecutor().(isql.Executor)
 	table := desctestutils.TestingGetPublicTableDescriptor(s.DB(), keys.SystemSQLCodec, "t", "a")
 	cache := NewTableStatisticsCache(
-		ctx,
 		10, /* cacheSize */
-		kvDB,
-		executor,
-		keys.SystemSQLCodec,
 		s.ClusterSettings(),
-		s.RangeFeedFactory().(*rangefeed.Factory),
-		s.CollectionFactory().(*descs.CollectionFactory),
+		s.InternalDB().(descs.DB),
 	)
+	require.NoError(t, cache.Start(ctx, keys.SystemSQLCodec, s.RangeFeedFactory().(*rangefeed.Factory)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// curTime is used as the current time throughout the test to ensure that the
@@ -320,8 +316,8 @@ func TestAverageRefreshTime(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if actual := avgRefreshTime(stats).Round(time.Minute); actual != expected {
-				return fmt.Errorf("expected avgRefreshTime %s but found %s",
+			if actual := avgFullRefreshTime(stats).Round(time.Minute); actual != expected {
+				return fmt.Errorf("expected avgFullRefreshTime %s but found %s",
 					expected.String(), actual.String())
 			}
 			return nil
@@ -354,7 +350,7 @@ func TestAverageRefreshTime(t *testing.T) {
 		})
 	}
 
-	// Since there are no stats yet, avgRefreshTime should return the default
+	// Since there are no stats yet, avgFullRefreshTime should return the default
 	// value.
 	if err := checkAverageRefreshTime(defaultAverageTimeBetweenRefreshes); err != nil {
 		t.Fatal(err)
@@ -414,7 +410,7 @@ func TestAverageRefreshTime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// None of the stats have the name AutoStatsName, so avgRefreshTime
+	// None of the stats have the name AutoStatsName, so avgFullRefreshTime
 	// should still return the default value.
 	if err := checkAverageRefreshTime(defaultAverageTimeBetweenRefreshes); err != nil {
 		t.Fatal(err)
@@ -465,7 +461,7 @@ func TestAverageRefreshTime(t *testing.T) {
 	// the statistics on table t. With rowsAffected=0, the probability of refresh
 	// is 0.
 	refresher.maybeRefreshStats(
-		ctx, table.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), table.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
 	if err := checkStatsCount(ctx, cache, table, 20 /* expected */); err != nil {
 		t.Fatal(err)
@@ -511,13 +507,13 @@ func TestAverageRefreshTime(t *testing.T) {
 
 	// The most recent stat is over 4 hours old, which is more than 2x the
 	// average time between refreshes, so this call must refresh the statistics
-	// on table t even though rowsAffected=0. After refresh, only 15 stats should
-	// remain (5 from column k and 10 from column v), since the old stats on k
-	// were deleted.
+	// on table t even though rowsAffected=0. After refresh, only 10 stats should
+	// remain (5 from column k and 5 from column v), since the old stats on k
+	// and v were deleted.
 	refresher.maybeRefreshStats(
-		ctx, table.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
+		ctx, s.Stopper(), table.GetID(), nil /* explicitSettings */, 0 /* rowsAffected */, time.Microsecond, /* asOf */
 	)
-	if err := checkStatsCount(ctx, cache, table, 15 /* expected */); err != nil {
+	if err := checkStatsCount(ctx, cache, table, 10 /* expected */); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -527,7 +523,7 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer sqlDB.Close()
 	defer s.Stopper().Stop(ctx)
 
@@ -546,17 +542,13 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 		`CREATE SCHEMA my_schema;
 		CREATE TABLE my_schema.b (j INT PRIMARY KEY);`)
 
-	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
+	executor := s.InternalExecutor().(isql.Executor)
 	cache := NewTableStatisticsCache(
-		ctx,
 		10, /* cacheSize */
-		kvDB,
-		executor,
-		keys.SystemSQLCodec,
 		s.ClusterSettings(),
-		s.RangeFeedFactory().(*rangefeed.Factory),
-		s.CollectionFactory().(*descs.CollectionFactory),
+		s.InternalDB().(descs.DB),
 	)
+	require.NoError(t, cache.Start(ctx, keys.SystemSQLCodec, s.RangeFeedFactory().(*rangefeed.Factory)))
 	refresher := MakeRefresher(s.AmbientCtx(), st, executor, cache, time.Microsecond /* asOfTime */)
 
 	AutomaticStatisticsClusterMode.Override(ctx, &st.SV, true)
@@ -582,34 +574,87 @@ func TestAutoStatsReadOnlyTables(t *testing.T) {
 		})
 }
 
+func TestAutoStatsOnStartupClusterSettingOff(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer sqlDB.Close()
+	defer s.Stopper().Stop(ctx)
+
+	st := cluster.MakeTestingClusterSettings()
+	AutomaticStatisticsClusterMode.Override(ctx, &st.SV, false)
+	evalCtx := eval.NewTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
+
+	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
+	sqlRun.Exec(t,
+		`CREATE DATABASE t;
+		CREATE TABLE t.a (k INT PRIMARY KEY);
+		ALTER TABLE t.a SET (sql_stats_automatic_collection_enabled = true);
+		CREATE TABLE t.b (k INT PRIMARY KEY);
+		ALTER TABLE t.b SET (sql_stats_automatic_collection_enabled = false);
+		CREATE TABLE t.c (k INT PRIMARY KEY);`)
+
+	executor := s.InternalExecutor().(isql.Executor)
+	cache := NewTableStatisticsCache(
+		10, /* cacheSize */
+		s.ClusterSettings(),
+		s.InternalDB().(descs.DB),
+	)
+	require.NoError(t, cache.Start(ctx, keys.SystemSQLCodec, s.RangeFeedFactory().(*rangefeed.Factory)))
+	refresher := MakeRefresher(s.AmbientCtx(), st, executor, cache, time.Microsecond /* asOfTime */)
+
+	// Refresher start should trigger stats collection on t.a.
+	if err := refresher.Start(
+		ctx, s.Stopper(), time.Millisecond, /* refreshInterval */
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// There should be one stat for table t.a.
+	sqlRun.CheckQueryResultsRetry(t,
+		`SELECT statistics_name, column_names, row_count FROM [SHOW STATISTICS FOR TABLE t.a]`,
+		[][]string{
+			{"__auto__", "{k}", "0"},
+		})
+
+	// There should be no stats for table t.b.
+	sqlRun.CheckQueryResultsRetry(t,
+		`SELECT statistics_name, column_names, row_count FROM [SHOW STATISTICS FOR TABLE t.b]`,
+		[][]string{})
+
+	// There should be no stats for table t.c.
+	sqlRun.CheckQueryResultsRetry(t,
+		`SELECT statistics_name, column_names, row_count FROM [SHOW STATISTICS FOR TABLE t.c]`,
+		[][]string{})
+}
+
 func TestNoRetryOnFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
-	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
+	executor := s.InternalExecutor().(isql.Executor)
 	cache := NewTableStatisticsCache(
-		ctx,
 		10, /* cacheSize */
-		kvDB,
-		executor,
-		keys.SystemSQLCodec,
 		s.ClusterSettings(),
-		s.RangeFeedFactory().(*rangefeed.Factory),
-		s.CollectionFactory().(*descs.CollectionFactory),
+		s.InternalDB().(descs.DB),
 	)
+	require.NoError(t, cache.Start(ctx, keys.SystemSQLCodec, s.RangeFeedFactory().(*rangefeed.Factory)))
 	r := MakeRefresher(s.AmbientCtx(), st, executor, cache, time.Microsecond /* asOfTime */)
 
 	// Try to refresh stats on a table that doesn't exist.
 	r.maybeRefreshStats(
-		ctx, 100 /* tableID */, nil /* explicitSettings */, math.MaxInt32,
+		ctx, s.Stopper(), 100 /* tableID */, nil /* explicitSettings */, math.MaxInt32,
 		time.Microsecond, /* asOfTime */
 	)
 
@@ -681,7 +726,8 @@ func TestDefaultColumns(t *testing.T) {
 	sqlRun := sqlutils.MakeSQLRunner(sqlDB)
 	sqlRun.Exec(t,
 		`CREATE DATABASE t;
-		CREATE TABLE t.a (c0 INT PRIMARY KEY);`)
+		CREATE TABLE t.a (c0 INT PRIMARY KEY)
+		WITH (sql_stats_automatic_collection_enabled = false);`)
 
 	for i := 1; i < 110; i++ {
 		// Add more columns than we will collect stats on.
@@ -705,25 +751,20 @@ func TestAnalyzeSystemTables(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	st := cluster.MakeTestingClusterSettings()
 	AutomaticStatisticsClusterMode.Override(ctx, &st.SV, false)
 	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
-	executor := s.InternalExecutor().(sqlutil.InternalExecutor)
+	executor := s.InternalExecutor().(isql.Executor)
 	cache := NewTableStatisticsCache(
-		ctx,
 		10, /* cacheSize */
-		kvDB,
-		executor,
-		keys.SystemSQLCodec,
 		s.ClusterSettings(),
-		s.RangeFeedFactory().(*rangefeed.Factory),
-		s.CollectionFactory().(*descs.CollectionFactory),
+		s.InternalDB().(descs.DB),
 	)
-
+	require.NoError(t, cache.Start(ctx, keys.SystemSQLCodec, s.RangeFeedFactory().(*rangefeed.Factory)))
 	var tableNames []string
 	tableNames = make([]string, 0, 40)
 
@@ -751,7 +792,8 @@ func TestAnalyzeSystemTables(t *testing.T) {
 	for _, tableName := range tableNames {
 		// Stats may not be collected on system.lease and system.table_statistics.
 		if tableName == "lease" || tableName == "table_statistics" ||
-			tableName == "jobs" || tableName == "scheduled_jobs" {
+			tableName == "jobs" || tableName == "scheduled_jobs" || tableName == "role_id_seq" ||
+			tableName == "descriptor_id_seq" {
 			continue
 		}
 		sql := fmt.Sprintf("ANALYZE system.%s", tableName)
@@ -772,8 +814,14 @@ func checkStatsCount(
 		if err != nil {
 			return err
 		}
-		if len(stats) != expected {
-			return fmt.Errorf("expected %d stat(s) but found %d", expected, len(stats))
+		var count int
+		for i := range stats {
+			if stats[i].Name != jobspb.ForecastStatsName {
+				count++
+			}
+		}
+		if count != expected {
+			return fmt.Errorf("expected %d stat(s) but found %d", expected, count)
 		}
 		return nil
 	})

@@ -18,7 +18,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"testing"
@@ -26,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/opbench"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -79,7 +78,7 @@ func TestOpBench(t *testing.T) {
 	}
 	for _, spec := range Benches {
 		t.Run(spec.Name, func(t *testing.T) {
-			runBench(t, spec, fmt.Sprintf(testutils.TestDataPath(t, "%s.csv"), spec.Name), rm)
+			runBench(t, spec, fmt.Sprintf(datapathutils.TestDataPath(t, "%s.csv"), spec.Name), rm)
 		})
 	}
 }
@@ -295,7 +294,7 @@ func runBench(t *testing.T, spec *opbench.Spec, path string, mode runMode) {
 	w.Flush()
 
 	if mode.rewriteEstimated || mode.rewriteActual {
-		if err := ioutil.WriteFile(path, result.Bytes(), 0644); err != nil {
+		if err := os.WriteFile(path, result.Bytes(), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}

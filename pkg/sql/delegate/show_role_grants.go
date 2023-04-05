@@ -23,7 +23,8 @@ import (
 
 // ShowRoleGrants returns role membership details for the specified roles and grantees.
 // Privileges: SELECT on system.role_members.
-//   Notes: postgres does not have a SHOW GRANTS ON ROLES statement.
+//
+//	Notes: postgres does not have a SHOW GRANTS ON ROLES statement.
 func (d *delegator) delegateShowRoleGrants(n *tree.ShowRoleGrants) (tree.Statement, error) {
 	const selectQuery = `
 SELECT role AS role_name,
@@ -71,5 +72,5 @@ SELECT role AS role_name,
 
 	}
 
-	return parse(query.String())
+	return d.parse(query.String())
 }

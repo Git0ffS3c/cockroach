@@ -12,6 +12,7 @@ package rpc
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -26,28 +27,44 @@ import (
 // knob functions are called at various points in the Context life cycle if they
 // are non-nil.
 type ContextTestingKnobs struct {
-
-	// UnaryClientInterceptor if non-nil will be called at dial time to provide
-	// the base unary interceptor for client connections.
-	// This function may return a nil interceptor to avoid injecting behavior
-	// for a given target and class.
-	UnaryClientInterceptor func(target string, class ConnectionClass) grpc.UnaryClientInterceptor
-
 	// StreamClient if non-nil will be called at dial time to provide
 	// the base stream interceptor for client connections.
 	// This function may return a nil interceptor to avoid injecting behavior
 	// for a given target and class.
+	//
+	// Note that this is not called for streaming RPCs using the
+	// internalClientAdapter - i.e. KV RPCs done against the local server.
 	StreamClientInterceptor func(target string, class ConnectionClass) grpc.StreamClientInterceptor
 
-	// ArtificialLatencyMap if non-nil contains a map from target address
+	// UnaryClientInterceptor, if non-nil, will be called when invoking any
+	// unary RPC.
+	UnaryClientInterceptor func(target string, class ConnectionClass) grpc.UnaryClientInterceptor
+
+	// InjectedLatencyOracle if non-nil contains a map from target address
 	// (server.RPCServingAddr() of a remote node) to artificial latency in
 	// milliseconds to inject. Setting this will cause the server to pause for
-	// the given amount of milliseconds on every network write.
-	ArtificialLatencyMap map[string]int
+	// the given duration on every network write.
+	InjectedLatencyOracle InjectedLatencyOracle
+
+	// InjectedLatencyEnabled is used to turn on or off the InjectedLatencyOracle.
+	InjectedLatencyEnabled func() bool
 
 	// StorageClusterID initializes the Context's StorageClusterID container to
 	// this value if non-nil at construction time.
 	StorageClusterID *uuid.UUID
+
+	// NoLoopbackDialer, when set, indicates that a test does not care
+	// about the special loopback dial semantics.
+	// If this is left unset, the test is responsible for ensuring
+	// SetLoopbackDialer() has been called on the rpc.Context.
+	// (This is done automatically by server.Server/server.SQLServerWrapper.)
+	NoLoopbackDialer bool
+}
+
+// InjectedLatencyOracle is a testing mechanism used to inject artificial
+// latency to an address.
+type InjectedLatencyOracle interface {
+	GetLatency(addr string) time.Duration
 }
 
 // NewInsecureTestingContext creates an insecure rpc Context suitable for tests.
@@ -77,11 +94,12 @@ func NewInsecureTestingContextWithKnobs(
 ) *Context {
 	return NewContext(ctx,
 		ContextOptions{
-			TenantID: roachpb.SystemTenantID,
-			Config:   &base.Config{Insecure: true},
-			Clock:    clock,
-			Stopper:  stopper,
-			Settings: cluster.MakeTestingClusterSettings(),
-			Knobs:    knobs,
+			TenantID:        roachpb.SystemTenantID,
+			Config:          &base.Config{Insecure: true},
+			Clock:           clock.WallClock(),
+			ToleratedOffset: clock.ToleratedOffset(),
+			Stopper:         stopper,
+			Settings:        cluster.MakeTestingClusterSettings(),
+			Knobs:           knobs,
 		})
 }

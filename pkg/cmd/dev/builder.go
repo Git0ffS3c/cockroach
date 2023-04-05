@@ -12,7 +12,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -92,27 +91,19 @@ func (d *dev) getDockerRunArgs(
 	if err != nil {
 		return
 	}
-	buf, err := d.os.ReadFile(filepath.Join(workspace, "build/teamcity-bazel-support.sh"))
+	bazelImageVersionFileContent, err := d.os.ReadFile(filepath.Join(workspace, "build", ".bazelbuilderversion"))
 	if err != nil {
 		return
 	}
-	var bazelImage string
-	for _, line := range strings.Split(buf, "\n") {
-		if strings.HasPrefix(line, "BAZEL_IMAGE=") {
-			bazelImage = strings.Trim(strings.TrimPrefix(line, "BAZEL_IMAGE="), "\n ")
-		}
-	}
-	if bazelImage == "" {
-		err = errors.New("could not find BAZEL_IMAGE in build/teamcity-bazel-support.sh")
-		return
-	}
+	bazelImage := strings.TrimSpace(bazelImageVersionFileContent)
 
 	// Ensure the Docker volume exists.
 	_, err = d.exec.CommandContextSilent(ctx, "docker", "volume", "inspect", volume)
 	if err != nil {
 		log.Printf("Creating volume %s with Docker...", volume)
-		_, err := d.exec.CommandContextSilent(ctx, "docker", "volume", "create", volume)
+		out, err := d.exec.CommandContextSilent(ctx, "docker", "volume", "create", volume)
 		if err != nil {
+			printStdoutAndErr(string(out), err)
 			return nil, err
 		}
 		// When Docker creates the volume, the owner will be `root`.

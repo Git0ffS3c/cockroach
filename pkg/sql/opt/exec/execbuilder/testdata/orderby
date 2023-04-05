@@ -245,7 +245,6 @@ vectorized: true
 │
 └── • render
     │ columns: (r)
-    │ estimated row count: 1,000 (missing stats)
     │ render r: b + 2
     │
     └── • scan
@@ -269,7 +268,6 @@ vectorized: true
 │
 └── • render
     │ columns: (y)
-    │ estimated row count: 1,000 (missing stats)
     │ render y: b + 2
     │
     └── • scan
@@ -540,7 +538,6 @@ vectorized: true
 • project
 │ columns: (b, c)
 │ ordering: +b,+c
-│ estimated row count: 10 (missing stats)
 │
 └── • scan
       columns: (a, b, c)
@@ -717,7 +714,6 @@ vectorized: true
 ·
 • project
 │ columns: (b)
-│ estimated row count: 1
 │
 └── • insert fast path
       columns: (a, b)
@@ -737,7 +733,6 @@ vectorized: true
 ·
 • project
 │ columns: (b)
-│ estimated row count: 1 (missing stats)
 │
 └── • delete
     │ columns: (a, b)
@@ -759,7 +754,6 @@ vectorized: true
 ·
 • project
 │ columns: (b)
-│ estimated row count: 1,000 (missing stats)
 │
 └── • update
     │ columns: (a, b)
@@ -770,7 +764,6 @@ vectorized: true
     │
     └── • render
         │ columns: (a, b, c, c_new)
-        │ estimated row count: 1,000 (missing stats)
         │ render c_new: true
         │ render a: a
         │ render b: b
@@ -845,6 +838,9 @@ vectorized: true
 statement ok
 CREATE TABLE foo(a INT, b CHAR)
 
+statement ok
+SET allow_ordinal_column_references=true
+
 # Check that sort by ordinal picks up the existing render.
 query T
 EXPLAIN (VERBOSE) SELECT b, a FROM foo ORDER BY @1
@@ -858,7 +854,6 @@ vectorized: true
 └── • render
     │ columns: (column6, a, b)
     │ ordering: +a
-    │ estimated row count: 1,000 (missing stats)
     │ render column6: a
     │ render a: a
     │ render b: b
@@ -887,7 +882,6 @@ vectorized: true
 └── • render
     │ columns: (column6, a, b)
     │ ordering: +b
-    │ estimated row count: 1,000 (missing stats)
     │ render column6: b
     │ render a: a
     │ render b: b
@@ -903,6 +897,9 @@ vectorized: true
               estimated row count: 1,000 (missing stats)
               table: foo@foo_pkey
               spans: FULL SCAN
+
+statement ok
+SET allow_ordinal_column_references=false
 
 # ------------------------------------------------------------------------------
 # Check star expansion in ORDER BY.
@@ -1111,7 +1108,6 @@ vectorized: true
     │
     └── • project
         │ columns: (k, v)
-        │ estimated row count: 2 (missing stats)
         │
         └── • lookup join (inner)
             │ columns: (column1, k, v)
@@ -1138,7 +1134,6 @@ vectorized: true
 └── • project
     │ columns: (k, k, v)
     │ ordering: -v,+k
-    │ estimated row count: 10 (missing stats)
     │
     └── • merge join (inner)
         │ columns: (k, v, k, v)
@@ -1233,7 +1228,6 @@ vectorized: true
     │
     └── • render
         │ columns: (nulls_ordering_b, a, b)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render a: a
         │ render b: b
@@ -1261,7 +1255,6 @@ vectorized: true
     │
     └── • render
         │ columns: (nulls_ordering_b, a, b)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render a: a
         │ render b: b
@@ -1307,7 +1300,6 @@ vectorized: true
     │
     └── • render
         │ columns: (nulls_ordering_b, nulls_ordering_c, a, b, c)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render nulls_ordering_c: c IS NULL
         │ render a: a
@@ -1343,7 +1335,6 @@ vectorized: true
     │
     └── • render
         │ columns: (nulls_ordering_b, a, b)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render a: a
         │ render b: b

@@ -15,17 +15,21 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 )
 
@@ -83,7 +87,7 @@ func registerImportNodeShutdown(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:    "import/nodeShutdown/worker",
-		Owner:   registry.OwnerBulkIO,
+		Owner:   registry.OwnerSQLSessions,
 		Cluster: r.MakeClusterSpec(4),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			c.Put(ctx, t.Cockroach(), "./cockroach")
@@ -97,7 +101,7 @@ func registerImportNodeShutdown(r registry.Registry) {
 	})
 	r.Add(registry.TestSpec{
 		Name:    "import/nodeShutdown/coordinator",
-		Owner:   registry.OwnerBulkIO,
+		Owner:   registry.OwnerSQLSessions,
 		Cluster: r.MakeClusterSpec(4),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			c.Put(ctx, t.Cockroach(), "./cockroach")
@@ -122,9 +126,9 @@ func registerImportTPCC(r registry.Registry) {
 
 		t.Status("running workload")
 		m := c.NewMonitor(ctx)
-		dul := NewDiskUsageLogger(t, c)
+		dul := roachtestutil.NewDiskUsageLogger(t, c)
 		m.Go(dul.Runner)
-		hc := NewHealthChecker(t, c, c.All())
+		hc := roachtestutil.NewHealthChecker(t, c, c.All())
 		m.Go(hc.Runner)
 
 		tick, perfBuf := initBulkJobPerfArtifacts(testName, timeout)
@@ -159,11 +163,11 @@ func registerImportTPCC(r registry.Registry) {
 		testName := fmt.Sprintf("import/tpcc/warehouses=%d/nodes=%d", warehouses, numNodes)
 		timeout := 5 * time.Hour
 		r.Add(registry.TestSpec{
-			Name:            testName,
-			Owner:           registry.OwnerBulkIO,
-			Cluster:         r.MakeClusterSpec(numNodes),
-			Timeout:         timeout,
-			EncryptAtRandom: true,
+			Name:              testName,
+			Owner:             registry.OwnerSQLSessions,
+			Cluster:           r.MakeClusterSpec(numNodes),
+			Timeout:           timeout,
+			EncryptionSupport: registry.EncryptionMetamorphic,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runImportTPCC(ctx, t, c, testName, timeout, warehouses)
 			},
@@ -172,11 +176,11 @@ func registerImportTPCC(r registry.Registry) {
 	const geoWarehouses = 4000
 	const geoZones = "europe-west2-b,europe-west4-b,asia-northeast1-b,us-west1-b"
 	r.Add(registry.TestSpec{
-		Name:            fmt.Sprintf("import/tpcc/warehouses=%d/geo", geoWarehouses),
-		Owner:           registry.OwnerBulkIO,
-		Cluster:         r.MakeClusterSpec(8, spec.CPU(16), spec.Geo(), spec.Zones(geoZones)),
-		Timeout:         5 * time.Hour,
-		EncryptAtRandom: true,
+		Name:              fmt.Sprintf("import/tpcc/warehouses=%d/geo", geoWarehouses),
+		Owner:             registry.OwnerSQLSessions,
+		Cluster:           r.MakeClusterSpec(8, spec.CPU(16), spec.Geo(), spec.Zones(geoZones)),
+		Timeout:           5 * time.Hour,
+		EncryptionSupport: registry.EncryptionMetamorphic,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runImportTPCC(ctx, t, c, fmt.Sprintf("import/tpcc/warehouses=%d/geo", geoWarehouses),
 				5*time.Hour, geoWarehouses)
@@ -204,11 +208,11 @@ func registerImportTPCH(r registry.Registry) {
 	} {
 		item := item
 		r.Add(registry.TestSpec{
-			Name:            fmt.Sprintf(`import/tpch/nodes=%d`, item.nodes),
-			Owner:           registry.OwnerBulkIO,
-			Cluster:         r.MakeClusterSpec(item.nodes),
-			Timeout:         item.timeout,
-			EncryptAtRandom: true,
+			Name:              fmt.Sprintf(`import/tpch/nodes=%d`, item.nodes),
+			Owner:             registry.OwnerSQLSessions,
+			Cluster:           r.MakeClusterSpec(item.nodes),
+			Timeout:           item.timeout,
+			EncryptionSupport: registry.EncryptionMetamorphic,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				tick, perfBuf := initBulkJobPerfArtifacts(t.Name(), item.timeout)
 
@@ -241,9 +245,9 @@ func registerImportTPCH(r registry.Registry) {
 					t.Fatal(err)
 				}
 				m := c.NewMonitor(ctx)
-				dul := NewDiskUsageLogger(t, c)
+				dul := roachtestutil.NewDiskUsageLogger(t, c)
 				m.Go(dul.Runner)
-				hc := NewHealthChecker(t, c, c.All())
+				hc := roachtestutil.NewHealthChecker(t, c, c.All())
 				m.Go(hc.Runner)
 
 				// TODO(peter): This currently causes the test to fail because we see a
@@ -324,9 +328,6 @@ func successfulImportStep(warehouses, nodeID int) versionStep {
 func runImportMixedVersion(
 	ctx context.Context, t test.Test, c cluster.Cluster, warehouses int, predecessorVersion string,
 ) {
-	// An empty string means that the cockroach binary specified by flag
-	// `cockroach` will be used.
-	const mainVersion = ""
 	roachNodes := c.All()
 
 	t.Status("starting csv servers")
@@ -337,8 +338,8 @@ func runImportMixedVersion(
 		preventAutoUpgradeStep(1),
 
 		// Upgrade some of the nodes.
-		binaryUpgradeStep(c.Node(1), mainVersion),
-		binaryUpgradeStep(c.Node(2), mainVersion),
+		binaryUpgradeStep(c.Node(1), clusterupgrade.MainVersion),
+		binaryUpgradeStep(c.Node(2), clusterupgrade.MainVersion),
 
 		successfulImportStep(warehouses, 1 /* nodeID */),
 	)
@@ -348,11 +349,14 @@ func runImportMixedVersion(
 func registerImportMixedVersion(r registry.Registry) {
 	r.Add(registry.TestSpec{
 		Name:  "import/mixed-versions",
-		Owner: registry.OwnerBulkIO,
+		Owner: registry.OwnerSQLSessions,
 		// Mixed-version support was added in 21.1.
 		Cluster: r.MakeClusterSpec(4),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			predV, err := PredecessorVersion(*t.BuildVersion())
+			if c.IsLocal() && runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
+			predV, err := version.PredecessorVersion(*t.BuildVersion())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -392,7 +396,7 @@ func registerImportDecommissioned(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:    "import/decommissioned",
-		Owner:   registry.OwnerBulkIO,
+		Owner:   registry.OwnerSQLSessions,
 		Cluster: r.MakeClusterSpec(4),
 		Run:     runImportDecommissioned,
 	})

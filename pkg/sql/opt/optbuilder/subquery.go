@@ -194,7 +194,7 @@ func (s *subquery) ResolvedType() *types.T {
 }
 
 // Eval is part of the tree.TypedExpr interface.
-func (s *subquery) Eval(_ tree.ExprEvaluator) (tree.Datum, error) {
+func (s *subquery) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("subquery must be replaced before evaluation"))
 }
 
@@ -331,18 +331,17 @@ func (b *Builder) buildSingleRowSubquery(
 //
 // We use the following transformations:
 //
-//   <var> IN (<subquery>)
-//     ==> ConstructAny(<subquery>, <var>, EqOp)
+//	<var> IN (<subquery>)
+//	  ==> ConstructAny(<subquery>, <var>, EqOp)
 //
-//   <var> NOT IN (<subquery>)
-//    ==> ConstructNot(ConstructAny(<subquery>, <var>, EqOp))
+//	<var> NOT IN (<subquery>)
+//	 ==> ConstructNot(ConstructAny(<subquery>, <var>, EqOp))
 //
-//   <var> <comp> {SOME|ANY}(<subquery>)
-//     ==> ConstructAny(<subquery>, <var>, <comp>)
+//	<var> <comp> {SOME|ANY}(<subquery>)
+//	  ==> ConstructAny(<subquery>, <var>, <comp>)
 //
-//   <var> <comp> ALL(<subquery>)
-//     ==> ConstructNot(ConstructAny(<subquery>, <var>, Negate(<comp>)))
-//
+//	<var> <comp> ALL(<subquery>)
+//	  ==> ConstructNot(ConstructAny(<subquery>, <var>, Negate(<comp>)))
 func (b *Builder) buildMultiRowSubquery(
 	c *tree.ComparisonExpr, inScope *scope, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr, outScope *scope) {
@@ -373,11 +372,19 @@ func (b *Builder) buildMultiRowSubquery(
 		))
 	}
 
-	// Construct the outer Any(...) operator.
-	out = b.factory.ConstructAny(input, scalar, &memo.SubqueryPrivate{
-		Cmp:          cmp,
-		OriginalExpr: s.Subquery,
-	})
+	if b.insideUDF {
+		// Any expressions cannot be built by the optimizer within a UDF, so
+		// build them as subqueries with ScalarGroupBy expressions instead.
+		sub := b.factory.CustomFuncs().ConstructGroupByAny(scalar, cmp, input)
+		out = b.factory.ConstructSubquery(sub, &memo.SubqueryPrivate{OriginalExpr: s.Subquery})
+	} else {
+		// Construct the outer Any(...) operator.
+		out = b.factory.ConstructAny(input, scalar, &memo.SubqueryPrivate{
+			Cmp:          cmp,
+			OriginalExpr: s.Subquery,
+		})
+	}
+
 	switch c.Operator.Symbol {
 	case treecmp.NotIn, treecmp.All:
 		// NOT Any(...)

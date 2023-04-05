@@ -56,11 +56,6 @@ func StartTenant(
 		}
 	}
 
-	if tc.Secure {
-		// TODO(radu): implement secure mode.
-		return errors.Errorf("secure mode not implemented for tenants yet")
-	}
-
 	startOpts.Target = install.StartTenantSQL
 	if startOpts.TenantID < 2 {
 		return errors.Errorf("invalid tenant ID %d (must be 2 or higher)", startOpts.TenantID)
@@ -71,7 +66,7 @@ func StartTenant(
 	saveNodes := hc.Nodes
 	hc.Nodes = hc.Nodes[:1]
 	l.Printf("Creating tenant metadata")
-	if err := hc.RunSQL(ctx, l, []string{
+	if err := hc.ExecSQL(ctx, l, "", []string{
 		`-e`,
 		fmt.Sprintf(createTenantIfNotExistsQuery, startOpts.TenantID),
 	}); err != nil {
@@ -84,6 +79,7 @@ func StartTenant(
 		kvAddrs = append(kvAddrs, fmt.Sprintf("%s:%d", hc.Host(node), hc.NodePort(node)))
 	}
 	startOpts.KVAddrs = strings.Join(kvAddrs, ",")
+	startOpts.KVCluster = hc
 	return tc.Start(ctx, l, startOpts)
 }
 

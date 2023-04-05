@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -41,8 +42,9 @@ func (c *CustomFuncs) LimitScanPrivate(
 // Scan operator.
 //
 // NOTE: Limiting unconstrained, non-partial index scans is done by the
-//       GenerateLimitedScans rule, since that can require IndexJoin operators
-//       to be generated.
+//
+//	GenerateLimitedScans rule, since that can require IndexJoin operators
+//	to be generated.
 func (c *CustomFuncs) CanLimitFilteredScan(
 	scanPrivate *memo.ScanPrivate, required props.OrderingChoice,
 ) bool {
@@ -68,7 +70,7 @@ func (c *CustomFuncs) CanLimitFilteredScan(
 	if scanPrivate.IsVirtualTable(md) && !required.Any() {
 		return false
 	}
-	ok, _ := ordering.ScanPrivateCanProvide(c.e.mem.Metadata(), scanPrivate, &required)
+	ok, _ := ordering.ScanPrivateCanProvide(md, scanPrivate, &required)
 	return ok
 }
 
@@ -92,14 +94,18 @@ func (c *CustomFuncs) CanLimitFilteredScan(
 // limited partial index scans. Limiting partial indexes is done by the
 // PushLimitIntoFilteredScans rule.
 func (c *CustomFuncs) GenerateLimitedScans(
-	grp memo.RelExpr, scanPrivate *memo.ScanPrivate, limit tree.Datum, required props.OrderingChoice,
+	grp memo.RelExpr,
+	required *physical.Required,
+	scanPrivate *memo.ScanPrivate,
+	limit tree.Datum,
+	requiredOrdering props.OrderingChoice,
 ) {
 	// Virtual indexes are not sorted, but are presented to the optimizer as
 	// sorted, and have a sort automatically applied to them on the output of the
 	// scan. Since this implicit sort happens after the scan, we can't place a
 	// hard limit on the scan if the query semantics require a sort order on the
 	// entire relation.
-	if scanPrivate.IsVirtualTable(c.e.mem.Metadata()) && !required.Any() {
+	if scanPrivate.IsVirtualTable(c.e.mem.Metadata()) && !requiredOrdering.Any() {
 		return
 	}
 	limitVal := int64(*limit.(*tree.DInt))
@@ -124,12 +130,13 @@ func (c *CustomFuncs) GenerateLimitedScans(
 		}
 
 		newScanPrivate := *scanPrivate
+		newScanPrivate.Distribution.Regions = nil
 		newScanPrivate.Index = index.Ordinal()
 
 		// If the alternate index does not conform to the ordering, then skip it.
 		// If reverse=true, then the scan needs to be in reverse order to match
-		// the required ordering.
-		ok, reverse := ordering.ScanPrivateCanProvide(c.e.mem.Metadata(), &newScanPrivate, &required)
+		// the requiredOrdering ordering.
+		ok, reverse := ordering.ScanPrivateCanProvide(c.e.mem.Metadata(), &newScanPrivate, &requiredOrdering)
 		if !ok {
 			return
 		}
@@ -265,13 +272,13 @@ func (c *CustomFuncs) MakeTopKPrivate(
 // For cases where the Scan's secondary index covers all needed columns, see
 // GenerateIndexScans, which does not construct an IndexJoin.
 func (c *CustomFuncs) GenerateLimitedTopKScans(
-	grp memo.RelExpr, sp *memo.ScanPrivate, tp *memo.TopKPrivate,
+	grp memo.RelExpr, required *physical.Required, sp *memo.ScanPrivate, tp *memo.TopKPrivate,
 ) {
-	required := tp.Ordering
+	requiredOrdering := tp.Ordering
 	// If the ordering was already optimized out (e.g., there is only one possible
-	// value for what would have been the required ordering), then there is no
+	// value for what would have been the requiredOrdering ordering), then there is no
 	// benefit to exploring limited top K.
-	if len(required.Columns) == 0 {
+	if len(requiredOrdering.Columns) == 0 {
 		return
 	}
 	// Iterate over all non-inverted and non-partial secondary indexes.
@@ -298,6 +305,12 @@ func (c *CustomFuncs) GenerateLimitedTopKScans(
 			return
 		}
 
+		// Otherwise, try to construct an IndexJoin operator that provides the
+		// columns missing from the index.
+		if sp.Flags.NoIndexJoin {
+			return
+		}
+
 		// Calculate the PK columns once.
 		if pkCols.Empty() {
 			pkCols = c.PrimaryKeyCols(sp.Table)
@@ -305,17 +318,18 @@ func (c *CustomFuncs) GenerateLimitedTopKScans(
 
 		// If the first index column and ordering column are not the same, then
 		// there is no benefit to exploring this index.
-		if col := sp.Table.ColumnID(index.Column(0).Ordinal()); !required.Columns[0].Group.Contains(col) {
+		if col := sp.Table.ColumnID(index.Column(0).Ordinal()); !requiredOrdering.Columns[0].Group.Contains(col) {
 			return
 		}
 
-		// If the index doesn't contain any of the required order columns, then
+		// If the index doesn't contain any of the requiredOrdering order columns, then
 		// there is no benefit to exploring this index.
-		if !required.Any() && !required.Group(0).Intersects(indexCols) {
+		if !requiredOrdering.Any() && !requiredOrdering.Group(0).Intersects(indexCols) {
 			return
 		}
 		// Scan whatever columns we need which are available from the index.
 		newScanPrivate := *sp
+		newScanPrivate.Distribution.Regions = nil
 		newScanPrivate.Index = index.Ordinal()
 		newScanPrivate.Cols = indexCols.Intersection(sp.Cols)
 		// If the index is not covering, scan the needed index columns plus
@@ -326,7 +340,7 @@ func (c *CustomFuncs) GenerateLimitedTopKScans(
 		// the index.
 		sb.AddIndexJoin(sp.Cols)
 		input := sb.BuildNewExpr()
-		// Use the overlapping indexes and required ordering.
+		// Use the overlapping indexes and requiredOrdering ordering.
 		newPrivate := *tp
 		grp.Memo().AddTopKToGroup(&memo.TopKExpr{Input: input, TopKPrivate: newPrivate}, grp)
 	})
@@ -385,7 +399,7 @@ func getPrefixFromOrdering(
 // based on the interesting orderings property. This enables the optimizer to
 // explore TopK with partially ordered input columns.
 func (c *CustomFuncs) GeneratePartialOrderTopK(
-	grp memo.RelExpr, input memo.RelExpr, private *memo.TopKPrivate,
+	grp memo.RelExpr, required *physical.Required, input memo.RelExpr, private *memo.TopKPrivate,
 ) {
 	orders := ordering.DeriveInterestingOrderings(input)
 	intraOrd := private.Ordering

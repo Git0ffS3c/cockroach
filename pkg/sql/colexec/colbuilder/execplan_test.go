@@ -12,6 +12,8 @@ package colbuilder
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -21,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -75,6 +78,7 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 	txn := kv.NewTxn(ctx, s.DB(), s.NodeID())
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -82,11 +86,11 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 		NodeID: evalCtx.NodeID,
 	}
 
-	streamingMemAcc := evalCtx.Mon.MakeBoundAccount()
+	streamingMemAcc := evalCtx.TestingMon.MakeBoundAccount()
 	defer streamingMemAcc.Close(ctx)
 
 	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
-	var spec descpb.IndexFetchSpec
+	var spec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
 		&spec, keys.SystemSQLCodec,
 		desc, desc.GetPrimaryIndex(),
@@ -137,6 +141,7 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 	defer r.TestCleanupNoError(t)
 
 	m := colexec.NewMaterializer(
+		nil, /* allocator */
 		flowCtx,
 		0, /* processorID */
 		r.OpWithMetaInfo,
@@ -157,4 +162,43 @@ func TestNewColOperatorExpectedTypeSchema(t *testing.T) {
 		rowIdx++
 	}
 	require.Equal(t, numRows, rowIdx)
+}
+
+// BenchmarkRenderPlanning benchmarks how long it takes to run a query with many
+// render expressions inside. With small number of rows to read, the overhead of
+// allocating the initial vectors for the projection operators dominates.
+func BenchmarkRenderPlanning(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(b, base.TestServerArgs{SQLMemoryPoolSize: 10 << 30})
+	defer s.Stopper().Stop(ctx)
+
+	jsonValue := `'{"string": "string", "int": 123, "null": null, "nested": {"string": "string", "int": 123, "null": null, "nested": {"string": "string", "int": 123, "null": null}}}'`
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	for _, numRows := range []int{1, 1 << 3, 1 << 6, 1 << 9} {
+		sqlDB.Exec(b, "DROP TABLE IF EXISTS bench")
+		sqlDB.Exec(b, "CREATE TABLE bench (id INT PRIMARY KEY, state JSONB)")
+		sqlDB.Exec(b, fmt.Sprintf(`INSERT INTO bench SELECT i, %s FROM generate_series(1, %d) AS g(i)`, jsonValue, numRows))
+		sqlDB.Exec(b, "ANALYZE bench")
+		for _, numRenders := range []int{1, 1 << 4, 1 << 8, 1 << 12} {
+			var sb strings.Builder
+			sb.WriteString("SELECT ")
+			for i := 0; i < numRenders; i++ {
+				if i > 0 {
+					sb.WriteString(", ")
+				}
+				sb.WriteString(fmt.Sprintf("state->'nested'->>'nested' AS test%d", i+1))
+			}
+			sb.WriteString(" FROM bench")
+			query := sb.String()
+			b.Run(fmt.Sprintf("rows=%d/renders=%d", numRows, numRenders), func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					sqlDB.Exec(b, query)
+				}
+			})
+		}
+	}
 }

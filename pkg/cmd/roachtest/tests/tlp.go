@@ -42,6 +42,7 @@ func registerTLP(r registry.Registry) {
 		RequiresLicense: true,
 		Tags:            nil,
 		Cluster:         r.MakeClusterSpec(1),
+		NativeLibs:      registry.LibGEOS,
 		Run:             runTLP,
 	})
 }
@@ -64,9 +65,6 @@ func runTLP(ctx context.Context, t test.Test, c cluster.Cluster) {
 	}
 
 	c.Put(ctx, t.Cockroach(), "./cockroach")
-	if err := c.PutLibraries(ctx, "./lib"); err != nil {
-		t.Fatalf("could not initialize libraries: %v", err)
-	}
 
 	for i := 0; ; i++ {
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
@@ -146,7 +144,8 @@ func runOneTLP(
 	defer mutSmither.Close()
 
 	// Initialize a smither that will never generate mutations.
-	tlpSmither, err := sqlsmith.NewSmither(conn, rnd, sqlsmith.DisableMutations())
+	tlpSmither, err := sqlsmith.NewSmither(conn, rnd,
+		sqlsmith.DisableMutations(), sqlsmith.DisableNondeterministicFns())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,9 +194,10 @@ func runMutationStatement(conn *gosql.DB, smither *sqlsmith.Smither, logStmt fun
 	stmt := smither.Generate()
 
 	// Ignore timeouts.
+	var err error
 	_ = runWithTimeout(func() error {
 		// Ignore errors. Log successful statements.
-		if _, err := conn.Exec(stmt); err == nil {
+		if _, err = conn.Exec(stmt); err == nil {
 			logStmt(stmt)
 		}
 		return nil

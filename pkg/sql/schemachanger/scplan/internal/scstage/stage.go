@@ -76,6 +76,13 @@ func (s Stage) String() string {
 		s.Phase.String(), s.Ordinal, s.StagesInPhase, ops)
 }
 
+// IsResetPreCommitStage returns true iff this is the first stage in the
+// pre-commit phase, also known as the reset stage, which is special in that
+// the elements transition _away_ from their targets instead of towards them.
+func (s Stage) IsResetPreCommitStage() bool {
+	return s.Phase == scop.PreCommitPhase && s.Ordinal == 1
+}
+
 // ValidateStages checks that the plan is valid.
 func ValidateStages(ts scpb.TargetState, stages []Stage, g *scgraph.Graph) error {
 	if len(stages) == 0 {
@@ -117,6 +124,7 @@ func ValidateStages(ts scpb.TargetState, stages []Stage, g *scgraph.Graph) error
 			return errors.Errorf("%s: preceded by %s stage",
 				stage.String(), currentPhase)
 		}
+		currentPhase = stage.Phase
 	}
 
 	// Check stage internal subgraph consistency.
@@ -144,6 +152,12 @@ func validateAdjacentStagesStates(previous, next Stage) error {
 }
 
 func validateStageSubgraph(ts scpb.TargetState, stage Stage, g *scgraph.Graph) error {
+	if stage.IsResetPreCommitStage() {
+		// Ignore the reset stage, which is the only one where we travel backwards
+		// in the graph.
+		return nil
+	}
+
 	// Transform the ops in a non-repeating sequence of their original op edges.
 	var queue []*scgraph.OpEdge
 	for _, op := range stage.EdgeOps {
@@ -157,9 +171,16 @@ func validateStageSubgraph(ts scpb.TargetState, stage Stage, g *scgraph.Graph) e
 		}
 	}
 
+	type beforeOrDuring int
+	const (
+		_ beforeOrDuring = iota
+		before
+		during
+	)
+
 	// Build the initial set of fulfilled nodes by traversing the graph
 	// recursively and backwards.
-	fulfilled := map[*screl.Node]bool{}
+	fulfilled := map[*screl.Node]beforeOrDuring{}
 	current := make([]*screl.Node, len(ts.Targets))
 	for i, status := range stage.Before {
 		t := &ts.Targets[i]
@@ -170,25 +191,22 @@ func validateStageSubgraph(ts scpb.TargetState, stage Stage, g *scgraph.Graph) e
 		}
 		current[i] = n
 	}
-	{
-		edgesTo := make(map[*screl.Node][]scgraph.Edge, g.Order())
-		_ = g.ForEachEdge(func(e scgraph.Edge) error {
-			edgesTo[e.To()] = append(edgesTo[e.To()], e)
-			return nil
-		})
-		var dfs func(n *screl.Node)
-		dfs = func(n *screl.Node) {
-			if _, found := fulfilled[n]; found {
-				return
+	for _, n := range current {
+		for {
+			fulfilled[n] = before
+			oe, ok := g.GetOpEdgeTo(n)
+			if !ok {
+				break
 			}
-			fulfilled[n] = true
-			for _, e := range edgesTo[n] {
-				dfs(e.From())
-			}
+			n = oe.From()
 		}
-		for _, n := range current {
-			dfs(n)
-		}
+	}
+
+	if stage.Phase == scop.StatementPhase {
+		// We can't validate the statement phase stages more deeply because
+		// the stage only contains a subset of the ops that are otherwise
+		// on its corresponding op-edges.
+		return nil
 	}
 
 	// Check that the precedence constraints are satisfied by walking from the
@@ -214,7 +232,9 @@ func validateStageSubgraph(ts scpb.TargetState, stage Stage, g *scgraph.Graph) e
 			// Prevent making progress on this target if there are unmet dependencies.
 			var hasUnmetDeps bool
 			if err := g.ForEachDepEdgeTo(oe.To(), func(de *scgraph.DepEdge) error {
-				hasUnmetDeps = hasUnmetDeps || !fulfilled[de.From()]
+				if _, isFulfilled := fulfilled[de.From()]; !isFulfilled {
+					hasUnmetDeps = true
+				}
 				return nil
 			}); err != nil {
 				return err
@@ -232,16 +252,41 @@ func validateStageSubgraph(ts scpb.TargetState, stage Stage, g *scgraph.Graph) e
 			}
 
 			current[i] = oe.To()
-			fulfilled[oe.To()] = true
+			fulfilled[oe.To()] = during
 			hasProgressed = true
+
+			// Check same-stage or previous-stage constraints.
+			if err := g.ForEachDepEdgeTo(oe.To(), func(de *scgraph.DepEdge) error {
+				switch fulfilled[de.From()] {
+				case before:
+					if de.Kind() == scgraph.SameStagePrecedence {
+						return errors.Errorf("%s not reached in same stage as %s, violates rule in %s",
+							de.From(), oe.To(), de.RuleNames())
+					}
+				case during:
+					if de.Kind() == scgraph.PreviousStagePrecedence {
+						return errors.Errorf("%s reached in same stage as %s, violates rule in %s",
+							de.From(), oe.To(), de.RuleNames())
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	// When we stop making progress we expect to have reached the After state.
 	for i, n := range current {
 		if n.CurrentStatus != stage.After[i] {
 			return errors.Errorf("internal inconsistency, "+
-				"ended in non-terminal status %s after walking the graph towards %s for %s",
-				n.CurrentStatus, stage.After[i], screl.ElementString(ts.Targets[i].Element()))
+				"element %s targets %s and should transition from %s to %s in this stage, "+
+				"but walking the graph blocks at %s",
+				screl.ElementString(ts.Targets[i].Element()),
+				ts.Targets[i].TargetStatus,
+				stage.Before[i],
+				stage.After[i],
+				n.CurrentStatus,
+			)
 		}
 	}
 

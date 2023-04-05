@@ -69,6 +69,11 @@ var (
 	// indexes counted in InvertedIndexCounter.
 	GeometryInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.geometry_inverted_index")
 
+	// TrigramInvertedIndexCounter is to be incremented every time a
+	// trigram inverted index is created. These are a subset of the
+	// indexes counted in InvertedIndexCounter.
+	TrigramInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.trigram_inverted_index")
+
 	// PartialIndexCounter is to be incremented every time a partial index is
 	// created. This includes both regular and inverted partial indexes.
 	PartialIndexCounter = telemetry.GetCounterOnce("sql.schema.partial_index")
@@ -87,10 +92,21 @@ var (
 	ExpressionIndexCounter = telemetry.GetCounterOnce("sql.schema.expression_index")
 )
 
+// SchemaChangeIndexCounter is to be incremented for certain CREATE
+// index operations.
+func SchemaChangeIndexCounter(typ string) telemetry.Counter {
+	return telemetry.GetCounter(fmt.Sprintf("sql.schema.%s_index", typ))
+}
+
 var (
 	// TempObjectCleanerDeletionCounter is to be incremented every time a temporary schema
 	// has been deleted by the temporary object cleaner.
 	TempObjectCleanerDeletionCounter = telemetry.GetCounterOnce("sql.schema.temp_object_cleaner.num_cleaned")
+)
+
+var (
+	// SchemaTelemetryExecuted is incremented when a schema telemetry job has executed.
+	SchemaTelemetryExecuted = telemetry.GetCounterOnce("sql.schema.telemetry.job_executed")
 )
 
 // SchemaNewColumnTypeQualificationCounter is to be incremented every time

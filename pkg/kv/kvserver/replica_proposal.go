@@ -12,17 +12,18 @@ package kvserver
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
@@ -114,7 +116,7 @@ type ProposalData struct {
 	// applies. Other than tests, we only need a few bits of the request
 	// here; this could be replaced with isLease and isChangeReplicas
 	// booleans.
-	Request *roachpb.BatchRequest
+	Request *kvpb.BatchRequest
 
 	// leaseStatus represents the lease under which the Request was evaluated and
 	// under which this proposal is being made. For lease requests, this is the
@@ -230,6 +232,10 @@ func (r *Replica) leasePostApplyLocked(
 	// Everything we do before then doesn't need to worry about requests being
 	// evaluated under the new lease.
 
+	// maybeSplit is true if we may have been called during splitPostApply, where
+	// prevLease equals newLease and we're applying the RHS lease.
+	var maybeSplit bool
+
 	// Sanity check to make sure that the lease sequence is moving in the right
 	// direction.
 	if s1, s2 := prevLease.Sequence, newLease.Sequence; s1 != 0 {
@@ -247,6 +253,7 @@ func (r *Replica) leasePostApplyLocked(
 				log.Fatalf(ctx, "sequence identical for different leases, prevLease=%s, newLease=%s",
 					redact.Safe(prevLease), redact.Safe(newLease))
 			}
+			maybeSplit = prevLease.Equal(newLease)
 		case s2 == s1+1:
 			// Lease sequence incremented by 1. Expected case.
 		case s2 > s1+1 && jumpOpt == assertNoLeaseJump:
@@ -263,10 +270,13 @@ func (r *Replica) leasePostApplyLocked(
 	leaseChangingHands := prevLease.Replica.StoreID != newLease.Replica.StoreID || prevLease.Sequence != newLease.Sequence
 
 	if iAmTheLeaseHolder {
-		// Log lease acquisition whenever an Epoch-based lease changes hands (or verbose
-		// logging is enabled).
-		if newLease.Type() == roachpb.LeaseEpoch && leaseChangingHands || log.V(1) {
-			log.VEventf(ctx, 1, "new range lease %s following %s", newLease, prevLease)
+		// Log lease acquisitions loudly when verbose logging is enabled or when the
+		// new leaseholder is draining, in which case it should be shedding leases.
+		// Otherwise, log a trace event.
+		if log.V(1) || r.store.IsDraining() {
+			log.Infof(ctx, "new range lease %s following %s", newLease, prevLease)
+		} else {
+			log.Eventf(ctx, "new range lease %s following %s", newLease, prevLease)
 		}
 	}
 
@@ -287,6 +297,15 @@ func (r *Replica) leasePostApplyLocked(
 		// explanation about why this is needed, see "Cooperative lease transfers"
 		// in pkg/util/hlc/doc.go.
 		r.Clock().Update(newLease.Start)
+
+		// As a result of moving the lease, update the minimum valid observed
+		// timestamp so that times before the lease start time are no longer
+		// respected. The observed timestamp on transactions refer to this node's
+		// clock. In range merges or lease transfers, a node becomes a leaseholder
+		// for data that it previously did not own and the transaction observed
+		// timestamp is no longer valid, so ignore observed timestamps before this
+		// time.
+		r.mu.minValidObservedTimestamp.Forward(newLease.Start)
 
 		// If this replica is a new holder of the lease, update the timestamp
 		// cache. Note that clock offset scenarios are handled via a stasis
@@ -313,11 +332,8 @@ func (r *Replica) leasePostApplyLocked(
 
 		// Reset the request counts used to make lease placement decisions and
 		// load-based splitting/merging decisions whenever starting a new lease.
-		if r.leaseholderStats != nil {
-			r.leaseholderStats.ResetRequestCounts()
-		}
 		if r.loadStats != nil {
-			r.loadStats.reset()
+			r.loadStats.Reset()
 		}
 		r.loadBasedSplitter.Reset(r.Clock().PhysicalTime())
 	}
@@ -339,24 +355,54 @@ func (r *Replica) leasePostApplyLocked(
 	// lease but not the updated merge or timestamp cache state, which can result
 	// in serializability violations.
 	r.mu.state.Lease = newLease
-	expirationBasedLease := r.requiresExpiringLeaseRLocked()
+
+	now := r.store.Clock().NowAsClockTimestamp()
+
+	// NB: ProposedTS is non-nil in practice, but we never fully migrated it
+	// in so we need to assume that it can be nil.
+	const slowLeaseWarningEnabled = false // see https://github.com/cockroachdb/cockroach/issues/97209
+	if slowLeaseWarningEnabled && iAmTheLeaseHolder && leaseChangingHands && newLease.ProposedTS != nil {
+		maybeLogSlowLeaseApplyWarning(ctx, time.Duration(now.WallTime-newLease.ProposedTS.WallTime), prevLease, newLease)
+	}
 
 	// Gossip the first range whenever its lease is acquired. We check to make
 	// sure the lease is active so that a trailing replica won't process an old
 	// lease request and attempt to gossip the first range.
-	now := r.store.Clock().NowAsClockTimestamp()
 	if leaseChangingHands && iAmTheLeaseHolder && r.IsFirstRange() && r.ownsValidLeaseRLocked(ctx, now) {
 		r.gossipFirstRangeLocked(ctx)
 	}
 
-	// Whenever we first acquire an expiration-based lease, notify the lease
-	// renewer worker that we want it to keep proactively renewing the lease
-	// before it expires.
-	if leaseChangingHands && iAmTheLeaseHolder && expirationBasedLease && r.ownsValidLeaseRLocked(ctx, now) {
-		r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
-		select {
-		case r.store.renewableLeasesSignal <- struct{}{}:
-		default:
+	if newLease.Type() == roachpb.LeaseExpiration && (leaseChangingHands || maybeSplit) &&
+		iAmTheLeaseHolder && r.ownsValidLeaseRLocked(ctx, now) {
+		if r.requiresExpirationLeaseRLocked() {
+			// Whenever we first acquire an expiration-based lease for a range that
+			// requires it (i.e. the liveness or meta ranges), notify the lease
+			// renewer worker that we want it to keep proactively renewing the lease
+			// before it expires.
+			//
+			// Other expiration leases are only proactively renewed if
+			// kv.expiration_leases_only.enabled is true, but in that case the renewal
+			// is handled by the Raft scheduler during Raft ticks.
+			r.store.renewableLeases.Store(int64(r.RangeID), unsafe.Pointer(r))
+			select {
+			case r.store.renewableLeasesSignal <- struct{}{}:
+			default:
+			}
+		} else if !r.shouldUseExpirationLeaseRLocked() {
+			// We received an expiration lease for a range that shouldn't keep using
+			// it, most likely as part of a lease transfer (which is always
+			// expiration-based). We've also applied it before it has expired. Upgrade
+			// this lease to the more efficient epoch-based one.
+			if log.V(1) {
+				log.VEventf(ctx, 1, "upgrading expiration lease %s to an epoch-based one", newLease)
+			}
+
+			if r.store.TestingKnobs().LeaseUpgradeInterceptor != nil {
+				r.store.TestingKnobs().LeaseUpgradeInterceptor(newLease)
+			}
+			st := r.leaseStatusForRequestRLocked(ctx, now, hlc.Timestamp{})
+			// Ignore the returned handle as we won't block on it.
+			_ = r.requestLeaseLocked(ctx, st)
 		}
 	}
 
@@ -371,15 +417,12 @@ func (r *Replica) leasePostApplyLocked(
 	currentOwner := newLease.OwnedBy(r.store.StoreID())
 	if leaseChangingHands && (prevOwner || currentOwner) {
 		if currentOwner {
-			r.store.maybeGossipOnCapacityChange(ctx, leaseAddEvent)
+			r.store.storeGossip.MaybeGossipOnCapacityChange(ctx, LeaseAddEvent)
 		} else if prevOwner {
-			r.store.maybeGossipOnCapacityChange(ctx, leaseRemoveEvent)
-		}
-		if r.leaseholderStats != nil {
-			r.leaseholderStats.ResetRequestCounts()
+			r.store.storeGossip.MaybeGossipOnCapacityChange(ctx, LeaseRemoveEvent)
 		}
 		if r.loadStats != nil {
-			r.loadStats.reset()
+			r.loadStats.Reset()
 		}
 	}
 
@@ -401,17 +444,10 @@ func (r *Replica) leasePostApplyLocked(
 				// Nothing to do.
 				return
 			}
-			if err := r.MaybeGossipSystemConfigRaftMuLocked(ctx); err != nil {
-				log.Errorf(ctx, "%v", err)
-			}
 			if err := r.MaybeGossipNodeLivenessRaftMuLocked(ctx, keys.NodeLivenessSpan); err != nil {
 				log.Errorf(ctx, "%v", err)
 			}
 		})
-		if leaseChangingHands && log.V(1) {
-			// This logging is useful to troubleshoot incomplete drains.
-			log.Info(ctx, "is now leaseholder")
-		}
 	}
 
 	// Inform the store of this lease.
@@ -427,6 +463,49 @@ func (r *Replica) leasePostApplyLocked(
 	}
 }
 
+// maybeLogSlowLeaseApplyWarning is called when the lease changes hands on the
+// new leaseholder. It logs if either the new lease was proposed well before it
+// became visible on the leaseholder (indicating replication lag) or if the
+// previous lease looks like we transferred a lease to a behind/offline replica.
+func maybeLogSlowLeaseApplyWarning(
+	ctx context.Context, newLeaseAppDelay time.Duration, prevLease, newLease *roachpb.Lease,
+) {
+	const slowLeaseApplyWarnThreshold = 500 * time.Millisecond
+	if newLeaseAppDelay > slowLeaseApplyWarnThreshold {
+		// If we hold the lease now and the lease was proposed "earlier", there
+		// must have been replication lag, and possibly reads and/or writes were
+		// delayed.
+		//
+		// We see this most commonly with lease transfers targeting a behind replica,
+		// or, in the worst case, a snapshot. We are constantly improving our
+		// heuristics for avoiding that[^1] but if it does happen it's good to know
+		// from the logs.
+		//
+		// In the case of a lease transfer, the two timestamps compared below are from
+		// different clocks, so there could be skew. We just pretend this is not the
+		// case, which is good enough here.
+		//
+		// [^1]: https://github.com/cockroachdb/cockroach/pull/82758
+		log.Warningf(ctx,
+			"lease %v active after replication lag of ~%.2fs; foreground traffic may have been impacted [prev=%v]",
+			newLease, newLeaseAppDelay.Seconds(), prevLease,
+		)
+	} else if prevLease.Type() == roachpb.LeaseExpiration &&
+		newLease.Type() == roachpb.LeaseEpoch &&
+		newLease.AcquisitionType == roachpb.LeaseAcquisitionType_Request {
+		// If the previous lease is expiration-based, but the new lease is not and
+		// the acquisition was non-cooperative, it is likely that a lease transfer
+		// (which is expiration-based) went to a follower that then couldn't hold
+		// the lease alive (for example, didn't apply it in time for it to
+		// actually serve any traffic). The result was likely an outage which
+		// resolves right now, so log to point this out.
+		log.Warningf(ctx,
+			"lease %v expired before being followed by lease %s; foreground traffic may have been impacted",
+			prevLease, newLease,
+		)
+	}
+}
+
 var addSSTPreApplyWarn = struct {
 	threshold time.Duration
 	log.EveryN
@@ -436,7 +515,7 @@ func addSSTablePreApply(
 	ctx context.Context,
 	st *cluster.Settings,
 	eng storage.Engine,
-	sideloaded SideloadStorage,
+	sideloaded logstore.SideloadStorage,
 	term, index uint64,
 	sst kvserverpb.ReplicatedEvalResult_AddSSTable,
 	limiter *rate.Limiter,
@@ -470,64 +549,47 @@ func addSSTablePreApply(
 	eng.PreIngestDelay(ctx)
 	tEndDelayed = timeutil.Now()
 
-	copied := false
-	if eng.InMem() {
-		// Ingest a copy of the SST. Otherwise, Pebble will claim and mutate the
-		// sst.Data byte slice, which will also be used later by e.g. rangefeeds.
-		data := make([]byte, len(sst.Data))
-		copy(data, sst.Data)
-		path = fmt.Sprintf("%x", checksum)
-		if err := eng.WriteFile(path, data); err != nil {
-			log.Fatalf(ctx, "unable to write sideloaded SSTable at term %d, index %d: %s", term, index, err)
-		}
-	} else {
-		ingestPath := path + ".ingested"
+	ingestPath := path + ".ingested"
 
-		// The SST may already be on disk, thanks to the sideloading
-		// mechanism.  If so we can try to add that file directly, via a new
-		// hardlink if the filesystem supports it, rather than writing a new
-		// copy of it.  We cannot pass it the path in the sideload store as
-		// the engine deletes the passed path on success.
-		if linkErr := eng.Link(path, ingestPath); linkErr == nil {
-			ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
-			if ingestErr != nil {
-				log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
-			}
-			// Adding without modification succeeded, no copy necessary.
-			log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
-			return false
+	// The SST may already be on disk, thanks to the sideloading mechanism.  If
+	// so we can try to add that file directly, via a new hardlink if the
+	// filesystem supports it, rather than writing a new copy of it.  We cannot
+	// pass it the path in the sideload store as the engine deletes the passed
+	// path on success.
+	if linkErr := eng.Link(path, ingestPath); linkErr == nil {
+		ingestErr := eng.IngestExternalFiles(ctx, []string{ingestPath})
+		if ingestErr != nil {
+			log.Fatalf(ctx, "while ingesting %s: %v", ingestPath, ingestErr)
 		}
-
-		path = ingestPath
-
-		log.Eventf(ctx, "copying SSTable for ingestion at index %d, term %d: %s", index, term, path)
-
-		// TODO(tschottdorf): remove this once sideloaded storage guarantees its
-		// existence.
-		if err := eng.MkdirAll(filepath.Dir(path)); err != nil {
-			panic(err)
-		}
-		if _, err := eng.Stat(path); err == nil {
-			// The file we want to ingest exists. This can happen since the
-			// ingestion may apply twice (we ingest before we mark the Raft
-			// command as committed). Just unlink the file (the storage engine
-			// created a hard link); after that we're free to write it again.
-			if err := eng.Remove(path); err != nil {
-				log.Fatalf(ctx, "while removing existing file during ingestion of %s: %+v", path, err)
-			}
-		}
-
-		if err := writeFileSyncing(ctx, path, sst.Data, eng, 0600, st, limiter); err != nil {
-			log.Fatalf(ctx, "while ingesting %s: %+v", path, err)
-		}
-		copied = true
+		// Adding without modification succeeded, no copy necessary.
+		log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
+		return false /* copied */
 	}
 
-	if err := eng.IngestExternalFiles(ctx, []string{path}); err != nil {
-		log.Fatalf(ctx, "while ingesting %s: %+v", path, err)
+	log.Eventf(ctx, "copying SSTable for ingestion at index %d, term %d: %s", index, term, ingestPath)
+
+	// TODO(tschottdorf): remove this once sideloaded storage guarantees its
+	// existence.
+	if err := eng.MkdirAll(filepath.Dir(ingestPath), os.ModePerm); err != nil {
+		panic(err)
 	}
-	log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, path)
-	return copied
+	if _, err := eng.Stat(ingestPath); err == nil {
+		// The file we want to ingest exists. This can happen since the
+		// ingestion may apply twice (we ingest before we mark the Raft
+		// command as committed). Just unlink the file (the storage engine
+		// created a hard link); after that we're free to write it again.
+		if err := eng.Remove(ingestPath); err != nil {
+			log.Fatalf(ctx, "while removing existing file during ingestion of %s: %+v", ingestPath, err)
+		}
+	}
+	if err := kvserverbase.WriteFileSyncing(ctx, ingestPath, sst.Data, eng, 0600, st, limiter); err != nil {
+		log.Fatalf(ctx, "while ingesting %s: %+v", ingestPath, err)
+	}
+	if err := eng.IngestExternalFiles(ctx, []string{ingestPath}); err != nil {
+		log.Fatalf(ctx, "while ingesting %s: %+v", ingestPath, err)
+	}
+	log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, ingestPath)
+	return true /* copied */
 }
 
 func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult result.LocalResult) {
@@ -596,26 +658,6 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 		lResult.MaybeAddToSplitQueue = false
 	}
 
-	// The gossip triggers below require raftMu to be held, but
-	// handleReadWriteLocalEvalResult() may be called from non-Raft code paths (in
-	// particular for noop proposals). LocalResult.RequiresRaft() will force
-	// results that set these gossip triggers to always go via Raft such that
-	// raftMu is held. The triggers assert that callers hold the mutex during race
-	// tests via raftMu.AssertHeld().
-	if lResult.MaybeGossipSystemConfig {
-		if err := r.MaybeGossipSystemConfigRaftMuLocked(ctx); err != nil {
-			log.Errorf(ctx, "%v", err)
-		}
-		lResult.MaybeGossipSystemConfig = false
-	}
-
-	if lResult.MaybeGossipSystemConfigIfHaveFailure {
-		if err := r.MaybeGossipSystemConfigIfHaveFailureRaftMuLocked(ctx); err != nil {
-			log.Errorf(ctx, "%v", err)
-		}
-		lResult.MaybeGossipSystemConfigIfHaveFailure = false
-	}
-
 	if lResult.MaybeGossipNodeLiveness != nil {
 		if err := r.MaybeGossipNodeLivenessRaftMuLocked(ctx, *lResult.MaybeGossipNodeLiveness); err != nil {
 			log.Errorf(ctx, "%v", err)
@@ -636,8 +678,8 @@ func (r *Replica) handleReadWriteLocalEvalResult(ctx context.Context, lResult re
 // proposalResult indicates the result of a proposal. Exactly one of
 // Reply and Err is set, and it represents the result of the proposal.
 type proposalResult struct {
-	Reply              *roachpb.BatchResponse
-	Err                *roachpb.Error
+	Reply              *kvpb.BatchResponse
+	Err                *kvpb.Error
 	EncounteredIntents []roachpb.Intent
 	EndTxns            []result.EndTxnIntents
 }
@@ -658,12 +700,13 @@ type proposalResult struct {
 func (r *Replica) evaluateProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
-	ba *roachpb.BatchRequest,
-	ui uncertainty.Interval,
+	ba *kvpb.BatchRequest,
 	g *concurrency.Guard,
-) (*result.Result, bool, *roachpb.Error) {
+	st *kvserverpb.LeaseStatus,
+	ui uncertainty.Interval,
+) (*result.Result, bool, *kvpb.Error) {
 	if ba.Timestamp.IsEmpty() {
-		return nil, false, roachpb.NewErrorf("can't propose Raft command with zero timestamp")
+		return nil, false, kvpb.NewErrorf("can't propose Raft command with zero timestamp")
 	}
 
 	// Evaluate the commands. If this returns without an error, the batch should
@@ -676,7 +719,7 @@ func (r *Replica) evaluateProposal(
 	//
 	// TODO(tschottdorf): absorb all returned values in `res` below this point
 	// in the call stack as well.
-	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, ui, g)
+	batch, ms, br, res, pErr := r.evaluateWriteBatch(ctx, idKey, ba, g, st, ui)
 
 	// Note: reusing the proposer's batch when applying the command on the
 	// proposer was explored as an optimization but resulted in no performance
@@ -686,7 +729,7 @@ func (r *Replica) evaluateProposal(
 	}
 
 	if pErr != nil {
-		if _, ok := pErr.GetDetail().(*roachpb.ReplicaCorruptionError); ok {
+		if _, ok := pErr.GetDetail().(*kvpb.ReplicaCorruptionError); ok {
 			return &res, false /* needConsensus */, pErr
 		}
 
@@ -737,21 +780,9 @@ func (r *Replica) evaluateProposal(
 
 		// Set the proposal's replicated result, which contains metadata and
 		// side-effects that are to be replicated to all replicas.
-		res.Replicated.IsLeaseRequest = ba.IsLeaseRequest()
+		res.Replicated.IsLeaseRequest = ba.IsSingleRequestLeaseRequest()
 		if ba.AppliesTimestampCache() {
 			res.Replicated.WriteTimestamp = ba.WriteTimestamp()
-		} else {
-			if !r.ClusterSettings().Version.IsActive(ctx, clusterversion.DontProposeWriteTimestampForLeaseTransfers) {
-				// For misc requests, use WriteTimestamp to propagate a clock signal. This
-				// is particularly important for lease transfers, as it assures that the
-				// follower getting the lease will have a clock above the start time of
-				// its lease.
-				//
-				// This is no longer needed in v22.1 because nodes running v22.1 and
-				// above will update their clock directly from the new lease's start
-				// time.
-				res.Replicated.WriteTimestamp = r.store.Clock().Now()
-			}
 		}
 		res.Replicated.Delta = ms.ToStatsDelta()
 
@@ -766,17 +797,17 @@ func (r *Replica) evaluateProposal(
 
 // requestToProposal converts a BatchRequest into a ProposalData, by
 // evaluating it. The returned ProposalData is partially valid even
-// on a non-nil *roachpb.Error and should be proposed through Raft
+// on a non-nil *kvpb.Error and should be proposed through Raft
 // if ProposalData.command is non-nil.
 func (r *Replica) requestToProposal(
 	ctx context.Context,
 	idKey kvserverbase.CmdIDKey,
-	ba *roachpb.BatchRequest,
-	st kvserverpb.LeaseStatus,
-	ui uncertainty.Interval,
+	ba *kvpb.BatchRequest,
 	g *concurrency.Guard,
-) (*ProposalData, *roachpb.Error) {
-	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, ui, g)
+	st *kvserverpb.LeaseStatus,
+	ui uncertainty.Interval,
+) (*ProposalData, *kvpb.Error) {
+	res, needConsensus, pErr := r.evaluateProposal(ctx, idKey, ba, g, st, ui)
 
 	// Fill out the results even if pErr != nil; we'll return the error below.
 	proposal := &ProposalData{
@@ -785,7 +816,7 @@ func (r *Replica) requestToProposal(
 		doneCh:      make(chan proposalResult, 1),
 		Local:       &res.Local,
 		Request:     ba,
-		leaseStatus: st,
+		leaseStatus: *st,
 	}
 
 	if needConsensus {

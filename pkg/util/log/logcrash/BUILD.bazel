@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -29,10 +30,11 @@ go_test(
         "crash_reporting_unix_test.go",
         "main_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":logcrash"],
     deps = [
         "//pkg/base",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/settings/cluster",
@@ -91,3 +93,5 @@ go_test(
         "//conditions:default": [],
     }),
 )
+
+get_x_data(name = "get_x_data")

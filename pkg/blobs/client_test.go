@@ -13,14 +13,11 @@ package blobs
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
@@ -35,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func createTestResources(t testing.TB) (string, string, *stop.Stopper, func()) {
@@ -57,27 +55,24 @@ func setUpService(
 	localExternalDir string,
 	remoteExternalDir string,
 ) BlobClientFactory {
-	s := rpc.NewServer(rpcContext)
+	s, err := rpc.NewServer(rpcContext)
+	require.NoError(t, err)
+
 	remoteBlobServer, err := NewBlobService(remoteExternalDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	blobspb.RegisterBlobServer(s, remoteBlobServer)
 	ln, err := netutil.ListenAndServeGRPC(rpcContext.Stopper, s, util.TestAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
-	s2 := rpc.NewServer(rpcContext)
+	s2, err := rpc.NewServer(rpcContext)
+	require.NoError(t, err)
 	localBlobServer, err := NewBlobService(localExternalDir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+
 	blobspb.RegisterBlobServer(s2, localBlobServer)
 	ln2, err := netutil.ListenAndServeGRPC(rpcContext.Stopper, s2, util.TestAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	localDialer := nodedialer.New(rpcContext,
 		func(nodeID roachpb.NodeID) (net.Addr, error) {
@@ -92,9 +87,10 @@ func setUpService(
 	localNodeIDContainer := &base.NodeIDContainer{}
 	localNodeIDContainer.Set(context.Background(), localNodeID)
 	return NewBlobClientFactory(
-		localNodeIDContainer,
+		base.NewSQLIDContainerForNode(localNodeIDContainer),
 		localDialer,
 		localExternalDir,
+		true, /* allowLocalFastpath */
 	)
 }
 
@@ -103,7 +99,7 @@ func writeTestFile(t testing.TB, file string, content []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = ioutil.WriteFile(file, content, 0600)
+	err = os.WriteFile(file, content, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +112,7 @@ func TestBlobClientReadFile(t *testing.T) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
@@ -197,7 +193,7 @@ func TestBlobClientReadFile(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(content, tc.fileContent) {
-				t.Fatal(fmt.Sprintf(`fetched file content incorrect, expected %s, got %s`, tc.fileContent, content))
+				t.Fatalf(`fetched file content incorrect, expected %s, got %s`, tc.fileContent, content)
 			}
 		})
 	}
@@ -210,7 +206,7 @@ func TestBlobClientWriteFile(t *testing.T) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
@@ -274,12 +270,12 @@ func TestBlobClientWriteFile(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Check that file is now in correct node
-			content, err := ioutil.ReadFile(filepath.Join(tc.destinationNodeDir, tc.filename))
+			content, err := os.ReadFile(filepath.Join(tc.destinationNodeDir, tc.filename))
 			if err != nil {
 				t.Fatal(err, "unable to read fetched file")
 			}
 			if !bytes.Equal(content, byteContent) {
-				t.Fatal(fmt.Sprintf(`fetched file content incorrect, expected %s, got %s`, tc.fileContent, content))
+				t.Fatalf(`fetched file content incorrect, expected %s, got %s`, tc.fileContent, content)
 			}
 		})
 	}
@@ -292,7 +288,7 @@ func TestBlobClientList(t *testing.T) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
@@ -407,7 +403,7 @@ func TestBlobClientDeleteFrom(t *testing.T) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
@@ -470,7 +466,7 @@ func TestBlobClientDeleteFrom(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			_, err = ioutil.ReadFile(filepath.Join(localExternalDir, tc.filename))
+			_, err = os.ReadFile(filepath.Join(localExternalDir, tc.filename))
 			if err == nil {
 				t.Fatal(err, "file should have been deleted")
 			}
@@ -485,7 +481,7 @@ func TestBlobClientStat(t *testing.T) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 

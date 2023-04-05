@@ -8,7 +8,9 @@ import (
 	context "context"
 	reflect "reflect"
 
+	kvpb "github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	roachpb "github.com/cockroachdb/cockroach/pkg/roachpb"
+	rpc "github.com/cockroachdb/cockroach/pkg/rpc"
 	gomock "github.com/golang/mock/gomock"
 )
 
@@ -50,9 +52,11 @@ func (mr *MockTransportMockRecorder) IsExhausted() *gomock.Call {
 }
 
 // MoveToFront mocks base method.
-func (m *MockTransport) MoveToFront(arg0 roachpb.ReplicaDescriptor) {
+func (m *MockTransport) MoveToFront(arg0 roachpb.ReplicaDescriptor) bool {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "MoveToFront", arg0)
+	ret := m.ctrl.Call(m, "MoveToFront", arg0)
+	ret0, _ := ret[0].(bool)
+	return ret0
 }
 
 // MoveToFront indicates an expected call of MoveToFront.
@@ -62,13 +66,12 @@ func (mr *MockTransportMockRecorder) MoveToFront(arg0 interface{}) *gomock.Call 
 }
 
 // NextInternalClient mocks base method.
-func (m *MockTransport) NextInternalClient(arg0 context.Context) (context.Context, roachpb.InternalClient, error) {
+func (m *MockTransport) NextInternalClient(arg0 context.Context) (rpc.RestrictedInternalClient, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "NextInternalClient", arg0)
-	ret0, _ := ret[0].(context.Context)
-	ret1, _ := ret[1].(roachpb.InternalClient)
-	ret2, _ := ret[2].(error)
-	return ret0, ret1, ret2
+	ret0, _ := ret[0].(rpc.RestrictedInternalClient)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // NextInternalClient indicates an expected call of NextInternalClient.
@@ -104,10 +107,10 @@ func (mr *MockTransportMockRecorder) Release() *gomock.Call {
 }
 
 // SendNext mocks base method.
-func (m *MockTransport) SendNext(arg0 context.Context, arg1 roachpb.BatchRequest) (*roachpb.BatchResponse, error) {
+func (m *MockTransport) SendNext(arg0 context.Context, arg1 *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "SendNext", arg0, arg1)
-	ret0, _ := ret[0].(*roachpb.BatchResponse)
+	ret0, _ := ret[0].(*kvpb.BatchResponse)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }

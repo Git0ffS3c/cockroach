@@ -15,11 +15,11 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowflow"
@@ -66,7 +66,6 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 3 /* nodes */, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(context.Background())
-	kvDB := tc.Server(0).DB()
 
 	testCases := []struct {
 		name     string
@@ -192,7 +191,7 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 				Encodings: []execinfrapb.OutputRouterSpec_RangeRouterSpec_ColumnEncoding{
 					{
 						Column:   0,
-						Encoding: descpb.DatumEncoding_ASCENDING_KEY,
+						Encoding: catenumpb.DatumEncoding_ASCENDING_KEY,
 					},
 				},
 				DefaultDest: &defaultStream,
@@ -233,11 +232,12 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 			flowCtx := execinfra.FlowCtx{
 				Cfg: &execinfra.ServerConfig{
 					Settings: st,
-					DB:       kvDB,
+					DB:       tc.Server(0).InternalDB().(descs.DB),
 					Codec:    keys.SystemSQLCodec,
 					Stopper:  tc.Stopper(),
 				},
 				EvalCtx:     &evalCtx,
+				Mon:         evalCtx.TestingMon,
 				DiskMonitor: testDiskMonitor,
 			}
 
@@ -247,8 +247,7 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 			require.NoError(t, err)
 
 			post := execinfrapb.PostProcessSpec{}
-			c.procSpec.Validation = jobspb.RestoreValidation_DefaultRestore
-			proc, err := newSplitAndScatterProcessor(&flowCtx, 0 /* processorID */, c.procSpec, &post, out)
+			proc, err := newSplitAndScatterProcessor(ctx, &flowCtx, 0 /* processorID */, c.procSpec, &post)
 			require.NoError(t, err)
 			ssp, ok := proc.(*splitAndScatterProcessor)
 			if !ok {
@@ -258,7 +257,7 @@ func TestSplitAndScatterProcessor(t *testing.T) {
 			// Inject a mock scatterer.
 			ssp.scatterer = &mockScatterer{numNodes: c.numNodes}
 
-			ssp.Run(context.Background())
+			ssp.Run(context.Background(), out)
 			wg.Wait()
 
 			// Ensure that all the outputs are properly closed.

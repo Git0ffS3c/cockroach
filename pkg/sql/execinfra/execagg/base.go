@@ -11,10 +11,12 @@
 package execagg
 
 import (
+	"context"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -38,7 +40,7 @@ func GetAggregateInfo(
 		return builtins.NewAnyNotNullAggregate, inputTypes[0], nil
 	}
 
-	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(fn.String()))
+	_, builtins := builtinsregistry.GetBuiltinProperties(strings.ToLower(fn.String()))
 	for _, b := range builtins {
 		typs := b.Types.Types()
 		if len(typs) != len(inputTypes) {
@@ -47,7 +49,7 @@ func GetAggregateInfo(
 		match := true
 		for i, t := range typs {
 			if !inputTypes[i].Equivalent(t) {
-				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
+				if b.CalledOnNullInput && inputTypes[i].IsAmbiguous() {
 					continue
 				}
 				match = false
@@ -73,6 +75,7 @@ func GetAggregateInfo(
 //
 // evalCtx will not be mutated.
 func GetAggregateConstructor(
+	ctx context.Context,
 	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 	aggInfo *execinfrapb.AggregatorSpec_Aggregation,
@@ -91,11 +94,11 @@ func GetAggregateConstructor(
 	for j, argument := range aggInfo.Arguments {
 		h := execinfrapb.ExprHelper{}
 		// Pass nil types and row - there are no variables in these expressions.
-		if err = h.Init(argument, nil /* types */, semaCtx, evalCtx); err != nil {
+		if err = h.Init(ctx, argument, nil /* types */, semaCtx, evalCtx); err != nil {
 			err = errors.Wrapf(err, "%s", argument)
 			return
 		}
-		d, err = h.Eval(nil /* row */)
+		d, err = h.Eval(ctx, nil /* row */)
 		if err != nil {
 			err = errors.Wrapf(err, "%s", argument)
 			return
@@ -131,7 +134,7 @@ func GetWindowFunctionInfo(
 			"function is neither an aggregate nor a window function",
 		)
 	}
-	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(funcStr))
+	_, builtins := builtinsregistry.GetBuiltinProperties(strings.ToLower(funcStr))
 	for _, b := range builtins {
 		typs := b.Types.Types()
 		if len(typs) != len(inputTypes) {
@@ -140,7 +143,7 @@ func GetWindowFunctionInfo(
 		match := true
 		for i, t := range typs {
 			if !inputTypes[i].Equivalent(t) {
-				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
+				if b.CalledOnNullInput && inputTypes[i].IsAmbiguous() {
 					continue
 				}
 				match = false

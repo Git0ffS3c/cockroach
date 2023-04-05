@@ -90,7 +90,10 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 		s3.Cfg.Settings,
 		s3.DistSenderI().(*kvcoord.DistSender),
 		s3.Gossip(),
-		s3.GetNode().Descriptor, nil,
+		s3.GetNode().Descriptor.NodeID,
+		s3.GetNode().Descriptor.Locality,
+		s3.Clock(),
+		nil, // rpcCtx
 		replicaoracle.BinPackingChoice)
 
 	var spans []spanWithDir
@@ -108,7 +111,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 
 	// Resolve the spans. Since the range descriptor cache doesn't have any
 	// leases, all the ranges should be grouped and "assigned" to replica 0.
-	replicas, err := resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil), spans...)
+	replicas, err := resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil, nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +138,7 @@ func TestSpanResolverUsesCaches(t *testing.T) {
 	if err := populateCache(tc.Conns[3], 3 /* expectedNumRows */); err != nil {
 		t.Fatal(err)
 	}
-	replicas, err = resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil), spans...)
+	replicas, err = resolveSpans(context.Background(), lr.NewSpanResolverIterator(nil, nil), spans...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,11 +202,14 @@ func TestSpanResolver(t *testing.T) {
 		s.(*server.TestServer).Cfg.Settings,
 		s.DistSenderI().(*kvcoord.DistSender),
 		s.GossipI().(*gossip.Gossip),
-		s.(*server.TestServer).GetNode().Descriptor, nil,
+		s.(*server.TestServer).GetNode().Descriptor.NodeID,
+		s.(*server.TestServer).GetNode().Descriptor.Locality,
+		s.Clock(),
+		nil, // rpcCtx
 		replicaoracle.BinPackingChoice)
 
 	ctx := context.Background()
-	it := lr.NewSpanResolverIterator(nil)
+	it := lr.NewSpanResolverIterator(nil, nil)
 
 	testCases := []struct {
 		spans    []roachpb.Span
@@ -295,12 +301,14 @@ func TestMixedDirections(t *testing.T) {
 		s.(*server.TestServer).Cfg.Settings,
 		s.DistSenderI().(*kvcoord.DistSender),
 		s.GossipI().(*gossip.Gossip),
-		s.(*server.TestServer).GetNode().Descriptor,
-		nil,
+		s.(*server.TestServer).GetNode().Descriptor.NodeID,
+		s.(*server.TestServer).GetNode().Descriptor.Locality,
+		s.Clock(),
+		nil, // rpcCtx
 		replicaoracle.BinPackingChoice)
 
 	ctx := context.Background()
-	it := lr.NewSpanResolverIterator(nil)
+	it := lr.NewSpanResolverIterator(nil, nil)
 
 	spans := []spanWithDir{
 		orient(kvcoord.Ascending, makeSpan(tableDesc, 11, 15))[0],

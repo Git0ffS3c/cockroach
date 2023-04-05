@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keysbase"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // EncVal is the encoded form of a value in the inverted column. This library
@@ -32,16 +33,16 @@ import (
 //
 // It would be ideal if the inverted column only contained Datums, since we
 // could then work with a Datum here. However, JSON breaks that approach:
-// - JSON inverted columns use a custom encoding that uses a special byte
-//   jsonInvertedIndex, followed by the bytes produced by the various
-//   implementations of the encodeInvertedIndexKey() method in the JSON
-//   interface. This could be worked around by using a JSON datum that
-//   represents a single path as the start key of the span, and representing
-//   [start, start] spans. We would special case the encoding logic to
-//   recognize that it is dealing with JSON (we have similar special path code
-//   for JSON elsewhere). But this is insufficient (next bullet).
-// - Expressions like x ? 'b' don't have operands that are JSON, but can be
-//   represented using a span on the inverted column.
+//   - JSON inverted columns use a custom encoding that uses a special byte
+//     jsonInvertedIndex, followed by the bytes produced by the various
+//     implementations of the encodeInvertedIndexKey() method in the JSON
+//     interface. This could be worked around by using a JSON datum that
+//     represents a single path as the start key of the span, and representing
+//     [start, start] spans. We would special case the encoding logic to
+//     recognize that it is dealing with JSON (we have similar special path code
+//     for JSON elsewhere). But this is insufficient (next bullet).
+//   - Expressions like x ? 'b' don't have operands that are JSON, but can be
+//     represented using a span on the inverted column.
 //
 // So we make it the job of the caller of this library to encode the inverted
 // column. Note that the second bullet above has some similarities with the
@@ -141,30 +142,34 @@ func (is Spans) Equals(other Spans) bool {
 }
 
 // Format pretty-prints the spans.
-func (is Spans) Format(tp treeprinter.Node, label string) {
+func (is Spans) Format(tp treeprinter.Node, label string, redactable bool) {
 	if len(is) == 0 {
 		tp.Childf("%s: empty", label)
 		return
 	}
 	if len(is) == 1 {
-		tp.Childf("%s: %s", label, formatSpan(is[0]))
+		tp.Childf("%s: %s", label, formatSpan(is[0], redactable))
 		return
 	}
 	n := tp.Child(label)
 	for i := 0; i < len(is); i++ {
-		n.Child(formatSpan(is[i]))
+		n.Child(formatSpan(is[i], redactable))
 	}
 }
 
-func formatSpan(span Span) string {
+func formatSpan(span Span, redactable bool) string {
 	end := span.End
 	spanEndOpenOrClosed := ')'
 	if span.IsSingleVal() {
 		end = span.Start
 		spanEndOpenOrClosed = ']'
 	}
-	return fmt.Sprintf("[%s, %s%c", strconv.Quote(string(span.Start)),
+	output := fmt.Sprintf("[%s, %s%c", strconv.Quote(string(span.Start)),
 		strconv.Quote(string(end)), spanEndOpenOrClosed)
+	if redactable {
+		output = string(redact.Sprintf("%s", redact.Unsafe(output)))
+	}
+	return output
 }
 
 // Len implements sort.Interface.
@@ -195,26 +200,29 @@ func (is Spans) End(i int) []byte {
 // to be evaluated on the inverted index. Any implementation can be used in the
 // builder functions And() and Or(), but in practice there are two useful
 // implementations provided here:
-// - SpanExpression: this is the normal expression representing unions and
-//   intersections over spans of the inverted index. A SpanExpression is the
-//   root of an expression tree containing other SpanExpressions (there is one
-//   exception when a SpanExpression tree can contain non-SpanExpressions,
-//   discussed below for Joins).
-// - NonInvertedColExpression: this is a marker expression representing the universal
-//   span, due to it being an expression on the non inverted column. This only appears in
-//   expression trees with a single node, since Anding with such an expression simply
-//   changes the tightness to false and Oring with this expression replaces the
-//   other expression with a NonInvertedColExpression.
+//   - SpanExpression: this is the normal expression representing unions and
+//     intersections over spans of the inverted index. A SpanExpression is the
+//     root of an expression tree containing other SpanExpressions (there is one
+//     exception when a SpanExpression tree can contain non-SpanExpressions,
+//     discussed below for Joins).
+//   - NonInvertedColExpression: this is a marker expression representing the universal
+//     span, due to it being an expression on the non inverted column. This only appears in
+//     expression trees with a single node, since Anding with such an expression simply
+//     changes the tightness to false and Oring with this expression replaces the
+//     other expression with a NonInvertedColExpression.
 //
-// Optimizer cost estimation
+// # Optimizer cost estimation
 //
 // There are two cases:
-// - Single table expression: after generating the Expression, the
-//   optimizer will check that it is a *SpanExpression -- if not, it is a
-//   NonInvertedColExpression, which implies a full inverted index scan, and
-//   it is definitely not worth using the inverted index. There are two costs for
-//   using the inverted index:
+//
+//   - Single table expression: after generating the Expression, the
+//     optimizer will check that it is a *SpanExpression -- if not, it is a
+//     NonInvertedColExpression, which implies a full inverted index scan, and
+//     it is definitely not worth using the inverted index. There are two costs for
+//     using the inverted index:
+//
 //   - The scan cost: this should be estimated by using SpanExpression.SpansToRead.
+//
 //   - The cardinality of the output set after evaluating the expression: this
 //     requires a traversal of the expression to assign cardinality to the
 //     spans in each FactoredUnionSpans (this could be done using a mean,
@@ -227,55 +235,55 @@ func (is Spans) End(i int) []byte {
 //     used to derive the expected cardinality of the union of the two sets
 //     and the intersection of the two sets.
 //
-// - Join expression: Assigning a cost is hard since there are two
-//   parameters, corresponding to the left and right columns. In some cases,
-//   like Geospatial, the expression that could be generated is a black-box to
-//   the optimizer since the quad-tree traversal is unknown until partial
-//   application (when one of the parameters is known). Minimally, we do need to
-//   know whether the user expression is going to cause a full inverted index
-//   scan due to parts of the expression referring to non-inverted columns.
-//   The optimizer will provide its own placeholder implementation of
-//   Expression into which it can embed whatever information it wants.
-//   Let's call this the UnknownExpression -- it will only exist at the
-//   leaves of the expression tree. It will use this UnknownExpression
-//   whenever there is an expression involving both the inverted columns. If
-//   the final expression is a NonInvertedColExpression, it is definitely not
-//   worth using the inverted index. If the final expression is an
-//   UnknownExpression (the tree must be a single node) or a *SpanExpression,
-//   the optimizer could either conjure up some magic cost number or try to
-//   compose one using costs assigned to each span (as described in the
-//   previous bullet) and to each leaf-level UnknownExpression.
+//   - Join expression: Assigning a cost is hard since there are two
+//     parameters, corresponding to the left and right columns. In some cases,
+//     like Geospatial, the expression that could be generated is a black-box to
+//     the optimizer since the quad-tree traversal is unknown until partial
+//     application (when one of the parameters is known). Minimally, we do need to
+//     know whether the user expression is going to cause a full inverted index
+//     scan due to parts of the expression referring to non-inverted columns.
+//     The optimizer will provide its own placeholder implementation of
+//     Expression into which it can embed whatever information it wants.
+//     Let's call this the UnknownExpression -- it will only exist at the
+//     leaves of the expression tree. It will use this UnknownExpression
+//     whenever there is an expression involving both the inverted columns. If
+//     the final expression is a NonInvertedColExpression, it is definitely not
+//     worth using the inverted index. If the final expression is an
+//     UnknownExpression (the tree must be a single node) or a *SpanExpression,
+//     the optimizer could either conjure up some magic cost number or try to
+//     compose one using costs assigned to each span (as described in the
+//     previous bullet) and to each leaf-level UnknownExpression.
 //
-// Query evaluation
+// # Query evaluation
 //
 // There are two cases:
-// - Single table expression: The optimizer will convert the *SpanExpression
-//   into a form that is passed to the evaluation machinery, which can recreate
-//   the *SpanExpression and evaluate it. The optimizer will have constructed
-//   the spans for the evaluation using SpanExpression.SpansToRead, so the
-//   expression evaluating code does not need to concern itself with the spans
-//   to be read.
-//   e.g. the query was of the form ... WHERE x <@ '{"a":1, "b":2}'::json
-//   The optimizer constructs a *SpanExpression, and
+//   - Single table expression: The optimizer will convert the *SpanExpression
+//     into a form that is passed to the evaluation machinery, which can recreate
+//     the *SpanExpression and evaluate it. The optimizer will have constructed
+//     the spans for the evaluation using SpanExpression.SpansToRead, so the
+//     expression evaluating code does not need to concern itself with the spans
+//     to be read.
+//     e.g. the query was of the form ... WHERE x <@ '{"a":1, "b":2}'::json
+//     The optimizer constructs a *SpanExpression, and
 //   - uses the serialization of the *SpanExpression as the spec for a processor
 //     that will evaluate the expression.
 //   - uses the SpanExpression.SpansToRead to specify the inverted index
 //     spans that must be read and fed to the processor.
-// - Join expression: The optimizer had an expression tree with the root as
-//   a *SpanExpression or an UnknownExpression. Therefore it knows that after
-//   partial application the expression will be a *SpanExpression. It passes the
-//   inverted expression with two unknowns, as a string, to the join execution
-//   machinery. The optimizer provides a way to do partial application for each
-//   input row, and returns a *SpanExpression, which is evaluated on the
-//   inverted index.
-//   e.g. the join query was of the form
-//   ... ON t1.x <@ t2.y OR (t1.x @> t2.y AND t2.y @> '{"a":1, "b":2}'::json)
-//   and the optimizer decides to use the inverted index on t2.y. The optimizer
-//   passes an expression string with two unknowns in the InvertedJoinerSpec,
-//   where @1 represents t1.x and @2 represents t2.y. For each input row of
-//   t1 the inverted join processor asks the optimizer to apply the value of @1
-//   and return a *SpanExpression, which the join processor will evaluate on
-//   the inverted index.
+//   - Join expression: The optimizer had an expression tree with the root as
+//     a *SpanExpression or an UnknownExpression. Therefore it knows that after
+//     partial application the expression will be a *SpanExpression. It passes the
+//     inverted expression with two unknowns, as a string, to the join execution
+//     machinery. The optimizer provides a way to do partial application for each
+//     input row, and returns a *SpanExpression, which is evaluated on the
+//     inverted index.
+//     e.g. the join query was of the form
+//     ... ON t1.x <@ t2.y OR (t1.x @> t2.y AND t2.y @> '{"a":1, "b":2}'::json)
+//     and the optimizer decides to use the inverted index on t2.y. The optimizer
+//     passes an expression string with two unknowns in the InvertedJoinerSpec,
+//     where @1 represents t1.x and @2 represents t2.y. For each input row of
+//     t1 the inverted join processor asks the optimizer to apply the value of @1
+//     and return a *SpanExpression, which the join processor will evaluate on
+//     the inverted index.
 type Expression interface {
 	// IsTight returns whether the inverted expression is tight, i.e., will the
 	// original expression not need to be reevaluated on each row output by the
@@ -297,11 +305,17 @@ type SpanExpression struct {
 	// Tight mirrors the definition of IsTight().
 	Tight bool
 
-	// Unique is true if the spans are guaranteed not to produce duplicate
-	// primary keys. Otherwise, Unique is false. Unique may be true for certain
-	// JSON or Array SpanExpressions, and it holds when unique SpanExpressions
-	// are combined with And. It does not hold when these SpanExpressions are
-	// combined with Or.
+	// Unique is true if the spans in FactoredUnionSpans are guaranteed not to
+	// produce duplicate primary keys. Otherwise, Unique is false. Unique may
+	// be true for certain JSON or Array SpanExpressions, and it holds when
+	// unique SpanExpressions are combined with And. It does not hold when
+	// these SpanExpressions are combined with Or.
+	//
+	// Once a SpanExpression is built, this field is relevant if the root
+	// SpanExpression has no children (i.e., Operator is None). In this case,
+	// Unique is used to determine whether an invertedFilter is needed on top
+	// of the inverted index scan to deduplicate keys (an invertedFilter is
+	// always necessary if Operator is not None).
 	Unique bool
 
 	// SpansToRead are the spans to read from the inverted index
@@ -381,17 +395,17 @@ func (s *SpanExpression) Copy() Expression {
 func (s *SpanExpression) String() string {
 	tp := treeprinter.New()
 	n := tp.Child("span expression")
-	s.Format(n, true /* includeSpansToRead */)
+	s.Format(n, true /* includeSpansToRead */, false /* redactable */)
 	return tp.String()
 }
 
 // Format pretty-prints the SpanExpression.
-func (s *SpanExpression) Format(tp treeprinter.Node, includeSpansToRead bool) {
+func (s *SpanExpression) Format(tp treeprinter.Node, includeSpansToRead, redactable bool) {
 	tp.Childf("tight: %t, unique: %t", s.Tight, s.Unique)
 	if includeSpansToRead {
-		s.SpansToRead.Format(tp, "to read")
+		s.SpansToRead.Format(tp, "to read", redactable)
 	}
-	s.FactoredUnionSpans.Format(tp, "union spans")
+	s.FactoredUnionSpans.Format(tp, "union spans", redactable)
 	if s.Operator == None {
 		return
 	}
@@ -401,15 +415,15 @@ func (s *SpanExpression) Format(tp treeprinter.Node, includeSpansToRead bool) {
 	case SetIntersection:
 		tp = tp.Child("INTERSECTION")
 	}
-	formatExpression(tp, s.Left, includeSpansToRead)
-	formatExpression(tp, s.Right, includeSpansToRead)
+	formatExpression(tp, s.Left, includeSpansToRead, redactable)
+	formatExpression(tp, s.Right, includeSpansToRead, redactable)
 }
 
-func formatExpression(tp treeprinter.Node, expr Expression, includeSpansToRead bool) {
+func formatExpression(tp treeprinter.Node, expr Expression, includeSpansToRead, redactable bool) {
 	switch e := expr.(type) {
 	case *SpanExpression:
 		n := tp.Child("span expression")
-		e.Format(n, includeSpansToRead)
+		e.Format(n, includeSpansToRead, redactable)
 	default:
 		tp.Child(fmt.Sprintf("%v", e))
 	}

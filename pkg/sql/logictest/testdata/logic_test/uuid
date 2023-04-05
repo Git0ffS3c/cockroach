@@ -152,6 +152,18 @@ SELECT uuid_generate_v1mc() = uuid_generate_v1mc()
 ----
 false
 
+# Verify that uuid_generate_v1 does not return deterministic output for the MAC
+# address bits.
+query B
+SELECT substr(uuid_generate_v1()::TEXT, 24) = substr(uuid_generate_v1()::TEXT, 24)
+----
+false
+
+query B
+SELECT substr(uuid_generate_v1mc()::TEXT, 24) = substr(uuid_generate_v1mc()::TEXT, 24)
+----
+false
+
 query T
 SELECT uuid_generate_v3(uuid_ns_x500(), 'cat')
 ----
@@ -162,3 +174,12 @@ SELECT uuid_generate_v5(uuid_ns_oid(), 'dog')
 ----
 9a8b57c4-73a4-5dfb-b888-6fff478edf63
 
+# Regression test for incorrect concatenation of a UUID with a STRING in the
+# vectorized engine (#83093).
+statement ok
+CREATE TABLE t83093 (u) AS SELECT 'eb64afe6-ade7-40ce-8352-4bb5eec39075'::UUID
+
+query T
+SELECT u || 'foo' FROM t83093
+----
+eb64afe6-ade7-40ce-8352-4bb5eec39075foo

@@ -16,11 +16,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -32,22 +33,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -57,6 +53,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -64,6 +61,7 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -75,7 +73,7 @@ import (
 func TestSelfBootstrap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
+	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +88,7 @@ func TestPanicRecovery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{})
+	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{})
 	require.NoError(t, err)
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
@@ -131,14 +129,13 @@ func TestHealthCheck(t *testing.T) {
 
 	cfg := zonepb.DefaultZoneConfig()
 	cfg.NumReplicas = proto.Int32(1)
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &TestingKnobs{
 				DefaultZoneConfigOverride: &cfg,
 			},
 		},
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,8 +222,8 @@ func TestServerStartClock(t *testing.T) {
 	// Run a command so that we are sure to touch the timestamp cache. This is
 	// actually not needed because other commands run during server
 	// initialization, but we cannot guarantee that's going to stay that way.
-	get := &roachpb.GetRequest{
-		RequestHeader: roachpb.RequestHeader{Key: roachpb.Key("a")},
+	get := &kvpb.GetRequest{
+		RequestHeader: kvpb.RequestHeader{Key: roachpb.Key("a")},
 	}
 	if _, err := kv.SendWrapped(
 		context.Background(), s.DB().NonTransactionalSender(), get,
@@ -273,7 +270,7 @@ func TestPlainHTTPServer(t *testing.T) {
 	} else {
 		func() {
 			defer resp.Body.Close()
-			if _, err := io.Copy(ioutil.Discard, resp.Body); err != nil {
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -351,6 +348,9 @@ func TestAcceptEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var uncompressedSize int64
+	var compressedSize int64
+
 	testData := []struct {
 		acceptEncoding string
 		newReader      func(io.Reader) io.Reader
@@ -387,116 +387,29 @@ func TestAcceptEncoding(t *testing.T) {
 			if ce := resp.Header.Get(httputil.ContentEncodingHeader); ce != d.acceptEncoding {
 				t.Fatalf("unexpected content encoding: '%s' != '%s'", ce, d.acceptEncoding)
 			}
-			r := d.newReader(resp.Body)
+
+			// Measure and stash resposne body length for later comparison
+			rawBytes, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			rawBodyLength := int64(len(rawBytes))
+			if d.acceptEncoding == "" {
+				uncompressedSize = rawBodyLength
+			} else {
+				compressedSize = rawBodyLength
+			}
+
+			r := d.newReader(bytes.NewReader(rawBytes))
 			var data serverpb.JSONResponse
 			if err := jsonpb.Unmarshal(r, &data); err != nil {
 				t.Error(err)
 			}
 		}()
 	}
-}
 
-// TestSystemConfigGossip tests that system config gossip works in the mixed
-// version state. After the 22.1 release is finalized, system config gossip
-// will no longer occur.
-//
-// TODO(ajwerner): Delete this test in 22.2.
-func TestSystemConfigGossip(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	settings := cluster.MakeTestingClusterSettingsWithVersions(
-		clusterversion.TestingBinaryMinSupportedVersion,
-		clusterversion.TestingBinaryMinSupportedVersion,
-		false,
-	)
-	serverArgs := base.TestServerArgs{
-		Settings: settings,
-		Knobs: base.TestingKnobs{
-			Store: &kvserver.StoreTestingKnobs{
-				DisableMergeQueue: true,
-			},
-			Server: &TestingKnobs{
-				BinaryVersionOverride:          clusterversion.TestingBinaryMinSupportedVersion,
-				DisableAutomaticVersionUpgrade: make(chan struct{}),
-			},
-		},
-	}
-	s, _, kvDB := serverutils.StartServer(t, serverArgs)
-	defer s.Stopper().Stop(ctx)
-	ts := s.(*TestServer)
-
-	key := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, descpb.ID(keys.MaxSystemConfigDescID+1))
-	valAt := func(i int) *descpb.Descriptor {
-		return dbdesc.NewInitial(
-			descpb.ID(i), "foo", username.AdminRoleName(),
-		).DescriptorProto()
-	}
-
-	// Register a callback for gossip updates.
-	resultChan := ts.Gossip().DeprecatedRegisterSystemConfigChannel()
-
-	// The span gets gossiped when it first shows up.
-	select {
-	case <-resultChan:
-
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("did not receive gossip message")
-	}
-
-	// Write a system key with the transaction marked as having a Gossip trigger.
-	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		if err := txn.DeprecatedSetSystemConfigTrigger(true /* forSystemTenant */); err != nil {
-			return err
-		}
-		return txn.Put(ctx, key, valAt(2))
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// This has to be wrapped in a SucceedSoon because system migrations on the
-	// testserver's startup can trigger system config updates without the key we
-	// wrote.
-	testutils.SucceedsSoon(t, func() error {
-		// New system config received.
-		var systemConfig *config.SystemConfig
-		select {
-		case <-resultChan:
-			systemConfig = ts.gossip.DeprecatedGetSystemConfig()
-
-		case <-time.After(500 * time.Millisecond):
-			return errors.Errorf("did not receive gossip message")
-		}
-
-		// Now check the new config.
-		var val *roachpb.Value
-		for _, kv := range systemConfig.Values {
-			if bytes.Equal(key, kv.Key) {
-				val = &kv.Value
-				break
-			}
-		}
-		if val == nil {
-			return errors.Errorf("key not found in gossiped info")
-		}
-
-		// Make sure the returned value is valAt(2).
-		var got descpb.Descriptor
-		if err := val.GetProto(&got); err != nil {
-			return err
-		}
-
-		_, expected, _, _ := descpb.FromDescriptor(valAt(2))
-		_, db, _, _ := descpb.FromDescriptor(&got)
-		if db == nil {
-			panic(errors.Errorf("found nil database: %v", got))
-		}
-		if !reflect.DeepEqual(*db, *expected) {
-			panic(errors.Errorf("mismatch: expected %+v, got %+v", *expected, *db))
-		}
-		return nil
-	})
+	// Ensure compressed responses are smaller than uncompressed ones when the
+	// uncompressed body would be larger than one MTU.
+	require.Greater(t, uncompressedSize, int64(1400), "gzip compression testing requires a response body > 1400 bytes (one MTU). Please update the test response.")
+	require.Less(t, compressedSize, uncompressedSize, "Compressed response body must be smaller than uncompressed response body")
 }
 
 func TestListenerFileCreation(t *testing.T) {
@@ -506,7 +419,7 @@ func TestListenerFileCreation(t *testing.T) {
 	dir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
 
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{
 		StoreSpecs: []base.StoreSpec{{
 			Path: dir,
 		}},
@@ -538,7 +451,7 @@ func TestListenerFileCreation(t *testing.T) {
 		}
 		delete(expectedFiles, base)
 
-		data, err := ioutil.ReadFile(file)
+		data, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -569,7 +482,8 @@ func TestClusterIDMismatch(t *testing.T) {
 			StoreID:   roachpb.StoreID(i + 1),
 		}
 		if err := storage.MVCCPutProto(
-			context.Background(), e, nil, keys.StoreIdentKey(), hlc.Timestamp{}, nil, &sIdent); err != nil {
+			context.Background(), e, nil, keys.StoreIdentKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &sIdent,
+		); err != nil {
 
 			t.Fatal(err)
 		}
@@ -625,13 +539,13 @@ func TestEnsureInitialWallTimeMonotonicity(t *testing.T) {
 			a := assert.New(t)
 
 			const maxOffset = 500 * time.Millisecond
-			m := hlc.NewManualClock(test.clockStartTime)
-			c := hlc.NewClock(m.UnixNano, maxOffset)
+			m := timeutil.NewManualTime(timeutil.Unix(0, test.clockStartTime))
+			c := hlc.NewClock(m, maxOffset, maxOffset)
 
 			sleepUntilFn := func(ctx context.Context, t hlc.Timestamp) error {
-				delta := t.WallTime - c.Now().WallTime
+				delta := t.GoTime().Sub(c.Now().GoTime())
 				if delta > 0 {
-					m.Increment(delta)
+					m.Advance(delta)
 				}
 				return nil
 			}
@@ -701,8 +615,8 @@ func TestPersistHLCUpperBound(t *testing.T) {
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
 			a := assert.New(t)
-			m := hlc.NewManualClock(int64(1))
-			c := hlc.NewClock(m.UnixNano, time.Nanosecond)
+			m := timeutil.NewManualTime(timeutil.Unix(0, 1))
+			c := hlc.NewClockForTesting(m)
 
 			var persistErr error
 			var persistedUpperBound int64
@@ -740,7 +654,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 
 			fatal = false
 			// persist an upper bound
-			m.Increment(100)
+			m.Advance(100)
 			wallTime3 := c.Now().WallTime
 			persistHLCUpperBoundIntervalCh <- test.persistInterval
 			<-tickProcessedCh
@@ -769,7 +683,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 
 			// Increment clock by 100 and tick the timer.
 			// A persist should have happened
-			m.Increment(100)
+			m.Advance(100)
 			tickerCh <- timeutil.Now()
 			<-tickProcessedCh
 			secondPersist := persistedUpperBound
@@ -799,7 +713,7 @@ func TestPersistHLCUpperBound(t *testing.T) {
 
 			persistHLCUpperBoundIntervalCh <- test.persistInterval
 			<-tickProcessedCh
-			m.Increment(100)
+			m.Advance(100)
 			tickerCh <- timeutil.Now()
 			<-tickProcessedCh
 			// If persisting fails, a fatal error is expected
@@ -825,11 +739,6 @@ func TestServeIndexHTML(t *testing.T) {
 	</head>
 	<body>
 		<div id="react-layout"></div>
-
-		<script>
-			window.dataFromServer = %s;
-		</script>
-
 		<script src="bundle.js" type="text/javascript"></script>
 	</body>
 </html>
@@ -847,10 +756,6 @@ func TestServeIndexHTML(t *testing.T) {
 	t.Run("Insecure mode", func(t *testing.T) {
 		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 			Insecure: true,
-			// This test server argument has the same effect as setting the environment variable
-			// `COCKROACH_EXPERIMENTAL_REQUIRE_WEB_SESSION` to false, or not setting it.
-			// In test servers, web sessions are required by default.
-			DisableWebSessionAuthentication: true,
 		})
 		defer s.Stopper().Stop(ctx)
 		tsrv := s.(*TestServer)
@@ -864,7 +769,7 @@ func TestServeIndexHTML(t *testing.T) {
 			defer resp.Body.Close()
 			require.Equal(t, 200, resp.StatusCode)
 
-			respBytes, err := ioutil.ReadAll(resp.Body)
+			respBytes, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
 			respString := string(respBytes)
@@ -885,20 +790,26 @@ Binary built without web UI.
 			defer resp.Body.Close()
 			require.Equal(t, 200, resp.StatusCode)
 
-			respBytes, err := ioutil.ReadAll(resp.Body)
+			respBytes, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
 			respString := string(respBytes)
+			require.Equal(t, htmlTemplate, respString)
+
+			resp, err = client.Get(s.AdminURL() + "/uiconfig")
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, 200, resp.StatusCode)
+
+			respBytes, err = io.ReadAll(resp.Body)
+			require.NoError(t, err)
 			expected := fmt.Sprintf(
-				htmlTemplate,
-				fmt.Sprintf(
-					`{"ExperimentalUseLogin":false,"LoginEnabled":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
-					build.GetInfo().Tag,
-					build.BinaryVersionPrefix(),
-					1,
-				),
+				`{"Insecure":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true}}`,
+				build.GetInfo().Tag,
+				build.BinaryVersionPrefix(),
+				1,
 			)
-			require.Equal(t, expected, respString)
+			require.Equal(t, expected, string(respBytes))
 		})
 	})
 
@@ -921,7 +832,7 @@ Binary built without web UI.
 			{
 				loggedInClient,
 				fmt.Sprintf(
-					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
+					`{"Insecure":false,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true}}`,
 					build.GetInfo().Tag,
 					build.BinaryVersionPrefix(),
 					1,
@@ -930,7 +841,7 @@ Binary built without web UI.
 			{
 				loggedOutClient,
 				fmt.Sprintf(
-					`{"ExperimentalUseLogin":true,"LoginEnabled":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":""}`,
+					`{"Insecure":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true}}`,
 					build.GetInfo().Tag,
 					build.BinaryVersionPrefix(),
 					1,
@@ -948,12 +859,23 @@ Binary built without web UI.
 				defer resp.Body.Close()
 				require.Equal(t, 200, resp.StatusCode)
 
-				respBytes, err := ioutil.ReadAll(resp.Body)
+				respBytes, err := io.ReadAll(resp.Body)
 				require.NoError(t, err)
 
 				respString := string(respBytes)
-				expected := fmt.Sprintf(htmlTemplate, testCase.json)
-				require.Equal(t, expected, respString)
+				require.Equal(t, htmlTemplate, respString)
+
+				req, err = http.NewRequestWithContext(ctx, "GET", s.AdminURL()+"/uiconfig", nil)
+				require.NoError(t, err)
+
+				resp, err = testCase.client.Do(req)
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, 200, resp.StatusCode)
+
+				respBytes, err = io.ReadAll(resp.Body)
+				require.NoError(t, err)
+				require.Equal(t, testCase.json, string(respBytes))
 			})
 		}
 	})
@@ -1024,7 +946,7 @@ Binary built without web UI.
 				defer cachedResp.Body.Close()
 				require.Equal(t, 304, cachedResp.StatusCode)
 
-				respBytes, err := ioutil.ReadAll(cachedResp.Body)
+				respBytes, err := io.ReadAll(cachedResp.Body)
 				require.NoError(t, err)
 				require.Empty(t, respBytes, "Server must provide empty body for cached response")
 
@@ -1153,14 +1075,14 @@ func TestAssertEnginesEmpty(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	eng, err := storage.Open(ctx, storage.InMemory())
+	eng, err := storage.Open(ctx, storage.InMemory(), cluster.MakeClusterSettings())
 	require.NoError(t, err)
 	defer eng.Close()
 
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
-	require.NoError(t, storage.MVCCPutProto(ctx, eng, nil, keys.StoreClusterVersionKey(),
-		hlc.Timestamp{}, nil, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}))
+	require.NoError(t, storage.MVCCPutProto(ctx, eng, nil, keys.DeprecatedStoreClusterVersionKey(),
+		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}))
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
 	batch := eng.NewBatch()
@@ -1168,7 +1090,10 @@ func TestAssertEnginesEmpty(t *testing.T) {
 		Key:       []byte{0xde, 0xad, 0xbe, 0xef},
 		Timestamp: hlc.Timestamp{WallTime: 100},
 	}
-	require.NoError(t, batch.PutMVCC(key, []byte("foo")))
+	value := storage.MVCCValue{
+		Value: roachpb.MakeValueFromString("foo"),
+	}
+	require.NoError(t, batch.PutMVCC(key, value))
 	require.NoError(t, batch.Commit(false))
 	require.Error(t, assertEnginesEmpty([]storage.Engine{eng}))
 }
@@ -1241,4 +1166,71 @@ func Test_makeFakeNodeStatuses(t *testing.T) {
 			require.True(t, testutils.IsError(err, tt.expErr), "%+v didn't match expectation %s", err, tt.expErr)
 		})
 	}
+}
+
+// TestSocketAutoNumbering checks that a socket name
+// ending with `.0` in the input config gets auto-assigned
+// the actual TCP port number.
+func TestSocketAutoNumbering(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	socketName := "foo.0"
+	// We need a temp directory in which we'll create the unix socket.
+	// On BSD, binding to a socket is limited to a path length of 104 characters
+	// (including the NUL terminator). In glibc, this limit is 108 characters.
+	// macOS has a tendency to produce very long temporary directory names, so
+	// we are careful to keep all the constants involved short.
+	baseTmpDir := os.TempDir()
+	if len(baseTmpDir) >= 104-1-len(socketName)-1-4-len("TestSocketAutoNumbering")-10 {
+		t.Logf("temp dir name too long: %s", baseTmpDir)
+		t.Logf("using /tmp instead.")
+		// Note: /tmp might fail in some systems, that's why we still prefer
+		// os.TempDir() if available.
+		baseTmpDir = "/tmp"
+	}
+	tempDir, err := os.MkdirTemp(baseTmpDir, "TestSocketAutoNumbering")
+	require.NoError(t, err)
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	socketFile := filepath.Join(tempDir, socketName)
+
+	ctx := context.Background()
+
+	params := base.TestServerArgs{
+		Insecure:   true,
+		SocketFile: socketFile,
+	}
+	s, _, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	_, expectedPort, err := addr.SplitHostPort(s.SQLAddr(), "")
+	require.NoError(t, err)
+
+	if socketPath := s.(*TestServer).Cfg.SocketFile; !strings.HasSuffix(socketPath, "."+expectedPort) {
+		t.Errorf("expected unix socket ending with port %q, got %q", expectedPort, socketPath)
+	}
+}
+
+// Test that connections using the internal SQL loopback listener work.
+func TestInternalSQL(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	conf, err := pgx.ParseConfig("")
+	require.NoError(t, err)
+	conf.User = "root"
+	// Configure pgx to connect on the loopback listener.
+	conf.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return s.(*TestServer).Server.loopbackPgL.Connect(ctx)
+	}
+	conn, err := pgx.ConnectConfig(ctx, conf)
+	require.NoError(t, err)
+	// Run a random query to check that it all works.
+	r := conn.QueryRow(ctx, "SELECT count(*) FROM system.sqlliveness")
+	var count int
+	require.NoError(t, r.Scan(&count))
 }

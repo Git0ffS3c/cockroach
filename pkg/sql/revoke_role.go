@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
@@ -29,12 +30,6 @@ type RevokeRoleNode struct {
 	roles       []username.SQLUsername
 	members     []username.SQLUsername
 	adminOption bool
-
-	run revokeRoleRun
-}
-
-type revokeRoleRun struct {
-	rowsAffected int
 }
 
 // RevokeRole represents a GRANT ROLE statement.
@@ -96,13 +91,13 @@ func (p *planner) RevokeRoleNode(ctx context.Context, n *tree.RevokeRole) (*Revo
 
 	for _, r := range inputRoles {
 		if _, ok := roles[r]; !ok {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", r)
+			return nil, sqlerrors.NewUndefinedUserError(r)
 		}
 	}
 
 	for _, m := range inputMembers {
 		if _, ok := roles[m]; !ok {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %s does not exist", m)
+			return nil, sqlerrors.NewUndefinedUserError(m)
 		}
 	}
 
@@ -134,11 +129,11 @@ func (n *RevokeRoleNode) startExec(params runParams) error {
 					"role/user %s cannot be removed from role %s or lose the ADMIN OPTION",
 					username.RootUser, username.AdminRole)
 			}
-			affected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+			affected, err := params.p.InternalSQLTxn().ExecEx(
 				params.ctx,
 				opName,
 				params.p.txn,
-				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+				sessiondata.RootUserSessionDataOverride,
 				memberStmt,
 				r.Normalized(), m.Normalized(),
 			)
@@ -156,8 +151,6 @@ func (n *RevokeRoleNode) startExec(params runParams) error {
 			return err
 		}
 	}
-
-	n.run.rowsAffected += rowsAffected
 
 	return nil
 }

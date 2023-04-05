@@ -16,7 +16,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,11 +25,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -66,6 +66,8 @@ type TestCLI struct {
 	omitArgs bool
 	// if true, prints the requested exit code during RunWithArgs.
 	reportExitCode bool
+	// if true, targets the system tenant.
+	useSystemTenant bool
 }
 
 // TestCLIParams contains parameters used by TestCLI.
@@ -87,6 +89,15 @@ type TestCLIParams struct {
 	// TenantArgs will be used to initialize the test tenant. This should
 	// be set when the test needs to run in multitenant mode.
 	TenantArgs *base.TestTenantArgs
+
+	// SharedProcessTenantArgs will be used to initialize a test tenant that is
+	// running in the same process as the test server. This should be set when the
+	// test needs to run in multitenant mode.
+	SharedProcessTenantArgs *base.TestSharedProcessTenantArgs
+
+	// UseSystemTenant is used to force the test to target the system tenant
+	// in a shared process multitenant test.
+	UseSystemTenant bool
 }
 
 // testTempFilePrefix is a sentinel marker to be used as the prefix of a
@@ -100,7 +111,7 @@ const testTempFilePrefix = "test-temp-prefix-"
 // from the uniquely generated (temp directory) file path.
 const testUserfileUploadTempDirPrefix = "test-userfile-upload-temp-dir-"
 
-func (c *TestCLI) fail(err interface{}) {
+func (c *TestCLI) fail(err error) {
 	if c.t != nil {
 		defer c.logScope.Close(c.t)
 		c.t.Fatal(err)
@@ -117,7 +128,7 @@ func NewCLITest(params TestCLIParams) TestCLI {
 func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerArgs)) TestCLI {
 	c := TestCLI{t: params.T}
 
-	certsDir, err := ioutil.TempDir("", "cli-test")
+	certsDir, err := os.MkdirTemp("", "cli-test")
 	if err != nil {
 		c.fail(err)
 	}
@@ -152,7 +163,7 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 		if params.NoNodelocal {
 			args.ExternalIODir = ""
 		}
-		s, err := serverutils.StartServerRaw(args)
+		s, err := serverutils.StartServerRaw(params.T, args)
 		if err != nil {
 			c.fail(err)
 		}
@@ -162,15 +173,28 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 		log.Infof(context.Background(), "SQL listener at %s", c.ServingSQLAddr())
 	}
 
-	if params.TenantArgs != nil {
+	if params.TenantArgs != nil && params.SharedProcessTenantArgs != nil {
+		c.fail(errors.AssertionFailedf("cannot set both TenantArgs and SharedProcessTenantArgs"))
+	}
+
+	if params.TenantArgs != nil || params.SharedProcessTenantArgs != nil {
 		if c.TestServer == nil {
 			c.fail(errors.AssertionFailedf("multitenant mode for CLI requires a DB server, try setting `NoServer` argument to false"))
 		}
+	}
+
+	if params.TenantArgs != nil {
 		if c.Insecure() {
 			params.TenantArgs.ForceInsecure = true
 		}
 		c.tenant, _ = serverutils.StartTenant(c.t, c.TestServer, *params.TenantArgs)
 	}
+
+	if params.SharedProcessTenantArgs != nil {
+		c.tenant, _ = serverutils.StartSharedProcessTenant(c.t, c.TestServer, *params.SharedProcessTenantArgs)
+		c.useSystemTenant = params.UseSystemTenant
+	}
+
 	baseCfg.User = username.NodeUserName()
 
 	// Ensure that CLI error messages and anything meant for the
@@ -208,7 +232,7 @@ func (c *TestCLI) stopServer() {
 func (c *TestCLI) RestartServer(params TestCLIParams) {
 	c.stopServer()
 	log.Info(context.Background(), "restarting server")
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+	s, err := serverutils.StartServerRaw(params.T, base.TestServerArgs{
 		Insecure:    params.Insecure,
 		SSLCertsDir: c.certsDir,
 		StoreSpecs:  params.StoreSpecs,
@@ -323,14 +347,14 @@ func isSQLCommand(args []string) (bool, error) {
 		return false, err
 	}
 	// We use --echo-sql as a marker of SQL-only commands.
-	if f := flagSetForCmd(cmd).Lookup(cliflags.EchoSQL.Name); f != nil {
+	if f := cliflagcfg.FlagSetForCmd(cmd).Lookup(cliflags.EchoSQL.Name); f != nil {
 		return true, nil
 	}
 	return false, nil
 }
 
 func (c TestCLI) getRPCAddr() string {
-	if c.tenant != nil {
+	if c.tenant != nil && !c.useSystemTenant {
 		return c.tenant.RPCAddr()
 	}
 	return c.ServingRPCAddr()
@@ -414,7 +438,7 @@ func (c TestCLI) RunWithCAArgs(origArgs []string) {
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
 		if c.TestServer != nil {
-			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, security.EmbeddedCAKey)))
+			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, certnames.EmbeddedCAKey)))
 			args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 		}
 		args = append(args, origArgs[1:]...)

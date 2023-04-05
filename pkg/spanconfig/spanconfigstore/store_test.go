@@ -20,8 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigbounds"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
@@ -65,44 +66,49 @@ func (s *spanConfigStore) TestingSplitKeys(tb testing.TB, start, end roachpb.RKe
 // TestDataDriven runs datadriven tests against the Store interface.
 // The syntax is as follows:
 //
-// 		apply
-// 		delete [a,c)
-// 		set [c,h):X
-// 		set {entire-keyspace}:X
-// 		set {source=1,target=1}:Y
-// 		----
-// 		deleted [b,d)
-// 		deleted [e,g)
-// 		added [c,h):X
-// 		added {entire-keyspace}:X
-// 		added {source=1,target=1}:Y
+//	apply
+//	delete [a,c)
+//	set [c,h):X
+//	set {entire-keyspace}:X
+//	set {source=1,target=1}:Y
+//	----
+//	deleted [b,d)
+//	deleted [e,g)
+//	added [c,h):X
+//	added {entire-keyspace}:X
+//	added {source=1,target=1}:Y
 //
-// 		get key=b
-// 		----
-// 		conf=A # or conf=FALLBACK if the key is not present
+//	get key=b
+//	----
+//	conf=A # or conf=FALLBACK if the key is not present
 //
-// 		needs-split span=[b,h)
-// 		----
-// 		true
+//	needs-split span=[b,h)
+//	----
+//	true
 //
-// 		compute-split span=[b,h)
-// 		----
-// 		key=c
+//	compute-split span=[b,h)
+//	----
+//	key=c
 //
-// 		split-keys span=[b,h)
-// 		----
-// 		key=c
+//	split-keys span=[b,h)
+//	----
+//	key=c
 //
-// 		overlapping span=[b,h)
-// 		----
-// 		[b,d):A
-// 		[d,f):B
-// 		[f,h):A
+//	overlapping span=[b,h)
+//	----
+//	[b,d):A
+//	[d,f):B
+//	[f,h):A
 //
-// 		interned
-// 		----
-// 		A (refs = 2)
-// 		B (refs = 1)
+//	interned
+//	----
+//	A (refs = 2)
+//	B (refs = 1)
+//
+// declare-bounds
+// set /Tenant/20:{GC.ttl_start=15, GC.ttl_end=30}
+// delete /Tenant/10
+// ----
 //
 // Text of the form [a,b), {entire-keyspace}, {source=1,target=20}, and [a,b):C
 // correspond to targets {spans, system targets} and span config records; see
@@ -111,10 +117,12 @@ func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	boundsReader := newMockBoundsReader()
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		store := New(
 			spanconfigtestutils.ParseConfig(t, "FALLBACK"),
-			cluster.MakeTestingClusterSettings(),
+			cluster.MakeClusterSettings(),
+			boundsReader,
 			&spanconfig.TestingKnobs{
 				StoreIgnoreCoalesceAdjacentExceptions: true,
 				StoreInternConfigsInDryRuns:           true,
@@ -147,7 +155,8 @@ func TestDataDriven(t *testing.T) {
 
 			case "get":
 				d.ScanArgs(t, "key", &keyStr)
-				config, err := store.GetSpanConfigForKey(ctx, roachpb.RKey(keyStr))
+				key, _ := spanconfigtestutils.ParseKey(t, keyStr)
+				config, err := store.GetSpanConfigForKey(ctx, roachpb.RKey(key))
 				require.NoError(t, err)
 				return fmt.Sprintf("conf=%s", spanconfigtestutils.PrintSpanConfig(config))
 
@@ -155,14 +164,16 @@ func TestDataDriven(t *testing.T) {
 				d.ScanArgs(t, "span", &spanStr)
 				span := spanconfigtestutils.ParseSpan(t, spanStr)
 				start, end := roachpb.RKey(span.Key), roachpb.RKey(span.EndKey)
-				result := store.NeedsSplit(ctx, start, end)
+				result, err := store.NeedsSplit(ctx, start, end)
+				require.NoError(t, err)
 				return fmt.Sprintf("%t", result)
 
 			case "compute-split":
 				d.ScanArgs(t, "span", &spanStr)
 				span := spanconfigtestutils.ParseSpan(t, spanStr)
 				start, end := roachpb.RKey(span.Key), roachpb.RKey(span.EndKey)
-				splitKey := store.ComputeSplitKey(ctx, start, end)
+				splitKey, err := store.ComputeSplitKey(ctx, start, end)
+				require.NoError(t, err)
 				if splitKey == nil {
 					return "n/a"
 				}
@@ -205,6 +216,9 @@ func TestDataDriven(t *testing.T) {
 				}
 				return b.String()
 
+			case "declare-bounds":
+				updates := spanconfigtestutils.ParseDeclareBoundsArguments(t, d.Input)
+				boundsReader.apply(updates)
 			default:
 				t.Fatalf("unknown command: %s", d.Cmd)
 			}
@@ -212,6 +226,34 @@ func TestDataDriven(t *testing.T) {
 			return ""
 		})
 	})
+}
+
+type mockBoundsReader struct {
+	bounds map[roachpb.TenantID]*spanconfigbounds.Bounds
+}
+
+func newMockBoundsReader() *mockBoundsReader {
+	m := mockBoundsReader{
+		bounds: make(map[roachpb.TenantID]*spanconfigbounds.Bounds),
+	}
+	return &m
+}
+
+// Bounds implements the spanconfigbounds.Reader interface.
+func (m *mockBoundsReader) Bounds(id roachpb.TenantID) (*spanconfigbounds.Bounds, bool) {
+	bounds, found := m.bounds[id]
+	return bounds, found
+}
+
+func (m *mockBoundsReader) apply(updates []spanconfigtestutils.BoundsUpdate) {
+	for _, update := range updates {
+		if update.Deleted {
+			delete(m.bounds, update.TenantID)
+			continue
+		}
+
+		m.bounds[update.TenantID] = update.Bounds
+	}
 }
 
 // TestStoreClone verifies that a cloned store contains the same contents as the
@@ -245,19 +287,24 @@ func TestStoreClone(t *testing.T) {
 		),
 		makeSpanConfigAddition(
 			spanconfig.MakeTargetFromSystemTarget(spanconfig.TestingMakeTenantKeyspaceTargetOrFatal(
-				t, roachpb.SystemTenantID, roachpb.MakeTenantID(10),
+				t, roachpb.SystemTenantID, roachpb.MustMakeTenantID(10),
 			)),
 			spanconfigtestutils.ParseConfig(t, "H"),
 		),
 		makeSpanConfigAddition(
 			spanconfig.MakeTargetFromSystemTarget(spanconfig.TestingMakeTenantKeyspaceTargetOrFatal(
-				t, roachpb.MakeTenantID(10), roachpb.MakeTenantID(10),
+				t, roachpb.MustMakeTenantID(10), roachpb.MustMakeTenantID(10),
 			)),
 			spanconfigtestutils.ParseConfig(t, "I"),
 		),
 	}
 
-	original := New(roachpb.TestingDefaultSpanConfig(), cluster.MakeClusterSettings(), nil)
+	original := New(
+		roachpb.TestingDefaultSpanConfig(),
+		cluster.MakeClusterSettings(),
+		NewEmptyBoundsReader(),
+		nil,
+	)
 	original.Apply(ctx, false, updates...)
 	clone := original.Clone()
 
@@ -293,6 +340,7 @@ func BenchmarkStoreComputeSplitKey(b *testing.B) {
 			store := New(
 				roachpb.SpanConfig{},
 				cluster.MakeClusterSettings(),
+				NewEmptyBoundsReader(),
 				&spanconfig.TestingKnobs{
 					StoreIgnoreCoalesceAdjacentExceptions: true,
 				},
@@ -320,7 +368,8 @@ func BenchmarkStoreComputeSplitKey(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_ = store.ComputeSplitKey(ctx, roachpb.RKey(query.Key), roachpb.RKey(query.EndKey))
+				_, err := store.ComputeSplitKey(ctx, roachpb.RKey(query.Key), roachpb.RKey(query.EndKey))
+				require.NoError(b, err)
 			}
 		})
 	}

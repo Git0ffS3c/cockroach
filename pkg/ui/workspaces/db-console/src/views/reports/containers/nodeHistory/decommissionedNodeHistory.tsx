@@ -75,9 +75,7 @@ const sortByDecommissioningDate = (
   return 0;
 };
 
-export class DecommissionedNodeHistory extends React.Component<
-  DecommissionedNodeHistoryProps
-> {
+export class DecommissionedNodeHistory extends React.Component<DecommissionedNodeHistoryProps> {
   columns: ColumnsConfig<DecommissionedNodeStatusRow> = [
     {
       key: "id",
@@ -90,7 +88,7 @@ export class DecommissionedNodeHistory extends React.Component<
       title: "Decommissioned On",
       sorter: sortByDecommissioningDate,
       render: (_text, record) => {
-        return record.decommissionedDate.format("LL[ at ]h:mm a UTC");
+        return record.decommissionedDate.format(util.DATE_FORMAT_24_UTC);
       },
     },
   ];

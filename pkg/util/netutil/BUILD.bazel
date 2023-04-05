@@ -1,8 +1,10 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "netutil",
     srcs = [
+        "loopback.go",
         "net.go",
         "srv.go",
     ],
@@ -28,6 +30,7 @@ go_test(
         "net_test.go",
         "srv_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":netutil"],
     deps = [
         "//pkg/util/contextutil",
@@ -38,3 +41,5 @@ go_test(
         "@org_golang_google_grpc//:go_default_library",
     ],
 )
+
+get_x_data(name = "get_x_data")

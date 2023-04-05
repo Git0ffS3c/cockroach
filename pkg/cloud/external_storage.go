@@ -18,11 +18,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 )
@@ -46,11 +45,16 @@ type ExternalStorage interface {
 
 	// Conf should return the serializable configuration required to reconstruct
 	// this ExternalStorage implementation.
-	Conf() roachpb.ExternalStorage
+	Conf() cloudpb.ExternalStorage
 
 	// ExternalIOConf should return the configuration containing several server
 	// configured options pertaining to an ExternalStorage implementation.
 	ExternalIOConf() base.ExternalIODirConfig
+
+	// RequiresExternalIOAccounting should return true if the
+	// ExternalStorage implementation should be accounted for when
+	// calculating resource usage.
+	RequiresExternalIOAccounting() bool
 
 	// Settings should return the cluster settings used to configure the
 	// ExternalStorage implementation.
@@ -95,17 +99,17 @@ type ExternalStorage interface {
 type ListingFn func(string) error
 
 // ExternalStorageFactory describes a factory function for ExternalStorage.
-type ExternalStorageFactory func(ctx context.Context, dest roachpb.ExternalStorage) (ExternalStorage, error)
+type ExternalStorageFactory func(ctx context.Context, dest cloudpb.ExternalStorage, opts ...ExternalStorageOption) (ExternalStorage, error)
 
 // ExternalStorageFromURIFactory describes a factory function for ExternalStorage given a URI.
 type ExternalStorageFromURIFactory func(ctx context.Context, uri string,
-	user username.SQLUsername) (ExternalStorage, error)
+	user username.SQLUsername, opts ...ExternalStorageOption) (ExternalStorage, error)
 
 // SQLConnI encapsulates the interfaces which will be implemented by the network
 // backed SQLConn which is used to interact with the userfile tables.
 type SQLConnI interface {
-	driver.QueryerContext
-	driver.ExecerContext
+	Query(ctx context.Context, query string, args ...interface{}) (driver.Rows, error)
+	Exec(ctx context.Context, query string, args ...interface{}) error
 }
 
 // ErrFileDoesNotExist is a sentinel error for indicating that a specified
@@ -139,7 +143,7 @@ type ExternalStorageURIContext struct {
 
 // ExternalStorageURIParser functions parses a URL into a structured
 // ExternalStorage configuration.
-type ExternalStorageURIParser func(ExternalStorageURIContext, *url.URL) (roachpb.ExternalStorage, error)
+type ExternalStorageURIParser func(ExternalStorageURIContext, *url.URL) (cloudpb.ExternalStorage, error)
 
 // ExternalStorageContext contains the dependencies passed to external storage
 // implementations during creation.
@@ -147,12 +151,21 @@ type ExternalStorageContext struct {
 	IOConf            base.ExternalIODirConfig
 	Settings          *cluster.Settings
 	BlobClientFactory blobs.BlobClientFactory
-	InternalExecutor  sqlutil.InternalExecutor
-	DB                *kv.DB
+	DB                isql.DB
+	Options           []ExternalStorageOption
+	Limiters          Limiters
+	MetricsRecorder   MetricsRecorder
+}
+
+// ExternalStorageOptions holds dependencies and values that can be
+// overridden by callers of an ExternalStorageFactory via a passed
+// ExternalStorageOption.
+type ExternalStorageOptions struct {
+	ioAccountingInterceptor ReadWriterInterceptor
 }
 
 // ExternalStorageConstructor is a function registered to create instances
 // of a given external storage implementation.
 type ExternalStorageConstructor func(
-	context.Context, ExternalStorageContext, roachpb.ExternalStorage,
+	context.Context, ExternalStorageContext, cloudpb.ExternalStorage,
 ) (ExternalStorage, error)

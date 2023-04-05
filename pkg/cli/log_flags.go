@@ -13,13 +13,14 @@ package cli
 import (
 	"context"
 	"flag"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
@@ -40,9 +41,13 @@ import (
 // and non-server commands (e.g. 'node ls').
 func setupLogging(ctx context.Context, cmd *cobra.Command, isServerCmd, applyConfig bool) error {
 	// Compatibility check for command-line usage.
-	if cliCtx.deprecatedLogOverrides.anySet() &&
+	if cliCtx.logOverrides.anySet() &&
 		cliCtx.logConfigInput.isSet {
 		return errors.Newf("--%s is incompatible with legacy discrete logging flags", cliflags.Log.Name)
+	}
+
+	if err := validateLogConfigVars(cliCtx.logConfigVars); err != nil {
+		return errors.Wrap(err, "invalid logging configuration")
 	}
 
 	// Sanity check to prevent misuse of API.
@@ -60,17 +65,16 @@ func setupLogging(ctx context.Context, cmd *cobra.Command, isServerCmd, applyCon
 	defaultLogDir := firstStoreDir
 
 	// Legacy log directory override.
-	// TODO(knz): Deprecated in v21.1. Remove in v21.2.
-	forceDisableLogDir := cliCtx.deprecatedLogOverrides.logDir.isSet &&
-		cliCtx.deprecatedLogOverrides.logDir.s == ""
+	forceDisableLogDir := cliCtx.logOverrides.logDir.isSet &&
+		cliCtx.logOverrides.logDir.s == ""
 	if forceDisableLogDir {
 		defaultLogDir = nil
 	}
-	forceSetLogDir := cliCtx.deprecatedLogOverrides.logDir.isSet &&
-		cliCtx.deprecatedLogOverrides.logDir.s != ""
+	forceSetLogDir := cliCtx.logOverrides.logDir.isSet &&
+		cliCtx.logOverrides.logDir.s != ""
 	if forceSetLogDir {
 		ambiguousLogDirs = false
-		defaultLogDir = &cliCtx.deprecatedLogOverrides.logDir.s
+		defaultLogDir = &cliCtx.logOverrides.logDir.s
 	}
 
 	// Set up a base configuration template.
@@ -88,8 +92,12 @@ func setupLogging(ctx context.Context, cmd *cobra.Command, isServerCmd, applyCon
 	if isDemoCmd(cmd) {
 		// `cockroach demo` is special: it starts a server, but without
 		// disk and interactively. We don't want to litter the console
-		// with warning or error messages unless overridden.
-		h.Config.Sinks.Stderr.Filter = severity.NONE
+		// with warning or error messages unless overridden; however,
+		// should the command encounter a log.Fatal event, we want
+		// to inform the user (who is guaranteed to be looking at the screen).
+		//
+		// NB: this can be overridden from the command line as usual.
+		h.Config.Sinks.Stderr.Filter = severity.FATAL
 	} else if !isServerCmd && !isWorkloadCmd(cmd) {
 		// Client commands don't typically have a log directory so they
 		// naturally default to stderr logging. However, we don't want
@@ -110,15 +118,21 @@ func setupLogging(ctx context.Context, cmd *cobra.Command, isServerCmd, applyCon
 
 	// If some overrides were specified via the discrete flags,
 	// apply them.
-	//
-	// NB: this is for backward-compatibility and is deprecated in
-	// v21.1.
-	// TODO(knz): Remove this.
-	cliCtx.deprecatedLogOverrides.propagate(&h.Config, commandSpecificDefaultLegacyStderrOverride)
+	cliCtx.logOverrides.propagate(&h.Config, commandSpecificDefaultLegacyStderrOverride)
 
 	// If a configuration was specified via --log, load it.
 	if cliCtx.logConfigInput.isSet {
-		if err := h.Set(cliCtx.logConfigInput.s); err != nil {
+		s := cliCtx.logConfigInput.s
+
+		if len(cliCtx.logConfigVars) > 0 {
+			var err error
+			s, err = expandEnvironmentVariables(s, cliCtx.logConfigVars)
+			if err != nil {
+				return errors.Wrap(err, "unable to expand environment variables")
+			}
+		}
+
+		if err := h.Set(s); err != nil {
 			return err
 		}
 		if h.Config.FileDefaults.Dir != nil {
@@ -128,7 +142,6 @@ func setupLogging(ctx context.Context, cmd *cobra.Command, isServerCmd, applyCon
 
 	// Legacy behavior: if no files were specified by the configuration,
 	// add some pre-defined files in servers.
-	// TODO(knz): Deprecated in v21.1. Remove this.
 	if isServerCmd && len(h.Config.Sinks.FileGroups) == 0 {
 		addPredefinedLogFiles(&h.Config)
 	}
@@ -174,9 +187,11 @@ func setupLogging(ctx context.Context, cmd *cobra.Command, isServerCmd, applyCon
 	}
 
 	// Configuration ready and directories exist; apply it.
-	if _, err := log.ApplyConfig(h.Config); err != nil {
+	logShutdownFn, err := log.ApplyConfig(h.Config)
+	if err != nil {
 		return err
 	}
+	cliCtx.logShutdownFn = logShutdownFn
 
 	// If using a custom config, report the configuration at the start of the logging stream.
 	if cliCtx.logConfigInput.isSet {
@@ -243,8 +258,6 @@ func getDefaultLogDirFromStores() (dir *string, ambiguousLogDirs bool) {
 // This struct interfaces between the YAML-based configuration
 // mechanism in package 'logconfig', and the logic that initializes
 // the logging system.
-//
-// TODO(knz): Deprecated in v21.1. Remove this.
 type logConfigFlags struct {
 	// Override value of file-defaults:dir.
 	logDir settableString
@@ -275,8 +288,6 @@ type logConfigFlags struct {
 
 // newLogConfigOverrides defines a new logConfigFlags
 // from the default logging configuration.
-//
-// TODO(knz): Deprecated in v21.1. Remove this.
 func newLogConfigOverrides() *logConfigFlags {
 	l := &logConfigFlags{}
 	l.fileMaxSizeVal = humanizeutil.NewBytesValue(&l.fileMaxSize)
@@ -383,7 +394,7 @@ type fileContentsValue struct {
 // Set implements the pflag.Value interface.
 func (l *fileContentsValue) Set(s string) error {
 	l.fileName = s
-	b, err := ioutil.ReadFile(s)
+	b, err := os.ReadFile(s)
 	if err != nil {
 		return err
 	}
@@ -427,17 +438,17 @@ func addPredefinedLogFiles(c *logconfig.Config) {
 		panic(errors.NewAssertionErrorWithWrappedErrf(err, "programming error: incorrect config"))
 	}
 	*c = h.Config
-	if cliCtx.deprecatedLogOverrides.sqlAuditLogDir.isSet {
-		c.Sinks.FileGroups["sql-audit"].Dir = &cliCtx.deprecatedLogOverrides.sqlAuditLogDir.s
+	if cliCtx.logOverrides.sqlAuditLogDir.isSet {
+		c.Sinks.FileGroups["sql-audit"].Dir = &cliCtx.logOverrides.sqlAuditLogDir.s
 	}
 }
 
 // predefinedLogFiles are the files defined when the --log flag
 // does not otherwise override the file sinks.
-// TODO(knz): add the PRIVILEGES channel.
 const predefinedLogFiles = `
 sinks:
  file-groups:
+  kv-distribution:        { channels: KV_DISTRIBUTION }
   default:
     channels:
       INFO: [DEV, OPS]
@@ -456,3 +467,45 @@ sinks:
     max-file-size: 102400
     max-group-size: 1048576
 `
+
+// validateLogConfigVars return an error if any of the passed logging
+// configuration variables are are not permissible. For security, variables
+// that start with COCKROACH_ are explicitly disallowed. See #81146 for more.
+func validateLogConfigVars(vars []string) error {
+	for _, v := range vars {
+		if strings.HasPrefix(strings.ToUpper(v), "COCKROACH_") {
+			return errors.Newf("use of %s is not allowed as a logging configuration variable", v)
+		}
+	}
+	return nil
+}
+
+// expandEnvironmentVariables replaces variables used in string with their
+// values pulled from the environment. If there are variables in the string
+// that are not contained in vars, they will be replaced with the empty string.
+func expandEnvironmentVariables(s string, vars []string) (string, error) {
+	var err error
+
+	m := map[string]string{}
+	// Only pull variable values from the environment if their key is present
+	// in vars to create an allow list.
+	for _, k := range vars {
+		v, ok := envutil.ExternalEnvString(k, 1)
+		if !ok {
+			err = errors.CombineErrors(err, errors.Newf("variable %q is not defined in environment", k))
+			continue
+		}
+		m[k] = v
+	}
+
+	s = os.Expand(s, func(k string) string {
+		v, ok := m[k]
+		if !ok {
+			err = errors.CombineErrors(err, errors.Newf("unknown variable %q used in configuration", k))
+			return ""
+		}
+		return v
+	})
+
+	return s, err
+}

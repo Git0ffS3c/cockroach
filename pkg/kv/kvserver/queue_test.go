@@ -50,6 +50,8 @@ type testQueueImpl struct {
 	noop          bool  // if enabled, process will return false
 }
 
+var _ queueImpl = &testQueueImpl{}
+
 func (tq *testQueueImpl) shouldQueue(
 	_ context.Context, now hlc.ClockTimestamp, r *Replica, _ spanconfig.StoreReader,
 ) (bool, float64) {
@@ -70,6 +72,11 @@ func (tq *testQueueImpl) getProcessed() int {
 	return int(atomic.LoadInt32(&tq.processed))
 }
 
+func (*testQueueImpl) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (tq *testQueueImpl) timer(_ time.Duration) time.Duration {
 	if tq.blocker != nil {
 		<-tq.blocker
@@ -84,10 +91,14 @@ func (tq *testQueueImpl) purgatoryChan() <-chan time.Time {
 	return tq.pChan
 }
 
+func (tq *testQueueImpl) updateChan() <-chan time.Time {
+	return nil
+}
+
 func makeTestBaseQueue(name string, impl queueImpl, store *Store, cfg queueConfig) *baseQueue {
 	if !cfg.acceptsUnsplitRanges {
 		// Needed in order to pass the validation in newBaseQueue.
-		cfg.needsSystemConfig = true
+		cfg.needsSpanConfigs = true
 	}
 	cfg.successes = metric.NewCounter(metric.Metadata{Name: "processed"})
 	cfg.failures = metric.NewCounter(metric.Metadata{Name: "failures"})
@@ -202,7 +213,7 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	if v := bq.pending.Value(); v != 2 {
 		t.Errorf("expected 2 pending replicas; got %d", v)
 	}
-	if bq.pop() != r2 {
+	if r, _ := bq.pop(); r != r2 {
 		t.Error("expected r2")
 	} else {
 		bq.finishProcessingReplica(ctx, stopper, r2, nil)
@@ -210,7 +221,7 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	if v := bq.pending.Value(); v != 1 {
 		t.Errorf("expected 1 pending replicas; got %d", v)
 	}
-	if bq.pop() != r1 {
+	if r, _ := bq.pop(); r != r1 {
 		t.Error("expected r1")
 	} else {
 		bq.finishProcessingReplica(ctx, stopper, r1, nil)
@@ -218,7 +229,7 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	if v := bq.pending.Value(); v != 0 {
 		t.Errorf("expected 0 pending replicas; got %d", v)
 	}
-	if r := bq.pop(); r != nil {
+	if r, _ := bq.pop(); r != nil {
 		t.Errorf("expected empty queue; got %v", r)
 	}
 
@@ -244,17 +255,17 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	if bq.Length() != 2 {
 		t.Fatalf("expected length 2; got %d", bq.Length())
 	}
-	if bq.pop() != r1 {
+	if r, _ := bq.pop(); r != r1 {
 		t.Error("expected r1")
 	} else {
 		bq.finishProcessingReplica(ctx, stopper, r1, nil)
 	}
-	if bq.pop() != r2 {
+	if r, _ := bq.pop(); r != r2 {
 		t.Error("expected r2")
 	} else {
 		bq.finishProcessingReplica(ctx, stopper, r2, nil)
 	}
-	if r := bq.pop(); r != nil {
+	if r, _ := bq.pop(); r != nil {
 		t.Errorf("expected empty queue; got %v", r)
 	}
 
@@ -266,17 +277,17 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	if bq.Length() != 2 {
 		t.Fatalf("expected length 2; got %d", bq.Length())
 	}
-	if bq.pop() != r1 {
+	if r, _ := bq.pop(); r != r1 {
 		t.Error("expected r1")
 	} else {
 		bq.finishProcessingReplica(ctx, stopper, r1, nil)
 	}
-	if bq.pop() != r2 {
+	if r, _ := bq.pop(); r != r2 {
 		t.Error("expected r2")
 	} else {
 		bq.finishProcessingReplica(ctx, stopper, r2, nil)
 	}
-	if r := bq.pop(); r != nil {
+	if r, _ := bq.pop(); r != nil {
 		t.Errorf("expected empty queue; got %v", r)
 	}
 
@@ -290,7 +301,7 @@ func TestBaseQueueAddUpdateAndRemove(t *testing.T) {
 	if v := bq.pending.Value(); v != 1 {
 		t.Errorf("expected 1 pending replicas; got %d", v)
 	}
-	if bq.pop() != r1 {
+	if r, _ := bq.pop(); r != r1 {
 		t.Errorf("expected r1")
 	} else {
 		bq.finishProcessingReplica(ctx, stopper, r1, nil)
@@ -336,7 +347,7 @@ func TestBaseQueueSamePriorityFIFO(t *testing.T) {
 		}
 	}
 	for _, expRepl := range repls {
-		actRepl := bq.pop()
+		actRepl, _ := bq.pop()
 		if actRepl != expRepl {
 			t.Fatalf("expected %v, got %v", expRepl, actRepl)
 		}
@@ -568,7 +579,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 	{
 		confReader, err := tc.store.GetConfReader(ctx)
 		require.Nil(t, confReader)
-		require.True(t, errors.Is(err, errSysCfgUnavailable))
+		require.True(t, errors.Is(err, errSpanConfigsUnavailable))
 	}
 
 	r, err := tc.store.GetReplica(1)
@@ -586,7 +597,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 
 	// bqNeedsSysCfg will not add the replica or process it without a system config.
 	bqNeedsSysCfg := makeTestBaseQueue("test", testQueue, tc.store, queueConfig{
-		needsSystemConfig:    true,
+		needsSpanConfigs:     true,
 		acceptsUnsplitRanges: true,
 		maxSize:              1,
 	})
@@ -612,7 +623,7 @@ func TestNeedsSystemConfig(t *testing.T) {
 	// Now check that a queue which doesn't require the system config can
 	// successfully add and process a replica.
 	bqNoSysCfg := makeTestBaseQueue("test", testQueue, tc.store, queueConfig{
-		needsSystemConfig:    false,
+		needsSpanConfigs:     false,
 		acceptsUnsplitRanges: true,
 		maxSize:              1,
 	})
@@ -691,20 +702,25 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 	bq.Start(stopper)
 
 	// Check our config.
-	var sysCfg *config.SystemConfig
+	var cfg spanconfig.StoreReader
 	testutils.SucceedsSoon(t, func() error {
-		sysCfg = s.cfg.Gossip.DeprecatedGetSystemConfig()
-		if sysCfg == nil {
+		cfg, err = bq.store.GetConfReader(ctx)
+		require.NoError(t, err)
+		if cfg == nil {
 			return errors.New("system config not yet present")
 		}
 		return nil
 	})
 	neverSplitsDesc := neverSplits.Desc()
-	if sysCfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
+	needsSplit, err := cfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey)
+	require.NoError(t, err)
+	if needsSplit {
 		t.Fatal("System config says range needs to be split")
 	}
 	willSplitDesc := willSplit.Desc()
-	if sysCfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey) {
+	needsSplit, err = cfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey)
+	require.NoError(t, err)
+	if needsSplit {
 		t.Fatal("System config says range needs to be split")
 	}
 
@@ -736,11 +752,15 @@ func TestAcceptsUnsplitRanges(t *testing.T) {
 
 	// Check our config.
 	neverSplitsDesc = neverSplits.Desc()
-	if sysCfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey) {
+	needsSplit, err = cfg.NeedsSplit(ctx, neverSplitsDesc.StartKey, neverSplitsDesc.EndKey)
+	require.NoError(t, err)
+	if needsSplit {
 		t.Fatal("System config says range needs to be split")
 	}
 	willSplitDesc = willSplit.Desc()
-	if !sysCfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey) {
+	needsSplit, err = cfg.NeedsSplit(ctx, willSplitDesc.StartKey, willSplitDesc.EndKey)
+	require.NoError(t, err)
+	if !needsSplit {
 		t.Fatal("System config says range does not need to be split")
 	}
 
@@ -908,6 +928,8 @@ type processTimeoutQueueImpl struct {
 	testQueueImpl
 }
 
+var _ queueImpl = &processTimeoutQueueImpl{}
+
 func (pq *processTimeoutQueueImpl) process(
 	ctx context.Context, r *Replica, _ spanconfig.StoreReader,
 ) (processed bool, err error) {
@@ -979,7 +1001,8 @@ func TestQueueRateLimitedTimeoutFunc(t *testing.T) {
 	ctx := context.Background()
 	type testCase struct {
 		guaranteedProcessingTime time.Duration
-		rateLimit                int64 // bytes/s
+		recoverySnapshotRate     int64 // bytes/s
+		rebalanceSnapshotRate    int64 // bytes/s
 		replicaSize              int64 // bytes
 		expectedTimeout          time.Duration
 	}
@@ -987,8 +1010,9 @@ func TestQueueRateLimitedTimeoutFunc(t *testing.T) {
 		return fmt.Sprintf("%+v", tc), func(t *testing.T) {
 			st := cluster.MakeTestingClusterSettings()
 			queueGuaranteedProcessingTimeBudget.Override(ctx, &st.SV, tc.guaranteedProcessingTime)
-			recoverySnapshotRate.Override(ctx, &st.SV, tc.rateLimit)
-			tf := makeRateLimitedTimeoutFunc(recoverySnapshotRate)
+			recoverySnapshotRate.Override(ctx, &st.SV, tc.recoverySnapshotRate)
+			rebalanceSnapshotRate.Override(ctx, &st.SV, tc.rebalanceSnapshotRate)
+			tf := makeRateLimitedTimeoutFunc(recoverySnapshotRate, rebalanceSnapshotRate)
 			repl := mvccStatsReplicaInQueue{
 				size: tc.replicaSize,
 			}
@@ -998,25 +1022,57 @@ func TestQueueRateLimitedTimeoutFunc(t *testing.T) {
 	for _, tc := range []testCase{
 		{
 			guaranteedProcessingTime: time.Minute,
-			rateLimit:                1 << 30,
+			recoverySnapshotRate:     1 << 30,
+			rebalanceSnapshotRate:    1 << 20, // minimum rate for timeout calculation.
 			replicaSize:              1 << 20,
-			expectedTimeout:          time.Minute,
+			expectedTimeout:          time.Minute, // the minimum timeout (guaranteedProcessingTime).
 		},
 		{
 			guaranteedProcessingTime: time.Minute,
-			rateLimit:                1 << 20,
+			recoverySnapshotRate:     1 << 20, // minimum rate for timeout calculation.
+			rebalanceSnapshotRate:    1 << 30,
+			replicaSize:              1 << 20,
+			expectedTimeout:          time.Minute, // the minimum timeout (guaranteedProcessingTime).
+		},
+		{
+			guaranteedProcessingTime: time.Minute,
+			recoverySnapshotRate:     1 << 20, // minimum rate for timeout calculation.
+			rebalanceSnapshotRate:    2 << 20,
+			replicaSize:              100 << 20,
+			expectedTimeout:          100 * time.Second * permittedRangeScanSlowdown,
+		},
+		{
+			guaranteedProcessingTime: time.Minute,
+			recoverySnapshotRate:     2 << 20,
+			rebalanceSnapshotRate:    1 << 20, // minimum rate for timeout calculation.
 			replicaSize:              100 << 20,
 			expectedTimeout:          100 * time.Second * permittedRangeScanSlowdown,
 		},
 		{
 			guaranteedProcessingTime: time.Hour,
-			rateLimit:                1 << 20,
+			recoverySnapshotRate:     1 << 20, // minimum rate for timeout calculation.
+			rebalanceSnapshotRate:    1 << 30,
 			replicaSize:              100 << 20,
-			expectedTimeout:          time.Hour,
+			expectedTimeout:          time.Hour, // the minimum timeout (guaranteedProcessingTime).
+		},
+		{
+			guaranteedProcessingTime: time.Hour,
+			recoverySnapshotRate:     1 << 30,
+			rebalanceSnapshotRate:    1 << 20, // minimum rate for timeout calculation.
+			replicaSize:              100 << 20,
+			expectedTimeout:          time.Hour, // the minimum timeout (guaranteedProcessingTime).
 		},
 		{
 			guaranteedProcessingTime: time.Minute,
-			rateLimit:                1 << 10,
+			recoverySnapshotRate:     1 << 10, // minimum rate for timeout calculation.
+			rebalanceSnapshotRate:    1 << 20,
+			replicaSize:              100 << 20,
+			expectedTimeout:          100 * (1 << 10) * time.Second * permittedRangeScanSlowdown,
+		},
+		{
+			guaranteedProcessingTime: time.Minute,
+			recoverySnapshotRate:     1 << 20,
+			rebalanceSnapshotRate:    1 << 10, // minimum rate for timeout calculation.
 			replicaSize:              100 << 20,
 			expectedTimeout:          100 * (1 << 10) * time.Second * permittedRangeScanSlowdown,
 		},
@@ -1029,6 +1085,8 @@ func TestQueueRateLimitedTimeoutFunc(t *testing.T) {
 type processTimeQueueImpl struct {
 	testQueueImpl
 }
+
+var _ queueImpl = &processTimeQueueImpl{}
 
 func (pq *processTimeQueueImpl) process(
 	_ context.Context, _ *Replica, _ spanconfig.StoreReader,
@@ -1165,6 +1223,8 @@ type parallelQueueImpl struct {
 	processBlocker chan struct{}
 	processing     int32 // accessed atomically
 }
+
+var _ queueImpl = &parallelQueueImpl{}
 
 func (pq *parallelQueueImpl) process(
 	ctx context.Context, repl *Replica, confReader spanconfig.StoreReader,

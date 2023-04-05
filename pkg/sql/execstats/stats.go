@@ -14,11 +14,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	pbtypes "github.com/gogo/protobuf/types"
 )
 
 // ShouldCollectStats is a helper function used to determine if a processor
@@ -29,28 +29,78 @@ func ShouldCollectStats(ctx context.Context, collectStats bool) bool {
 	return collectStats && tracing.SpanFromContext(ctx) != nil
 }
 
-// GetCumulativeContentionTime is a helper function to calculate the cumulative
-// contention time from the tracing span from the context. All contention events
-// found in the trace are included.
-func GetCumulativeContentionTime(ctx context.Context) time.Duration {
-	var cumulativeContentionTime time.Duration
-	recording := tracing.SpanFromContext(ctx).GetConfiguredRecording()
-	if recording == nil {
-		return cumulativeContentionTime
+// ContentionEventsListener calculates the cumulative contention time across all
+// kvpb.ContentionEvents seen by the listener.
+type ContentionEventsListener struct {
+	CumulativeContentionTime time.Duration
+}
+
+var _ tracing.EventListener = &ContentionEventsListener{}
+
+// Notify is part of the tracing.EventListener interface.
+func (c *ContentionEventsListener) Notify(event tracing.Structured) tracing.EventConsumptionStatus {
+	ce, ok := event.(protoutil.Message).(*kvpb.ContentionEvent)
+	if !ok {
+		return tracing.EventNotConsumed
 	}
-	var ev roachpb.ContentionEvent
-	for i := range recording {
-		recording[i].Structured(func(any *pbtypes.Any, _ time.Time) {
-			if !pbtypes.Is(any, &ev) {
-				return
-			}
-			if err := pbtypes.UnmarshalAny(any, &ev); err != nil {
-				return
-			}
-			cumulativeContentionTime += ev.Duration
-		})
+	c.CumulativeContentionTime += ce.Duration
+	return tracing.EventConsumed
+}
+
+// ScanStatsListener aggregates all kvpb.ScanStats objects into a single
+// ScanStats object.
+type ScanStatsListener struct {
+	ScanStats
+}
+
+var _ tracing.EventListener = &ScanStatsListener{}
+
+// Notify is part of the tracing.EventListener interface.
+func (l *ScanStatsListener) Notify(event tracing.Structured) tracing.EventConsumptionStatus {
+	ss, ok := event.(protoutil.Message).(*kvpb.ScanStats)
+	if !ok {
+		return tracing.EventNotConsumed
 	}
-	return cumulativeContentionTime
+	l.ScanStats.NumInterfaceSteps += ss.NumInterfaceSteps
+	l.ScanStats.NumInternalSteps += ss.NumInternalSteps
+	l.ScanStats.NumInterfaceSeeks += ss.NumInterfaceSeeks
+	l.ScanStats.NumInternalSeeks += ss.NumInternalSeeks
+	l.ScanStats.BlockBytes += ss.BlockBytes
+	l.ScanStats.BlockBytesInCache += ss.BlockBytesInCache
+	l.ScanStats.KeyBytes += ss.KeyBytes
+	l.ScanStats.ValueBytes += ss.ValueBytes
+	l.ScanStats.PointCount += ss.PointCount
+	l.ScanStats.PointsCoveredByRangeTombstones += ss.PointsCoveredByRangeTombstones
+	l.ScanStats.RangeKeyCount += ss.RangeKeyCount
+	l.ScanStats.RangeKeyContainedPoints += ss.RangeKeyContainedPoints
+	l.ScanStats.RangeKeySkippedPoints += ss.RangeKeySkippedPoints
+	l.ScanStats.SeparatedPointCount += ss.SeparatedPointCount
+	l.ScanStats.SeparatedPointValueBytes += ss.SeparatedPointValueBytes
+	l.ScanStats.SeparatedPointValueBytesFetched += ss.SeparatedPointValueBytesFetched
+	l.ScanStats.NumGets += ss.NumGets
+	l.ScanStats.NumScans += ss.NumScans
+	l.ScanStats.NumReverseScans += ss.NumReverseScans
+	return tracing.EventConsumed
+}
+
+// TenantConsumptionListener aggregates consumed RUs from all
+// kvpb.TenantConsumption events seen by the listener.
+type TenantConsumptionListener struct {
+	ConsumedRU uint64
+}
+
+var _ tracing.EventListener = &TenantConsumptionListener{}
+
+// Notify is part of the tracing.EventListener interface.
+func (l *TenantConsumptionListener) Notify(
+	event tracing.Structured,
+) tracing.EventConsumptionStatus {
+	tc, ok := event.(protoutil.Message).(*kvpb.TenantConsumption)
+	if !ok {
+		return tracing.EventNotConsumed
+	}
+	l.ConsumedRU += uint64(tc.RU)
+	return tracing.EventConsumed
 }
 
 // ScanStats contains statistics on the internal MVCC operators used to satisfy
@@ -70,7 +120,22 @@ type ScanStats struct {
 	NumInterfaceSeeks uint64
 	// NumInternalSeeks is the number of times that MVCC seek was invoked
 	// internally, including to step over internal, uncompacted Pebble versions.
-	NumInternalSeeks uint64
+	NumInternalSeeks                uint64
+	BlockBytes                      uint64
+	BlockBytesInCache               uint64
+	KeyBytes                        uint64
+	ValueBytes                      uint64
+	PointCount                      uint64
+	PointsCoveredByRangeTombstones  uint64
+	RangeKeyCount                   uint64
+	RangeKeyContainedPoints         uint64
+	RangeKeySkippedPoints           uint64
+	SeparatedPointCount             uint64
+	SeparatedPointValueBytes        uint64
+	SeparatedPointValueBytesFetched uint64
+	NumGets                         uint64
+	NumScans                        uint64
+	NumReverseScans                 uint64
 }
 
 // PopulateKVMVCCStats adds data from the input ScanStats to the input KVStats.
@@ -79,30 +144,16 @@ func PopulateKVMVCCStats(kvStats *execinfrapb.KVStats, ss *ScanStats) {
 	kvStats.NumInternalSteps = optional.MakeUint(ss.NumInternalSteps)
 	kvStats.NumInterfaceSeeks = optional.MakeUint(ss.NumInterfaceSeeks)
 	kvStats.NumInternalSeeks = optional.MakeUint(ss.NumInternalSeeks)
-}
-
-// GetScanStats is a helper function to calculate scan stats from the tracing
-// span from the context.
-func GetScanStats(ctx context.Context) (ss ScanStats) {
-	recording := tracing.SpanFromContext(ctx).GetConfiguredRecording()
-	if recording == nil {
-		return ScanStats{}
-	}
-	var ev roachpb.ScanStats
-	for i := range recording {
-		recording[i].Structured(func(any *pbtypes.Any, _ time.Time) {
-			if !pbtypes.Is(any, &ev) {
-				return
-			}
-			if err := pbtypes.UnmarshalAny(any, &ev); err != nil {
-				return
-			}
-
-			ss.NumInterfaceSteps += ev.NumInterfaceSteps
-			ss.NumInternalSteps += ev.NumInternalSteps
-			ss.NumInterfaceSeeks += ev.NumInterfaceSeeks
-			ss.NumInternalSeeks += ev.NumInternalSeeks
-		})
-	}
-	return ss
+	kvStats.BlockBytes = optional.MakeUint(ss.BlockBytes)
+	kvStats.BlockBytesInCache = optional.MakeUint(ss.BlockBytesInCache)
+	kvStats.KeyBytes = optional.MakeUint(ss.KeyBytes)
+	kvStats.ValueBytes = optional.MakeUint(ss.ValueBytes)
+	kvStats.PointCount = optional.MakeUint(ss.PointCount)
+	kvStats.PointsCoveredByRangeTombstones = optional.MakeUint(ss.PointsCoveredByRangeTombstones)
+	kvStats.RangeKeyCount = optional.MakeUint(ss.RangeKeyCount)
+	kvStats.RangeKeyContainedPoints = optional.MakeUint(ss.RangeKeyContainedPoints)
+	kvStats.RangeKeySkippedPoints = optional.MakeUint(ss.RangeKeySkippedPoints)
+	kvStats.NumGets = optional.MakeUint(ss.NumGets)
+	kvStats.NumScans = optional.MakeUint(ss.NumScans)
+	kvStats.NumReverseScans = optional.MakeUint(ss.NumReverseScans)
 }

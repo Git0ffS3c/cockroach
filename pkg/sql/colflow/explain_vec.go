@@ -12,7 +12,6 @@ package colflow
 
 import (
 	"context"
-	"math"
 	"reflect"
 	"sort"
 
@@ -25,8 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/util/admission"
-	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
 )
@@ -34,51 +31,48 @@ import (
 // convertToVecTree converts the flow to a tree of vectorized operators
 // returning a list of the leap operators or an error if the flow vectorization
 // is not supported. Note that it does so by setting up the full flow without
-// running the components asynchronously, so it is pretty expensive.
-// It also returns a non-nil cleanup function that releases all
-// execinfra.Releasable objects which can *only* be performed once opChains are
-// no longer needed.
+// running the components asynchronously, so it is pretty expensive. It also
+// returns a non-nil cleanup function that closes all the closers as well as
+// releases all execreleasable.Releasable objects which can *only* be performed
+// once opChains are no longer needed.
 func convertToVecTree(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	flow *execinfrapb.FlowSpec,
 	localProcessors []execinfra.LocalProcessor,
-	isPlanLocal bool,
+	recordingStats bool,
 ) (opChains execopnode.OpChains, cleanup func(), err error) {
-	if !isPlanLocal && len(localProcessors) > 0 {
+	if !flowCtx.Local && len(localProcessors) > 0 {
 		return nil, func() {}, errors.AssertionFailedf("unexpectedly non-empty LocalProcessors when plan is not local")
 	}
+	flowBase := flowinfra.NewFlowBase(
+		*flowCtx,
+		nil,                     /* sp */
+		nil,                     /* flowReg */
+		&execinfra.RowChannel{}, /* rowSyncFlowConsumer */
+		// We optimistically assume that sql.DistSQLReceiver can be used as an
+		// execinfra.BatchReceiver, so we always pass in a fakeBatchReceiver to
+		// the creator.
+		&fakeBatchReceiver{},
+		localProcessors,
+		nil,       /* localVectorSources */
+		func() {}, /* onFlowCleanupEnd */
+		"",        /* statementSQL */
+	)
+	creator := newVectorizedFlowCreator(
+		flowBase, nil /* componentCreator */, recordingStats,
+		colcontainer.DiskQueueCfg{}, flowCtx.Cfg.VecFDSemaphore,
+	)
 	fuseOpt := flowinfra.FuseNormally
-	if isPlanLocal && !execinfra.HasParallelProcessors(flow) {
+	if flowCtx.Local && !execinfra.HasParallelProcessors(flow) {
 		fuseOpt = flowinfra.FuseAggressively
 	}
-	// We optimistically assume that sql.DistSQLReceiver can be used as an
-	// execinfra.BatchReceiver, so we always pass in a fakeBatchReceiver to the
-	// creator.
-	creator := newVectorizedFlowCreator(
-		newNoopFlowCreatorHelper(), vectorizedRemoteComponentCreator{}, false, false,
-		nil, &execinfra.RowChannel{}, &fakeBatchReceiver{}, flowCtx.Cfg.PodNodeDialer, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
-		flowCtx.Cfg.VecFDSemaphore, flowCtx.NewTypeResolver(flowCtx.Txn),
-		admission.WorkInfo{},
-	)
-	// We create an unlimited memory account because we're interested whether the
-	// flow is supported via the vectorized engine in general (without paying
-	// attention to the memory since it is node-dependent in the distributed
-	// case).
-	memoryMonitor := mon.NewMonitor(
-		"convert-to-vec-tree",
-		mon.MemoryResource,
-		nil,           /* curCount */
-		nil,           /* maxHist */
-		-1,            /* increment */
-		math.MaxInt64, /* noteworthy */
-		flowCtx.Cfg.Settings,
-	)
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
-	defer memoryMonitor.Stop(ctx)
-	defer creator.cleanup(ctx)
-	opChains, _, err = creator.setupFlow(ctx, flowCtx, flow.Processors, localProcessors, fuseOpt)
-	return opChains, creator.Release, err
+	opChains, _, err = creator.setupFlow(ctx, flow.Processors, fuseOpt)
+	cleanup = func() {
+		creator.cleanup(ctx)
+		creator.Release()
+	}
+	return opChains, cleanup, err
 }
 
 // fakeBatchReceiver exists for the sole purpose of convertToVecTree method. In
@@ -106,11 +100,6 @@ type flowWithNode struct {
 // It also supports printing of already constructed operator chains which takes
 // priority if non-nil (flows are ignored). All operators in opChains are
 // assumed to be planned on the gateway.
-//
-// As the second return parameter it returns a non-nil cleanup function which
-// can be called only **after** closing the planNode tree containing the
-// explainVecNode (if ExplainVec is used by another caller, then it can be
-// called at any time).
 func ExplainVec(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
@@ -119,22 +108,12 @@ func ExplainVec(
 	opChains execopnode.OpChains,
 	gatewaySQLInstanceID base.SQLInstanceID,
 	verbose bool,
-	distributed bool,
-) (_ []string, cleanup func(), _ error) {
+	recordingStats bool,
+) ([]string, error) {
 	tp := treeprinter.NewWithStyle(treeprinter.CompactStyle)
 	root := tp.Child("│")
-	var (
-		cleanups      []func()
-		err           error
-		conversionErr error
-	)
-	defer func() {
-		cleanup = func() {
-			for _, c := range cleanups {
-				c()
-			}
-		}
-	}()
+	var err error
+	var conversionErr error
 	// It is possible that when iterating over execopnode.OpNodes we will hit a
 	// panic (an input that doesn't implement OpNode interface), so we're
 	// catching such errors.
@@ -150,8 +129,11 @@ func ExplainVec(
 			// last.
 			sort.Slice(sortedFlows, func(i, j int) bool { return sortedFlows[i].sqlInstanceID < sortedFlows[j].sqlInstanceID })
 			for _, flow := range sortedFlows {
-				opChains, cleanup, err = convertToVecTree(ctx, flowCtx, flow.flow, localProcessors, !distributed)
-				cleanups = append(cleanups, cleanup)
+				var cleanup func()
+				opChains, cleanup, err = convertToVecTree(ctx, flowCtx, flow.flow, localProcessors, recordingStats)
+				// We need to delay the cleanup until after the tree has been
+				// formatted.
+				defer cleanup()
 				if err != nil {
 					conversionErr = err
 					return
@@ -160,12 +142,12 @@ func ExplainVec(
 			}
 		}
 	}); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if conversionErr != nil {
-		return nil, nil, conversionErr
+		return nil, conversionErr
 	}
-	return tp.FormattedRows(), nil, nil
+	return tp.FormattedRows(), nil
 }
 
 func formatChains(

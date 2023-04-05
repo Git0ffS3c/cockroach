@@ -34,15 +34,15 @@ func TestVerifyPassword(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
-
-	ie := sql.MakeInternalExecutor(
-		context.Background(),
-		s.(*server.TestServer).Server.PGServer().SQLServer,
-		sql.MemoryMetrics{},
-		s.ExecutorConfig().(sql.ExecutorConfig).Settings,
+	s, db, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			// Need to disable the test tenant here because it appears as
+			// though we don't have all the same roles in the tenant as we
+			// have in the host cluster (like root).
+			DefaultTestTenant: base.TestTenantDisabled,
+		},
 	)
+	defer s.Stopper().Stop(ctx)
 
 	ts := s.(*server.TestServer)
 
@@ -70,6 +70,8 @@ func TestVerifyPassword(t *testing.T) {
 
 		{"richardc", "12345", "NOLOGIN", "", nil},
 		{"richardc2", "12345", "NOSQLLOGIN", "", nil},
+		{"has_global_nosqlogin", "12345", "", "", nil},
+		{"inherits_global_nosqlogin", "12345", "", "", nil},
 		{"before_epoch", "12345", "", "VALID UNTIL '1969-01-01'", nil},
 		{"epoch", "12345", "", "VALID UNTIL '1970-01-01'", nil},
 		{"cockroach", "12345", "", "VALID UNTIL '2100-01-01'", nil},
@@ -95,6 +97,12 @@ func TestVerifyPassword(t *testing.T) {
 		t.Fatalf("failed to grant admin: %s", err)
 	}
 
+	// Set up NOSQLLOGIN global privilege.
+	_, err = db.Exec("GRANT SYSTEM NOSQLLOGIN TO has_global_nosqlogin")
+	require.NoError(t, err)
+	_, err = db.Exec("GRANT has_global_nosqlogin TO inherits_global_nosqlogin")
+	require.NoError(t, err)
+
 	for _, tc := range []struct {
 		testName                    string
 		username                    string
@@ -119,8 +127,11 @@ func TestVerifyPassword(t *testing.T) {
 		{"username does not exist should fail", "doesntexist", "zxcvbn", false, false, false},
 
 		{"user with NOLOGIN role option should fail", "richardc", "12345", false, false, false},
-		// This is the one test case where SQL and DB Console login outcomes differ.
+		// The NOSQLLOGIN cases are the only cases where SQL and DB Console login outcomes differ.
 		{"user with NOSQLLOGIN role option should fail SQL but succeed on DB Console", "richardc2", "12345", false, false, true},
+		{"user with NOSQLLOGIN global privilege should fail SQL but succeed on DB Console", "has_global_nosqlogin", "12345", false, false, true},
+		{"user who inherits NOSQLLOGIN global privilege should fail SQL but succeed on DB Console", "inherits_global_nosqlogin", "12345", false, false, true},
+
 		{"user with VALID UNTIL before the Unix epoch should fail", "before_epoch", "12345", false, false, false},
 		{"user with VALID UNTIL at Unix epoch should fail", "epoch", "12345", false, false, false},
 		{"user with VALID UNTIL future date should succeed", "cockroach", "12345", false, true, true},
@@ -132,7 +143,7 @@ func TestVerifyPassword(t *testing.T) {
 			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 			username := username.MakeSQLUsernameFromPreNormalizedString(tc.username)
 			exists, canLoginSQL, canLoginDBConsole, isSuperuser, _, pwRetrieveFn, err := sql.GetUserSessionInitInfo(
-				context.Background(), &execCfg, &ie, username, "", /* databaseName */
+				context.Background(), &execCfg, username, "", /* databaseName */
 			)
 
 			if err != nil {

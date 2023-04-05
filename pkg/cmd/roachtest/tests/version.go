@@ -13,12 +13,14 @@ package tests
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -103,7 +105,7 @@ func registerVersion(r registry.Registry) {
 					//
 					// https://github.com/cockroachdb/cockroach/issues/37737#issuecomment-496026918
 					if !strings.HasPrefix(binaryVersion, "2.") {
-						if err := c.CheckReplicaDivergenceOnDB(ctx, t.L(), db); err != nil {
+						if err := roachtestutil.CheckReplicaDivergenceOnDB(ctx, t.L(), db); err != nil {
 							return errors.Wrapf(err, "node %d", i)
 						}
 					}
@@ -217,10 +219,14 @@ func registerVersion(r registry.Registry) {
 	for _, n := range []int{3, 5} {
 		r.Add(registry.TestSpec{
 			Name:    fmt.Sprintf("version/mixed/nodes=%d", n),
-			Owner:   registry.OwnerKV,
+			Timeout: 4 * time.Hour,
+			Owner:   registry.OwnerTestEng,
 			Cluster: r.MakeClusterSpec(n + 1),
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				pred, err := PredecessorVersion(*t.BuildVersion())
+				if c.IsLocal() && runtime.GOARCH == "arm64" {
+					t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+				}
+				pred, err := version.PredecessorVersion(*t.BuildVersion())
 				if err != nil {
 					t.Fatal(err)
 				}

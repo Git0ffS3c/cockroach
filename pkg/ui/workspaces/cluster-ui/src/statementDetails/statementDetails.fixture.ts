@@ -17,6 +17,8 @@ import { StatementDetailsResponse } from "../api";
 
 const history = createMemoryHistory({ initialEntries: ["/statements"] });
 
+const lastUpdated = moment("Nov 28 2022 01:30:00 GMT");
+
 const statementDetailsNoData: StatementDetailsResponse = {
   statement: {
     metadata: {
@@ -37,6 +39,7 @@ const statementDetailsNoData: StatementDetailsResponse = {
       max_retries: new Long(0),
       legacy_last_err: "",
       num_rows: { mean: 0, squared_diffs: 0 },
+      idle_lat: { mean: 0, squared_diffs: 0 },
       parse_lat: { mean: 0, squared_diffs: 0 },
       plan_lat: { mean: 0, squared_diffs: 0 },
       run_lat: { mean: 0, squared_diffs: 0 },
@@ -57,6 +60,7 @@ const statementDetailsNoData: StatementDetailsResponse = {
         contention_time: { mean: 0, squared_diffs: 0 },
         network_messages: { mean: 0, squared_diffs: 0 },
         max_disk_usage: { mean: 0, squared_diffs: 0 },
+        cpu_sql_nanos: { mean: 0, squared_diffs: 0 },
       },
       sql_type: "",
       last_exec_timestamp: { seconds: new Long(-62135596800) },
@@ -95,6 +99,10 @@ const statementDetailsData: StatementDetailsResponse = {
       num_rows: {
         mean: 6,
         squared_diffs: 0,
+      },
+      idle_lat: {
+        mean: 0.0000876,
+        squared_diffs: 2.35792e-8,
       },
       parse_lat: {
         mean: 0.0000876,
@@ -167,6 +175,10 @@ const statementDetailsData: StatementDetailsResponse = {
           mean: 0,
           squared_diffs: 0,
         },
+        cpu_sql_nanos: {
+          mean: 0,
+          squared_diffs: 0,
+        },
       },
       sql_type: "TypeDML",
       last_exec_timestamp: {
@@ -187,6 +199,10 @@ const statementDetailsData: StatementDetailsResponse = {
         legacy_last_err_redacted: "",
         num_rows: {
           mean: 6,
+          squared_diffs: 0,
+        },
+        idle_lat: {
+          mean: 0.00004,
           squared_diffs: 0,
         },
         parse_lat: {
@@ -260,6 +276,10 @@ const statementDetailsData: StatementDetailsResponse = {
             mean: 0,
             squared_diffs: 0,
           },
+          cpu_sql_nanos: {
+            mean: 0,
+            squared_diffs: 0,
+          },
         },
         sql_type: "TypeDML",
         last_exec_timestamp: {
@@ -284,6 +304,10 @@ const statementDetailsData: StatementDetailsResponse = {
         num_rows: {
           mean: 6,
           squared_diffs: 0,
+        },
+        idle_lat: {
+          mean: 0.000071,
+          squared_diffs: 4.050000000000001e-9,
         },
         parse_lat: {
           mean: 0.000071,
@@ -356,6 +380,10 @@ const statementDetailsData: StatementDetailsResponse = {
             mean: 0,
             squared_diffs: 0,
           },
+          cpu_sql_nanos: {
+            mean: 0,
+            squared_diffs: 0,
+          },
         },
         sql_type: "TypeDML",
         last_exec_timestamp: {
@@ -379,6 +407,10 @@ const statementDetailsData: StatementDetailsResponse = {
         legacy_last_err_redacted: "",
         num_rows: {
           mean: 6,
+          squared_diffs: 0,
+        },
+        idle_lat: {
+          mean: 0.000046,
           squared_diffs: 0,
         },
         parse_lat: {
@@ -452,6 +484,10 @@ const statementDetailsData: StatementDetailsResponse = {
             mean: 0,
             squared_diffs: 0,
           },
+          cpu_sql_nanos: {
+            mean: 0,
+            squared_diffs: 0,
+          },
         },
         sql_type: "TypeDML",
         last_exec_timestamp: {
@@ -475,6 +511,10 @@ const statementDetailsData: StatementDetailsResponse = {
         legacy_last_err_redacted: "",
         num_rows: {
           mean: 6,
+          squared_diffs: 0,
+        },
+        idle_lat: {
+          mean: 0.00021,
           squared_diffs: 0,
         },
         parse_lat: {
@@ -548,6 +588,10 @@ const statementDetailsData: StatementDetailsResponse = {
             mean: 0,
             squared_diffs: 0,
           },
+          cpu_sql_nanos: {
+            mean: 0,
+            squared_diffs: 0,
+          },
         },
         sql_type: "TypeDML",
         last_exec_timestamp: {
@@ -575,6 +619,10 @@ const statementDetailsData: StatementDetailsResponse = {
           mean: 6,
           squared_diffs: 0,
         },
+        idle_lat: {
+          mean: 0.0000876,
+          squared_diffs: 2.35792e-8,
+        },
         parse_lat: {
           mean: 0.0000876,
           squared_diffs: 2.35792e-8,
@@ -643,6 +691,10 @@ const statementDetailsData: StatementDetailsResponse = {
             squared_diffs: 0,
           },
           max_disk_usage: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          cpu_sql_nanos: {
             mean: 0,
             squared_diffs: 0,
           },
@@ -669,6 +721,10 @@ const statementDetailsData: StatementDetailsResponse = {
           mean: 6,
           squared_diffs: 0,
         },
+        idle_lat: {
+          mean: 0.0000876,
+          squared_diffs: 2.35792e-8,
+        },
         parse_lat: {
           mean: 0.0000876,
           squared_diffs: 2.35792e-8,
@@ -737,6 +793,10 @@ const statementDetailsData: StatementDetailsResponse = {
             squared_diffs: 0,
           },
           max_disk_usage: {
+            mean: 0,
+            squared_diffs: 0,
+          },
+          cpu_sql_nanos: {
             mean: 0,
             squared_diffs: 0,
           },
@@ -777,6 +837,7 @@ export const getStatementDetailsPropsFixture = (
     },
   },
   isLoading: false,
+  lastUpdated: lastUpdated,
   timeScale: {
     windowSize: moment.duration(5, "day"),
     sampleSize: moment.duration(5, "minutes"),
@@ -784,16 +845,8 @@ export const getStatementDetailsPropsFixture = (
     key: "Custom",
   },
   statementFingerprintID: "4705782015019656142",
-  latestQuery: "SELECT * FROM crdb_internal.node_build_info",
-  latestFormattedQuery: "SELECT * FROM crdb_internal.node_build_info\n",
   statementDetails: withData ? statementDetailsData : statementDetailsNoData,
   statementsError: null,
-  nodeNames: {
-    "1": "127.0.0.1:55529 (n1)",
-    "2": "127.0.0.1:55532 (n2)",
-    "3": "127.0.0.1:55538 (n3)",
-    "4": "127.0.0.1:55546 (n4)",
-  },
   nodeRegions: {
     "1": "gcp-us-east1",
     "2": "gcp-us-east1",
@@ -805,12 +858,11 @@ export const getStatementDetailsPropsFixture = (
   refreshNodes: noop,
   refreshNodesLiveness: noop,
   refreshUserSQLRoles: noop,
+  refreshStatementFingerprintInsights: noop,
   diagnosticsReports: [],
   dismissStatementDiagnosticsAlertMessage: noop,
   onTimeScaleChange: noop,
   createStatementDiagnosticsReport: noop,
-  onStatementDetailsQueryChange: noop,
-  onStatementDetailsFormattedQueryChange: noop,
   uiConfig: {
     showStatementDiagnosticsLink: true,
   },

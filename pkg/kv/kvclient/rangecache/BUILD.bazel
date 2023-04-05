@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -7,6 +8,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/util",
@@ -17,7 +19,6 @@ go_library(
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/syncutil/singleflight",
-        "//pkg/util/tracing",
         "@com_github_biogo_store//llrb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_logtags//:logtags",
@@ -28,6 +29,7 @@ go_test(
     name = "rangecache_test",
     size = "small",
     srcs = ["range_cache_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":rangecache"],
     deps = [
         "//pkg/keys",
@@ -43,3 +45,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

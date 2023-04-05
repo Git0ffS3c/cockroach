@@ -11,9 +11,13 @@
 import { Filters, defaultFilters } from ".";
 import { Location } from "history";
 import {
-  ActiveStatementFilters,
-  ActiveTransactionFilters,
-} from "src/activeExecutions/types";
+  RecentStatementFilters,
+  RecentTransactionFilters,
+} from "src/recentExecutions/types";
+import {
+  WorkloadInsightEventFilters,
+  SchemaInsightEventFilters,
+} from "../insights";
 
 // This function returns a Filters object populated with values from the URL, or null
 // if there were no filters set.
@@ -35,14 +39,15 @@ export function getFiltersFromURL(location: Location): Partial<Filters> | null {
   return filters;
 }
 
-export function getActiveStatementFiltersFromURL(
+export function getRecentStatementFiltersFromURL(
   location: Location,
-): Partial<ActiveStatementFilters> | null {
+): Partial<RecentStatementFilters> | null {
   const filters = getFiltersFromURL(location);
   if (!filters) return null;
 
   const appFilters = {
     app: filters.app,
+    executionStatus: filters.executionStatus,
   };
 
   // If every entry is null, there were no active stmt filters. Return null.
@@ -51,18 +56,53 @@ export function getActiveStatementFiltersFromURL(
   return appFilters;
 }
 
-export function getActiveTransactionFiltersFromURL(
+export function getRecentTransactionFiltersFromURL(
   location: Location,
-): Partial<ActiveTransactionFilters> | null {
+): Partial<RecentTransactionFilters> | null {
   const filters = getFiltersFromURL(location);
   if (!filters) return null;
 
   const appFilters = {
     app: filters.app,
+    executionStatus: filters.executionStatus,
   };
 
   // If every entry is null, there were no active stmt filters. Return null.
   if (Object.values(appFilters).every(val => !val)) return null;
 
   return appFilters;
+}
+
+export function getWorkloadInsightEventFiltersFromURL(
+  location: Location,
+): Partial<WorkloadInsightEventFilters> | null {
+  const filters = getFiltersFromURL(location);
+  if (!filters) return null;
+
+  const appFilters = {
+    app: filters.app,
+    workloadInsightType: filters.workloadInsightType,
+  };
+
+  // If every entry is null, there were no active filters. Return null.
+  if (Object.values(appFilters).every(val => !val)) return null;
+
+  return appFilters;
+}
+
+export function getSchemaInsightEventFiltersFromURL(
+  location: Location,
+): Partial<SchemaInsightEventFilters> | null {
+  const filters = getFiltersFromURL(location);
+  if (!filters) return null;
+
+  const schemaFilters = {
+    database: filters.database,
+    schemaInsightType: filters.schemaInsightType,
+  };
+
+  // If every entry is null, there were no active filters. Return null.
+  if (Object.values(schemaFilters).every(val => !val)) return null;
+
+  return schemaFilters;
 }

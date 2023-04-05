@@ -18,11 +18,10 @@ import {
 } from "../sortedtable";
 import {
   transactionsCountBarChart,
-  transactionsRowsReadBarChart,
   transactionsBytesReadBarChart,
-  transactionsRowsWrittenBarChart,
   transactionsLatencyBarChart,
   transactionsContentionBarChart,
+  transactionsCPUBarChart,
   transactionsMaxMemUsageBarChart,
   transactionsNetworkBytesBarChart,
   transactionsRetryBarChart,
@@ -30,7 +29,14 @@ import {
 import { statisticsTableTitles } from "../statsTableUtil/statsTableUtil";
 import { tableClasses } from "./transactionsTableClasses";
 import { transactionLink } from "./transactionsCells";
-import { FixLong, longToInt, TimestampToString } from "src/util";
+import {
+  FixFingerprintHexValue,
+  Count,
+  FixLong,
+  longToInt,
+  TimestampToString,
+  unset,
+} from "src/util";
 import { SortSetting } from "../sortedtable";
 import {
   getStatementsByFingerprintId,
@@ -41,8 +47,10 @@ import {
 import classNames from "classnames/bind";
 import statsTablePageStyles from "src/statementsTable/statementsTableContent.module.scss";
 
-export type Transaction = protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
-type Statement = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+export type Transaction =
+  protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
+type Statement =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 
 interface TransactionsTable {
   transactions: TransactionInfo[];
@@ -54,6 +62,7 @@ interface TransactionsTable {
 }
 
 export interface TransactionInfo extends Transaction {
+  regions: string[];
   regionNodes: string[];
 }
 
@@ -94,15 +103,7 @@ export function makeTransactionsColumns(
   };
 
   const countBar = transactionsCountBarChart(transactions);
-  const rowsReadBar = transactionsRowsReadBarChart(
-    transactions,
-    defaultBarChartOptions,
-  );
   const bytesReadBar = transactionsBytesReadBarChart(
-    transactions,
-    defaultBarChartOptions,
-  );
-  const rowsWrittenBar = transactionsRowsWrittenBarChart(
     transactions,
     defaultBarChartOptions,
   );
@@ -111,6 +112,10 @@ export function makeTransactionsColumns(
     latencyClasses.barChart,
   );
   const contentionBar = transactionsContentionBarChart(
+    transactions,
+    sampledExecStatsBarChartOptions,
+  );
+  const cpuBar = transactionsCPUBarChart(
     transactions,
     sampledExecStatsBarChartOptions,
   );
@@ -131,16 +136,19 @@ export function makeTransactionsColumns(
       title: statisticsTableTitles.transactions(statType),
       cell: (item: TransactionInfo) =>
         transactionLink({
-          transactionText: statementFingerprintIdsToText(
-            item.stats_data.statement_fingerprint_ids,
-            statements,
-          ),
-          transactionSummary: statementFingerprintIdsToSummarizedText(
-            item.stats_data.statement_fingerprint_ids,
-            statements,
-          ),
+          transactionText:
+            statementFingerprintIdsToText(
+              item.stats_data.statement_fingerprint_ids,
+              statements,
+            ) || "Transaction query unavailable.",
+          transactionSummary:
+            statementFingerprintIdsToSummarizedText(
+              item.stats_data.statement_fingerprint_ids,
+              statements,
+            ) || "Transaction query unavailable.",
           aggregatedTs: TimestampToString(item.stats_data.aggregated_ts),
-          transactionFingerprintId: item.stats_data.transaction_fingerprint_id.toString(),
+          transactionFingerprintId:
+            item.stats_data.transaction_fingerprint_id.toString(),
           search,
         }),
       sort: (item: TransactionInfo) =>
@@ -160,12 +168,27 @@ export function makeTransactionsColumns(
         FixLong(Number(item.stats_data.stats.count)),
     },
     {
-      name: "rowsRead",
-      title: statisticsTableTitles.rowsRead(statType),
-      cell: rowsReadBar,
+      name: "applicationName",
+      title: statisticsTableTitles.applicationName(statType),
+      className: cx("statements-table__col-app-name"),
+      cell: (item: TransactionInfo) =>
+        item.stats_data?.app?.length > 0 ? item.stats_data?.app : unset,
+      sort: (item: TransactionInfo) => item.stats_data?.app,
+      showByDefault: false,
+    },
+    {
+      name: "rowsProcessed",
+      title: statisticsTableTitles.rowsProcessed(statType),
+      cell: (item: TransactionInfo) =>
+        `${Count(Number(item.stats_data.stats.rows_read.mean))} Reads / ${Count(
+          Number(item.stats_data.stats.rows_written?.mean),
+        )} Writes`,
       className: cx("statements-table__col-rows-read"),
       sort: (item: TransactionInfo) =>
-        FixLong(Number(item.stats_data.stats.rows_read.mean)),
+        FixLong(
+          Number(item.stats_data.stats.rows_read.mean) +
+            Number(item.stats_data.stats.rows_written?.mean),
+        ),
     },
     {
       name: "bytesRead",
@@ -174,15 +197,6 @@ export function makeTransactionsColumns(
       className: cx("statements-table__col-bytes-read"),
       sort: (item: TransactionInfo) =>
         FixLong(Number(item.stats_data.stats.bytes_read.mean)),
-    },
-    {
-      name: "rowsWritten",
-      title: statisticsTableTitles.rowsWritten(statType),
-      cell: rowsWrittenBar,
-      className: cx("statements-table__col-rows-written"),
-      sort: (item: TransactionInfo) =>
-        FixLong(Number(item.stats_data.stats.rows_written?.mean)),
-      showByDefault: false,
     },
     {
       name: "time",
@@ -198,6 +212,14 @@ export function makeTransactionsColumns(
       className: cx("statements-table__col-contention"),
       sort: (item: TransactionInfo) =>
         FixLong(Number(item.stats_data.stats.exec_stats.contention_time?.mean)),
+    },
+    {
+      name: "cpu",
+      title: statisticsTableTitles.cpu(statType),
+      cell: cpuBar,
+      className: cx("statements-table__col-cpu"),
+      sort: (item: TransactionInfo) =>
+        FixLong(Number(item.stats_data.stats.exec_stats.cpu_sql_nanos?.mean)),
     },
     {
       name: "maxMemUsage",
@@ -222,16 +244,7 @@ export function makeTransactionsColumns(
       sort: (item: TransactionInfo) =>
         longToInt(Number(item.stats_data.stats.max_retries)),
     },
-    {
-      name: "regionNodes",
-      title: statisticsTableTitles.regionNodes(statType),
-      className: cx("statements-table__col-regions"),
-      cell: (item: TransactionInfo) => {
-        return longListWithTooltip(item.regionNodes.sort().join(", "), 50);
-      },
-      sort: (item: TransactionInfo) => item.regionNodes.sort().join(", "),
-      hideIfTenant: true,
-    },
+    makeRegionsColumn(isTenant),
     {
       name: "statementsCount",
       title: statisticsTableTitles.statementsCount(statType),
@@ -240,7 +253,44 @@ export function makeTransactionsColumns(
       sort: (item: TransactionInfo) =>
         item.stats_data.statement_fingerprint_ids.length,
     },
-  ].filter(c => !(isTenant && c.hideIfTenant));
+    {
+      name: "transactionFingerprintId",
+      title: statisticsTableTitles.transactionFingerprintId(statType),
+      cell: (item: TransactionInfo) =>
+        FixFingerprintHexValue(
+          item.stats_data?.transaction_fingerprint_id.toString(16),
+        ),
+      sort: (item: TransactionInfo) =>
+        item.stats_data?.transaction_fingerprint_id.toString(16),
+      showByDefault: false,
+    },
+  ];
+}
+
+function makeRegionsColumn(
+  isTenant: boolean,
+): ColumnDescriptor<TransactionInfo> {
+  if (isTenant) {
+    return {
+      name: "regions",
+      title: statisticsTableTitles.regions("transaction"),
+      className: cx("statements-table__col-regions"),
+      cell: (item: TransactionInfo) => {
+        return longListWithTooltip(item.regions.sort().join(", "), 50);
+      },
+      sort: (item: TransactionInfo) => item.regions.sort().join(", "),
+    };
+  } else {
+    return {
+      name: "regionNodes",
+      title: statisticsTableTitles.regionNodes("transaction"),
+      className: cx("statements-table__col-regions"),
+      cell: (item: TransactionInfo) => {
+        return longListWithTooltip(item.regionNodes.sort().join(", "), 50);
+      },
+      sort: (item: TransactionInfo) => item.regionNodes.sort().join(", "),
+    };
+  }
 }
 
 export const TransactionsTable: React.FC<TransactionsTable> = props => {

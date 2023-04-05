@@ -13,7 +13,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -53,6 +52,8 @@ func init() {
 }
 
 func setOrchestrationVersion(_ *cobra.Command, _ []string) error {
+	// make sure we have the leading "v" in the version
+	orchestrationFlags.version = "v" + strings.TrimPrefix(orchestrationFlags.version, "v")
 	dirInfo, err := os.Stat(orchestrationFlags.templatesDir)
 	if err != nil {
 		return fmt.Errorf("cannot stat templates directory: %w", err)
@@ -79,7 +80,7 @@ func setOrchestrationVersion(_ *cobra.Command, _ []string) error {
 		if err := os.MkdirAll(destDir, 0755); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}
-		contents, err := ioutil.ReadFile(filePath)
+		contents, err := os.ReadFile(filePath)
 		if err != nil {
 			return err
 		}
@@ -88,7 +89,7 @@ func setOrchestrationVersion(_ *cobra.Command, _ []string) error {
 		if strings.HasSuffix(destFile, ".yaml") {
 			generatedContents = fmt.Sprintf("# Generated file, DO NOT EDIT. Source: %s\n", filePath) + generatedContents
 		}
-		err = ioutil.WriteFile(destFile, []byte(generatedContents), fileInfo.Mode().Perm())
+		err = os.WriteFile(destFile, []byte(generatedContents), fileInfo.Mode().Perm())
 		if err != nil {
 			return err
 		}

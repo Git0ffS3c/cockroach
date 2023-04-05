@@ -12,7 +12,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl/enginepbccl"
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -79,28 +79,60 @@ AES128_CTR:be235...   # AES-128 encryption with store key ID
 		RunE: clierrorplus.MaybeDecorateError(runEncryptionActiveKey),
 	}
 
+	encryptionDecryptCmd := &cobra.Command{
+		Use:   "encryption-decrypt <directory> <in-file> [out-file]",
+		Short: "decrypt a file from an encrypted store",
+		Long: `Decrypts a file from an encrypted store, and outputs it to the
+specified path.
+
+If out-file is not specified, the command will output the decrypted contents to
+stdout.
+`,
+		Args: cobra.MinimumNArgs(2),
+		RunE: clierrorplus.MaybeDecorateError(runDecrypt),
+	}
+
+	encryptionRegistryList := &cobra.Command{
+		Use:   "encryption-registry-list <directory>",
+		Short: "list files in the encryption-at-rest file registry",
+		Long: `Prints a list of files in an Encryption At Rest file registry, along
+with their env type and encryption settings (if applicable).
+`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: clierrorplus.MaybeDecorateError(runList),
+	}
+
 	// Add commands to the root debug command.
 	// We can't add them to the lists of commands (eg: DebugCmdsForPebble) as cli init() is called before us.
 	cli.DebugCmd.AddCommand(encryptionStatusCmd)
 	cli.DebugCmd.AddCommand(encryptionActiveKeyCmd)
+	cli.DebugCmd.AddCommand(encryptionDecryptCmd)
+	cli.DebugCmd.AddCommand(encryptionRegistryList)
 
 	// Add the encryption flag to commands that need it.
+	// For the encryption-status command.
 	f := encryptionStatusCmd.Flags()
-	cli.VarFlag(f, &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
+	cliflagcfg.VarFlag(f, &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
 	// And other flags.
 	f.BoolVar(&encryptionStatusOpts.activeStoreIDOnly, "active-store-key-id-only", false,
 		"print active store key ID and exit")
+	// For the encryption-decrypt command.
+	f = encryptionDecryptCmd.Flags()
+	cliflagcfg.VarFlag(f, &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
+	// For the encryption-registry-list command.
+	f = encryptionRegistryList.Flags()
+	cliflagcfg.VarFlag(f, &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
 
 	// Add encryption flag to all OSS debug commands that want it.
 	for _, cmd := range cli.DebugCommandsRequiringEncryption {
 		// storeEncryptionSpecs is in start.go.
-		cli.VarFlag(cmd.Flags(), &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
+		cliflagcfg.VarFlag(cmd.Flags(), &storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
 	}
 
 	// init has already run in cli/debug.go since this package imports it, so
 	// DebugPebbleCmd already has all its subcommands. We could traverse those
 	// here. But we don't need to by using PersistentFlags.
-	cli.VarFlag(cli.DebugPebbleCmd.PersistentFlags(),
+	cliflagcfg.VarFlag(cli.DebugPebbleCmd.PersistentFlags(),
 		&storeEncryptionSpecs, cliflagsccl.EnterpriseEncryption)
 
 	cli.PopulateStorageConfigHook = fillEncryptionOptionsForStore
@@ -306,7 +338,7 @@ func getActiveEncryptionkey(dir string) (string, string, error) {
 	}
 
 	// Open the file registry. Return plaintext if it does not exist.
-	contents, err := ioutil.ReadFile(registryFile)
+	contents, err := os.ReadFile(registryFile)
 	if err != nil {
 		if oserror.IsNotExist(err) {
 			return enginepbccl.EncryptionType_Plaintext.String(), "", nil

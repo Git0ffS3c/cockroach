@@ -23,7 +23,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
@@ -40,6 +42,9 @@ type TestClusterInterface interface {
 
 	// Server returns the TestServerInterface corresponding to a specific node.
 	Server(idx int) TestServerInterface
+
+	// NodeIDs returns the IDs of the nodes in the cluster.
+	NodeIDs() []roachpb.NodeID
 
 	// ServerConn returns a gosql.DB connection to a specific node.
 	ServerConn(idx int) *gosql.DB
@@ -84,7 +89,7 @@ type TestClusterInterface interface {
 
 	// AddNonVoters adds non-voting replicas for a range on a set of stores.
 	//
-	//This method blocks until the new replicas become a part of the Raft group.
+	// This method blocks until the new replicas become a part of the Raft group.
 	AddNonVoters(
 		startKey roachpb.Key,
 		targets ...roachpb.ReplicationTarget,
@@ -114,7 +119,7 @@ type TestClusterInterface interface {
 	// RebalanceVoterOrFatal rebalances a voting replica from src to dest but wil
 	// fatal if it fails.
 	RebalanceVoterOrFatal(
-		ctx context.Context, t *testing.T, startKey roachpb.Key, src, dest roachpb.ReplicationTarget,
+		ctx context.Context, t testing.TB, startKey roachpb.Key, src, dest roachpb.ReplicationTarget,
 	) *roachpb.RangeDescriptor
 
 	// SwapVoterWithNonVoter atomically "swaps" the voting replica located on
@@ -129,7 +134,7 @@ type TestClusterInterface interface {
 	// SwapVoterWithNonVoterOrFatal is the same as SwapVoterWithNonVoter but will
 	// fatal if it fails.
 	SwapVoterWithNonVoterOrFatal(
-		t *testing.T, startKey roachpb.Key, voterTarget, nonVoterTarget roachpb.ReplicationTarget,
+		t testing.TB, startKey roachpb.Key, voterTarget, nonVoterTarget roachpb.ReplicationTarget,
 	) *roachpb.RangeDescriptor
 
 	// FindRangeLeaseHolder returns the current lease holder for the given range.
@@ -157,6 +162,12 @@ type TestClusterInterface interface {
 	TransferRangeLease(
 		rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
 	) error
+
+	// TransferRangeLeaseOrFatal is the same as TransferRangeLease but will fatal
+	// if it fails.
+	TransferRangeLeaseOrFatal(
+		t testing.TB, rangeDesc roachpb.RangeDescriptor, dest roachpb.ReplicationTarget,
+	)
 
 	// MoveRangeLeaseNonCooperatively performs a non-cooperative transfer of the
 	// lease for a range from whoever has it to a particular store. That store
@@ -198,9 +209,50 @@ type TestClusterInterface interface {
 	// range is lazily split off on the first call to ScratchRange.
 	ScratchRange(t testing.TB) roachpb.Key
 
+	// ScratchRangeWithExpirationLease is like ScratchRange, but returns a system
+	// range with an expiration lease.
+	ScratchRangeWithExpirationLease(t testing.TB) roachpb.Key
+
 	// WaitForFullReplication waits until all stores in the cluster
 	// have no ranges with replication pending.
 	WaitForFullReplication() error
+
+	// StartedDefaultTestTenant returns whether this cluster started a
+	// default tenant for testing.
+	StartedDefaultTestTenant() bool
+
+	// StorageClusterConn returns a gosql.DB connection to the first server in a
+	// storage cluster. This is useful in environments where it's not clear
+	// whether ServerConn is returning a connection to the storage cluster or a
+	// secondary tenant.
+	StorageClusterConn() *gosql.DB
+
+	// SplitTable splits a range in the table, creates a replica for the right
+	// side of the split on TargetNodeIdx, and moves the lease for the right
+	// side of the split to TargetNodeIdx for each SplitPoint. This forces the
+	// querying against the table to be distributed.
+	//
+	// TODO(radu): we should verify that the queries in tests using SplitTable
+	// are indeed distributed as intended.
+	SplitTable(t *testing.T, desc catalog.TableDescriptor, sps []SplitPoint)
+
+	// WaitForTenantCapabilities waits until all servers have the specified
+	// tenant capabilities for the specified tenant ID.
+	// Only boolean capabilities are currently supported as we wait for the
+	// specified capabilities to have a "true" value.
+	WaitForTenantCapabilities(*testing.T, roachpb.TenantID, map[tenantcapabilities.ID]string)
+
+	// ToggleReplicateQueues activates or deactivates the replication queues on all
+	// the stores on all the nodes.
+	ToggleReplicateQueues(active bool)
+}
+
+// SplitPoint describes a split point that is passed to SplitTable.
+type SplitPoint struct {
+	// TargetNodeIdx is the node that will have the lease for the new range.
+	TargetNodeIdx int
+	// Vals is list of values forming a primary key for the table.
+	Vals []interface{}
 }
 
 // TestClusterFactory encompasses the actual implementation of the shim
@@ -227,6 +279,13 @@ func StartNewTestCluster(
 ) TestClusterInterface {
 	cluster := NewTestCluster(t, numNodes, args)
 	cluster.Start(t)
+	for i := 0; i < cluster.NumServers(); i++ {
+		sysconfigProvider := cluster.Server(i).SystemConfigProvider()
+		sysconfig := sysconfigProvider.GetSystemConfig()
+		if sysconfig != nil {
+			sysconfig.PurgeZoneConfigCache()
+		}
+	}
 	return cluster
 }
 

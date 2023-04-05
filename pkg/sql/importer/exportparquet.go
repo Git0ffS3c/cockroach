@@ -28,7 +28,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
@@ -131,7 +130,7 @@ func newParquetExporter(sp execinfrapb.ExportSpec, typs []*types.T) (*parquetExp
 	if err != nil {
 		return nil, err
 	}
-	schema := newParquetSchema(parquetColumns)
+	schema := NewParquetSchema(parquetColumns)
 
 	exporter = &parquetExporter{
 		buf:            buf,
@@ -157,6 +156,14 @@ type ParquetColumn struct {
 	// DecodeFn converts a native go type, created by the parquet vendor while
 	// reading a parquet file, into a crdb column value
 	DecodeFn func(interface{}) (tree.Datum, error)
+}
+
+// GetEncoder gets (exports) the encoder for a ParquetColumn.
+func (pc *ParquetColumn) GetEncoder() (func(datum tree.Datum) (interface{}, error), error) {
+	if pc.encodeFn == nil {
+		return nil, errors.Errorf("Parquet column does not have an encode function")
+	}
+	return pc.encodeFn, nil
 }
 
 // newParquetColumns creates a list of parquet columns, given the input relation's column types.
@@ -403,7 +410,11 @@ func NewParquetColumn(typ *types.T, name string, nullable bool) (ParquetColumn, 
 			return []byte(d.(*tree.DEnum).LogicalRep), nil
 		}
 		col.DecodeFn = func(x interface{}) (tree.Datum, error) {
-			return tree.MakeDEnumFromLogicalRepresentation(typ, string(x.([]byte)))
+			e, err := tree.MakeDEnumFromLogicalRepresentation(typ, string(x.([]byte)))
+			if err != nil {
+				return nil, err
+			}
+			return tree.NewDEnum(e), nil
 		}
 	case types.Box2DFamily:
 		populateLogicalStringCol(schemaEl)
@@ -598,7 +609,7 @@ func NewParquetColumn(typ *types.T, name string, nullable bool) (ParquetColumn, 
 				if elt.ResolvedType().Family() == types.UnknownFamily {
 					// skip encoding the datum
 				} else {
-					el, err = grandChild.encodeFn(elt)
+					el, err = grandChild.encodeFn(tree.UnwrapDOidWrapper(elt))
 					if err != nil {
 						return col, err
 					}
@@ -657,12 +668,14 @@ func NewParquetColumn(typ *types.T, name string, nullable bool) (ParquetColumn, 
 	return col, nil
 }
 
-// newParquetSchema creates the schema for the parquet file,
-// see example schema:
-//     https://github.com/fraugster/parquet-go/issues/18#issuecomment-946013210
+// NewParquetSchema creates the schema for the parquet file, see example schema:
+//
+//	https://github.com/fraugster/parquet-go/issues/18#issuecomment-946013210
+//
 // see docs here:
-//     https://pkg.go.dev/github.com/fraugster/parquet-go/parquetschema#SchemaDefinition
-func newParquetSchema(parquetFields []ParquetColumn) *parquetschema.SchemaDefinition {
+//
+//	https://pkg.go.dev/github.com/fraugster/parquet-go/parquetschema#SchemaDefinition
+func NewParquetSchema(parquetFields []ParquetColumn) *parquetschema.SchemaDefinition {
 	schemaDefinition := new(parquetschema.SchemaDefinition)
 	schemaDefinition.RootColumn = new(parquetschema.ColumnDefinition)
 	schemaDefinition.RootColumn.SchemaElement = parquet.NewSchemaElement()
@@ -676,21 +689,20 @@ func newParquetSchema(parquetFields []ParquetColumn) *parquetschema.SchemaDefini
 }
 
 func newParquetWriterProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.ExportSpec,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	c := &parquetWriterProcessor{
 		flowCtx:     flowCtx,
 		processorID: processorID,
 		spec:        spec,
 		input:       input,
-		output:      output,
 	}
 	semaCtx := tree.MakeSemaContext()
-	if err := c.out.Init(&execinfrapb.PostProcessSpec{}, c.OutputTypes(), &semaCtx, flowCtx.NewEvalCtx()); err != nil {
+	if err := c.out.Init(ctx, &execinfrapb.PostProcessSpec{}, c.OutputTypes(), &semaCtx, flowCtx.NewEvalCtx()); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -702,7 +714,6 @@ type parquetWriterProcessor struct {
 	spec        execinfrapb.ExportSpec
 	input       execinfra.RowSource
 	out         execinfra.ProcOutputHelper
-	output      execinfra.RowReceiver
 }
 
 var _ execinfra.Processor = &parquetWriterProcessor{}
@@ -721,17 +732,17 @@ func (sp *parquetWriterProcessor) MustBeStreaming() bool {
 	return false
 }
 
-func (sp *parquetWriterProcessor) Run(ctx context.Context) {
+func (sp *parquetWriterProcessor) Run(ctx context.Context, output execinfra.RowReceiver) {
 	ctx, span := tracing.ChildSpan(ctx, "parquetWriter")
 	defer span.Finish()
 
 	instanceID := sp.flowCtx.EvalCtx.NodeID.SQLInstanceID()
-	uniqueID := builtins.GenerateUniqueInt(instanceID)
+	uniqueID := builtins.GenerateUniqueInt(builtins.ProcessUniqueID(instanceID))
 
 	err := func() error {
 		typs := sp.input.OutputTypes()
 		sp.input.Start(ctx)
-		input := execinfra.MakeNoMetadataRowSource(sp.input, sp.output)
+		input := execinfra.MakeNoMetadataRowSource(sp.input, output)
 		alloc := &tree.DatumAlloc{}
 
 		exporter, err := newParquetExporter(sp.spec, typs)
@@ -772,10 +783,11 @@ func (sp *parquetWriterProcessor) Run(ctx context.Context) {
 							return err
 						}
 
-						// If we're encoding a DOidWrapper, then we want to cast the wrapped datum.
-						// Note that we pass in nil as the first argument since we're not interested
-						// in evaluating the evalCtx's placeholders.
-						edNative, err := exporter.parquetColumns[i].encodeFn(eval.UnwrapDatum(nil, ed.Datum))
+						// If we're encoding a DOidWrapper, then we want to cast
+						// the wrapped datum. Note that we don't use
+						// eval.UnwrapDatum since we're not interested in
+						// evaluating the placeholders.
+						edNative, err := exporter.parquetColumns[i].encodeFn(tree.UnwrapDOidWrapper(ed.Datum))
 						if err != nil {
 							return err
 						}
@@ -833,14 +845,14 @@ func (sp *parquetWriterProcessor) Run(ctx context.Context) {
 				),
 			}
 
-			cs, err := sp.out.EmitRow(ctx, res, sp.output)
+			cs, err := sp.out.EmitRow(ctx, res, output)
 			if err != nil {
 				return err
 			}
 			if cs != execinfra.NeedMoreRows {
-				// TODO(dt): presumably this is because our recv already closed due to
-				// another error... so do we really need another one?
-				return errors.New("unexpected closure of consumer")
+				// We don't return an error here because we want the error (if any) that
+				// actually caused the consumer to enter a closed/draining state to take precendence.
+				return nil
 			}
 			if done {
 				break
@@ -852,7 +864,12 @@ func (sp *parquetWriterProcessor) Run(ctx context.Context) {
 
 	// TODO(dt): pick up tracing info in trailing meta
 	execinfra.DrainAndClose(
-		ctx, sp.output, err, func(context.Context) {} /* pushTrailingMeta */, sp.input)
+		ctx, output, err, func(context.Context, execinfra.RowReceiver) {} /* pushTrailingMeta */, sp.input)
+}
+
+// Resume is part of the execinfra.Processor interface.
+func (sp *parquetWriterProcessor) Resume(output execinfra.RowReceiver) {
+	panic("not implemented")
 }
 
 func init() {

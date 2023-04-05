@@ -41,21 +41,21 @@ var Contradiction = &Set{contradiction: true}
 // expression tree each time.
 //
 // A few examples:
-//  - @1 >= 10
-//      /@1: [/10 - ]
 //
-//  - @1 > 10 AND @2 = 5
-//      /@1: [/11 - ]
-//      /@2: [/5 - /5]
+//   - @1 >= 10
+//     /@1: [/10 - ]
 //
-//  - (@1 = 10 AND @2 > 5) OR (@1 = 20 AND @2 > 0)
-//      /@1: [/10 - /10] [/20 - /20]
-//      /@2: [/1 - ]
+//   - @1 > 10 AND @2 = 5
+//     /@1: [/11 - ]
+//     /@2: [/5 - /5]
 //
-//  - @1 > 10.5 AND @2 != 'foo'
-//      /@1: (10.5 - ]
-//      /@2: [ - 'foo') ('foo' - ]
+//   - (@1 = 10 AND @2 > 5) OR (@1 = 20 AND @2 > 0)
+//     /@1: [/10 - /10] [/20 - /20]
+//     /@2: [/1 - ]
 //
+//   - @1 > 10.5 AND @2 != 'foo'
+//     /@1: (10.5 - ]
+//     /@2: [ - 'foo') ('foo' - ]
 type Set struct {
 	// firstConstraint holds the first constraint in the set and otherConstraints
 	// hold any constraints beyond the first. These are separated in order to
@@ -185,7 +185,9 @@ func (s *Set) Intersect(evalCtx *eval.Context, other *Set) *Set {
 // may not be "tight", meaning that the new constraint set might allow
 // additional combinations of values that neither of the input sets allowed. For
 // example:
-//   (x > 1 AND y > 10) OR (x < 5 AND y < 50)
+//
+//	(x > 1 AND y > 10) OR (x < 5 AND y < 50)
+//
 // the union is unconstrained (and thus allows combinations like x,y = 10,0).
 //
 // Union returns the merged set.
@@ -312,26 +314,60 @@ func (s *Set) ExtractValueForConstCol(evalCtx *eval.Context, col opt.ColumnID) t
 	return nil
 }
 
-// HasSingleColumnConstValues returns true if the Set contains a single
-// constraint on a single column which allows for one or more non-ranging
-// constant values. On success, returns the column and the constant value.
-func (s *Set) HasSingleColumnConstValues(
-	evalCtx *eval.Context,
-) (col opt.ColumnID, constValues tree.Datums, ok bool) {
+// HasSingleColumnNonNullConstValues returns true if all of the following are
+// true:
+//   - The given column is the only constrained column.
+//   - The column is constrained to a set of constant values.
+//   - None of the values are NULL.
+func (s *Set) HasSingleColumnNonNullConstValues(evalCtx *eval.Context, col opt.ColumnID) bool {
 	if s.Length() != 1 {
-		return 0, nil, false
+		return false
 	}
 	c := s.Constraint(0)
-	if c.Columns.Count() != 1 || c.Prefix(evalCtx) != 1 {
-		return 0, nil, false
+	if c.Columns.Count() != 1 {
+		return false
 	}
+	if c.Columns.Get(0).ID() != col {
+		return false
+	}
+	for i, n := 0, c.Spans.Count(); i < n; i++ {
+		sp := c.Spans.Get(i)
+		start := sp.StartKey()
+		end := sp.EndKey()
+		if start.Length() < 1 || end.Length() < 1 {
+			return false
+		}
+		startVal := start.Value(0)
+		if startVal == tree.DNull {
+			return false
+		}
+		if startVal.Compare(evalCtx, end.Value(0)) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// ExtractSingleColumnNonNullConstValues returns the constant values that the
+// given column is constrained to. It returns ok=false if any of the following
+// are not true:
+//   - The given column is the only constrained column.
+//   - The column is constrained to a set of constant values.
+//   - None of the values are NULL.
+func (s *Set) ExtractSingleColumnNonNullConstValues(
+	evalCtx *eval.Context, col opt.ColumnID,
+) (constValues tree.Datums, ok bool) {
+	if ok := s.HasSingleColumnNonNullConstValues(evalCtx, col); !ok {
+		return nil, false
+	}
+	c := s.Constraint(0)
 	numSpans := c.Spans.Count()
 	constValues = make(tree.Datums, numSpans)
 	for i := range constValues {
 		val := c.Spans.Get(i).StartKey().Value(0)
 		constValues[i] = val
 	}
-	return c.Columns.Get(0).ID(), constValues, true
+	return constValues, true
 }
 
 // allocConstraint allocates space for a new constraint in the set and returns

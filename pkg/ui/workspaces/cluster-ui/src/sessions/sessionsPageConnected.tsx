@@ -14,7 +14,7 @@ import { analyticsActions, AppState } from "src/store";
 import { SessionsState } from "src/store/sessions";
 
 import { createSelector } from "reselect";
-import { OwnProps, SessionsPage } from "./index";
+import { SessionsPage } from "./index";
 
 import { actions as sessionsActions } from "src/store/sessions";
 import { actions as localStorageActions } from "src/store/localStorage";
@@ -26,26 +26,17 @@ import {
 import { Dispatch } from "redux";
 import { Filters } from "../queryFilter";
 import { sqlStatsSelector } from "../store/sqlStats/sqlStats.selector";
+import { localStorageSelector } from "../store/utils/selectors";
 
 export const selectSessionsData = createSelector(
   sqlStatsSelector,
   sessionsState => (sessionsState.valid ? sessionsState.data : null),
 );
 
-export const adminUISelector = createSelector(
-  (state: AppState) => state.adminUI,
-  adminUiState => adminUiState,
-);
-
-export const localStorageSelector = createSelector(
-  adminUISelector,
-  adminUiState => adminUiState.localStorage,
-);
-
 export const selectSessions = createSelector(
-  (state: AppState) => state.adminUI.sessions,
+  (state: AppState) => state.adminUI?.sessions,
   (state: SessionsState) => {
-    if (!state.data) {
+    if (!state?.data) {
       return null;
     }
     return state.data.sessions.map(session => {
@@ -55,9 +46,9 @@ export const selectSessions = createSelector(
 );
 
 export const selectAppName = createSelector(
-  (state: AppState) => state.adminUI.sessions,
+  (state: AppState) => state.adminUI?.sessions,
   (state: SessionsState) => {
-    if (!state.data) {
+    if (!state?.data) {
       return null;
     }
     return state.data.internal_app_name_prefix;
@@ -65,7 +56,7 @@ export const selectAppName = createSelector(
 );
 
 export const selectSortSetting = createSelector(
-  (state: AppState) => state.adminUI.localStorage,
+  (state: AppState) => state.adminUI?.localStorage,
   localStorage => localStorage["sortSetting/SessionsPage"],
 );
 
@@ -73,7 +64,7 @@ export const selectColumns = createSelector(
   localStorageSelector,
   localStorage =>
     localStorage["showColumns/SessionsPage"]
-      ? localStorage["showColumns/SessionsPage"].split(",")
+      ? localStorage["showColumns/SessionsPage"]?.split(",")
       : null,
 );
 
@@ -87,7 +78,7 @@ export const SessionsPageConnected = withRouter(
     (state: AppState, props: RouteComponentProps) => ({
       sessions: selectSessions(state),
       internalAppNamePrefix: selectAppName(state),
-      sessionsError: state.adminUI.sessions.lastError,
+      sessionsError: state.adminUI?.sessions.lastError,
       sortSetting: selectSortSetting(state),
       columns: selectColumns(state),
       filters: selectFilters(state),
@@ -143,7 +134,7 @@ export const SessionsPageConnected = withRouter(
           analyticsActions.track({
             name: "Filter Clicked",
             page: "Sessions",
-            filterName: "app",
+            filterName: "filters",
             value: value.toString(),
           }),
         );

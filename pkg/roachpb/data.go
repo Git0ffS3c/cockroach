@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/keysbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -43,13 +44,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 const (
 	localPrefixByte = '\x01'
 	// LocalMaxByte is the end of the local key range.
 	LocalMaxByte = '\x02'
+	// PrevishKeyLength is a reasonable key length to use for Key.Prevish(),
+	// typically when peeking to the left of a known key. We want this to be as
+	// tight as possible, since it can e.g. be used for latch spans. However, the
+	// exact previous key has infinite length, so we assume that most keys are
+	// less than 1024 bytes, or have a fairly unique 1024-byte prefix.
+	PrevishKeyLength = 1024
 )
 
 var (
@@ -69,12 +76,23 @@ var (
 
 	// PrettyPrintKey prints a key in human readable format. It's
 	// implemented in package git.com/cockroachdb/cockroach/keys to avoid
-	// package circle import.
+	// circular package import dependencies (see keys.PrettyPrint for
+	// implementation).
 	// valDirs correspond to the encoding direction of each encoded value
 	// in the key (if known). If left unspecified, the default encoding
 	// direction for each value type is used (see
 	// encoding.go:prettyPrintFirstValue).
+	// See SafeFormatKey for a redaction-safe implementation.
 	PrettyPrintKey func(valDirs []encoding.Direction, key Key) string
+
+	// SafeFormatKey is the generalized redaction function used to redact pretty
+	// printed keys. It's implemented in git.com/cockroachdb/cockroach/keys to
+	// avoid circular package import dependencies (see keys.SafeFormat for
+	// implementation).
+	// valDirs correspond to the encoding direction of each encoded value
+	// in the key (if known). If left unspecified, the default encoding
+	// direction for each value type is used (see encoding.go:prettyPrintFirstValue).
+	SafeFormatKey func(w redact.SafeWriter, valDirs []encoding.Direction, key Key)
 
 	// PrettyPrintRange prints a key range in human readable format. It's
 	// implemented in package git.com/cockroachdb/cockroach/keys to avoid
@@ -127,13 +145,20 @@ func (rk RKey) PrefixEnd() RKey {
 	return RKey(keysbase.PrefixEnd(rk))
 }
 
+// SafeFormat - see Key.SafeFormat.
+func (rk RKey) SafeFormat(w redact.SafePrinter, r rune) {
+	rk.AsRawKey().SafeFormat(w, r)
+}
+
 func (rk RKey) String() string {
 	return Key(rk).String()
 }
 
-// StringWithDirs - see Key.String.WithDirs.
-func (rk RKey) StringWithDirs(valDirs []encoding.Direction, maxLen int) string {
-	return Key(rk).StringWithDirs(valDirs, maxLen)
+// StringWithDirs - see Key.StringWithDirs.
+func (rk RKey) StringWithDirs(valDirs []encoding.Direction) string {
+	var buf redact.StringBuilder
+	Key(rk).StringWithDirs(&buf, valDirs)
+	return buf.String()
 }
 
 // Key is a custom type for a byte string in proto
@@ -155,6 +180,21 @@ func (k Key) Clone() Key {
 // value should be treated as immutable after.
 func (k Key) Next() Key {
 	return Key(encoding.BytesNext(k))
+}
+
+// Prevish returns a previous key in lexicographic sort order. It is impossible
+// in general to find the exact immediate predecessor key, because it has an
+// infinite number of 0xff bytes at the end, so this returns the nearest
+// previous key right-padded with 0xff up to length bytes. An infinite number of
+// keys may exist between Key and Key.Prevish(), as keys have unbounded length.
+// This also implies that k.Prevish().IsPrev(k) will often be false.
+//
+// PrevishKeyLength can be used as a reasonable length in most situations.
+//
+// The method may only take a shallow copy of the Key, so both the receiver and
+// the return value should be treated as immutable after.
+func (k Key) Prevish(length int) Key {
+	return Key(encoding.BytesPrevish(k, length))
 }
 
 // IsPrev is a more efficient version of k.Next().Equal(m).
@@ -181,30 +221,31 @@ func (k Key) Compare(b Key) int {
 	return bytes.Compare(k, b)
 }
 
+// SafeFormat implements the redact.SafeFormatter interface.
+func (k Key) SafeFormat(w redact.SafePrinter, _ rune) {
+	SafeFormatKey(w, nil /* valDirs */, k)
+}
+
 // String returns a string-formatted version of the key.
 func (k Key) String() string {
-	return k.StringWithDirs(nil /* valDirs */, 0 /* maxLen */)
+	return redact.StringWithoutMarkers(k)
 }
 
 // StringWithDirs is the value encoding direction-aware version of String.
 //
 // Args:
-// valDirs: The direction for the key's components, generally needed for correct
-// 	decoding. If nil, the values are pretty-printed with default encoding
-// 	direction.
-// maxLen: If not 0, only the first maxLen chars from the decoded key are
-//   returned, plus a "..." suffix.
-func (k Key) StringWithDirs(valDirs []encoding.Direction, maxLen int) string {
-	var s string
+//
+//	valDirs: The direction for the key's components, generally needed for
+//	correct decoding. If nil, the values are pretty-printed with default
+//	encoding direction.
+//
+//	returned, plus a "..." suffix.
+func (k Key) StringWithDirs(buf *redact.StringBuilder, valDirs []encoding.Direction) {
 	if PrettyPrintKey != nil {
-		s = PrettyPrintKey(valDirs, k)
+		buf.Print(PrettyPrintKey(valDirs, k))
 	} else {
-		s = fmt.Sprintf("%q", []byte(k))
+		buf.Printf("%q", []byte(k))
 	}
-	if maxLen != 0 && len(s) > maxLen {
-		return s[0:maxLen] + "..."
-	}
-	return s
 }
 
 // Format implements the fmt.Formatter interface.
@@ -855,12 +896,10 @@ func (ct InternalCommitTrigger) Kind() redact.SafeString {
 		return "change-replicas"
 	case ct.ModifiedSpanTrigger != nil:
 		switch {
-		case ct.ModifiedSpanTrigger.SystemConfigSpan:
-			return "modified-span (system-config)"
 		case ct.ModifiedSpanTrigger.NodeLivenessSpan != nil:
 			return "modified-span (node-liveness)"
 		default:
-			panic("unknown modified-span commit trigger kind")
+			panic(fmt.Sprintf("unknown modified-span commit trigger kind %v", ct))
 		}
 	case ct.StickyBitTrigger != nil:
 		return "sticky-bit"
@@ -897,6 +936,7 @@ func (TransactionStatus) SafeValue() {}
 func MakeTransaction(
 	name string,
 	baseKey Key,
+	isoLevel isolation.Level,
 	userPriority UserPriority,
 	now hlc.Timestamp,
 	maxOffsetNs int64,
@@ -912,6 +952,7 @@ func MakeTransaction(
 		TxnMeta: enginepb.TxnMeta{
 			Key:               baseKey,
 			ID:                u,
+			IsoLevel:          isoLevel,
 			WriteTimestamp:    now,
 			MinTimestamp:      now,
 			Priority:          MakePriority(userPriority),
@@ -929,6 +970,7 @@ func MakeTransaction(
 // occurred, i.e. the maximum of ReadTimestamp and LastHeartbeat.
 func (t Transaction) LastActive() hlc.Timestamp {
 	ts := t.LastHeartbeat
+	// TODO(nvanbenschoten): remove this when we remove synthetic timestamps.
 	if !t.ReadTimestamp.Synthetic {
 		ts.Forward(t.ReadTimestamp)
 	}
@@ -982,6 +1024,35 @@ func (t *Transaction) AssertInitialized(ctx context.Context) {
 		log.Fatalf(ctx, "uninitialized txn: %s", *t)
 	}
 }
+
+// UserPriority is a custom type for transaction's user priority.
+type UserPriority float64
+
+func (up UserPriority) String() string {
+	switch up {
+	case MinUserPriority:
+		return "low"
+	case UnspecifiedUserPriority, NormalUserPriority:
+		return "normal"
+	case MaxUserPriority:
+		return "high"
+	default:
+		return fmt.Sprintf("%g", float64(up))
+	}
+}
+
+const (
+	// MinUserPriority is the minimum allowed user priority.
+	MinUserPriority UserPriority = 0.001
+	// UnspecifiedUserPriority means NormalUserPriority.
+	UnspecifiedUserPriority UserPriority = 0
+	// NormalUserPriority is set to 1, meaning ops run through the database
+	// are all given equal weight when a random priority is chosen. This can
+	// be set specifically via client.NewDBWithPriority().
+	NormalUserPriority UserPriority = 1
+	// MaxUserPriority is the maximum allowed user priority.
+	MaxUserPriority UserPriority = 1000
+)
 
 // MakePriority generates a random priority value, biased by the specified
 // userPriority. If userPriority=100, the random priority will be 100x more
@@ -1129,6 +1200,7 @@ func (t *Transaction) Update(o *Transaction) {
 	if len(t.Key) == 0 {
 		t.Key = o.Key
 	}
+	t.IsoLevel = o.IsoLevel
 
 	// Update epoch-scoped state, depending on the two transactions' epochs.
 	if t.Epoch < o.Epoch {
@@ -1320,28 +1392,29 @@ func (t *Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.ClockTimestamp, b
 //
 // Additionally, the caller must ensure:
 //
-// 1) if the new range overlaps with some range in the list, then it
-//    also overlaps with every subsequent range in the list.
+//  1. if the new range overlaps with some range in the list, then it
+//     also overlaps with every subsequent range in the list.
 //
-// 2) the new range's "end" seqnum is larger or equal to the "end"
-//    seqnum of the last element in the list.
+//  2. the new range's "end" seqnum is larger or equal to the "end"
+//     seqnum of the last element in the list.
 //
 // For example:
-//     current list [3 5] [10 20] [22 24]
-//     new item:    [8 26]
-//     final list:  [3 5] [8 26]
 //
-//     current list [3 5] [10 20] [22 24]
-//     new item:    [28 32]
-//     final list:  [3 5] [10 20] [22 24] [28 32]
+//	current list [3 5] [10 20] [22 24]
+//	new item:    [8 26]
+//	final list:  [3 5] [8 26]
+//
+//	current list [3 5] [10 20] [22 24]
+//	new item:    [28 32]
+//	final list:  [3 5] [10 20] [22 24] [28 32]
 //
 // This corresponds to savepoints semantics:
 //
-// - Property 1 says that a rollback to an earlier savepoint
-//   rolls back over all writes following that savepoint.
-// - Property 2 comes from that the new range's 'end' seqnum is the
-//   current write seqnum and thus larger than or equal to every
-//   previously seen value.
+//   - Property 1 says that a rollback to an earlier savepoint
+//     rolls back over all writes following that savepoint.
+//   - Property 2 comes from that the new range's 'end' seqnum is the
+//     current write seqnum and thus larger than or equal to every
+//     previously seen value.
 func (t *Transaction) AddIgnoredSeqNumRange(newRange enginepb.IgnoredSeqNumRange) {
 	// Truncate the list at the last element not included in the new range.
 
@@ -1381,132 +1454,6 @@ func (tr *TransactionRecord) AsTransaction() Transaction {
 	t.InFlightWrites = tr.InFlightWrites
 	t.IgnoredSeqNums = tr.IgnoredSeqNums
 	return t
-}
-
-// PrepareTransactionForRetry returns a new Transaction to be used for retrying
-// the original Transaction. Depending on the error, this might return an
-// already-existing Transaction with an incremented epoch, or a completely new
-// Transaction.
-//
-// The caller should generally check that the error was meant for this
-// Transaction before calling this.
-//
-// pri is the priority that should be used when giving the restarted transaction
-// the chance to get a higher priority. Not used when the transaction is being
-// aborted.
-//
-// In case retryErr tells us that a new Transaction needs to be created,
-// isolation and name help initialize this new transaction.
-func PrepareTransactionForRetry(
-	ctx context.Context, pErr *Error, pri UserPriority, clock *hlc.Clock,
-) Transaction {
-	if pErr.TransactionRestart() == TransactionRestart_NONE {
-		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
-	}
-
-	if pErr.GetTxn() == nil {
-		log.Fatalf(ctx, "missing txn for retryable error: %s", pErr)
-	}
-
-	txn := *pErr.GetTxn()
-	aborted := false
-	switch tErr := pErr.GetDetail().(type) {
-	case *TransactionAbortedError:
-		// The txn coming with a TransactionAbortedError is not supposed to be used
-		// for the restart. Instead, a brand new transaction is created.
-		aborted = true
-		// TODO(andrei): Should we preserve the ObservedTimestamps across the
-		// restart?
-		errTxnPri := txn.Priority
-		// Start the new transaction at the current time from the local clock.
-		// The local hlc should have been advanced to at least the error's
-		// timestamp already.
-		now := clock.NowAsClockTimestamp()
-		txn = MakeTransaction(
-			txn.Name,
-			nil, // baseKey
-			// We have errTxnPri, but this wants a UserPriority. So we're going to
-			// overwrite the priority below.
-			NormalUserPriority,
-			now.ToTimestamp(),
-			clock.MaxOffset().Nanoseconds(),
-			txn.CoordinatorNodeID,
-		)
-		// Use the priority communicated back by the server.
-		txn.Priority = errTxnPri
-	case *ReadWithinUncertaintyIntervalError:
-		txn.WriteTimestamp.Forward(tErr.RetryTimestamp())
-	case *TransactionPushError:
-		// Increase timestamp if applicable, ensuring that we're just ahead of
-		// the pushee.
-		txn.WriteTimestamp.Forward(tErr.PusheeTxn.WriteTimestamp)
-		txn.UpgradePriority(tErr.PusheeTxn.Priority - 1)
-	case *TransactionRetryError:
-		// Transaction.Timestamp has already been forwarded to be ahead of any
-		// timestamp cache entries or newer versions which caused the restart.
-		if tErr.Reason == RETRY_SERIALIZABLE {
-			// For RETRY_SERIALIZABLE case, we want to bump timestamp further than
-			// timestamp cache.
-			// This helps transactions that had their commit timestamp fixed (See
-			// roachpb.Transaction.CommitTimestampFixed for details on when it happens)
-			// or transactions that hit read-write contention and can't bump
-			// read timestamp because of later writes.
-			// Upon retry, we want those transactions to restart on now() instead of
-			// closed ts to give them some time to complete without a need to refresh
-			// read spans yet again and possibly fail.
-			// The tradeoff here is that transactions that failed because they were
-			// waiting on locks or were slowed down in their first epoch for any other
-			// reason (e.g. lease transfers, network congestion, node failure, etc.)
-			// would have a chance to retry and succeed, but transactions that are
-			// just slow would still retry indefinitely and delay transactions that
-			// try to write to the keys this transaction reads because reads are not
-			// in the past anymore.
-			now := clock.Now()
-			txn.WriteTimestamp.Forward(now)
-		}
-	case *WriteTooOldError:
-		// Increase the timestamp to the ts at which we've actually written.
-		txn.WriteTimestamp.Forward(tErr.RetryTimestamp())
-	default:
-		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
-	}
-	if !aborted {
-		if txn.Status.IsFinalized() {
-			log.Fatalf(ctx, "transaction unexpectedly finalized in (%T): %s", pErr.GetDetail(), pErr)
-		}
-		txn.Restart(pri, txn.Priority, txn.WriteTimestamp)
-	}
-	return txn
-}
-
-// TransactionRefreshTimestamp returns whether the supplied error is a retry
-// error that can be discarded if the transaction in the error is refreshed. If
-// true, the function returns the timestamp that the Transaction object should
-// be refreshed at in order to discard the error and avoid a restart.
-func TransactionRefreshTimestamp(pErr *Error) (bool, hlc.Timestamp) {
-	txn := pErr.GetTxn()
-	if txn == nil {
-		return false, hlc.Timestamp{}
-	}
-	timestamp := txn.WriteTimestamp
-	switch err := pErr.GetDetail().(type) {
-	case *TransactionRetryError:
-		if err.Reason != RETRY_SERIALIZABLE && err.Reason != RETRY_WRITE_TOO_OLD {
-			return false, hlc.Timestamp{}
-		}
-	case *WriteTooOldError:
-		// TODO(andrei): Chances of success for on write-too-old conditions might be
-		// usually small: if our txn previously read the key that generated this
-		// error, obviously the refresh will fail. It might be worth trying to
-		// detect these cases and save the futile attempt; we'd need to have access
-		// to the key that generated the error.
-		timestamp.Forward(err.RetryTimestamp())
-	case *ReadWithinUncertaintyIntervalError:
-		timestamp.Forward(err.RetryTimestamp())
-	default:
-		return false, hlc.Timestamp{}
-	}
-	return true, timestamp
 }
 
 // Replicas returns all of the replicas present in the descriptor after this
@@ -1550,7 +1497,7 @@ func confChangeImpl(
 	checkExists := func(in ReplicaDescriptor) error {
 		for _, rDesc := range replicas {
 			if rDesc.ReplicaID == in.ReplicaID {
-				if a, b := in.GetType(), rDesc.GetType(); a != b {
+				if in.Type != rDesc.Type {
 					return errors.Errorf("have %s, but descriptor has %s", in, rDesc)
 				}
 				return nil
@@ -1573,7 +1520,7 @@ func confChangeImpl(
 			NodeID: uint64(rDesc.ReplicaID),
 		})
 
-		switch rDesc.GetType() {
+		switch rDesc.Type {
 		case VOTER_OUTGOING:
 			// If a voter is removed through joint consensus, it will
 			// be turned into an outgoing voter first.
@@ -1613,7 +1560,7 @@ func confChangeImpl(
 				return nil, err
 			}
 		default:
-			return nil, errors.Errorf("can't remove replica in state %v", rDesc.GetType())
+			return nil, errors.Errorf("can't remove replica in state %v", rDesc.Type)
 		}
 	}
 
@@ -1626,7 +1573,7 @@ func confChangeImpl(
 		}
 
 		var changeType raftpb.ConfChangeType
-		switch rDesc.GetType() {
+		switch rDesc.Type {
 		case VOTER_FULL:
 			// We're adding a new voter.
 			changeType = raftpb.ConfChangeAddNode
@@ -1645,7 +1592,7 @@ func confChangeImpl(
 			// A voter that is demoting was just removed and re-added in the
 			// `removals` handler. We should not see it again here.
 			// A voter that's outgoing similarly has no reason to show up here.
-			return nil, errors.Errorf("can't add replica in state %v", rDesc.GetType())
+			return nil, errors.Errorf("can't add replica in state %v", rDesc.Type)
 		}
 		sl = append(sl, raftpb.ConfChangeSingle{
 			Type:   changeType,
@@ -1659,7 +1606,7 @@ func confChangeImpl(
 	// descriptor already.
 	var enteringJoint bool
 	for _, rDesc := range replicas {
-		switch rDesc.GetType() {
+		switch rDesc.Type {
 		case VOTER_INCOMING, VOTER_OUTGOING, VOTER_DEMOTING_LEARNER, VOTER_DEMOTING_NON_VOTER:
 			enteringJoint = true
 		default:
@@ -1886,13 +1833,8 @@ func (l Lease) Equivalent(newL Lease) bool {
 	// Ignore the ReplicaDescriptor's type. This shouldn't affect lease
 	// equivalency because Raft state shouldn't be factored into the state of a
 	// Replica's lease. We don't expect a leaseholder to ever become a LEARNER
-	// replica, but that also shouldn't prevent it from extending its lease. The
-	// code also avoids a potential bug where an unset ReplicaType and a set
-	// VOTER ReplicaType are considered distinct and non-equivalent.
-	//
-	// Change this line to the following when ReplicaType becomes non-nullable:
-	//  l.Replica.Type, newL.Replica.Type = 0, 0
-	l.Replica.Type, newL.Replica.Type = nil, nil
+	// replica, but that also shouldn't prevent it from extending its lease.
+	l.Replica.Type, newL.Replica.Type = 0, 0
 	// If both leases are epoch-based, we must dereference the epochs
 	// and then set to nil.
 	switch l.Type() {
@@ -2068,6 +2010,11 @@ func (ls LockStateInfo) String() string {
 	return redact.StringWithoutMarkers(ls)
 }
 
+// Clone returns a copy of the span.
+func (s Span) Clone() Span {
+	return Span{Key: s.Key.Clone(), EndKey: s.EndKey.Clone()}
+}
+
 // EqualValue is Equal.
 //
 // TODO(tbg): remove this passthrough.
@@ -2081,11 +2028,11 @@ func (s Span) Equal(o Span) bool {
 }
 
 // Overlaps returns true WLOG for span A and B iff:
-// 1. Both spans contain one key (just the start key) and they are equal; or
-// 2. The span with only one key is contained inside the other span; or
-// 3. The end key of span A is strictly greater than the start key of span B
-//    and the end key of span B is strictly greater than the start key of span
-//    A.
+//  1. Both spans contain one key (just the start key) and they are equal; or
+//  2. The span with only one key is contained inside the other span; or
+//  3. The end key of span A is strictly greater than the start key of span B
+//     and the end key of span B is strictly greater than the start key of span
+//     A.
 func (s Span) Overlaps(o Span) bool {
 	if !s.Valid() || !o.Valid() {
 		return false
@@ -2317,6 +2264,24 @@ type RSpan struct {
 	Key, EndKey RKey
 }
 
+// KeySpan returns the Span with the StartKey forwarded to LocalMax, if necessary.
+//
+// See: https://github.com/cockroachdb/cockroach/issues/95055
+func (rs RSpan) KeySpan() RSpan {
+	start := rs.Key
+	if start.Equal(RKeyMin) {
+		// The first range in the keyspace is declared to start at KeyMin (the
+		// lowest possible key). That is a lie, however, since the local key space
+		// ([LocalMin,LocalMax)) doesn't belong to this range; it doesn't belong to
+		// any range in particular.
+		start = RKey(LocalMax)
+	}
+	return RSpan{
+		Key:    start,
+		EndKey: rs.EndKey,
+	}
+}
+
 // Equal compares for equality.
 func (rs RSpan) Equal(o RSpan) bool {
 	return rs.Key.Equal(o.Key) && rs.EndKey.Equal(o.EndKey)
@@ -2355,20 +2320,20 @@ func (rs RSpan) String() string {
 }
 
 // Intersect returns the intersection of the current span and the
-// descriptor's range. Returns an error if the span and the
-// descriptor's range do not overlap.
-func (rs RSpan) Intersect(desc *RangeDescriptor) (RSpan, error) {
-	if !rs.Key.Less(desc.EndKey) || !desc.StartKey.Less(rs.EndKey) {
-		return rs, errors.Errorf("span and descriptor's range do not overlap: %s vs %s", rs, desc)
+// given range. Returns an error if the span and the range do not
+// overlap.
+func (rs RSpan) Intersect(rspan RSpan) (RSpan, error) {
+	if !rs.Key.Less(rspan.EndKey) || !rspan.Key.Less(rs.EndKey) {
+		return rs, errors.Errorf("spans do not overlap: %s vs %s", rs, rspan)
 	}
 
 	key := rs.Key
-	if key.Less(desc.StartKey) {
-		key = desc.StartKey
+	if key.Less(rspan.Key) {
+		key = rspan.Key
 	}
 	endKey := rs.EndKey
-	if !desc.ContainsKeyRange(desc.StartKey, endKey) {
-		endKey = desc.EndKey
+	if !rspan.ContainsKeyRange(rspan.Key, endKey) {
+		endKey = rspan.EndKey
 	}
 	return RSpan{key, endKey}, nil
 }
@@ -2487,8 +2452,9 @@ var _ = (SequencedWriteBySeq{}).Find
 
 func init() {
 	// Inject the format dependency into the enginepb package.
-	enginepb.FormatBytesAsKey = func(k []byte) string { return Key(k).String() }
-	enginepb.FormatBytesAsValue = func(v []byte) string { return Value{RawBytes: v}.PrettyPrint() }
+	enginepb.FormatBytesAsKey = func(k []byte) redact.RedactableString {
+		return redact.Sprint(Key(k))
+	}
 }
 
 // SafeValue implements the redact.SafeValue interface.
@@ -2504,4 +2470,14 @@ func (r *RowCount) Add(other RowCount) {
 	r.DataSize += other.DataSize
 	r.Rows += other.Rows
 	r.IndexEntries += other.IndexEntries
+}
+
+func (tid *TenantID) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var id uint64
+	if err := unmarshal(&id); err == nil {
+		tid.InternalValue = id
+		return nil
+	} else {
+		return unmarshal(tid)
+	}
 }

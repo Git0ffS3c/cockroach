@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	tu "github.com/cockroachdb/cockroach/pkg/testutils"
+	tu "github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -38,18 +38,17 @@ import (
 //
 //   - predtest vars=(var1 type1, var2 type2, ...)"
 //
-//   The vars argument sets the names and types of the variables in the
-//   expressions.
+//     The vars argument sets the names and types of the variables in the
+//     expressions.
 //
-//   The test input must be in the format:
+//     The test input must be in the format:
 //
-//      [filter expression]
-//      =>
-//      [predicate expression]
+//     [filter expression]
+//     =>
+//     [predicate expression]
 //
-//   The "=>" symbol denotes implication. For example, "a => b" tests if
-//   expression a implies expression b.
-//
+//     The "=>" symbol denotes implication. For example, "a => b" tests if
+//     expression a implies expression b.
 func TestImplicator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -61,7 +60,7 @@ func TestImplicator(t *testing.T) {
 			var err error
 
 			var f norm.Factory
-			f.Init(&evalCtx, nil /* catalog */)
+			f.Init(context.Background(), &evalCtx, nil /* catalog */)
 			md := f.Metadata()
 
 			if d.Cmd != "predtest" {
@@ -114,8 +113,9 @@ func TestImplicator(t *testing.T) {
 				buf.WriteString("none")
 			} else {
 				execBld := execbuilder.New(
-					nil /* factory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
+					context.Background(), nil /* factory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
 					&remainingFilters, &evalCtx, false, /* allowAutoCommit */
+					false, /* isANSIDML */
 				)
 				expr, err := execBld.BuildScalar()
 				if err != nil {
@@ -167,13 +167,13 @@ func BenchmarkImplicator(b *testing.B) {
 		{
 			name:    "single-exact-match-extra-filters",
 			vars:    "a int, b int, c int, d int, e int",
-			filters: "a < 0 AND b > 0 AND c >= 10 AND d = 4 AND @5 = 5",
+			filters: "a < 0 AND b > 0 AND c >= 10 AND d = 4 AND e = 5",
 			pred:    "c >= 10",
 		},
 		{
 			name:    "single-inexact-match-extra-filters",
 			vars:    "a int, b int, c int, d int, e int",
-			filters: "a < 0 AND b > 0 AND c >= 10 AND d = 4 AND @5 = 5",
+			filters: "a < 0 AND b > 0 AND c >= 10 AND d = 4 AND e = 5",
 			pred:    "c > 0",
 		},
 		{
@@ -268,7 +268,7 @@ func BenchmarkImplicator(b *testing.B) {
 
 	for _, tc := range testCases {
 		var f norm.Factory
-		f.Init(&evalCtx, nil /* catalog */)
+		f.Init(context.Background(), &evalCtx, nil /* catalog */)
 		md := f.Metadata()
 
 		// Parse the variable types.
@@ -341,7 +341,8 @@ func makeFilters(
 	}
 
 	// Create a fake Select and input so that normalization rules are run.
-	p := &props.Relational{OutputCols: cols, Cardinality: card, Stats: stats}
+	p := &props.Relational{OutputCols: cols, Cardinality: card}
+	*p.Statistics() = stats
 	fakeRel := f.ConstructFakeRel(&memo.FakeRelPrivate{Props: p})
 	sel := f.ConstructSelect(fakeRel, filters)
 

@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
@@ -43,7 +43,9 @@ type splitAndScatterer interface {
 	scatter(ctx context.Context, codec keys.SQLCodec, scatterKey roachpb.Key) (roachpb.NodeID, error)
 }
 
-type noopSplitAndScatterer struct{}
+type noopSplitAndScatterer struct {
+	scatterNode roachpb.NodeID
+}
 
 var _ splitAndScatterer = noopSplitAndScatterer{}
 
@@ -56,7 +58,7 @@ func (n noopSplitAndScatterer) split(_ context.Context, _ keys.SQLCodec, _ roach
 func (n noopSplitAndScatterer) scatter(
 	_ context.Context, _ keys.SQLCodec, _ roachpb.Key,
 ) (roachpb.NodeID, error) {
-	return 0, nil
+	return n.scatterNode, nil
 }
 
 // dbSplitAndScatter is the production implementation of this processor's
@@ -124,8 +126,8 @@ func (s dbSplitAndScatterer) scatter(
 	}
 
 	log.VEventf(ctx, 1, "scattering new key %+v", newScatterKey)
-	req := &roachpb.AdminScatterRequest{
-		RequestHeader: roachpb.RequestHeaderFromSpan(roachpb.Span{
+	req := &kvpb.AdminScatterRequest{
+		RequestHeader: kvpb.RequestHeaderFromSpan(roachpb.Span{
 			Key:    newScatterKey,
 			EndKey: newScatterKey.Next(),
 		}),
@@ -155,15 +157,12 @@ func (s dbSplitAndScatterer) scatter(
 		return 0, nil
 	}
 
-	return s.findDestination(res.(*roachpb.AdminScatterResponse)), nil
+	return s.findDestination(res.(*kvpb.AdminScatterResponse)), nil
 }
 
 // findDestination returns the node ID of the node of the destination of the
 // AdminScatter request. If the destination cannot be found, 0 is returned.
-func (s dbSplitAndScatterer) findDestination(res *roachpb.AdminScatterResponse) roachpb.NodeID {
-	// A request from a 20.1 node will not have a RangeInfos with a lease.
-	// For this mixed-version state, we'll report the destination as node 0
-	// and suffer a bit of inefficiency.
+func (s dbSplitAndScatterer) findDestination(res *kvpb.AdminScatterResponse) roachpb.NodeID {
 	if len(res.RangeInfos) > 0 {
 		// If the lease is not populated, we return the 0 value anyway. We receive 1
 		// RangeInfo per range that was scattered. Since we send a scatter request
@@ -193,7 +192,6 @@ type splitAndScatterProcessor struct {
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.SplitAndScatterSpec
-	output  execinfra.RowReceiver
 
 	scatterer splitAndScatterer
 	// cancelScatterAndWaitForWorker cancels the scatter goroutine and waits for
@@ -209,16 +207,12 @@ type splitAndScatterProcessor struct {
 var _ execinfra.Processor = &splitAndScatterProcessor{}
 
 func newSplitAndScatterProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.SplitAndScatterSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
-
-	if spec.Validation != jobspb.RestoreValidation_DefaultRestore {
-		return nil, errors.New("Split and Scatter Processor does not support validation yet")
-	}
 
 	numEntries := 0
 	for _, chunk := range spec.Chunks {
@@ -232,17 +226,20 @@ func newSplitAndScatterProcessor(
 		return nil, err
 	}
 
-	scatterer := makeSplitAndScatterer(db, kr)
+	scatterer := makeSplitAndScatterer(db.KV(), kr)
+	if spec.ValidateOnly {
+		nodeID, _ := flowCtx.NodeID.OptionalNodeID()
+		scatterer = noopSplitAndScatterer{nodeID}
+	}
 	ssp := &splitAndScatterProcessor{
 		flowCtx:   flowCtx,
 		spec:      spec,
-		output:    output,
 		scatterer: scatterer,
 		// Large enough so that it never blocks.
 		doneScatterCh:     make(chan entryNode, numEntries),
 		routingDatumCache: make(map[roachpb.NodeID]rowenc.EncDatum),
 	}
-	if err := ssp.Init(ssp, post, splitAndScatterOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	if err := ssp.Init(ctx, ssp, post, splitAndScatterOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: nil, // there are no inputs to drain
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -375,6 +372,18 @@ func runSplitAndScatter(
 			if err != nil {
 				return err
 			}
+			if chunkDestination == 0 {
+				// If scatter failed to find a node for range ingestion, route the range
+				// to the node currently running the split and scatter processor.
+				if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); ok {
+					chunkDestination = nodeID
+					log.Warningf(ctx, "scatter returned node 0. "+
+						"Route span starting at %s to current node %v", scatterKey, nodeID)
+				} else {
+					log.Warningf(ctx, "scatter returned node 0. "+
+						"Route span starting at %s to default stream", scatterKey)
+				}
+			}
 
 			sc := scatteredChunk{
 				destination: chunkDestination,
@@ -445,11 +454,11 @@ func routingSpanForSQLInstance(sqlInstanceID base.SQLInstanceID) ([]byte, []byte
 	startDatum, endDatum := routingDatumsForSQLInstance(sqlInstanceID)
 
 	startBytes, endBytes := make([]byte, 0), make([]byte, 0)
-	startBytes, err := startDatum.Encode(splitAndScatterOutputTypes[0], &alloc, descpb.DatumEncoding_ASCENDING_KEY, startBytes)
+	startBytes, err := startDatum.Encode(splitAndScatterOutputTypes[0], &alloc, catenumpb.DatumEncoding_ASCENDING_KEY, startBytes)
 	if err != nil {
 		return nil, nil, err
 	}
-	endBytes, err = endDatum.Encode(splitAndScatterOutputTypes[0], &alloc, descpb.DatumEncoding_ASCENDING_KEY, endBytes)
+	endBytes, err = endDatum.Encode(splitAndScatterOutputTypes[0], &alloc, catenumpb.DatumEncoding_ASCENDING_KEY, endBytes)
 	if err != nil {
 		return nil, nil, err
 	}

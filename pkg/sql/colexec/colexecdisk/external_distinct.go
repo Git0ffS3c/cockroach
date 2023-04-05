@@ -36,7 +36,8 @@ func NewExternalDistinct(
 	createDiskBackedSorter DiskBackedSorterConstructor,
 	inMemUnorderedDistinct colexecop.Operator,
 	diskAcc *mon.BoundAccount,
-) colexecop.Operator {
+	converterMemAcc *mon.BoundAccount,
+) (colexecop.Operator, colexecop.Closer) {
 	distinctSpec := args.Spec.Core.Distinct
 	distinctCols := distinctSpec.DistinctColumns
 	inMemMainOpConstructor := func(partitionedInputs []*partitionerToOperator) colexecop.ResettableOperator {
@@ -99,6 +100,7 @@ func NewExternalDistinct(
 		inMemMainOpConstructor,
 		diskBackedFallbackOpConstructor,
 		diskAcc,
+		converterMemAcc,
 		numRequiredActivePartitions,
 	)
 	// The last thing we need to do is making sure that the output has the
@@ -111,13 +113,13 @@ func NewExternalDistinct(
 	outputOrdering := args.Spec.Core.Distinct.OutputOrdering
 	if len(outputOrdering.Columns) == 0 {
 		// No particular output ordering is required.
-		return ed
+		return ed, ed
 	}
 	// TODO(yuzefovich): the fact that we're planning an additional external
 	// sort isn't accounted for when considering the number file descriptors to
 	// acquire. Not urgent, but it should be fixed.
 	maxNumberActivePartitions := calculateMaxNumberActivePartitions(flowCtx, args, numRequiredActivePartitions)
-	return createDiskBackedSorter(ed, inputTypes, outputOrdering.Columns, maxNumberActivePartitions)
+	return createDiskBackedSorter(ed, inputTypes, outputOrdering.Columns, maxNumberActivePartitions), ed
 }
 
 // unorderedDistinctFilterer filters out tuples that are duplicates of the
@@ -158,7 +160,7 @@ func (f *unorderedDistinctFilterer) Next() coldata.Batch {
 			//
 			// See https://github.com/cockroachdb/cockroach/pull/58006#pullrequestreview-565859919
 			// for all the gory details.
-			f.ud.Ht.MaybeRepairAfterDistinctBuild()
+			f.ud.Ht.RepairAfterDistinctBuild()
 			f.ud.MaybeEmitErrorOnDup(f.ud.LastInputBatchOrigLen, batch.Length())
 			f.seenBatch = true
 			return batch

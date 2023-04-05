@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -30,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
@@ -44,7 +46,13 @@ func TestSystemConfigWatcher(t *testing.T, skipSecondary bool) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	s, sqlDB, kvDB := serverutils.StartServer(t,
+		base.TestServerArgs{
+			// Test runs against tenant, so no need to create the default
+			// test tenant.
+			DefaultTestTenant: base.TestTenantDisabled,
+		},
+	)
 	defer s.Stopper().Stop(ctx)
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 	// Shorten the closed timestamp duration as a cheeky way to check the
@@ -65,7 +73,7 @@ func TestSystemConfigWatcher(t *testing.T, skipSecondary bool) {
 			runTest(t, tenant, tenantDB, func(t *testing.T) []roachpb.KeyValue {
 				return kvtenant.GossipSubscriptionSystemConfigMask.Apply(
 					config.SystemConfigEntries{
-						Values: getSystemConfig(ctx, t, keys.SystemSQLCodec, kvDB),
+						Values: getSystemDescriptorAndZonesSpans(ctx, t, keys.SystemSQLCodec, kvDB),
 					},
 				).Values
 			})
@@ -96,13 +104,15 @@ func runTest(
 		if rs == nil {
 			return errors.New("nil config")
 		}
-		sc := getSystemConfig(ctx, t, execCfg.Codec, kvDB)
+		entries := protoutil.Clone(&rs.SystemConfigEntries).(*config.SystemConfigEntries)
+		sc := getSystemDescriptorAndZonesSpans(ctx, t, execCfg.Codec, kvDB)
 		if extraRows != nil {
 			sc = append(sc, extraRows(t)...)
 			sort.Sort(roachpb.KeyValueByKey(sc))
 		}
-		if !assert.Equal(noopT{}, sc, rs.Values) {
-			return errors.Errorf("mismatch: %v", pretty.Diff(sc, rs.Values))
+		sort.Sort(roachpb.KeyValueByKey(entries.Values))
+		if !assert.Equal(noopT{}, sc, entries.Values) {
+			return errors.Errorf("mismatch: %v", pretty.Diff(sc, entries.Values))
 		}
 		return nil
 	}
@@ -118,18 +128,29 @@ func runTest(
 	waitForEqual(t)
 }
 
-func getSystemConfig(
+func getSystemDescriptorAndZonesSpans(
 	ctx context.Context, t *testing.T, codec keys.SQLCodec, kvDB *kv.DB,
 ) []roachpb.KeyValue {
-	var ba roachpb.BatchRequest
-	ba.Add(roachpb.NewScan(
-		append(codec.TenantPrefix(), keys.SystemConfigSpan.Key...),
-		append(codec.TenantPrefix(), keys.SystemConfigSpan.EndKey...),
-		false, // forUpdate
-	))
-	br, pErr := kvDB.NonTransactionalSender().Send(ctx, ba)
-	require.NoError(t, pErr.GoError())
-	return br.Responses[0].GetScan().Rows
+	scanSpanForRows := func(startKey, endKey roachpb.Key) (rows []roachpb.KeyValue) {
+		ba := &kvpb.BatchRequest{}
+		ba.Add(
+			kvpb.NewScan(
+				append(codec.TenantPrefix(), startKey...),
+				append(codec.TenantPrefix(), endKey...),
+				false, // forUpdate
+			),
+		)
+		br, pErr := kvDB.NonTransactionalSender().Send(ctx, ba)
+		require.NoError(t, pErr.GoError())
+
+		rows = br.Responses[0].GetScan().Rows
+		return rows
+	}
+
+	return append(
+		scanSpanForRows(keys.SystemDescriptorTableSpan.Key, keys.SystemDescriptorTableSpan.EndKey),
+		scanSpanForRows(keys.SystemZonesTableSpan.Key, keys.SystemZonesTableSpan.EndKey)...,
+	)
 }
 
 type noopT struct{}

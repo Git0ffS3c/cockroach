@@ -19,17 +19,21 @@ import {
 } from "src/store/sessions";
 import { actions as terminateQueryActions } from "src/store/terminateQuery";
 import { actions as nodesActions } from "src/store/nodes";
+import { actions as localStorageActions } from "src/store/localStorage";
 import { actions as nodesLivenessActions } from "src/store/liveness";
 
 import { nodeDisplayNameByIDSelector } from "src/store/nodes";
 import { selectIsTenant } from "../store/uiConfig";
+import { TimeScale } from "src/timeScaleDropdown";
 
 export const SessionDetailsPageConnected = withRouter(
   connect(
     (state: AppState, props: RouteComponentProps) => ({
-      nodeNames: nodeDisplayNameByIDSelector(state),
+      nodeNames: selectIsTenant(state)
+        ? {}
+        : nodeDisplayNameByIDSelector(state),
       session: selectSession(state, props),
-      sessionError: state.adminUI.sessions.lastError,
+      sessionError: state.adminUI?.sessions.lastError,
       uiConfig: selectSessionDetailsUiConfig(state),
       isTenant: selectIsTenant(state),
     }),
@@ -39,6 +43,10 @@ export const SessionDetailsPageConnected = withRouter(
       cancelQuery: terminateQueryActions.terminateQuery,
       refreshNodes: nodesActions.refresh,
       refreshNodesLiveness: nodesLivenessActions.refresh,
+      setTimeScale: (ts: TimeScale) =>
+        localStorageActions.updateTimeScale({
+          value: ts,
+        }),
       onTerminateSessionClick: () =>
         analyticsActions.track({
           name: "Session Actions Clicked",

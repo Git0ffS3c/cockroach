@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
@@ -27,6 +28,7 @@ go_library(
         "//pkg/util/mon",
         "//pkg/util/syncutil",
         "//pkg/util/tracing",
+        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@io_opentelemetry_go_otel//attribute",
@@ -40,14 +42,15 @@ go_test(
         "input_sync_test.go",
         "routers_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":rowflow"],
     tags = ["no-remote"],
     deps = [
         "//pkg/base",
         "//pkg/keys",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/colinfo",
-        "//pkg/sql/catalog/descpb",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
         "//pkg/sql/randgen",
@@ -63,6 +66,7 @@ go_test(
         "//pkg/util/mon",
         "//pkg/util/randutil",
         "//pkg/util/tracing",
+        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_gogo_protobuf//types",
         "@com_github_stretchr_testify//require",
@@ -76,3 +80,5 @@ disallowed_imports_test(
         "//pkg/sql/distsql",
     ],
 )
+
+get_x_data(name = "get_x_data")

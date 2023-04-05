@@ -10,9 +10,7 @@
 
 import { Action } from "redux";
 import { PayloadAction } from "src/interfaces/action";
-import { google } from "@cockroachlabs/crdb-protobuf-client";
-import IDuration = google.protobuf.IDuration;
-import { TimeScale } from "src/redux/timeScale";
+import { TimeScale, api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 
 export const CREATE_STATEMENT_DIAGNOSTICS_REPORT =
   "cockroachui/statements/CREATE_STATEMENT_DIAGNOSTICS_REPORT";
@@ -33,24 +31,12 @@ export type DiagnosticsReportPayload = {
   statementFingerprint: string;
 };
 
-export type CreateStatementDiagnosticsReportPayload = {
-  statementFingerprint: string;
-  minExecLatency: IDuration;
-  expiresAfter: IDuration;
-};
-
 export function createStatementDiagnosticsReportAction(
-  statementFingerprint: string,
-  minExecLatency: IDuration,
-  expiresAfter: IDuration,
-): PayloadAction<CreateStatementDiagnosticsReportPayload> {
+  insertStmtDiagnosticsRequest: clusterUiApi.InsertStmtDiagnosticRequest,
+): PayloadAction<clusterUiApi.InsertStmtDiagnosticRequest> {
   return {
     type: CREATE_STATEMENT_DIAGNOSTICS_REPORT,
-    payload: {
-      statementFingerprint,
-      minExecLatency,
-      expiresAfter,
-    },
+    payload: insertStmtDiagnosticsRequest,
   };
 }
 
@@ -66,18 +52,12 @@ export function createStatementDiagnosticsReportFailedAction(): Action {
   };
 }
 
-export type CancelStatementDiagnosticsReportPayload = {
-  requestID: Long;
-};
-
 export function cancelStatementDiagnosticsReportAction(
-  requestID: Long,
-): PayloadAction<CancelStatementDiagnosticsReportPayload> {
+  cancelStmtDiagnosticsRequest: clusterUiApi.CancelStmtDiagnosticRequest,
+): PayloadAction<clusterUiApi.CancelStmtDiagnosticRequest> {
   return {
     type: CANCEL_STATEMENT_DIAGNOSTICS_REPORT,
-    payload: {
-      requestID,
-    },
+    payload: cancelStmtDiagnosticsRequest,
   };
 }
 
@@ -108,14 +88,16 @@ export function createOpenDiagnosticsModalAction(
         Combined Stats Actions
 ****************************************/
 
-export const SET_COMBINED_STATEMENTS_TIME_SCALE =
-  "cockroachui/statements/SET_COMBINED_STATEMENTS_TIME_SCALE";
+// Setting the timescale using this action type has some additional
+// side effects, see statementSagas.ts for the saga function:
+export const SET_GLOBAL_TIME_SCALE =
+  "cockroachui/statements/SET_GLOBAL_TIME_SCALE";
 
-export function setCombinedStatementsTimeScaleAction(
+export function setGlobalTimeScaleAction(
   ts: TimeScale,
 ): PayloadAction<TimeScale> {
   return {
-    type: SET_COMBINED_STATEMENTS_TIME_SCALE,
+    type: SET_GLOBAL_TIME_SCALE,
     payload: ts,
   };
 }

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -17,7 +18,6 @@ go_library(
         "//pkg/roachprod/logger",
         "//pkg/roachprod/vm",
         "//pkg/roachprod/vm/flagstub",
-        "//pkg/util/log",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_azure_azure_sdk_for_go//profiles/latest/compute/mgmt/compute",
@@ -33,3 +33,5 @@ go_library(
         "@org_golang_x_sync//errgroup",
     ],
 )
+
+get_x_data(name = "get_x_data")

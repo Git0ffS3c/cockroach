@@ -11,16 +11,21 @@
 package norm
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins" // register all builtins in builtins:init() for memo package
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -64,6 +69,7 @@ type AppliedRuleFunc func(ruleName opt.RuleName, source, target opt.Expr)
 // Optgen DSL, the factory always calls the `onConstruct` method as its last
 // step, in order to allow any custom manual code to execute.
 type Factory struct {
+	ctx     context.Context
 	evalCtx *eval.Context
 
 	// mem is the Memo data structure that the factory builds.
@@ -94,6 +100,10 @@ type Factory struct {
 	// methods. It is incremented when a constructor function is called, and
 	// decremented when a constructor function returns.
 	constructorStackDepth int
+
+	// disabledRules is a set of rules that are not allowed to run, used when
+	// rules are disabled during testing to prevent rule cycles.
+	disabledRules intsets.Fast
 }
 
 // maxConstructorStackDepth is the maximum allowed depth of a constructor call
@@ -109,7 +119,7 @@ const maxConstructorStackDepth = 10_000
 // Injecting this builtins dependency in the init function allows the memo
 // package to access builtin properties without importing the builtins package.
 func init() {
-	memo.GetBuiltinProperties = builtins.GetBuiltinProperties
+	memo.GetBuiltinProperties = builtinsregistry.GetBuiltinProperties
 }
 
 // Init initializes a Factory structure with a new, blank memo structure inside.
@@ -117,17 +127,18 @@ func init() {
 //
 // By default, a factory only constant-folds immutable operators; this can be
 // changed using FoldingControl().AllowStableFolds().
-func (f *Factory) Init(evalCtx *eval.Context, catalog cat.Catalog) {
+func (f *Factory) Init(ctx context.Context, evalCtx *eval.Context, catalog cat.Catalog) {
 	// Initialize (or reinitialize) the memo.
 	mem := f.mem
 	if mem == nil {
 		mem = &memo.Memo{}
 	}
-	mem.Init(evalCtx)
+	mem.Init(ctx, evalCtx)
 
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*f = Factory{
+		ctx:     ctx,
 		mem:     mem,
 		evalCtx: evalCtx,
 		catalog: catalog,
@@ -156,7 +167,16 @@ func (f *Factory) DetachMemo() *memo.Memo {
 	m := f.mem
 	f.mem = nil
 	m.Detach()
-	f.Init(f.evalCtx, nil /* catalog */)
+	f.Init(f.ctx, f.evalCtx, nil /* catalog */)
+	return m
+}
+
+// ReleaseMemo is just like DetachMemo but it doesn't call Detach on the memo
+// preserving any statistics information for explain purposes (distinct, null
+// count etc).
+func (f *Factory) ReleaseMemo() *memo.Memo {
+	m := f.mem
+	f.mem = nil
 	return m
 }
 
@@ -165,6 +185,35 @@ func (f *Factory) DetachMemo() *memo.Memo {
 // are applied).
 func (f *Factory) DisableOptimizations() {
 	f.NotifyOnMatchedRule(func(opt.RuleName) bool { return false })
+}
+
+// DisableOptimizationRules disables a specific set of transformation rules.
+func (f *Factory) DisableOptimizationRules(disabledRules intsets.Fast) {
+	f.NotifyOnMatchedRule(func(rule opt.RuleName) bool {
+		return !disabledRules.Contains(int(rule))
+	})
+}
+
+// DisableOptimizationRulesTemporarily disables a specific set transformation
+// rules during the execution of the given function fn. A MatchedRuleFunc
+// previously set by NotifyOnMatchedRule is not invoked during execution of fn,
+// but will be invoked for future rule matches after fn returns.
+func (f *Factory) DisableOptimizationRulesTemporarily(disabledRules intsets.Fast, fn func()) {
+	originalMatchedRule := f.matchedRule
+	f.DisableOptimizationRules(disabledRules)
+	fn()
+	f.matchedRule = originalMatchedRule
+}
+
+// DisableOptimizationsTemporarily disables all transformation rules during the
+// execution of the given function fn. A MatchedRuleFunc previously set by
+// NotifyOnMatchedRule is not invoked during execution of fn, but will be
+// invoked for future rule matches after fn returns.
+func (f *Factory) DisableOptimizationsTemporarily(fn func()) {
+	originalMatchedRule := f.matchedRule
+	f.DisableOptimizations()
+	fn()
+	f.matchedRule = originalMatchedRule
 }
 
 // NotifyOnMatchedRule sets a callback function which is invoked each time a
@@ -181,6 +230,14 @@ func (f *Factory) NotifyOnMatchedRule(matchedRule MatchedRuleFunc) {
 // no further notifications are sent.
 func (f *Factory) NotifyOnAppliedRule(appliedRule AppliedRuleFunc) {
 	f.appliedRule = appliedRule
+}
+
+// SetDisabledRules is used to prevent normalization rule cycles when rules are
+// disabled during testing. SetDisabledRules does not prevent rules from
+// matching - rather, it notifies the Factory that rules have been prevented
+// from matching using NotifyOnMatchedRule.
+func (f *Factory) SetDisabledRules(disabledRules intsets.Fast) {
+	f.disabledRules = disabledRules
 }
 
 // Memo returns the memo structure that the factory is operating upon.
@@ -221,17 +278,17 @@ func (f *Factory) EvalContext() *eval.Context {
 //
 // Sample usage:
 //
-//   var replaceFn ReplaceFunc
-//   replaceFn = func(e opt.Expr) opt.Expr {
-//     if e.Op() == opt.PlaceholderOp {
-//       return f.ConstructConst(evalPlaceholder(e))
-//     }
+//	var replaceFn ReplaceFunc
+//	replaceFn = func(e opt.Expr) opt.Expr {
+//	  if e.Op() == opt.PlaceholderOp {
+//	    return f.ConstructConst(evalPlaceholder(e))
+//	  }
 //
-//     // Copy e, calling replaceFn on its inputs recursively.
-//     return f.CopyAndReplaceDefault(e, replaceFn)
-//   }
+//	  // Copy e, calling replaceFn on its inputs recursively.
+//	  return f.CopyAndReplaceDefault(e, replaceFn)
+//	}
 //
-//   f.CopyAndReplace(from, fromProps, replaceFn)
+//	f.CopyAndReplace(from, fromProps, replaceFn)
 //
 // NOTE: Callers must take care to always create brand new copies of non-
 // singleton source nodes rather than referencing existing nodes. The source
@@ -292,11 +349,33 @@ func (f *Factory) AssignPlaceholders(from *memo.Memo) (err error) {
 	var replaceFn ReplaceFunc
 	replaceFn = func(e opt.Expr) opt.Expr {
 		if placeholder, ok := e.(*memo.PlaceholderExpr); ok {
-			d, err := eval.Expr(f.evalCtx, e.(*memo.PlaceholderExpr).Value)
+			d, err := eval.Expr(f.ctx, f.evalCtx, e.(*memo.PlaceholderExpr).Value)
 			if err != nil {
 				panic(err)
 			}
 			return f.ConstructConstVal(d, placeholder.DataType())
+		}
+		// A recursive CTE may have the stats change on its Initial expression
+		// after placeholder assignment, if that happens we need to
+		// propagate that change to the Binding expression and rebuild
+		// everything.
+		if rcte, ok := e.(*memo.RecursiveCTEExpr); ok {
+			newInitial := f.CopyAndReplaceDefault(rcte.Initial, replaceFn).(memo.RelExpr)
+			if newInitial != rcte.Initial {
+				newBinding := f.ConstructFakeRel(&memo.FakeRelPrivate{
+					Props: MakeBindingPropsForRecursiveCTE(
+						props.AnyCardinality, rcte.Binding.Relational().OutputCols,
+						newInitial.Relational().Statistics().RowCount)})
+				if id := rcte.WithBindingID(); id != 0 {
+					f.Metadata().AddWithBinding(id, newBinding)
+				}
+				return f.ConstructRecursiveCTE(
+					newBinding,
+					newInitial,
+					f.invokeReplace(rcte.Recursive, replaceFn).(memo.RelExpr),
+					&rcte.RecursiveCTEPrivate,
+				)
+			}
 		}
 		return f.CopyAndReplaceDefault(e, replaceFn)
 	}
@@ -329,7 +408,7 @@ func (f *Factory) onMaxConstructorStackDepthExceeded() {
 	if buildutil.CrdbTestBuild {
 		panic(err)
 	}
-	errorutil.SendReport(f.evalCtx.Ctx(), &f.evalCtx.Settings.SV, err)
+	errorutil.SendReport(f.ctx, &f.evalCtx.Settings.SV, err)
 }
 
 // onConstructRelational is called as a final step by each factory method that
@@ -342,10 +421,10 @@ func (f *Factory) onConstructRelational(rel memo.RelExpr) memo.RelExpr {
 	// the logical properties of the group in question.
 	if rel.Op() != opt.ValuesOp {
 		relational := rel.Relational()
-		// We can do this if we only contain leak-proof operators. As an example of
+		// We can do this if we only contain leakproof operators. As an example of
 		// an immutable operator that should not be folded: a Limit on top of an
 		// empty input has to error out if the limit turns out to be negative.
-		if relational.Cardinality.IsZero() && relational.VolatilitySet.IsLeakProof() {
+		if relational.Cardinality.IsZero() && relational.VolatilitySet.IsLeakproof() {
 			if f.matchedRule == nil || f.matchedRule(opt.SimplifyZeroCardinalityGroup) {
 				values := f.funcs.ConstructEmptyValues(relational.OutputCols)
 				if f.appliedRule != nil {

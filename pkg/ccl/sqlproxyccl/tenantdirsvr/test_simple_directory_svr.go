@@ -44,7 +44,7 @@ type TestSimpleDirectoryServer struct {
 var _ tenant.DirectoryServer = &TestSimpleDirectoryServer{}
 
 // NewTestSimpleDirectoryServer constructs a new simple directory server.
-func NewTestSimpleDirectoryServer(podAddr string) (tenant.DirectoryServer, *grpc.Server) {
+func NewTestSimpleDirectoryServer(podAddr string) (*TestSimpleDirectoryServer, *grpc.Server) {
 	dir := &TestSimpleDirectoryServer{podAddr: podAddr}
 	dir.mu.deleted = make(map[roachpb.TenantID]struct{})
 	grpcServer := grpc.NewServer()
@@ -62,7 +62,7 @@ func (d *TestSimpleDirectoryServer) ListPods(
 ) (*tenant.ListPodsResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.mu.deleted[roachpb.MakeTenantID(req.TenantID)]; ok {
+	if _, ok := d.mu.deleted[roachpb.MustMakeTenantID(req.TenantID)]; ok {
 		return &tenant.ListPodsResponse{}, nil
 	}
 	return &tenant.ListPodsResponse{
@@ -83,6 +83,10 @@ func (d *TestSimpleDirectoryServer) ListPods(
 func (d *TestSimpleDirectoryServer) WatchPods(
 	req *tenant.WatchPodsRequest, server tenant.Directory_WatchPodsServer,
 ) error {
+	// Insted of returning right away, we block until context is done.
+	// This prevents the proxy server from constantly trying to establish
+	// a watch in test environments, causing spammy logs.
+	<-server.Context().Done()
 	return nil
 }
 
@@ -97,7 +101,7 @@ func (d *TestSimpleDirectoryServer) EnsurePod(
 ) (*tenant.EnsurePodResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.mu.deleted[roachpb.MakeTenantID(req.TenantID)]; ok {
+	if _, ok := d.mu.deleted[roachpb.MustMakeTenantID(req.TenantID)]; ok {
 		return nil, status.Errorf(codes.NotFound, "tenant has been deleted")
 	}
 	return &tenant.EnsurePodResponse{}, nil
@@ -112,7 +116,7 @@ func (d *TestSimpleDirectoryServer) GetTenant(
 ) (*tenant.GetTenantResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.mu.deleted[roachpb.MakeTenantID(req.TenantID)]; ok {
+	if _, ok := d.mu.deleted[roachpb.MustMakeTenantID(req.TenantID)]; ok {
 		return nil, status.Errorf(codes.NotFound, "tenant has been deleted")
 	}
 	// Note that we do not return a ClusterName field here. Doing this skips

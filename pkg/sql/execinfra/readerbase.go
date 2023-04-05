@@ -16,9 +16,12 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -32,8 +35,8 @@ const readerOverflowProtection = 1000000000000000 /* 10^15 */
 func LimitHint(specLimitHint int64, post *execinfrapb.PostProcessSpec) (limitHint int64) {
 	// We prioritize the post process's limit since ProcOutputHelper
 	// will tell us to stop once we emit enough rows.
-	if post.Limit != 0 && post.Limit <= readerOverflowProtection {
-		limitHint = int64(post.Limit)
+	if post.Limit != 0 && post.Limit+post.Offset <= readerOverflowProtection && post.Limit+post.Offset > 0 {
+		limitHint = int64(post.Limit + post.Offset)
 	} else if specLimitHint != 0 && specLimitHint <= readerOverflowProtection {
 		limitHint = specLimitHint
 	}
@@ -198,4 +201,63 @@ func (h *LimitHintHelper) ReadSomeRows(rowsRead int64) error {
 		}
 	}
 	return nil
+}
+
+// UseStreamer returns whether the kvstreamer.Streamer API should be used as
+// well as the txn that should be used (regardless of the boolean return value).
+func (flowCtx *FlowCtx) UseStreamer() (bool, *kv.Txn, error) {
+	useStreamer := flowCtx.EvalCtx.SessionData().StreamerEnabled && flowCtx.Txn != nil &&
+		flowCtx.Txn.Type() == kv.LeafTxn && flowCtx.MakeLeafTxn != nil
+	if !useStreamer {
+		return false, flowCtx.Txn, nil
+	}
+	leafTxn, err := flowCtx.MakeLeafTxn()
+	if leafTxn == nil || err != nil {
+		// leafTxn might be nil in some flows which run outside of the txn, the
+		// streamer should not be used in such cases.
+		return false, flowCtx.Txn, err
+	}
+	return true, leafTxn, nil
+}
+
+// UseStreamerEnabled determines the default value for the 'streamer_enabled'
+// session variable.
+// TODO(yuzefovich): consider removing this at some point.
+var UseStreamerEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.distsql.use_streamer.enabled",
+	"determines whether the usage of the Streamer API is allowed. "+
+		"Enabling this will increase the speed of lookup/index joins "+
+		"while adhering to memory limits.",
+	true,
+)
+
+// This number was chosen by running TPCH queries 3, 4, 5, 9, and 19 with
+// varying batch sizes and choosing the smallest batch size that offered a
+// significant performance improvement. Larger batch sizes offered small to no
+// marginal improvements.
+const joinReaderIndexJoinStrategyBatchSizeDefault = 4 << 20 /* 4 MiB */
+
+// JoinReaderIndexJoinStrategyBatchSize determines the size of input batches
+// used to construct a single lookup KV batch by
+// rowexec.joinReaderIndexJoinStrategy as well as colfetcher.ColIndexJoin.
+var JoinReaderIndexJoinStrategyBatchSize = settings.RegisterByteSizeSetting(
+	settings.TenantWritable,
+	"sql.distsql.join_reader_index_join_strategy.batch_size",
+	"size limit on the input rows to construct a single lookup KV batch "+
+		"(by the joinReader processor and the ColIndexJoin operator (when the "+
+		"latter doesn't use the Streamer API))",
+	joinReaderIndexJoinStrategyBatchSizeDefault,
+	settings.PositiveInt,
+)
+
+// GetIndexJoinBatchSize returns the lookup rows batch size hint for the index
+// joins.
+func GetIndexJoinBatchSize(sd *sessiondata.SessionData) int64 {
+	if sd.JoinReaderIndexJoinStrategyBatchSize == 0 {
+		// In some tests the session data might not be set - use the default
+		// value then.
+		return joinReaderIndexJoinStrategyBatchSizeDefault
+	}
+	return sd.JoinReaderIndexJoinStrategyBatchSize
 }

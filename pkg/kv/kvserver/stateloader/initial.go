@@ -13,7 +13,6 @@ package stateloader
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -30,15 +29,6 @@ import (
 const (
 	raftInitialLogIndex = 10
 	raftInitialLogTerm  = 5
-
-	// RaftLogTermSignalForAddRaftAppliedIndexTermMigration is never persisted
-	// in the state machine or in HardState. It is only used in
-	// AddRaftAppliedIndexTermMigration to signal to the below raft code that
-	// the migration should happen when applying the raft log entry that
-	// contains ReplicatedEvalResult.State.RaftAppliedIndexTerm equal to this
-	// value. It is less than raftInitialLogTerm since that ensures it will
-	// never be used under normal operation.
-	RaftLogTermSignalForAddRaftAppliedIndexTermMigration = 3
 )
 
 // WriteInitialReplicaState sets up a new Range, but without writing an
@@ -55,8 +45,8 @@ func WriteInitialReplicaState(
 	desc roachpb.RangeDescriptor,
 	lease roachpb.Lease,
 	gcThreshold hlc.Timestamp,
+	gcHint roachpb.GCHint,
 	replicaVersion roachpb.Version,
-	writeRaftAppliedIndexTerm bool,
 ) (enginepb.MVCCStats, error) {
 	rsl := Make(desc.RangeID)
 	var s kvserverpb.ReplicaState
@@ -65,15 +55,14 @@ func WriteInitialReplicaState(
 		Index: raftInitialLogIndex,
 	}
 	s.RaftAppliedIndex = s.TruncatedState.Index
-	if writeRaftAppliedIndexTerm {
-		s.RaftAppliedIndexTerm = s.TruncatedState.Term
-	}
+	s.RaftAppliedIndexTerm = s.TruncatedState.Term
 	s.Desc = &roachpb.RangeDescriptor{
 		RangeID: desc.RangeID,
 	}
 	s.Stats = &ms
 	s.Lease = &lease
 	s.GCThreshold = &gcThreshold
+	s.GCHint = &gcHint
 	if (replicaVersion != roachpb.Version{}) {
 		s.Version = &replicaVersion
 	}
@@ -88,6 +77,12 @@ func WriteInitialReplicaState(
 		return enginepb.MVCCStats{}, errors.Wrap(err, "error reading GCThreshold")
 	} else if !existingGCThreshold.IsEmpty() {
 		log.Fatalf(ctx, "expected trivial GCthreshold, but found %+v", existingGCThreshold)
+	}
+
+	if existingGCHint, err := rsl.LoadGCHint(ctx, readWriter); err != nil {
+		return enginepb.MVCCStats{}, errors.Wrap(err, "error reading GCHint")
+	} else if !existingGCHint.IsEmpty() {
+		return enginepb.MVCCStats{}, errors.AssertionFailedf("expected trivial GCHint, but found %+v", existingGCHint)
 	}
 
 	if existingVersion, err := rsl.LoadVersion(ctx, readWriter); err != nil {
@@ -115,17 +110,18 @@ func WriteInitialRangeState(
 ) error {
 	initialLease := roachpb.Lease{}
 	initialGCThreshold := hlc.Timestamp{}
+	initialGCHint := roachpb.GCHint{}
 	initialMS := enginepb.MVCCStats{}
 
-	writeRaftAppliedIndexTerm :=
-		clusterversion.ClusterVersion{Version: replicaVersion}.IsActiveVersion(
-			clusterversion.ByKey(clusterversion.AddRaftAppliedIndexTermMigration))
 	if _, err := WriteInitialReplicaState(
-		ctx, readWriter, initialMS, desc, initialLease, initialGCThreshold,
-		replicaVersion, writeRaftAppliedIndexTerm,
+		ctx, readWriter, initialMS, desc, initialLease, initialGCThreshold, initialGCHint,
+		replicaVersion,
 	); err != nil {
 		return err
 	}
+
+	// TODO(sep-raft-log): when the log storage is separated, the below can't be
+	// written in the same batch. Figure out the ordering required here.
 	sl := Make(desc.RangeID)
 	if err := sl.SynthesizeRaftState(ctx, readWriter); err != nil {
 		return err

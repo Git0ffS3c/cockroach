@@ -12,7 +12,6 @@ package server
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -35,34 +34,36 @@ type usersResponse struct {
 
 // swagger:operation GET /users/ listUsers
 //
-// List users
+// # List users
 //
 // List SQL users on this cluster.
 //
 // ---
 // parameters:
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of results to return in this call.
-//   required: false
-// - name: offset
-//   type: integer
-//   in: query
-//   description: Continuation token for results after a past limited run.
-//   required: false
+//   - name: limit
+//     type: integer
+//     in: query
+//     description: Maximum number of results to return in this call.
+//     required: false
+//   - name: offset
+//     type: integer
+//     in: query
+//     description: Continuation token for results after a past limited run.
+//     required: false
+//
 // produces:
 // - application/json
 // responses:
-//   "200":
-//     description: Users response
-//     schema:
-//       "$ref": "#/definitions/usersResponse"
+//
+//	"200":
+//	  description: Users response
+//	  schema:
+//	    "$ref": "#/definitions/usersResponse"
 func (a *apiV2Server) listUsers(w http.ResponseWriter, r *http.Request) {
 	limit, offset := getSimplePaginationValues(r)
 	ctx := r.Context()
-	username := getSQLUsername(ctx)
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
+	ctx = a.sqlServer.AnnotateCtx(ctx)
 
 	query := `SELECT username FROM system.users WHERE "isRole" = false ORDER BY username`
 	qargs := []interface{}{}
@@ -74,7 +75,7 @@ func (a *apiV2Server) listUsers(w http.ResponseWriter, r *http.Request) {
 			qargs = append(qargs, offset)
 		}
 	}
-	it, err := a.admin.server.sqlServer.internalExecutor.QueryIteratorEx(
+	it, err := a.sqlServer.internalExecutor.QueryIteratorEx(
 		ctx, "admin-users", nil, /* txn */
 		sessiondata.InternalExecutorOverride{User: username},
 		query, qargs...,
@@ -113,56 +114,48 @@ type eventsResponse struct {
 
 // swagger:operation GET /events/ listEvents
 //
-// List events
+// # List events
 //
 // Lists the latest event log entries, in descending order.
 //
 // ---
 // parameters:
-// - name: type
-//   type: string
-//   in: query
-//   description: Type of events to filter for (e.g. "create_table"). Only one
+//   - name: type
+//     type: string
+//     in: query
+//     description: Type of events to filter for (e.g. "create_table"). Only one
 //     event type can be specified at a time.
-//   required: false
-// - name: targetID
-//   type: integer
-//   in: query
-//   description: Filter for events with this targetID. Only one targetID can
-//    be specified at a time.
-//   required: false
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of results to return in this call.
-//   required: false
-// - name: offset
-//   type: integer
-//   in: query
-//   description: Continuation token for results after a past limited run.
-//   required: false
+
+//	required: false
+//	- name: limit
+//	  type: integer
+//	  in: query
+//	  description: Maximum number of results to return in this call.
+//	  required: false
+//	- name: offset
+//	  type: integer
+//	  in: query
+//	  description: Continuation token for results after a past limited run.
+//	  required: false
+//
 // produces:
 // - application/json
 // responses:
-//   "200":
-//     description: Events response
-//     schema:
-//       "$ref": "#/definitions/eventsResponse"
+//
+//	"200":
+//	  description: Events response
+//	  schema:
+//	    "$ref": "#/definitions/eventsResponse"
 func (a *apiV2Server) listEvents(w http.ResponseWriter, r *http.Request) {
 	limit, offset := getSimplePaginationValues(r)
 	ctx := r.Context()
-	username := getSQLUsername(ctx)
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
+	ctx = a.sqlServer.AnnotateCtx(ctx)
 	queryValues := r.URL.Query()
 
 	req := &serverpb.EventsRequest{}
 	if typ := queryValues.Get("type"); len(typ) > 0 {
 		req.Type = typ
-	}
-	if targetID := queryValues.Get("targetID"); len(targetID) > 0 {
-		if targetIDInt, err := strconv.ParseInt(targetID, 10, 64); err == nil {
-			req.TargetId = targetIDInt
-		}
 	}
 
 	var resp eventsResponse
@@ -192,34 +185,36 @@ type databasesResponse struct {
 
 // swagger:operation GET /databases/ listDatabases
 //
-// List databases
+// # List databases
 //
 // Lists all databases on this cluster.
 //
 // ---
 // parameters:
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of results to return in this call.
-//   required: false
-// - name: offset
-//   type: integer
-//   in: query
-//   description: Continuation token for results after a past limited run.
-//   required: false
+//   - name: limit
+//     type: integer
+//     in: query
+//     description: Maximum number of results to return in this call.
+//     required: false
+//   - name: offset
+//     type: integer
+//     in: query
+//     description: Continuation token for results after a past limited run.
+//     required: false
+//
 // produces:
 // - application/json
 // responses:
-//   "200":
-//     description: Databases response
-//     schema:
-//       "$ref": "#/definitions/databasesResponse"
+//
+//	"200":
+//	  description: Databases response
+//	  schema:
+//	    "$ref": "#/definitions/databasesResponse"
 func (a *apiV2Server) listDatabases(w http.ResponseWriter, r *http.Request) {
 	limit, offset := getSimplePaginationValues(r)
 	ctx := r.Context()
-	username := getSQLUsername(ctx)
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
+	ctx = a.sqlServer.AnnotateCtx(ctx)
 
 	var resp databasesResponse
 	req := &serverpb.DatabasesRequest{}
@@ -239,37 +234,37 @@ func (a *apiV2Server) listDatabases(w http.ResponseWriter, r *http.Request) {
 // swagger:model databaseDetailsResponse
 type databaseDetailsResponse struct {
 	// DescriptorID is an identifier used to uniquely identify this database.
-	// It can be used to find events pertaining to this database by filtering on
-	// the 'target_id' field of events.
 	DescriptorID int64 `json:"descriptor_id,omitempty"`
 }
 
 // swagger:operation GET /databases/{database}/ databaseDetails
 //
-// Get database descriptor ID
+// # Get database descriptor ID
 //
 // Returns the database's descriptor ID.
 //
 // ---
 // parameters:
-// - name: database
-//   type: string
-//   in: path
-//   description: Name of database being looked up.
-//   required: true
+//   - name: database
+//     type: string
+//     in: path
+//     description: Name of database being looked up.
+//     required: true
+//
 // produces:
 // - application/json
 // responses:
-//   "200":
-//     description: Database details response
-//     schema:
-//       "$ref": "#/definitions/databaseDetailsResponse"
-//   "404":
-//     description: Database not found
+//
+//	"200":
+//	  description: Database details response
+//	  schema:
+//	    "$ref": "#/definitions/databaseDetailsResponse"
+//	"404":
+//	  description: Database not found
 func (a *apiV2Server) databaseDetails(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	username := getSQLUsername(ctx)
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
+	ctx = a.sqlServer.AnnotateCtx(ctx)
 	pathVars := mux.Vars(r)
 	req := &serverpb.DatabaseDetailsRequest{
 		Database: pathVars["database_name"],
@@ -306,42 +301,44 @@ type databaseGrantsResponse struct {
 
 // swagger:operation GET /databases/{database}/grants/ databaseGrants
 //
-// Lists grants on a database
+// # Lists grants on a database
 //
 // Returns grants on a database. Grants are the privileges granted to users
 // on this database.
 //
 // ---
 // parameters:
-// - name: database
-//   type: string
-//   in: path
-//   description: Name of the database being looked up.
-//   required: true
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of grants to return in this call.
-//   required: false
-// - name: offset
-//   type: integer
-//   in: query
-//   description: Continuation token for results after a past limited run.
-//   required: false
+//   - name: database
+//     type: string
+//     in: path
+//     description: Name of the database being looked up.
+//     required: true
+//   - name: limit
+//     type: integer
+//     in: query
+//     description: Maximum number of grants to return in this call.
+//     required: false
+//   - name: offset
+//     type: integer
+//     in: query
+//     description: Continuation token for results after a past limited run.
+//     required: false
+//
 // produces:
 // - application/json
 // responses:
-//   "200":
-//     description: Database grants response
-//     schema:
-//       "$ref": "#/definitions/databaseGrantsResponse"
-//   "404":
-//     description: Database not found
+//
+//	"200":
+//	  description: Database grants response
+//	  schema:
+//	    "$ref": "#/definitions/databaseGrantsResponse"
+//	"404":
+//	  description: Database not found
 func (a *apiV2Server) databaseGrants(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit, offset := getSimplePaginationValues(r)
-	username := getSQLUsername(ctx)
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
+	ctx = a.sqlServer.AnnotateCtx(ctx)
 	pathVars := mux.Vars(r)
 	req := &serverpb.DatabaseDetailsRequest{
 		Database: pathVars["database_name"],
@@ -379,42 +376,44 @@ type databaseTablesResponse struct {
 
 // swagger:operation GET /databases/{database}/tables/ databaseTables
 //
-// Lists tables on a database
+// # Lists tables on a database
 //
 // Lists names of all tables in the database. The names of all responses will
 // be schema-qualified.
 //
 // ---
 // parameters:
-// - name: database
-//   type: string
-//   in: path
-//   description: Name of the database being looked up.
-//   required: true
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of tables to return in this call.
-//   required: false
-// - name: offset
-//   type: integer
-//   in: query
-//   description: Continuation token for results after a past limited run.
-//   required: false
+//   - name: database
+//     type: string
+//     in: path
+//     description: Name of the database being looked up.
+//     required: true
+//   - name: limit
+//     type: integer
+//     in: query
+//     description: Maximum number of tables to return in this call.
+//     required: false
+//   - name: offset
+//     type: integer
+//     in: query
+//     description: Continuation token for results after a past limited run.
+//     required: false
+//
 // produces:
 // - application/json
 // responses:
-//   "200":
-//     description: Database tables response
-//     schema:
-//       "$ref": "#/definitions/databaseTablesResponse"
-//   "404":
-//     description: Database not found
+//
+//	"200":
+//	  description: Database tables response
+//	  schema:
+//	    "$ref": "#/definitions/databaseTablesResponse"
+//	"404":
+//	  description: Database not found
 func (a *apiV2Server) databaseTables(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit, offset := getSimplePaginationValues(r)
-	username := getSQLUsername(ctx)
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
+	ctx = a.sqlServer.AnnotateCtx(ctx)
 	pathVars := mux.Vars(r)
 	req := &serverpb.DatabaseDetailsRequest{
 		Database: pathVars["database_name"],
@@ -442,38 +441,40 @@ type tableDetailsResponse serverpb.TableDetailsResponse
 
 // swagger:operation GET /databases/{database}/tables/{table}/ tableDetails
 //
-// Get table details
+// # Get table details
 //
 // Returns details about a table.
 //
 // ---
 // parameters:
-// - name: database
-//   type: string
-//   in: path
-//   description: Name of the database being looked up.
-//   required: true
-// - name: table
-//   type: string
-//   in: path
-//   description: Name of table being looked up. Table may be
-//	   schema-qualified (schema.table) and each name component that contains
-//	   sql unsafe characters such as . or uppercase letters must be surrounded
-//	   in double quotes like "naughty schema".table.
-//   required: true
+//   - name: database
+//     type: string
+//     in: path
+//     description: Name of the database being looked up.
+//     required: true
+//   - name: table
+//     type: string
+//     in: path
+//     description: Name of table being looked up. Table may be
+//     schema-qualified (schema.table) and each name component that contains
+//     sql unsafe characters such as . or uppercase letters must be surrounded
+//     in double quotes like "naughty schema".table.
+//     required: true
+//
 // produces:
 // - application/json
 // responses:
-//   "200":
-//     description: Database details response
-//     schema:
-//       "$ref": "#/definitions/tableDetailsResponse"
-//   "404":
-//     description: Database or table not found
+//
+//	"200":
+//	  description: Database details response
+//	  schema:
+//	    "$ref": "#/definitions/tableDetailsResponse"
+//	"404":
+//	  description: Database or table not found
 func (a *apiV2Server) tableDetails(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	username := getSQLUsername(ctx)
-	ctx = a.admin.server.AnnotateCtx(ctx)
+	username := userFromHTTPAuthInfoContext(ctx)
+	ctx = a.sqlServer.AnnotateCtx(ctx)
 	pathVars := mux.Vars(r)
 	req := &serverpb.TableDetailsRequest{
 		Database: pathVars["database_name"],

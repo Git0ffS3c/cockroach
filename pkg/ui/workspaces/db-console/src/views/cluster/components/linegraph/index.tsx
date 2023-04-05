@@ -25,8 +25,8 @@ import {
   Metric,
   MetricProps,
   MetricsDataComponentProps,
+  QueryTimeInfo,
 } from "src/views/shared/components/metricQuery";
-import {} from "@cockroachlabs/cluster-ui";
 import {
   calculateXAxisDomain,
   calculateYAxisDomain,
@@ -47,6 +47,7 @@ import {
 import _ from "lodash";
 
 export interface LineGraphProps extends MetricsDataComponentProps {
+  isKvGraph?: boolean;
   title?: string;
   subtitle?: string;
   legend?: boolean;
@@ -159,6 +160,11 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
     this.setNewTimeRange = this.setNewTimeRange.bind(this);
   }
 
+  static defaultProps: Partial<LineGraphProps> = {
+    // Marking a graph as not being KV-related is opt-in.
+    isKvGraph: true,
+  };
+
   // axis is copied from the nvd3 LineGraph component above
   axis = createSelector(
     (props: { children?: React.ReactNode }) => props.children,
@@ -186,14 +192,14 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   metrics = createSelector(
     (props: { children?: React.ReactNode }) => props.children,
     children => {
-      return findChildrenOfType(children as any, Metric) as React.ReactElement<
-        MetricProps
-      >[];
+      return findChildrenOfType(
+        children as any,
+        Metric,
+      ) as React.ReactElement<MetricProps>[];
     },
   );
 
-  // setNewTimeRange uses code from the TimeScaleDropdown component
-  // to set new start/end ranges in the query params and force a
+  // setNewTimeRange forces a
   // reload of the rest of the dashboard at new ranges via the props
   // `setMetricsFixedWindow` and `setTimeScale`.
   // TODO(davidh): centralize management of query params for time range
@@ -207,9 +213,11 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
       start: moment.unix(start),
       end: moment.unix(end),
     };
+    const seconds = moment.duration(moment.utc(end).diff(start)).asSeconds();
     let newTimeScale: TimeScale = {
-      ...findClosestTimeScale(defaultTimeScaleOptions, end - start, start),
+      ...findClosestTimeScale(defaultTimeScaleOptions, seconds),
       key: "Custom",
+      windowSize: moment.duration(moment.unix(end).diff(moment.unix(start))),
       fixedWindowEnd: moment.unix(end),
     };
     if (this.props.adjustTimeScaleOnChange) {
@@ -222,9 +230,6 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
     this.props.setTimeScale(newTimeScale);
     const { pathname, search } = this.props.history.location;
     const urlParams = new URLSearchParams(search);
-
-    urlParams.set("start", moment.unix(start).format("X"));
-    urlParams.set("end", moment.unix(end).format("X"));
 
     this.props.history.push({
       pathname,
@@ -251,10 +256,29 @@ export class LineGraph extends React.Component<LineGraphProps, {}> {
   // to a closure that holds a reference to this value.
   xAxisDomain: AxisDomain;
 
+  newTimeInfo(
+    newTimeInfo: QueryTimeInfo,
+    prevTimeInfo: QueryTimeInfo,
+  ): boolean {
+    if (newTimeInfo.start.compare(prevTimeInfo.start) !== 0) {
+      return true;
+    }
+    if (newTimeInfo.end.compare(prevTimeInfo.end) !== 0) {
+      return true;
+    }
+    if (newTimeInfo.sampleDuration.compare(prevTimeInfo.sampleDuration) !== 0) {
+      return true;
+    }
+
+    return false;
+  }
+
   componentDidUpdate(prevProps: Readonly<LineGraphProps>) {
     if (
       !this.props.data?.results ||
-      (prevProps.data === this.props.data && this.u !== undefined)
+      (prevProps.data === this.props.data &&
+        this.u !== undefined &&
+        !this.newTimeInfo(this.props.timeInfo, prevProps.timeInfo))
     ) {
       return;
     }

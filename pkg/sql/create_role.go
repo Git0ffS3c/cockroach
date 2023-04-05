@@ -18,9 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/password"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -42,8 +44,9 @@ type CreateRoleNode struct {
 
 // CreateRole represents a CREATE ROLE statement.
 // Privileges: INSERT on system.users.
-//   notes: postgres allows the creation of users with an empty password. We do
-//          as well, but disallow password authentication for these users.
+//
+//	notes: postgres allows the creation of users with an empty password. We do
+//	       as well, but disallow password authentication for these users.
 func (p *planner) CreateRole(ctx context.Context, n *tree.CreateRole) (planNode, error) {
 	return p.CreateRoleNode(ctx, n.Name, n.IfNotExists, n.IsRole,
 		"CREATE ROLE", n.KVOptions)
@@ -67,12 +70,15 @@ func (p *planner) CreateRoleNode(
 		return nil, pgerror.Newf(pgcode.ReservedName, "%s cannot be used as a role name here", roleSpec.RoleSpecType)
 	}
 
-	asStringOrNull := func(e tree.Expr, op string) (func() (bool, string, error), error) {
-		return p.TypeAsStringOrNull(ctx, e, op)
-	}
-	roleOptions, err := kvOptions.ToRoleOptions(asStringOrNull, opName)
+	roleOptions, err := roleoption.MakeListFromKVOptions(
+		ctx, kvOptions, p.ExprEvaluator(opName).LazyStringOrNull,
+	)
 	if err != nil {
 		return nil, err
+	}
+
+	if roleOptions.Contains(roleoption.CONTROLCHANGEFEED) {
+		p.BufferClientNotice(ctx, pgnotice.Newf(roleoption.ControlChangefeedDeprecationNoticeMsg))
 	}
 
 	if err := roleOptions.CheckRoleOptionConflicts(); err != nil {
@@ -130,11 +136,11 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 	}
 
 	// Check if the user/role exists.
-	row, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
+	row, err := params.p.InternalSQLTxn().QueryRowEx(
 		params.ctx,
 		opName,
 		params.p.txn,
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		fmt.Sprintf(`select "isRole" from %s where username = $1`, sessioninit.UsersTableName),
 		n.roleName,
 	)
@@ -150,16 +156,16 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 	}
 
 	// TODO(richardjcai): move hashedPassword column to system.role_options.
-	rowsAffected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
-		params.ctx,
-		opName,
-		params.p.txn,
-		fmt.Sprintf("insert into %s values ($1, $2, $3)", sessioninit.UsersTableName),
-		n.roleName,
-		hashedPassword,
-		n.isRole,
+	stmt := fmt.Sprintf("INSERT INTO %s VALUES ($1, $2, $3, $4)", sessioninit.UsersTableName)
+	roleID, err := descidgen.GenerateUniqueRoleID(params.ctx, params.ExecCfg().DB, params.ExecCfg().Codec)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := params.p.InternalSQLTxn().ExecEx(
+		params.ctx, opName, params.p.txn,
+		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
+		stmt, n.roleName, hashedPassword, n.isRole, roleID,
 	)
-
 	if err != nil {
 		return err
 	} else if rowsAffected != 1 {
@@ -168,43 +174,9 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 		)
 	}
 
-	// Get a map of statements to execute for role options and their values.
-	stmts, err := n.roleOptions.GetSQLStmts(func(o roleoption.Option) {
-		sqltelemetry.IncIAMOptionCounter(sqltelemetry.CreateRole, strings.ToLower(o.String()))
-	})
+	_, err = updateRoleOptions(params, opName, n.roleOptions, n.roleName, sqltelemetry.CreateRole)
 	if err != nil {
 		return err
-	}
-
-	for stmt, value := range stmts {
-		qargs := []interface{}{n.roleName}
-
-		if value != nil {
-			isNull, val, err := value()
-			if err != nil {
-				return err
-			}
-			if isNull {
-				// If the value of the role option is NULL, ensure that nil is passed
-				// into the statement placeholder, since val is string type "NULL"
-				// will not be interpreted as NULL by the InternalExecutor.
-				qargs = append(qargs, nil)
-			} else {
-				qargs = append(qargs, val)
-			}
-		}
-
-		_, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
-			params.ctx,
-			opName,
-			params.p.txn,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
-			stmt,
-			qargs...,
-		)
-		if err != nil {
-			return err
-		}
 	}
 
 	if sessioninit.CacheEnabled.Get(&params.p.ExecCfg().Settings.SV) {
@@ -220,6 +192,67 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 	return params.p.logEvent(params.ctx,
 		0, /* no target */
 		&eventpb.CreateRole{RoleName: n.roleName.Normalized()})
+}
+
+func updateRoleOptions(
+	params runParams,
+	opName string,
+	roleOptions roleoption.List,
+	roleName username.SQLUsername,
+	telemetryOp string,
+) (rowsAffected int, err error) {
+	// Get a map of statements to execute for role options and their values.
+	stmts, err := roleOptions.GetSQLStmts(func(o roleoption.Option) {
+		sqltelemetry.IncIAMOptionCounter(telemetryOp, strings.ToLower(o.String()))
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	rowsAffected = 0
+	for stmt, v := range stmts {
+		qargs := []interface{}{roleName}
+
+		if v.Value != nil {
+			isNull, val, err := v.Value()
+			if err != nil {
+				return 0, err
+			}
+			if isNull {
+				// If the value of the role option is NULL, ensure that nil is passed
+				// into the statement placeholder, since val is string type "NULL"
+				// will not be interpreted as NULL by the Executor.
+				qargs = append(qargs, nil)
+			} else {
+				qargs = append(qargs, val)
+			}
+		}
+
+		idRow, err := params.p.InternalSQLTxn().QueryRowEx(
+			params.ctx, `get-user-id`, params.p.Txn(), sessiondata.NodeUserSessionDataOverride,
+			`SELECT user_id FROM system.users WHERE username = $1`, roleName.Normalized(),
+		)
+		if err != nil {
+			return 0, err
+		}
+		qargs = append(qargs, tree.MustBeDOid(idRow[0]))
+
+		affected, err := params.p.InternalSQLTxn().ExecEx(
+			params.ctx,
+			opName,
+			params.p.txn,
+			sessiondata.RootUserSessionDataOverride,
+			stmt,
+			qargs...,
+		)
+		if err != nil {
+			return 0, err
+		}
+
+		rowsAffected += affected
+	}
+
+	return rowsAffected, err
 }
 
 // Next implements the planNode interface.
@@ -274,7 +307,7 @@ func (p *planner) checkPasswordAndGetHash(
 		var isPreHashed, schemeSupported bool
 		var schemeName string
 		var issueNum int
-		isPreHashed, schemeSupported, issueNum, schemeName, hashedPassword, err = password.CheckPasswordHashValidity(ctx, []byte(passwordStr))
+		isPreHashed, schemeSupported, issueNum, schemeName, hashedPassword, err = password.CheckPasswordHashValidity([]byte(passwordStr))
 		if err != nil {
 			return hashedPassword, pgerror.WithCandidateCode(err, pgcode.Syntax)
 		}
@@ -291,7 +324,7 @@ func (p *planner) checkPasswordAndGetHash(
 			"Passwords must be %d characters or longer.", minLength)
 	}
 
-	method := security.GetConfiguredPasswordHashMethod(ctx, &st.SV)
+	method := security.GetConfiguredPasswordHashMethod(&st.SV)
 	cost, err := security.GetConfiguredPasswordCost(ctx, &st.SV, method)
 	if err != nil {
 		return hashedPassword, errors.HandleAsAssertionFailure(err)

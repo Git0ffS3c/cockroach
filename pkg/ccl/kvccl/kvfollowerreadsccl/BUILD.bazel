@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -13,6 +14,7 @@ go_library(
         "//pkg/ccl/utilccl",
         "//pkg/kv",
         "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/closedts",
         "//pkg/roachpb",
@@ -40,33 +42,41 @@ go_test(
         "followerreads_test.go",
         "main_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":kvfollowerreadsccl"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
+        "//pkg/ccl",
+        "//pkg/ccl/kvccl/kvtenantccl",
         "//pkg/ccl/utilccl",
         "//pkg/keys",
         "//pkg/kv",
         "//pkg/kv/kvbase",
         "//pkg/kv/kvclient/kvcoord",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver",
         "//pkg/kv/kvserver/closedts",
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/roachpb",
         "//pkg/rpc",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
+        "//pkg/security/username",
         "//pkg/server",
         "//pkg/settings/cluster",
         "//pkg/sql",
         "//pkg/sql/physicalplan/replicaoracle",
         "//pkg/sql/sem/eval",
         "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util",
+        "//pkg/util/errorutil",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -81,3 +91,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

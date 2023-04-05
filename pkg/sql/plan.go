@@ -13,10 +13,8 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
@@ -25,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/errors"
 )
 
 // runParams is a struct containing all parameters passed to planNode.Next() and
@@ -71,7 +70,6 @@ func (r *runParams) Ann() *tree.Annotations {
 // - planNodeNames                 (walk.go)
 // - setLimitHint()                (limit_hint.go)
 // - planColumns()                 (plan_columns.go)
-//
 type planNode interface {
 	startExec(params runParams) error
 
@@ -149,6 +147,7 @@ type planNodeReadingOwnWrites interface {
 }
 
 var _ planNode = &alterIndexNode{}
+var _ planNode = &alterIndexVisibleNode{}
 var _ planNode = &alterSchemaNode{}
 var _ planNode = &alterSequenceNode{}
 var _ planNode = &alterTableNode{}
@@ -158,8 +157,10 @@ var _ planNode = &alterTypeNode{}
 var _ planNode = &bufferNode{}
 var _ planNode = &cancelQueriesNode{}
 var _ planNode = &cancelSessionsNode{}
-var _ planNode = &changePrivilegesNode{}
+var _ planNode = &changeDescriptorBackedPrivilegesNode{}
+var _ planNode = &completionsNode{}
 var _ planNode = &createDatabaseNode{}
+var _ planNode = &createFunctionNode{}
 var _ planNode = &createIndexNode{}
 var _ planNode = &createSequenceNode{}
 var _ planNode = &createStatsNode{}
@@ -202,7 +203,6 @@ var _ planNode = &renameColumnNode{}
 var _ planNode = &renameDatabaseNode{}
 var _ planNode = &renameIndexNode{}
 var _ planNode = &renameTableNode{}
-var _ planNode = &reparentDatabaseNode{}
 var _ planNode = &renderNode{}
 var _ planNode = &RevokeRoleNode{}
 var _ planNode = &rowCountNode{}
@@ -240,17 +240,17 @@ var _ planNodeReadingOwnWrites = &alterSchemaNode{}
 var _ planNodeReadingOwnWrites = &alterSequenceNode{}
 var _ planNodeReadingOwnWrites = &alterTableNode{}
 var _ planNodeReadingOwnWrites = &alterTypeNode{}
+var _ planNodeReadingOwnWrites = &createFunctionNode{}
 var _ planNodeReadingOwnWrites = &createIndexNode{}
 var _ planNodeReadingOwnWrites = &createSequenceNode{}
 var _ planNodeReadingOwnWrites = &createDatabaseNode{}
 var _ planNodeReadingOwnWrites = &createTableNode{}
 var _ planNodeReadingOwnWrites = &createTypeNode{}
 var _ planNodeReadingOwnWrites = &createViewNode{}
-var _ planNodeReadingOwnWrites = &changePrivilegesNode{}
+var _ planNodeReadingOwnWrites = &changeDescriptorBackedPrivilegesNode{}
 var _ planNodeReadingOwnWrites = &dropSchemaNode{}
 var _ planNodeReadingOwnWrites = &dropTypeNode{}
 var _ planNodeReadingOwnWrites = &refreshMaterializedViewNode{}
-var _ planNodeReadingOwnWrites = &reparentDatabaseNode{}
 var _ planNodeReadingOwnWrites = &setZoneConfigNode{}
 
 // planNodeRequireSpool serves as marker for nodes whose parent must
@@ -305,7 +305,7 @@ type planTop struct {
 	// mem/catalog retains the memo and catalog that were used to create the
 	// plan. Only set if needed by instrumentation (see ShouldSaveMemo).
 	mem     *memo.Memo
-	catalog *optCatalog
+	catalog optPlanningCatalog
 
 	// auditEvents becomes non-nil if any of the descriptors used by
 	// current statement is causing an auditing event. See exec_log.go.
@@ -335,6 +335,8 @@ type physicalPlanTop struct {
 	// closed explicitly since we don't have a planNode tree that performs the
 	// closure.
 	planNodesToClose []planNode
+	// onClose, if non-nil, will be called when closing this object.
+	onClose func()
 }
 
 func (p *physicalPlanTop) Close(ctx context.Context) {
@@ -342,6 +344,10 @@ func (p *physicalPlanTop) Close(ctx context.Context) {
 		plan.Close(ctx)
 	}
 	p.planNodesToClose = nil
+	if p.onClose != nil {
+		p.onClose()
+		p.onClose = nil
+	}
 }
 
 // planMaybePhysical is a utility struct representing a plan. It can currently
@@ -466,16 +472,10 @@ func (p *planTop) init(stmt *Statement, instrumentation *instrumentationHelper) 
 	}
 }
 
-// close ensures that the plan's resources have been deallocated.
-func (p *planTop) close(ctx context.Context) {
-	if p.flags.IsSet(planFlagExecDone) {
-		p.savePlanInfo(ctx)
-	}
-	p.planComponents.close(ctx)
-}
-
-// savePlanInfo uses p.explainPlan to populate the plan string and/or tree.
-func (p *planTop) savePlanInfo(ctx context.Context) {
+// savePlanInfo updates the instrumentationHelper with information about how the
+// plan was executed.
+// NB: should only be called _after_ the execution of the plan has completed.
+func (p *planTop) savePlanInfo() {
 	vectorized := p.flags.IsSet(planFlagVectorized)
 	distribution := physicalplan.LocalPlan
 	if p.flags.IsSet(planFlagFullyDistributed) {
@@ -483,7 +483,8 @@ func (p *planTop) savePlanInfo(ctx context.Context) {
 	} else if p.flags.IsSet(planFlagPartiallyDistributed) {
 		distribution = physicalplan.PartiallyDistributedPlan
 	}
-	p.instrumentation.RecordPlanInfo(distribution, vectorized)
+	containsMutation := p.flags.IsSet(planFlagContainsMutation)
+	p.instrumentation.RecordPlanInfo(distribution, vectorized, containsMutation)
 }
 
 // startExec calls startExec() on each planNode using a depth-first, post-order
@@ -527,6 +528,25 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 	// upcoming IR work will provide unique numeric type tags, which will
 	// elegantly solve this.
 	for _, planHook := range planHooks {
+
+		// If we don't have placeholder, we know we're just doing prepare and we
+		// should type check instead of doing the actual planning.
+		if !p.EvalContext().HasPlaceholders() {
+			matched, header, err := planHook.typeCheck(ctx, stmt, p)
+			if err != nil {
+				return nil, err
+			}
+			if !matched {
+				continue
+			}
+			return newHookFnNode(planHook.name, func(ctx context.Context, nodes []planNode, datums chan<- tree.Datums) error {
+				return errors.AssertionFailedf(
+					"cannot execute prepared %v statement",
+					planHook.name,
+				)
+			}, header, nil), nil
+		}
+
 		if fn, header, subplans, avoidBuffering, err := planHook.fn(ctx, stmt, p); err != nil {
 			return nil, err
 		} else if fn != nil {
@@ -537,19 +557,6 @@ func (p *planner) maybePlanHook(ctx context.Context, stmt tree.Statement) (planN
 		}
 	}
 	return nil, nil
-}
-
-// Mark transaction as operating on the system DB if the descriptor id
-// is within the SystemConfig range.
-func (p *planner) maybeSetSystemConfig(id descpb.ID) error {
-	if !descpb.IsSystemConfigID(id) || p.execCfg.Settings.Version.IsActive(
-		p.EvalContext().Ctx(), clusterversion.DisableSystemConfigGossipTrigger,
-	) {
-		return nil
-	}
-	// Mark transaction as operating on the system DB.
-	// Only the system tenant marks the SystemConfigTrigger.
-	return p.txn.DeprecatedSetSystemConfigTrigger(p.execCfg.Codec.ForSystemTenant())
 }
 
 // planFlags is used throughout the planning code to keep track of various
@@ -575,9 +582,6 @@ const (
 
 	// planFlagNotDistributed is set if the query execution is not distributed.
 	planFlagNotDistributed
-
-	// planFlagExecDone marks that execution has been completed.
-	planFlagExecDone
 
 	// planFlagImplicitTxn marks that the plan was run inside of an implicit
 	// transaction.
@@ -615,6 +619,10 @@ const (
 
 	// planFlagContainsMutation is set if the plan has any mutations.
 	planFlagContainsMutation
+
+	// planFlagContainsNonDefaultLocking is set if the plan has a node with
+	// non-default key locking strength.
+	planFlagContainsNonDefaultLocking
 )
 
 func (pf planFlags) IsSet(flag planFlags) bool {

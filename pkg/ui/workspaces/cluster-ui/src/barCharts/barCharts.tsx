@@ -13,11 +13,12 @@ import { stdDevLong, longToInt } from "src/util";
 import { Duration, Bytes, Percentage } from "src/util/format";
 import classNames from "classnames/bind";
 import styles from "./barCharts.module.scss";
-import { bar, formatTwoPlaces, approximify } from "./utils";
+import { bar, approximify } from "./utils";
 import { barChartFactory, BarChartOptions } from "./barChartFactory";
 import { AggregateStatistics } from "src/statementsTable/statementsTable";
 
-type StatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+type StatementStatistics =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 const cx = classNames.bind(styles);
 
 const countBars = [
@@ -26,16 +27,8 @@ const countBars = [
   ),
 ];
 
-const rowsReadBars = [
-  bar("rows-read", (d: StatementStatistics) => d.stats.rows_read.mean),
-];
-
 const bytesReadBars = [
   bar("bytes-read", (d: StatementStatistics) => d.stats.bytes_read.mean),
-];
-
-const rowsWrittenBars = [
-  bar("rows-written", (d: StatementStatistics) => d.stats.rows_written?.mean),
 ];
 
 const latencyBars = [
@@ -52,6 +45,13 @@ const contentionBars = [
   bar(
     "contention",
     (d: StatementStatistics) => d.stats.exec_stats.contention_time?.mean,
+  ),
+];
+
+const cpuBars = [
+  bar(
+    "cpu",
+    (d: StatementStatistics) => d.stats.exec_stats.cpu_sql_nanos?.mean,
   ),
 ];
 
@@ -77,15 +77,8 @@ const retryBars = [
   ),
 ];
 
-const rowsReadStdDev = bar(cx("rows-read-dev"), (d: StatementStatistics) =>
-  stdDevLong(d.stats.rows_read, d.stats.count),
-);
 const bytesReadStdDev = bar(cx("bytes-read-dev"), (d: StatementStatistics) =>
   stdDevLong(d.stats.bytes_read, d.stats.count),
-);
-const rowsWrittenStdDev = bar(
-  cx("rows-written-dev"),
-  (d: StatementStatistics) => stdDevLong(d.stats.rows_written, d.stats.count),
 );
 const latencyStdDev = bar(
   cx("bar-chart__overall-dev"),
@@ -93,6 +86,9 @@ const latencyStdDev = bar(
 );
 const contentionStdDev = bar(cx("contention-dev"), (d: StatementStatistics) =>
   stdDevLong(d.stats.exec_stats.contention_time, d.stats.exec_stats.count),
+);
+const cpuStdDev = bar(cx("cpu-dev"), (d: StatementStatistics) =>
+  stdDevLong(d.stats.exec_stats.cpu_sql_nanos, d.stats.exec_stats.count),
 );
 const maxMemUsageStdDev = bar(
   cx("max-mem-usage-dev"),
@@ -106,25 +102,11 @@ const networkBytesStdDev = bar(
 );
 
 export const countBarChart = barChartFactory("grey", countBars, approximify);
-export const rowsReadBarChart = barChartFactory(
-  "grey",
-  rowsReadBars,
-  approximify,
-  rowsReadStdDev,
-  formatTwoPlaces,
-);
 export const bytesReadBarChart = barChartFactory(
   "grey",
   bytesReadBars,
   Bytes,
   bytesReadStdDev,
-);
-export const rowsWrittenBarChart = barChartFactory(
-  "grey",
-  rowsWrittenBars,
-  approximify,
-  rowsWrittenStdDev,
-  formatTwoPlaces,
 );
 export const latencyBarChart = barChartFactory(
   "grey",
@@ -137,6 +119,12 @@ export const contentionBarChart = barChartFactory(
   contentionBars,
   v => Duration(v * 1e9),
   contentionStdDev,
+);
+export const cpuBarChart = barChartFactory(
+  "grey",
+  cpuBars,
+  v => Duration(v),
+  cpuStdDev,
 );
 export const maxMemUsageBarChart = barChartFactory(
   "grey",
@@ -161,10 +149,11 @@ export function workloadPctBarChart(
   return barChartFactory(
     "grey",
     [
-      bar(
-        "pct-workload",
-        (d: StatementStatistics) =>
-          (d.stats.service_lat.mean * longToInt(d.stats.count)) / totalWorkload,
+      bar("pct-workload", (d: StatementStatistics) =>
+        totalWorkload !== 0
+          ? (d.stats.service_lat.mean * longToInt(d.stats.count)) /
+            totalWorkload
+          : 0,
       ),
     ],
     v => Percentage(v, 1, 1),

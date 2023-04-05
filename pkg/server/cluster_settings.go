@@ -21,3 +21,14 @@ var SQLStatsResponseMax = settings.RegisterIntSetting(
 	20000,
 	settings.NonNegativeInt,
 ).WithPublic()
+
+// SQLStatsShowInternal controls if statistics for internal executions should be returned in sql stats APIs,
+// including: CombinedStatementStats, ListSessions, and ListLocalSessions.
+var SQLStatsShowInternal = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.stats.response.show_internal.enabled",
+	"controls if statistics for internal executions should be returned by the CombinedStatements and if "+
+		"internal sessions should be returned by the ListSessions endpoints. These endpoints are used to display "+
+		"statistics on the SQL Activity pages",
+	false,
+).WithPublic()

@@ -15,9 +15,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-// DescriptorCoverage specifies whether or not a subset of descriptors were
-// requested or if all the descriptors were requested, so all the descriptors
-// are covered in a given backup.
+// DescriptorCoverage specifies the subset of descriptors that are requested during a backup
+// or a restore.
 type DescriptorCoverage int32
 
 const (
@@ -28,26 +27,33 @@ const (
 	// backup is not said to have complete table coverage unless it was created
 	// by a `BACKUP TO` command.
 	RequestedDescriptors DescriptorCoverage = iota
+
 	// AllDescriptors table coverage means that backup is guaranteed to have all the
 	// relevant data in the cluster. These can only be created by running a
 	// full cluster backup with `BACKUP TO`.
 	AllDescriptors
+
+	// SystemUsers coverage indicates that only the system.users
+	// table will be restored from the backup.
+	SystemUsers
 )
 
 // BackupOptions describes options for the BACKUP execution.
 type BackupOptions struct {
-	CaptureRevisionHistory bool
-	EncryptionPassphrase   Expr
-	Detached               bool
-	EncryptionKMSURI       StringOrPlaceholderOptList
-	IncrementalStorage     StringOrPlaceholderOptList
+	CaptureRevisionHistory     Expr
+	IncludeAllSecondaryTenants Expr
+	EncryptionPassphrase       Expr
+	Detached                   *DBool
+	EncryptionKMSURI           StringOrPlaceholderOptList
+	IncrementalStorage         StringOrPlaceholderOptList
+	ExecutionLocality          Expr
 }
 
 var _ NodeFormatter = &BackupOptions{}
 
 // Backup represents a BACKUP statement.
 type Backup struct {
-	Targets *TargetList
+	Targets *BackupTargetList
 
 	// To is set to the root directory of the backup (called the <destination> in
 	// the docs).
@@ -120,28 +126,32 @@ func (node Backup) Coverage() DescriptorCoverage {
 
 // RestoreOptions describes options for the RESTORE execution.
 type RestoreOptions struct {
-	EncryptionPassphrase      Expr
-	DecryptionKMSURI          StringOrPlaceholderOptList
-	IntoDB                    Expr
-	SkipMissingFKs            bool
-	SkipMissingSequences      bool
-	SkipMissingSequenceOwners bool
-	SkipMissingViews          bool
-	Detached                  bool
-	SkipLocalitiesCheck       bool
-	DebugPauseOn              Expr
-	NewDBName                 Expr
-	IncrementalStorage        StringOrPlaceholderOptList
-	AsTenant                  Expr
+	EncryptionPassphrase             Expr
+	DecryptionKMSURI                 StringOrPlaceholderOptList
+	IntoDB                           Expr
+	SkipMissingFKs                   bool
+	SkipMissingSequences             bool
+	SkipMissingSequenceOwners        bool
+	SkipMissingViews                 bool
+	SkipMissingUDFs                  bool
+	Detached                         bool
+	SkipLocalitiesCheck              bool
+	DebugPauseOn                     Expr
+	NewDBName                        Expr
+	IncludeAllSecondaryTenants       Expr
+	IncrementalStorage               StringOrPlaceholderOptList
+	AsTenant                         Expr
+	ForceTenantID                    Expr
+	SchemaOnly                       bool
+	VerifyData                       bool
+	UnsafeRestoreIncompatibleVersion bool
 }
 
 var _ NodeFormatter = &RestoreOptions{}
 
 // Restore represents a RESTORE statement.
 type Restore struct {
-	Targets TargetList
-	// Whether this is the RESTORE SYSTEM USERS variant of RESTORE statement.
-	SystemUsers        bool
+	Targets            BackupTargetList
 	DescriptorCoverage DescriptorCoverage
 
 	// From contains the URIs for the backup(s) we seek to restore.
@@ -200,6 +210,16 @@ type KVOption struct {
 // KVOptions is a list of KVOptions.
 type KVOptions []KVOption
 
+// HasKey searches the set of options to discover if it has key.
+func (o *KVOptions) HasKey(key Name) bool {
+	for _, kv := range *o {
+		if kv.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
 // Format implements the NodeFormatter interface.
 func (o *KVOptions) Format(ctx *FmtCtx) {
 	for i := range *o {
@@ -242,8 +262,9 @@ func (o *BackupOptions) Format(ctx *FmtCtx) {
 		}
 		addSep = true
 	}
-	if o.CaptureRevisionHistory {
-		ctx.WriteString("revision_history")
+	if o.CaptureRevisionHistory != nil {
+		ctx.WriteString("revision_history = ")
+		ctx.FormatNode(o.CaptureRevisionHistory)
 		addSep = true
 	}
 
@@ -257,9 +278,12 @@ func (o *BackupOptions) Format(ctx *FmtCtx) {
 		}
 	}
 
-	if o.Detached {
+	if o.Detached != nil {
 		maybeAddSep()
 		ctx.WriteString("detached")
+		if o.Detached != DBoolTrue {
+			ctx.WriteString(" = FALSE")
+		}
 	}
 
 	if o.EncryptionKMSURI != nil {
@@ -273,13 +297,25 @@ func (o *BackupOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("incremental_location = ")
 		ctx.FormatNode(&o.IncrementalStorage)
 	}
+
+	if o.ExecutionLocality != nil {
+		maybeAddSep()
+		ctx.WriteString("execution locality = ")
+		ctx.FormatNode(o.ExecutionLocality)
+	}
+
+	if o.IncludeAllSecondaryTenants != nil {
+		maybeAddSep()
+		ctx.WriteString("include_all_secondary_tenants = ")
+		ctx.FormatNode(o.IncludeAllSecondaryTenants)
+	}
 }
 
 // CombineWith merges other backup options into this backup options struct.
 // An error is returned if the same option merged multiple times.
 func (o *BackupOptions) CombineWith(other *BackupOptions) error {
-	if o.CaptureRevisionHistory {
-		if other.CaptureRevisionHistory {
+	if o.CaptureRevisionHistory != nil {
+		if other.CaptureRevisionHistory != nil {
 			return errors.New("revision_history option specified multiple times")
 		}
 	} else {
@@ -292,8 +328,8 @@ func (o *BackupOptions) CombineWith(other *BackupOptions) error {
 		return errors.New("encryption_passphrase specified multiple times")
 	}
 
-	if o.Detached {
-		if other.Detached {
+	if o.Detached != nil {
+		if other.Detached != nil {
 			return errors.New("detached option specified multiple times")
 		}
 	} else {
@@ -312,6 +348,20 @@ func (o *BackupOptions) CombineWith(other *BackupOptions) error {
 		return errors.New("incremental_location option specified multiple times")
 	}
 
+	if o.ExecutionLocality == nil {
+		o.ExecutionLocality = other.ExecutionLocality
+	} else if other.ExecutionLocality != nil {
+		return errors.New("execution locality option specified multiple times")
+	}
+
+	if o.IncludeAllSecondaryTenants != nil {
+		if other.IncludeAllSecondaryTenants != nil {
+			return errors.New("include_all_secondary_tenants specified multiple times")
+		}
+	} else {
+		o.IncludeAllSecondaryTenants = other.IncludeAllSecondaryTenants
+	}
+
 	return nil
 }
 
@@ -319,9 +369,12 @@ func (o *BackupOptions) CombineWith(other *BackupOptions) error {
 func (o BackupOptions) IsDefault() bool {
 	options := BackupOptions{}
 	return o.CaptureRevisionHistory == options.CaptureRevisionHistory &&
-		o.Detached == options.Detached && cmp.Equal(o.EncryptionKMSURI, options.EncryptionKMSURI) &&
+		o.Detached == options.Detached &&
+		cmp.Equal(o.EncryptionKMSURI, options.EncryptionKMSURI) &&
 		o.EncryptionPassphrase == options.EncryptionPassphrase &&
-		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage)
+		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage) &&
+		o.ExecutionLocality == options.ExecutionLocality &&
+		o.IncludeAllSecondaryTenants == options.IncludeAllSecondaryTenants
 }
 
 // Format implements the NodeFormatter interface.
@@ -336,7 +389,11 @@ func (o *RestoreOptions) Format(ctx *FmtCtx) {
 	if o.EncryptionPassphrase != nil {
 		addSep = true
 		ctx.WriteString("encryption_passphrase = ")
-		ctx.FormatNode(o.EncryptionPassphrase)
+		if ctx.flags.HasFlags(FmtShowPasswords) {
+			ctx.FormatNode(o.EncryptionPassphrase)
+		} else {
+			ctx.WriteString(PasswordSubstitution)
+		}
 	}
 
 	if o.DecryptionKMSURI != nil {
@@ -377,6 +434,11 @@ func (o *RestoreOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("skip_missing_views")
 	}
 
+	if o.SkipMissingUDFs {
+		maybeAddSep()
+		ctx.WriteString("skip_missing_udfs")
+	}
+
 	if o.Detached {
 		maybeAddSep()
 		ctx.WriteString("detached")
@@ -393,6 +455,12 @@ func (o *RestoreOptions) Format(ctx *FmtCtx) {
 		ctx.FormatNode(o.NewDBName)
 	}
 
+	if o.IncludeAllSecondaryTenants != nil {
+		maybeAddSep()
+		ctx.WriteString("include_all_secondary_tenants = ")
+		ctx.FormatNode(o.IncludeAllSecondaryTenants)
+	}
+
 	if o.IncrementalStorage != nil {
 		maybeAddSep()
 		ctx.WriteString("incremental_location = ")
@@ -401,8 +469,28 @@ func (o *RestoreOptions) Format(ctx *FmtCtx) {
 
 	if o.AsTenant != nil {
 		maybeAddSep()
-		ctx.WriteString("tenant = ")
+		ctx.WriteString("tenant_name = ")
 		ctx.FormatNode(o.AsTenant)
+	}
+
+	if o.ForceTenantID != nil {
+		maybeAddSep()
+		ctx.WriteString("tenant = ")
+		ctx.FormatNode(o.ForceTenantID)
+	}
+
+	if o.SchemaOnly {
+		maybeAddSep()
+		ctx.WriteString("schema_only")
+	}
+	if o.VerifyData {
+		maybeAddSep()
+		ctx.WriteString("verify_backup_table_data")
+	}
+
+	if o.UnsafeRestoreIncompatibleVersion {
+		maybeAddSep()
+		ctx.WriteString("unsafe_restore_incompatible_version")
 	}
 }
 
@@ -459,6 +547,14 @@ func (o *RestoreOptions) CombineWith(other *RestoreOptions) error {
 		o.SkipMissingViews = other.SkipMissingViews
 	}
 
+	if o.SkipMissingUDFs {
+		if other.SkipMissingUDFs {
+			return errors.New("skip_missing_udfs specified multiple times")
+		}
+	} else {
+		o.SkipMissingUDFs = other.SkipMissingUDFs
+	}
+
 	if o.Detached {
 		if other.Detached {
 			return errors.New("detached option specified multiple times")
@@ -496,7 +592,44 @@ func (o *RestoreOptions) CombineWith(other *RestoreOptions) error {
 	if o.AsTenant == nil {
 		o.AsTenant = other.AsTenant
 	} else if other.AsTenant != nil {
+		return errors.New("tenant_name option specified multiple times")
+	}
+
+	if o.ForceTenantID == nil {
+		o.ForceTenantID = other.ForceTenantID
+	} else if other.ForceTenantID != nil {
 		return errors.New("tenant option specified multiple times")
+	}
+
+	if o.SchemaOnly {
+		if other.SchemaOnly {
+			return errors.New("schema_only option specified multiple times")
+		}
+	} else {
+		o.SchemaOnly = other.SchemaOnly
+	}
+	if o.VerifyData {
+		if other.VerifyData {
+			return errors.New("verify_backup_table_data option specified multiple times")
+		}
+	} else {
+		o.VerifyData = other.VerifyData
+	}
+
+	if o.IncludeAllSecondaryTenants != nil {
+		if other.IncludeAllSecondaryTenants != nil {
+			return errors.New("include_all_secondary_tenants specified multiple times")
+		}
+	} else {
+		o.IncludeAllSecondaryTenants = other.IncludeAllSecondaryTenants
+	}
+
+	if o.UnsafeRestoreIncompatibleVersion {
+		if other.UnsafeRestoreIncompatibleVersion {
+			return errors.New("unsafe_restore_incompatible_version specified multiple times")
+		}
+	} else {
+		o.UnsafeRestoreIncompatibleVersion = other.UnsafeRestoreIncompatibleVersion
 	}
 
 	return nil
@@ -509,6 +642,7 @@ func (o RestoreOptions) IsDefault() bool {
 		o.SkipMissingSequences == options.SkipMissingSequences &&
 		o.SkipMissingSequenceOwners == options.SkipMissingSequenceOwners &&
 		o.SkipMissingViews == options.SkipMissingViews &&
+		o.SkipMissingUDFs == options.SkipMissingUDFs &&
 		cmp.Equal(o.DecryptionKMSURI, options.DecryptionKMSURI) &&
 		o.EncryptionPassphrase == options.EncryptionPassphrase &&
 		o.IntoDB == options.IntoDB &&
@@ -517,5 +651,40 @@ func (o RestoreOptions) IsDefault() bool {
 		o.DebugPauseOn == options.DebugPauseOn &&
 		o.NewDBName == options.NewDBName &&
 		cmp.Equal(o.IncrementalStorage, options.IncrementalStorage) &&
-		o.AsTenant == options.AsTenant
+		o.AsTenant == options.AsTenant &&
+		o.ForceTenantID == options.ForceTenantID &&
+		o.SchemaOnly == options.SchemaOnly &&
+		o.VerifyData == options.VerifyData &&
+		o.IncludeAllSecondaryTenants == options.IncludeAllSecondaryTenants &&
+		o.UnsafeRestoreIncompatibleVersion == options.UnsafeRestoreIncompatibleVersion
+}
+
+// BackupTargetList represents a list of targets.
+// Only one field may be non-nil.
+type BackupTargetList struct {
+	Databases NameList
+	Schemas   ObjectNamePrefixList
+	Tables    TableAttrs
+	TenantID  TenantID
+}
+
+// Format implements the NodeFormatter interface.
+func (tl *BackupTargetList) Format(ctx *FmtCtx) {
+	if tl.Databases != nil {
+		ctx.WriteString("DATABASE ")
+		ctx.FormatNode(&tl.Databases)
+	} else if tl.Schemas != nil {
+		ctx.WriteString("SCHEMA ")
+		ctx.FormatNode(&tl.Schemas)
+	} else if tl.TenantID.Specified {
+		ctx.WriteString("TENANT ")
+		ctx.FormatNode(&tl.TenantID)
+	} else {
+		if tl.Tables.SequenceOnly {
+			ctx.WriteString("SEQUENCE ")
+		} else {
+			ctx.WriteString("TABLE ")
+		}
+		ctx.FormatNode(&tl.Tables.TablePatterns)
+	}
 }

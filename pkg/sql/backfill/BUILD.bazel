@@ -1,9 +1,11 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "backfill",
     srcs = [
         "backfill.go",
+        "index_backfiller_cols.go",
         "mvcc_index_merger.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/backfill",
@@ -12,15 +14,21 @@ go_library(
         "//pkg/base",
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/sql/catalog",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/fetchpb",
         "//pkg/sql/catalog/schemaexpr",
         "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/catalog/typedesc",
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
+        "//pkg/sql/isql",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/row",
         "//pkg/sql/rowenc",
         "//pkg/sql/rowinfra",
@@ -29,10 +37,10 @@ go_library(
         "//pkg/sql/sem/tree",
         "//pkg/sql/sqlerrors",
         "//pkg/sql/types",
-        "//pkg/util",
         "//pkg/util/admission/admissionpb",
         "//pkg/util/ctxgroup",
         "//pkg/util/hlc",
+        "//pkg/util/intsets",
         "//pkg/util/log",
         "//pkg/util/mon",
         "//pkg/util/syncutil",
@@ -40,3 +48,18 @@ go_library(
         "@com_github_cockroachdb_logtags//:logtags",
     ],
 )
+
+go_test(
+    name = "backfill_test",
+    srcs = ["index_backfiller_cols_test.go"],
+    args = ["-test.timeout=295s"],
+    embed = [":backfill"],
+    deps = [
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/catenumpb",
+        "//pkg/sql/catalog/descpb",
+        "@com_github_stretchr_testify//require",
+    ],
+)
+
+get_x_data(name = "get_x_data")

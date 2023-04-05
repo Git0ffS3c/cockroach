@@ -12,6 +12,7 @@ package scpb
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
@@ -21,7 +22,11 @@ import (
 // elements in the target state.
 type CurrentState struct {
 	TargetState
-	Current []Status
+
+	// Current holds the current statuses of the elements in the TargetState.
+	// Initial is like Current, except in the statement transaction, in which
+	// it instead holds the statuses at the beginning of the transaction.
+	Initial, Current []Status
 
 	// InRollback captures whether the job is currently rolling back.
 	// This is important to ensure that the job can be moved to the proper
@@ -40,10 +45,19 @@ type CurrentState struct {
 	Revertible bool
 }
 
+// WithCurrentStatuses returns a shallow copy of the current state
+// with a new set of current statuses.
+func (s CurrentState) WithCurrentStatuses(current []Status) CurrentState {
+	ret := s
+	ret.Current = current
+	return ret
+}
+
 // DeepCopy returns a deep copy of the receiver.
 func (s CurrentState) DeepCopy() CurrentState {
 	return CurrentState{
 		TargetState: *protoutil.Clone(&s.TargetState).(*TargetState),
+		Initial:     append(make([]Status, 0, len(s.Initial)), s.Initial...),
 		Current:     append(make([]Status, 0, len(s.Current)), s.Current...),
 		InRollback:  s.InRollback,
 		Revertible:  s.Revertible,
@@ -67,6 +81,18 @@ func (s *CurrentState) Rollback() {
 		}
 	}
 	s.InRollback = true
+}
+
+// StatementTags returns the concatenated statement tags in the current state.
+func (s CurrentState) StatementTags() string {
+	var sb strings.Builder
+	for i, stmt := range s.Statements {
+		if i > 0 {
+			sb.WriteString("; ")
+		}
+		sb.WriteString(stmt.StatementTag)
+	}
+	return sb.String()
 }
 
 // NumStatus is the number of values which Status may take on.
@@ -141,6 +167,7 @@ func MakeCurrentStateFromDescriptors(descriptorStates []*DescriptorState) (Curre
 				cs.JobID,
 			)
 		}
+		s.Initial = append(s.Initial, cs.CurrentStatuses...)
 		s.Current = append(s.Current, cs.CurrentStatuses...)
 		s.Targets = append(s.Targets, cs.Targets...)
 		targetRanks = append(targetRanks, cs.TargetRanks...)
@@ -185,6 +212,7 @@ func (s *stateAndRanks) Less(i, j int) bool { return s.ranks[i] < s.ranks[j] }
 func (s *stateAndRanks) Swap(i, j int) {
 	s.ranks[i], s.ranks[j] = s.ranks[j], s.ranks[i]
 	s.Targets[i], s.Targets[j] = s.Targets[j], s.Targets[i]
+	s.Initial[i], s.Initial[j] = s.Initial[j], s.Initial[i]
 	s.Current[i], s.Current[j] = s.Current[j], s.Current[i]
 }
 

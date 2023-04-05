@@ -29,6 +29,11 @@ var (
 		Description: "Denylist file to limit access to IP addresses and tenant ids.",
 	}
 
+	AllowList = FlagInfo{
+		Name:        "allowlist-file",
+		Description: "Allow file to limit access to tenants based on IP addresses.",
+	}
+
 	ProxyListenAddr = FlagInfo{
 		Name:        "listen-addr",
 		Description: "Listen address for incoming connections.",
@@ -76,6 +81,19 @@ var (
 		Description: "If true, use insecure connection to the backend.",
 	}
 
+	DisableConnectionRebalancing = FlagInfo{
+		Name:        "disable-connection-rebalancing",
+		Description: "If true, proxy will not attempt to rebalance connections.",
+	}
+
+	RequireProxyProtocol = FlagInfo{
+		Name: "require-proxy-protocol",
+		Description: `Requires PROXY protocol on the SQL listener. The HTTP
+listener will support the protocol on a best-effort basis. If this is set to
+true, the PROXY info from upstream will be trusted on both SQL and HTTP
+listeners, if the headers are allowed.`,
+	}
+
 	RatelimitBaseDelay = FlagInfo{
 		Name:        "ratelimit-base-delay",
 		Description: "Initial backoff after a failed login attempt. Set to 0 to disable rate limiting.",
@@ -89,11 +107,6 @@ var (
 	PollConfigInterval = FlagInfo{
 		Name:        "poll-config-interval",
 		Description: "Polling interval changes in config file.",
-	}
-
-	DrainTimeout = FlagInfo{
-		Name:        "drain-timeout",
-		Description: "Close DRAINING connections idle for this duration.",
 	}
 
 	TestDirectoryListenPort = FlagInfo{

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -5,23 +6,33 @@ go_library(
     srcs = [
         "base.go",
         "bulk_adder.go",
+        "forced_error.go",
         "knobs.go",
-        "raftversion.go",
         "stores.go",
+        "syncing_write.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverpb",
         "//pkg/roachpb",
         "//pkg/settings",
+        "//pkg/settings/cluster",
         "//pkg/util/errorutil",
         "//pkg/util/hlc",
+        "//pkg/util/humanizeutil",
+        "//pkg/util/log",
         "//pkg/util/quotapool",
-        "//pkg/util/tracing",
+        "//pkg/util/timeutil",
+        "//pkg/util/tracing/tracingpb",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_pebble//vfs",
         "@com_github_cockroachdb_redact//:redact",
+        "@org_golang_x_time//rate",
     ],
 )
+
+get_x_data(name = "get_x_data")

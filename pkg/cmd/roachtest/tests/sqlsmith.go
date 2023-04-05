@@ -21,12 +21,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 )
@@ -38,7 +36,10 @@ func registerSQLSmith(r registry.Registry) {
 		"seed":                      sqlsmith.Setups["seed"],
 		sqlsmith.RandTableSetupName: sqlsmith.Setups[sqlsmith.RandTableSetupName],
 		"tpch-sf1": func(r *rand.Rand) []string {
-			return []string{`RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit' WITH into_db = 'defaultdb';`}
+			return []string{`
+RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`}
 		},
 		"tpcc": func(r *rand.Rand) []string {
 			const version = "version=2.1.0,fks=true,interleaved=false,seed=1,warehouses=1"
@@ -56,7 +57,10 @@ func registerSQLSmith(r registry.Registry) {
 			} {
 				stmts = append(
 					stmts,
-					fmt.Sprintf("RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit' WITH into_db = 'defaultdb';",
+					fmt.Sprintf(`
+RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit'
+WITH into_db = 'defaultdb', unsafe_restore_incompatible_version;
+`,
 						t, version,
 					),
 				)
@@ -94,11 +98,9 @@ func registerSQLSmith(r registry.Registry) {
 		rng, seed := randutil.NewTestRand()
 		t.L().Printf("seed: %d", seed)
 
-		c.Put(ctx, t.Cockroach(), "./cockroach")
-		if err := c.PutLibraries(ctx, "./lib"); err != nil {
-			t.Fatalf("could not initialize libraries: %v", err)
-		}
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+		// With 50% chance use the cockroach-short binary that was compiled with
+		// --crdb_test build tag.
+		maybeUseBuildWithEnabledAssertions(ctx, t, c, rng, 0.5 /* eaProb */)
 
 		setupFunc, ok := setups[setupName]
 		if !ok {
@@ -128,35 +130,7 @@ func registerSQLSmith(r registry.Registry) {
 		}
 
 		if settingName == "multi-region" {
-			regionsSet := make(map[string]struct{})
-			var region, zone string
-			rows, err := conn.Query("SHOW REGIONS FROM CLUSTER")
-			if err != nil {
-				t.Fatal(err)
-			}
-			for rows.Next() {
-				if err := rows.Scan(&region, &zone); err != nil {
-					t.Fatal(err)
-				}
-				regionsSet[region] = struct{}{}
-			}
-
-			var regionList []string
-			for region := range regionsSet {
-				regionList = append(regionList, region)
-			}
-
-			if len(regionList) == 0 {
-				t.Fatal(errors.New("no regions, cannot run multi-region config"))
-			}
-
-			if _, err := conn.Exec(
-				fmt.Sprintf(`ALTER DATABASE defaultdb SET PRIMARY REGION "%s";
-ALTER TABLE seed_mr_table SET LOCALITY REGIONAL BY ROW;
-INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
-			); err != nil {
-				t.Fatal(err)
-			}
+			setupMultiRegionDatabase(t, conn, logStmt)
 		}
 
 		const timeout = time.Minute
@@ -232,6 +206,11 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 					_, err := conn.Exec(stmt)
 					if err == nil {
 						logStmt(stmt)
+						stmt = "EXPLAIN " + stmt
+						_, err = conn.Exec(stmt)
+						if err == nil {
+							logStmt(stmt)
+						}
 					}
 					done <- err
 				}(ctx)
@@ -281,7 +260,26 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 			for idx, c := range allConns {
 				if err := c.PingContext(ctx); err != nil {
 					logStmt(stmt)
-					t.Fatalf("ping node %d: %v\nprevious sql:\n%s;", idx+1, err, stmt)
+					nodeID := idx + 1
+					errStr := fmt.Sprintf("ping node %d: %v\n", nodeID, err)
+					hintStr := fmt.Sprintf(
+						"HINT: node likely crashed, check logs in artifacts > logs/%d.unredacted\n",
+						nodeID,
+					)
+
+					var sb strings.Builder
+					// Print the error message and a hint.
+					sb.WriteString(errStr)
+					sb.WriteString(hintStr)
+					// Print the previous SQL.
+					sb.WriteString(fmt.Sprintf("previous sql:\n%s;", stmt))
+					// Print the error message and hint again because
+					// github-post prunes the top of the error message away when
+					// the SQL is too long.
+					sb.WriteString(errStr)
+					sb.WriteString(hintStr)
+
+					t.Fatalf(sb.String())
 				}
 			}
 		}
@@ -295,12 +293,14 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 			clusterSpec = r.MakeClusterSpec(numNodes)
 		}
 		r.Add(registry.TestSpec{
-			Name: fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
-			// NB: sqlsmith failures should never block a release.
+			Name:            fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
 			Owner:           registry.OwnerSQLQueries,
 			Cluster:         clusterSpec,
+			NativeLibs:      registry.LibGEOS,
 			Timeout:         time.Minute * 20,
 			RequiresLicense: true,
+			// NB: sqlsmith failures should never block a release.
+			NonReleaseBlocker: true,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runSQLSmith(ctx, t, c, setup, setting)
 			},
@@ -317,4 +317,39 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 	settings["multi-region"] = sqlsmith.Settings["multi-region"]
 	register("tpcc", "ddl-nodrop")
 	register("seed-multi-region", "multi-region")
+}
+
+// setupMultiRegionDatabase is used to set up a multi-region database.
+func setupMultiRegionDatabase(t test.Test, conn *gosql.DB, logStmt func(string)) {
+	t.Helper()
+	regionsSet := make(map[string]struct{})
+	var region, zone string
+	rows, err := conn.Query("SHOW REGIONS FROM CLUSTER")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		if err := rows.Scan(&region, &zone); err != nil {
+			t.Fatal(err)
+		}
+		regionsSet[region] = struct{}{}
+	}
+
+	var regionList []string
+	for region := range regionsSet {
+		regionList = append(regionList, region)
+	}
+
+	if len(regionList) == 0 {
+		t.Fatal(errors.New("no regions, cannot run multi-region config"))
+	}
+
+	stmt := fmt.Sprintf(`ALTER DATABASE defaultdb SET PRIMARY REGION "%s";
+ALTER TABLE seed_mr_table SET LOCALITY REGIONAL BY ROW;
+INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0])
+	if _, err := conn.Exec(stmt); err != nil {
+		t.Fatal(err)
+	} else {
+		logStmt(stmt)
+	}
 }

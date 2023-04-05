@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -15,6 +16,7 @@ go_library(
         "//pkg/server/serverpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql/sem/catconstants",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
@@ -27,6 +29,7 @@ go_test(
         "index_usage_stats_rec_test.go",
         "local_index_usage_stats_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":idxusage"],
     deps = [
         "//pkg/roachpb",
@@ -39,3 +42,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

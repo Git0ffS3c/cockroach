@@ -17,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
@@ -28,10 +27,9 @@ import (
 // collector wrapper can be plugged in.
 type rowFetcher interface {
 	StartScan(
-		_ context.Context, _ *kv.Txn, _ roachpb.Spans, spanIDs []int, batchBytesLimit rowinfra.BytesLimit,
-		rowLimitHint rowinfra.RowLimit, traceKV bool, forceProductionKVBatchSize bool,
+		_ context.Context, _ roachpb.Spans, spanIDs []int,
+		batchBytesLimit rowinfra.BytesLimit, rowLimitHint rowinfra.RowLimit,
 	) error
-	StartScanFrom(_ context.Context, _ row.KVBatchFetcher, traceKV bool) error
 	StartInconsistentScan(
 		_ context.Context,
 		_ *kv.DB,
@@ -40,8 +38,6 @@ type rowFetcher interface {
 		spans roachpb.Spans,
 		batchBytesLimit rowinfra.BytesLimit,
 		rowLimitHint rowinfra.RowLimit,
-		traceKV bool,
-		forceProductionKVBatchSize bool,
 		qualityOfService sessiondatapb.QoSLevel,
 	) error
 
@@ -52,6 +48,7 @@ type rowFetcher interface {
 
 	Reset()
 	GetBytesRead() int64
+	GetBatchRequestsIssued() int64
 	// Close releases any resources held by this fetcher.
 	Close(ctx context.Context)
 }

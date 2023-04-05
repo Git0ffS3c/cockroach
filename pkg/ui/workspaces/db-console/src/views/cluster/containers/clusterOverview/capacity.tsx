@@ -10,7 +10,7 @@
 
 import d3 from "d3";
 
-import { ComputeByteScale } from "src/util/format";
+import { util } from "@cockroachlabs/cluster-ui";
 
 const LOW_DISK_SPACE_RATIO = 0.15;
 
@@ -41,24 +41,20 @@ function capacityChart() {
 
   const scale = d3.scale.linear().range([0, size.width]);
 
-  const axis = d3.svg
-    .axis()
-    .scale(scale)
-    .tickSize(TICK_SIZE)
-    .ticks(5);
+  const axis = d3.svg.axis().scale(scale).tickSize(TICK_SIZE).ticks(5);
 
   function recomputeScale(capacity: CapacityChartProps) {
     // Compute the appropriate scale factor for a value slightly smaller than the
     // usable capacity, so that if the usable capacity is exactly 1 {MiB,GiB,etc}
     // we show the scale in the next-smaller unit.
-    const byteScale = ComputeByteScale(capacity.usable - 1);
+    const byteScale = util.ComputeByteScale(capacity.usable - 1);
 
     const scaled = {
       used: capacity.used / byteScale.value,
       usable: capacity.usable / byteScale.value,
     };
 
-    axis.tickFormat(function(d) {
+    axis.tickFormat(function (d) {
       return d + " " + byteScale.units;
     });
     scale.domain([0, scaled.usable]);
@@ -103,10 +99,7 @@ function capacityChart() {
       .selectAll(".bg-normal")
       .data((d: CapacityChartProps) => [d]);
 
-    bgNormal
-      .enter()
-      .append("rect")
-      .attr("class", "bg-normal");
+    bgNormal.enter().append("rect").attr("class", "bg-normal");
 
     bgNormal.attr("width", lowDiskSpacePosition).attr("height", size.height);
 
@@ -114,10 +107,7 @@ function capacityChart() {
       .selectAll(".bg-low-disk-space")
       .data((d: CapacityChartProps) => [d]);
 
-    bgLowDiskSpace
-      .enter()
-      .append("rect")
-      .attr("class", "bg-low-disk-space");
+    bgLowDiskSpace.enter().append("rect").attr("class", "bg-low-disk-space");
 
     bgLowDiskSpace
       .attr("x", lowDiskSpacePosition)

@@ -21,11 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -47,11 +49,11 @@ func tkey(tableID uint32, chunks ...string) []byte {
 }
 
 func tenantPrefix(tenID uint64) []byte {
-	return keys.MakeTenantPrefix(roachpb.MakeTenantID(tenID))
+	return keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenID))
 }
 
 func tenantTkey(tenID uint64, tableID uint32, chunks ...string) []byte {
-	key := keys.MakeSQLCodec(roachpb.MakeTenantID(tenID)).TablePrefix(tableID)
+	key := keys.MakeSQLCodec(roachpb.MustMakeTenantID(tenID)).TablePrefix(tableID)
 	for _, c := range chunks {
 		key = append(key, []byte(c)...)
 	}
@@ -69,16 +71,16 @@ func sqlKV(tableID uint32, indexID, descID uint64) roachpb.KeyValue {
 func descriptor(descID uint32) roachpb.KeyValue {
 	id := descpb.ID(descID)
 	k := catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, id)
-	v := tabledesc.NewBuilder(&descpb.TableDescriptor{ID: id}).BuildImmutable()
+	v := &descpb.Descriptor{Union: &descpb.Descriptor_Table{Table: &descpb.TableDescriptor{ID: id}}}
 	kv := roachpb.KeyValue{Key: k}
-	if err := kv.Value.SetProto(v.DescriptorProto()); err != nil {
+	if err := kv.Value.SetProto(v); err != nil {
 		panic(err)
 	}
 	return kv
 }
 
 func tenant(tenID uint64) roachpb.KeyValue {
-	k := keys.SystemSQLCodec.TenantMetadataKey(roachpb.MakeTenantID(tenID))
+	k := keys.SystemSQLCodec.TenantMetadataKey(roachpb.MustMakeTenantID(tenID))
 	return kv(k, nil)
 }
 
@@ -315,12 +317,6 @@ func TestComputeSplitKeySystemRanges(t *testing.T) {
 		{roachpb.RKey(keys.NodeLivenessPrefix), roachpb.RKey(keys.NodeLivenessKeyMax), nil},
 		{roachpb.RKey(keys.NodeLivenessPrefix), roachpb.RKeyMax, keys.NodeLivenessKeyMax},
 		{roachpb.RKey(keys.NodeLivenessKeyMax), roachpb.RKeyMax, keys.TimeseriesPrefix},
-		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.NodeLivenessPrefix), nil},
-		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.NodeLivenessKeyMax), nil},
-		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.StoreIDGenerator), nil},
-		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.TimeseriesPrefix), nil},
-		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.TimeseriesPrefix.Next()), keys.TimeseriesPrefix},
-		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKeyMax, keys.TimeseriesPrefix},
 		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKey(keys.TimeseriesPrefix.Next()), nil},
 		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), nil},
 		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKeyMax, keys.TimeseriesPrefix.PrefixEnd()},
@@ -336,7 +332,8 @@ func TestComputeSplitKeySystemRanges(t *testing.T) {
 		Values: kvs,
 	}
 	for tcNum, tc := range testCases {
-		splitKey := cfg.ComputeSplitKey(context.Background(), tc.start, tc.end)
+		splitKey, err := cfg.ComputeSplitKey(context.Background(), tc.start, tc.end)
+		require.NoError(t, err)
 		expected := roachpb.RKey(tc.split)
 		if !splitKey.Equal(expected) {
 			t.Errorf("#%d: bad split:\ngot: %v\nexpected: %v", tcNum, splitKey, expected)
@@ -351,7 +348,7 @@ func TestComputeSplitKeyTableIDs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const (
-		reservedStart = keys.MaxSystemConfigDescID + 1
+		reservedStart = keys.DeprecatedMaxSystemConfigDescID + 1
 	)
 
 	// Used in place of roachpb.RKeyMin in order to test the behavior of splits
@@ -447,7 +444,8 @@ func TestComputeSplitKeyTableIDs(t *testing.T) {
 	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
 	for tcNum, tc := range testCases {
 		cfg.Values = tc.values
-		splitKey := cfg.ComputeSplitKey(context.Background(), tc.start, tc.end)
+		splitKey, err := cfg.ComputeSplitKey(context.Background(), tc.start, tc.end)
+		require.NoError(t, err)
 		if !splitKey.Equal(tc.split) {
 			t.Errorf("#%d: bad split:\ngot: %v\nexpected: %v", tcNum, splitKey, tc.split)
 		}
@@ -534,7 +532,8 @@ func TestComputeSplitKeyTenantBoundaries(t *testing.T) {
 	cfg := config.NewSystemConfig(zonepb.DefaultZoneConfigRef())
 	for tcNum, tc := range testCases {
 		cfg.Values = tc.values
-		splitKey := cfg.ComputeSplitKey(context.Background(), tc.start, tc.end)
+		splitKey, err := cfg.ComputeSplitKey(context.Background(), tc.start, tc.end)
+		require.NoError(t, err)
 		if !splitKey.Equal(tc.split) {
 			t.Errorf("#%d: bad split:\ngot: %v\nexpected: %v", tcNum, splitKey, tc.split)
 		}
@@ -557,9 +556,8 @@ func TestGetZoneConfigForKey(t *testing.T) {
 		{roachpb.RKey(keys.MetaMax), keys.SystemRangesID},
 		{roachpb.RKey(keys.SystemPrefix), keys.SystemRangesID},
 		{roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemRangesID},
-		{roachpb.RKey(keys.MigrationLease), keys.SystemRangesID},
 		{roachpb.RKey(keys.NodeLivenessPrefix), keys.LivenessRangesID},
-		{roachpb.RKey(keys.SystemSQLCodec.DescIDSequenceKey()), keys.SystemRangesID},
+		{roachpb.RKey(keys.LegacyDescIDGenerator), keys.SystemRangesID},
 		{roachpb.RKey(keys.NodeIDGenerator), keys.SystemRangesID},
 		{roachpb.RKey(keys.RangeIDGenerator), keys.SystemRangesID},
 		{roachpb.RKey(keys.StoreIDGenerator), keys.SystemRangesID},
@@ -570,8 +568,10 @@ func TestGetZoneConfigForKey(t *testing.T) {
 		{roachpb.RKey(keys.TableDataMin), keys.SystemDatabaseID},
 		{roachpb.RKey(keys.SystemConfigSplitKey), keys.SystemDatabaseID},
 
-		// Gossiped system tables should refer to the SystemDatabaseID.
-		{tkey(keys.ZonesTableID), keys.SystemDatabaseID},
+		{tkey(keys.ZonesTableID), keys.ZonesTableID},
+		{roachpb.RKey(keys.SystemZonesTableSpan.Key), keys.ZonesTableID},
+		{tkey(keys.DescriptorTableID), keys.DescriptorTableID},
+		{roachpb.RKey(keys.SystemDescriptorTableSpan.Key), keys.DescriptorTableID},
 
 		// Non-gossiped system tables should refer to themselves.
 		{tkey(keys.LeaseTableID), keys.LeaseTableID},
@@ -652,4 +652,32 @@ func TestSystemConfigMask(t *testing.T) {
 	}}
 	res := mask.Apply(entries)
 	require.Equal(t, exp, res)
+}
+
+func TestShouldSplitAtDesc(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	tbl1 := descpb.Descriptor{Union: &descpb.Descriptor_Table{Table: &descpb.TableDescriptor{}}}
+	tbl2 := descpb.Descriptor{Union: &descpb.Descriptor_Table{Table: &descpb.TableDescriptor{ViewQuery: "SELECT"}}}
+	tbl3 := descpb.Descriptor{Union: &descpb.Descriptor_Table{Table: &descpb.TableDescriptor{ViewQuery: "SELECT", IsMaterializedView: true}}}
+	db := descpb.Descriptor{Union: &descpb.Descriptor_Database{Database: &descpb.DatabaseDescriptor{
+		Name:              "db",
+		ID:                42,
+		Privileges:        catpb.NewBaseDatabasePrivilegeDescriptor(username.AdminRoleName()),
+		DefaultPrivileges: catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_DATABASE),
+	}}}
+	typ := descpb.Descriptor{Union: &descpb.Descriptor_Type{Type: &descpb.TypeDescriptor{}}}
+	schema := descpb.Descriptor{Union: &descpb.Descriptor_Schema{Schema: &descpb.SchemaDescriptor{}}}
+	for inner, should := range map[*descpb.Descriptor]bool{
+		&tbl1:   true,
+		&tbl2:   false,
+		&tbl3:   true,
+		&db:     false,
+		&typ:    false,
+		&schema: false,
+	} {
+		var rawDesc roachpb.Value
+		require.NoError(t, rawDesc.SetProto(inner))
+		require.Equal(t, should, config.ShouldSplitAtDesc(&rawDesc))
+	}
 }

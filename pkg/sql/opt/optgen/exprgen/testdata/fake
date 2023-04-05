@@ -25,19 +25,19 @@ expr
   [
     (OutputCols [ (NewColumn "a" "int") (NewColumn "b" "int") (NewColumn "c" "int")] )
     (Cardinality "5 - 1000")
-    (Stats `[
+    (stats `[
       {
         "columns": ["a"],
         "distinct_count": 100,
-        "null_count": 0, 
-        "row_count": 100, 
+        "null_count": 0,
+        "row_count": 100,
         "created_at": "2018-01-01 1:00:00.00000+00:00"
       },
       {
         "columns": ["b"],
         "distinct_count": 20,
-        "null_count": 5, 
-        "row_count": 100, 
+        "null_count": 5,
+        "row_count": 100,
         "created_at": "2018-01-01 1:00:00.00000+00:00"
       }
     ]`)
@@ -47,7 +47,7 @@ expr
 fake-rel
  ├── columns: a:1(int) b:2(int) c:3(int)
  ├── cardinality: [5 - 1000]
- ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=0, distinct(2)=20, null(2)=5, avgsize(2)=0]
+ ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(2)=20, null(2)=5]
  └── cost: 0.01
 
 # Verify that newer stats are preferred.
@@ -56,33 +56,33 @@ expr
   [
     (OutputCols [ (NewColumn "a" "int") (NewColumn "b" "int") (NewColumn "c" "int")] )
     (Cardinality "-")
-    (Stats `[
+    (stats `[
       {
         "columns": ["a"],
         "distinct_count": 100,
-        "null_count": 0, 
-        "row_count": 100, 
+        "null_count": 0,
+        "row_count": 100,
         "created_at": "2018-01-01 1:00:00.00000+00:00"
       },
       {
         "columns": ["a"],
         "distinct_count": 110,
-        "null_count": 0, 
-        "row_count": 110, 
+        "null_count": 0,
+        "row_count": 110,
         "created_at": "2018-01-02 1:00:00.00000+00:00"
       },
       {
         "columns": ["b"],
         "distinct_count": 20,
-        "null_count": 5, 
-        "row_count": 100, 
+        "null_count": 5,
+        "row_count": 100,
         "created_at": "2018-01-01 1:00:00.00000+00:00"
       },
       {
         "columns": ["b"],
         "distinct_count": 22,
-        "null_count": 5, 
-        "row_count": 120, 
+        "null_count": 5,
+        "row_count": 120,
         "created_at": "2018-01-03 1:00:00.00000+00:00"
       }
     ]`)
@@ -91,5 +91,5 @@ expr
 ----
 fake-rel
  ├── columns: a:1(int) b:2(int) c:3(int)
- ├── stats: [rows=120, distinct(1)=110, null(1)=0, avgsize(1)=0, distinct(2)=22, null(2)=5, avgsize(2)=0]
+ ├── stats: [rows=120, distinct(1)=110, null(1)=0, distinct(2)=22, null(2)=5]
  └── cost: 0.02

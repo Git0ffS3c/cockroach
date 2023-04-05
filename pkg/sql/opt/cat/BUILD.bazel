@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -26,11 +27,13 @@ go_library(
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/privilege",
         "//pkg/sql/roleoption",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
         "//pkg/sql/types",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_lib_pq//oid",
     ],
 )
@@ -39,6 +42,7 @@ go_test(
     name = "cat_test",
     size = "small",
     srcs = ["utils_test.go"],
+    args = ["-test.timeout=55s"],
     deps = [
         ":cat",
         "//pkg/sql/catalog/descpb",
@@ -46,3 +50,5 @@ go_test(
         "//pkg/sql/sem/tree",
     ],
 )
+
+get_x_data(name = "get_x_data")

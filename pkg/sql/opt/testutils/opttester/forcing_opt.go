@@ -11,12 +11,14 @@
 package opttester
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/errors"
 )
 
 // forcingOptimizer is a wrapper around an Optimizer which adds low-level
@@ -64,10 +66,11 @@ func newForcingOptimizer(
 		remaining:   steps,
 		lastMatched: opt.InvalidRuleName,
 	}
-	fo.o.Init(&tester.evalCtx, tester.catalog)
+	fo.o.Init(context.Background(), &tester.evalCtx, tester.catalog)
 	fo.o.Factory().FoldingControl().AllowStableFolds()
 	fo.coster.Init(&fo.o, &fo.groups)
 	fo.o.SetCoster(&fo.coster)
+	fo.o.Factory().SetDisabledRules(tester.Flags.DisableRules)
 
 	fo.o.NotifyOnMatchedRule(func(ruleName opt.RuleName) bool {
 		if ignoreNormRules && ruleName.IsNormalize() {
@@ -121,9 +124,20 @@ func (fo *forcingOptimizer) Optimize() opt.Expr {
 	return expr
 }
 
-// LookupPath returns the path of the given node.
+// LookupPath returns the path of the given node. If a path is not found, it
+// returns nil.
 func (fo *forcingOptimizer) LookupPath(target opt.Expr) []memoLoc {
 	return fo.groups.FindPath(fo.o.Memo().RootExpr(), target)
+}
+
+// MustLookupPath returns the path of the given node. If a path is not found, it
+// panics.
+func (fo *forcingOptimizer) MustLookupPath(target opt.Expr) []memoLoc {
+	path := fo.LookupPath(target)
+	if path == nil {
+		panic(errors.AssertionFailedf("could not find path to expr (%s)", target.Op()))
+	}
+	return path
 }
 
 // RestrictToExpr sets up the optimizer to restrict the result to only those
@@ -174,4 +188,11 @@ func (fc *forcingCoster) ComputeCost(e memo.RelExpr, required *physical.Required
 	}
 
 	return fc.inner.ComputeCost(e, required)
+}
+
+// MaybeGetBestCostRelation is part of the xform.Coster interface.
+func (fc *forcingCoster) MaybeGetBestCostRelation(
+	grp memo.RelExpr, required *physical.Required,
+) (best memo.RelExpr, ok bool) {
+	return fc.o.MaybeGetBestCostRelation(grp, required)
 }

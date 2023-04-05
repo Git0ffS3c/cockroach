@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package storage_test
+package storage
 
 import (
 	"context"
@@ -19,17 +19,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/stretchr/testify/require"
 )
 
-func makeIntTableKVs(numKeys, valueSize, maxRevisions int) []storage.MVCCKeyValue {
+func makeIntTableKVs(numKeys, valueSize, maxRevisions int) []MVCCKeyValue {
 	prefix := encoding.EncodeUvarintAscending(keys.SystemSQLCodec.TablePrefix(uint32(100)), uint64(1))
-	kvs := make([]storage.MVCCKeyValue, numKeys)
+	kvs := make([]MVCCKeyValue, numKeys)
 	r, _ := randutil.NewTestRand()
 
 	var k int
@@ -53,15 +53,15 @@ func makeIntTableKVs(numKeys, valueSize, maxRevisions int) []storage.MVCCKeyValu
 	return kvs
 }
 
-func makePebbleSST(t testing.TB, kvs []storage.MVCCKeyValue, ingestion bool) []byte {
+func makePebbleSST(t testing.TB, kvs []MVCCKeyValue, ingestion bool) []byte {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	f := &storage.MemFile{}
-	var w storage.SSTWriter
+	f := &MemObject{}
+	var w SSTWriter
 	if ingestion {
-		w = storage.MakeIngestionSSTWriter(ctx, st, f)
+		w = MakeIngestionSSTWriter(ctx, st, f)
 	} else {
-		w = storage.MakeBackupSSTWriter(ctx, st, f)
+		w = MakeBackupSSTWriter(ctx, st, &f.Buffer)
 	}
 	defer w.Close()
 
@@ -84,32 +84,70 @@ func TestMakeIngestionWriterOptions(t *testing.T) {
 		want sstable.TableFormat
 	}{
 		{
-			name: "before feature gate",
+			name: "22.2",
 			st: cluster.MakeTestingClusterSettingsWithVersions(
-				clusterversion.ByKey(clusterversion.EnablePebbleFormatVersionBlockProperties-1),
+				clusterversion.ByKey(clusterversion.V22_2),
 				clusterversion.TestingBinaryMinSupportedVersion,
 				true,
 			),
-			want: sstable.TableFormatRocksDBv2,
+			want: sstable.TableFormatPebblev2,
 		},
 		{
-			name: "at feature gate",
-			st: cluster.MakeTestingClusterSettingsWithVersions(
-				clusterversion.ByKey(clusterversion.EnablePebbleFormatVersionBlockProperties),
-				clusterversion.TestingBinaryMinSupportedVersion,
-				true,
-			),
-			want: sstable.TableFormatPebblev1,
+			name: "with value blocks",
+			st: func() *cluster.Settings {
+				st := cluster.MakeTestingClusterSettings()
+				ValueBlocksEnabled.Override(context.Background(), &st.SV, true)
+				return st
+			}(),
+			want: sstable.TableFormatPebblev3,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			opts := storage.MakeIngestionWriterOptions(ctx, tc.st)
+			opts := MakeIngestionWriterOptions(ctx, tc.st)
 			require.Equal(t, tc.want, opts.TableFormat)
 		})
 	}
+}
+
+func TestSSTWriterRangeKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	DisableMetamorphicSimpleValueEncoding(t)
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	sstFile := &MemObject{}
+	sst := MakeIngestionSSTWriter(ctx, st, sstFile)
+	defer sst.Close()
+
+	require.NoError(t, sst.Put(pointKey("a", 1), stringValueRaw("foo")))
+	require.EqualValues(t, 9, sst.DataSize)
+
+	require.NoError(t, sst.PutMVCCRangeKey(rangeKey("a", "e", 2), tombstoneLocalTS(1)))
+	require.EqualValues(t, 20, sst.DataSize)
+
+	require.NoError(t, sst.PutEngineRangeKey(roachpb.Key("f"), roachpb.Key("g"),
+		wallTSRaw(2), tombstoneLocalTSRaw(1)))
+	require.EqualValues(t, 31, sst.DataSize)
+
+	require.NoError(t, sst.Finish())
+
+	iter, err := NewMemSSTIterator(sstFile.Bytes(), false /* verify */, IterOptions{
+		KeyTypes:   IterKeyTypePointsAndRanges,
+		UpperBound: keys.MaxKey,
+	})
+	require.NoError(t, err)
+	defer iter.Close()
+
+	require.Equal(t, []interface{}{
+		rangeKV("a", "e", 2, tombstoneLocalTS(1)),
+		pointKV("a", 1, "foo"),
+		rangeKV("f", "g", 2, tombstoneLocalTS(1)),
+	}, scanIter(t, iter))
 }
 
 func BenchmarkWriteSSTable(b *testing.B) {

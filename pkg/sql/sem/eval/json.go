@@ -11,17 +11,22 @@
 package eval
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/errors"
 )
 
 // PopulateDatumWithJSON is used for the json to record function family, like
 // json_populate_record. It's less restrictive than the casting system, which
 // is why it's implemented separately.
-func PopulateDatumWithJSON(ctx *Context, j json.JSON, desiredType *types.T) (tree.Datum, error) {
+func PopulateDatumWithJSON(
+	ctx context.Context, evalCtx *Context, j json.JSON, desiredType *types.T,
+) (tree.Datum, error) {
 	if j == json.NullJSONValue {
 		return tree.DNull, nil
 	}
@@ -39,7 +44,7 @@ func PopulateDatumWithJSON(ctx *Context, j json.JSON, desiredType *types.T) (tre
 			if err != nil {
 				return nil, err
 			}
-			d.Array[i], err = PopulateDatumWithJSON(ctx, elt, elementTyp)
+			d.Array[i], err = PopulateDatumWithJSON(ctx, evalCtx, elt, elementTyp)
 			if err != nil {
 				return nil, err
 			}
@@ -50,7 +55,7 @@ func PopulateDatumWithJSON(ctx *Context, j json.JSON, desiredType *types.T) (tre
 		for i := range tup.D {
 			tup.D[i] = tree.DNull
 		}
-		err := PopulateRecordWithJSON(ctx, j, desiredType, tup)
+		err := PopulateRecordWithJSON(ctx, evalCtx, j, desiredType, tup)
 		return tup, err
 	}
 	var s string
@@ -60,11 +65,14 @@ func PopulateDatumWithJSON(ctx *Context, j json.JSON, desiredType *types.T) (tre
 		if err != nil {
 			return nil, err
 		}
+		if t == nil {
+			return nil, errors.AssertionFailedf("JSON NULL value was checked above")
+		}
 		s = *t
 	default:
 		s = j.String()
 	}
-	return PerformCast(ctx, tree.NewDString(s), desiredType)
+	return PerformCast(ctx, evalCtx, tree.NewDString(s), desiredType)
 }
 
 // PopulateRecordWithJSON is used for the json to record function family, like
@@ -77,7 +85,7 @@ func PopulateDatumWithJSON(ctx *Context, j json.JSON, desiredType *types.T) (tre
 // Each field will be set by a best-effort coercion to its type from the JSON
 // field. The logic is more permissive than casts.
 func PopulateRecordWithJSON(
-	ctx *Context, j json.JSON, desiredType *types.T, tup *tree.DTuple,
+	ctx context.Context, evalCtx *Context, j json.JSON, desiredType *types.T, tup *tree.DTuple,
 ) error {
 	if j.Type() != json.ObjectJSONType {
 		return pgerror.Newf(pgcode.InvalidParameterValue, "expected JSON object")
@@ -96,7 +104,7 @@ func PopulateRecordWithJSON(
 			// No value? Use the value that was already in the tuple.
 			continue
 		}
-		tup.D[i], err = PopulateDatumWithJSON(ctx, val, tupleTypes[i])
+		tup.D[i], err = PopulateDatumWithJSON(ctx, evalCtx, val, tupleTypes[i])
 		if err != nil {
 			return err
 		}

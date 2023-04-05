@@ -45,6 +45,7 @@ func TestExternalDistinct(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -67,15 +68,16 @@ func TestExternalDistinct(t *testing.T) {
 			var semsToCheck []semaphore.Semaphore
 			var outputOrdering execinfrapb.Ordering
 			verifier := colexectestutils.UnorderedVerifier
-			// Check that the external distinct and the disk-backed sort
-			// were added as Closers.
-			numExpectedClosers := 2
+			// Check that the disk spiller, the external distinct, and the
+			// disk-backed sort (which includes both the disk spiller and the
+			// sort) were added as Closers.
+			numExpectedClosers := 4
 			if tc.isOrderedOnDistinctCols {
 				outputOrdering = convertDistinctColsToOrdering(tc.distinctCols)
 				verifier = colexectestutils.OrderedVerifier
-				// The final disk-backed sort must also be added as a
-				// Closer.
-				numExpectedClosers++
+				// The disk spiller and the sort included in the final
+				// disk-backed sort must also be added as Closers.
+				numExpectedClosers += 2
 			}
 			tc.runTests(t, verifier, func(input []colexecop.Operator) (colexecop.Operator, error) {
 				// A sorter should never exceed ExternalSorterMinPartitions, even
@@ -91,14 +93,8 @@ func TestExternalDistinct(t *testing.T) {
 				require.Equal(t, numExpectedClosers, len(closers))
 				return distinct, err
 			})
-			if tc.errorOnDup == "" || tc.noError {
-				// We don't check that all FDs were released if an error is
-				// expected to be returned because our utility closeIfCloser()
-				// doesn't handle multiple closers (which is always the case for
-				// the external distinct).
-				for i, sem := range semsToCheck {
-					require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
-				}
+			for i, sem := range semsToCheck {
+				require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
 			}
 		}
 	}
@@ -116,6 +112,7 @@ func TestExternalDistinctSpilling(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -196,9 +193,9 @@ func TestExternalDistinctSpilling(t *testing.T) {
 				&monitorRegistry,
 			)
 			require.NoError(t, err)
-			// Check that the external distinct and the disk-backed sort
-			// were added as Closers.
-			numExpectedClosers := 2
+			// Check that the disk spiller, the external distinct, and the
+			// disk-backed sort (which accounts for two) were added as Closers.
+			numExpectedClosers := 4
 			require.Equal(t, numExpectedClosers, len(closers))
 			numRuns++
 			return distinct, nil
@@ -270,6 +267,7 @@ func BenchmarkExternalDistinct(b *testing.B) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},

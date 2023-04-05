@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 )
@@ -54,12 +55,12 @@ func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) 
 	// is a member of old roles and new roles and has CREATE privilege.
 	// Postgres first checks if the role exists before checking privileges.
 	for _, oldRole := range normalizedOldRoles {
-		roleExists, err := RoleExists(ctx, p.ExecCfg(), p.Txn(), oldRole)
+		roleExists, err := RoleExists(ctx, p.InternalSQLTxn(), oldRole)
 		if err != nil {
 			return nil, err
 		}
 		if !roleExists {
-			return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist", oldRole)
+			return nil, sqlerrors.NewUndefinedUserError(oldRole)
 		}
 	}
 	newRole, err := decodeusername.FromRoleSpec(
@@ -68,9 +69,9 @@ func (p *planner) ReassignOwnedBy(ctx context.Context, n *tree.ReassignOwnedBy) 
 	if err != nil {
 		return nil, err
 	}
-	roleExists, err := RoleExists(ctx, p.ExecCfg(), p.Txn(), newRole)
+	roleExists, err := RoleExists(ctx, p.InternalSQLTxn(), newRole)
 	if !roleExists {
-		return nil, pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist", newRole)
+		return nil, sqlerrors.NewUndefinedUserError(newRole)
 	}
 	if err != nil {
 		return nil, err
@@ -121,8 +122,7 @@ func (n *reassignOwnedByNode) startExec(params runParams) error {
 
 	// Filter for all objects in current database.
 	currentDatabase := params.p.CurrentDatabase()
-	currentDbDesc, err := params.p.Descriptors().GetMutableDatabaseByName(
-		params.ctx, params.p.txn, currentDatabase, tree.DatabaseLookupFlags{Required: true})
+	currentDbDesc, err := params.p.Descriptors().MutableByName(params.p.txn).Database(params.ctx, currentDatabase)
 	if err != nil {
 		return err
 	}
@@ -133,14 +133,22 @@ func (n *reassignOwnedByNode) startExec(params runParams) error {
 	for _, oldRole := range n.normalizedOldRoles {
 		// There should only be one database (current).
 		for _, dbID := range lCtx.dbIDs {
-			if IsOwner(lCtx.dbDescs[dbID], oldRole) {
+			isOwner, err := isOwner(params.ctx, params.p, lCtx.dbDescs[dbID], oldRole)
+			if err != nil {
+				return err
+			}
+			if isOwner {
 				if err := n.reassignDatabaseOwner(lCtx.dbDescs[dbID], params); err != nil {
 					return err
 				}
 			}
 		}
 		for _, schemaID := range lCtx.schemaIDs {
-			if IsOwner(lCtx.schemaDescs[schemaID], oldRole) {
+			isOwner, err := isOwner(params.ctx, params.p, lCtx.schemaDescs[schemaID], oldRole)
+			if err != nil {
+				return err
+			}
+			if isOwner {
 				// Don't reassign public schema.
 				// TODO(richardjcai): revisit this in 22.2, in 22.1 we do not allow
 				// modifying the public schema.
@@ -154,15 +162,34 @@ func (n *reassignOwnedByNode) startExec(params runParams) error {
 		}
 
 		for _, tbID := range lCtx.tbIDs {
-			if IsOwner(lCtx.tbDescs[tbID], oldRole) {
+			isOwner, err := isOwner(params.ctx, params.p, lCtx.tbDescs[tbID], oldRole)
+			if err != nil {
+				return err
+			}
+			if isOwner {
 				if err := n.reassignTableOwner(lCtx.tbDescs[tbID], params); err != nil {
 					return err
 				}
 			}
 		}
 		for _, typID := range lCtx.typIDs {
-			if IsOwner(lCtx.typDescs[typID], oldRole) && (lCtx.typDescs[typID].GetKind() != descpb.TypeDescriptor_ALIAS) {
-				if err := n.reassignTypeOwner(lCtx.typDescs[typID], params); err != nil {
+			isOwner, err := isOwner(params.ctx, params.p, lCtx.typDescs[typID], oldRole)
+			if err != nil {
+				return err
+			}
+			if isOwner && (lCtx.typDescs[typID].AsAliasTypeDescriptor() == nil) {
+				if err := n.reassignTypeOwner(lCtx.typDescs[typID].(catalog.NonAliasTypeDescriptor), params); err != nil {
+					return err
+				}
+			}
+		}
+		for _, fnID := range lCtx.fnIDs {
+			isOwner, err := isOwner(params.ctx, params.p, lCtx.fnDescs[fnID], oldRole)
+			if err != nil {
+				return err
+			}
+			if isOwner {
+				if err := n.reassignFunctionOwner(lCtx.fnDescs[fnID], params); err != nil {
 					return err
 				}
 			}
@@ -174,9 +201,12 @@ func (n *reassignOwnedByNode) startExec(params runParams) error {
 func (n *reassignOwnedByNode) reassignDatabaseOwner(
 	dbDesc catalog.DatabaseDescriptor, params runParams,
 ) error {
-	mutableDbDesc, err := params.p.Descriptors().GetMutableDescriptorByID(params.ctx, params.p.txn, dbDesc.GetID())
+	mutableDbDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Desc(params.ctx, dbDesc.GetID())
 	if err != nil {
 		return err
+	}
+	if mutableDbDesc.Dropped() {
+		return nil
 	}
 	owner, err := decodeusername.FromRoleSpec(
 		params.p.SessionData(), username.PurposeValidation, n.n.NewRole,
@@ -200,9 +230,12 @@ func (n *reassignOwnedByNode) reassignDatabaseOwner(
 func (n *reassignOwnedByNode) reassignSchemaOwner(
 	schemaDesc catalog.SchemaDescriptor, dbDesc *dbdesc.Mutable, params runParams,
 ) error {
-	mutableSchemaDesc, err := params.p.Descriptors().GetMutableDescriptorByID(params.ctx, params.p.txn, schemaDesc.GetID())
+	mutableSchemaDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Desc(params.ctx, schemaDesc.GetID())
 	if err != nil {
 		return err
+	}
+	if mutableSchemaDesc.Dropped() {
+		return nil
 	}
 	owner, err := decodeusername.FromRoleSpec(
 		params.p.SessionData(), username.PurposeValidation, n.n.NewRole,
@@ -226,11 +259,13 @@ func (n *reassignOwnedByNode) reassignSchemaOwner(
 func (n *reassignOwnedByNode) reassignTableOwner(
 	tbDesc catalog.TableDescriptor, params runParams,
 ) error {
-	mutableTbDesc, err := params.p.Descriptors().GetMutableDescriptorByID(params.ctx, params.p.txn, tbDesc.GetID())
+	mutableTbDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Desc(params.ctx, tbDesc.GetID())
 	if err != nil {
 		return err
 	}
-
+	if mutableTbDesc.Dropped() {
+		return nil
+	}
 	tableName, err := params.p.getQualifiedTableName(params.ctx, tbDesc)
 	if err != nil {
 		return err
@@ -255,14 +290,16 @@ func (n *reassignOwnedByNode) reassignTableOwner(
 }
 
 func (n *reassignOwnedByNode) reassignTypeOwner(
-	typDesc catalog.TypeDescriptor, params runParams,
+	typDesc catalog.NonAliasTypeDescriptor, params runParams,
 ) error {
-	mutableTypDesc, err := params.p.Descriptors().GetMutableDescriptorByID(params.ctx, params.p.txn, typDesc.GetID())
+	mutableTypDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Desc(params.ctx, typDesc.GetID())
 	if err != nil {
 		return err
 	}
-	arrayDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(
-		params.ctx, params.p.txn, typDesc.GetArrayTypeID())
+	if mutableTypDesc.Dropped() {
+		return nil
+	}
+	arrayDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, typDesc.GetArrayTypeID())
 	if err != nil {
 		return err
 	}
@@ -298,6 +335,26 @@ func (n *reassignOwnedByNode) reassignTypeOwner(
 		return err
 	}
 	return nil
+}
+
+func (n *reassignOwnedByNode) reassignFunctionOwner(
+	fnDesc catalog.FunctionDescriptor, params runParams,
+) error {
+	mutableDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Function(params.ctx, fnDesc.GetID())
+	if err != nil {
+		return err
+	}
+	if mutableDesc.Dropped() {
+		return nil
+	}
+	newOwner, err := decodeusername.FromRoleSpec(
+		params.p.SessionData(), username.PurposeValidation, n.n.NewRole,
+	)
+	if err != nil {
+		return err
+	}
+	mutableDesc.GetPrivileges().SetOwner(newOwner)
+	return params.p.writeFuncSchemaChange(params.ctx, mutableDesc)
 }
 
 func (n *reassignOwnedByNode) Next(runParams) (bool, error) { return false, nil }

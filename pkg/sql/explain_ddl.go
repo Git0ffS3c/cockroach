@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
@@ -67,15 +68,18 @@ func (n *explainDDLNode) startExec(params runParams) error {
 			return explainNotPossibleError
 		}
 	}
-	return n.setExplainValues(scNode.plannedState)
+	return n.setExplainValues(params.ctx, params.ExecCfg().Settings, scNode.plannedState)
 }
 
-func (n *explainDDLNode) setExplainValues(scState scpb.CurrentState) (err error) {
+func (n *explainDDLNode) setExplainValues(
+	ctx context.Context, settings *cluster.Settings, scState scpb.CurrentState,
+) (err error) {
 	defer func() {
 		err = errors.WithAssertionFailure(err)
 	}()
 	var p scplan.Plan
-	p, err = scplan.MakePlan(scState, scplan.Params{
+	p, err = scplan.MakePlan(ctx, scState, scplan.Params{
+		ActiveVersion:              settings.Version.ActiveVersion(ctx),
 		ExecutionPhase:             scop.StatementPhase,
 		SchemaChangerJobIDSupplier: func() jobspb.JobID { return 1 },
 	})

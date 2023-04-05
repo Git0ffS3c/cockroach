@@ -61,6 +61,8 @@ func TestSQLWatcherReactsToUpdates(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			ExternalIODir: dir,
+			// Test already runs from a tenant.
+			DefaultTestTenant: base.TestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				SpanConfig: &spanconfig.TestingKnobs{
 					ManagerDisableJobCreation: true, // disable the automatic job creation.
@@ -234,7 +236,7 @@ func TestSQLWatcherReactsToUpdates(t *testing.T) {
 				"BACKUP TENANT 2 INTO 'nodelocal://1/foo'",
 			},
 			expectedPTSUpdates: []spanconfig.ProtectedTimestampUpdate{{ClusterTarget: false,
-				TenantTarget: roachpb.MakeTenantID(2)}},
+				TenantTarget: roachpb.MustMakeTenantID(2)}},
 		},
 	}
 
@@ -286,6 +288,8 @@ func TestSQLWatcherMultiple(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Test already runs from a tenant.
+			DefaultTestTenant: base.TestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				SpanConfig: &spanconfig.TestingKnobs{
 					ManagerDisableJobCreation: true, // disable the automatic job creation.
@@ -416,6 +420,8 @@ func TestSQLWatcherOnEventError(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Test already runs from a tenant.
+			DefaultTestTenant: base.TestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				SpanConfig: &spanconfig.TestingKnobs{
 					ManagerDisableJobCreation: true, // disable the automatic job creation.
@@ -431,18 +437,18 @@ func TestSQLWatcherOnEventError(t *testing.T) {
 	tdb.Exec(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true`)
 	tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
 
-	noopCheckpointDuration := time.Hour // effectively disable no-op checkpoints
 	sqlWatcher := spanconfigsqlwatcher.New(
 		keys.SystemSQLCodec,
 		ts.ClusterSettings(),
 		ts.RangeFeedFactory().(*rangefeed.Factory),
 		1<<20, /* 1 MB, bufferMemLimit */
 		ts.Stopper(),
-		noopCheckpointDuration,
+		time.Second, // doesn't matter
 		&spanconfig.TestingKnobs{
 			SQLWatcherOnEventInterceptor: func() error {
 				return errors.New("boom")
 			},
+			SQLWatcherSkipNoopCheckpoints: true,
 		},
 	)
 
@@ -465,6 +471,8 @@ func TestSQLWatcherHandlerError(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Test already runs from a tenant.
+			DefaultTestTenant: base.TestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				SpanConfig: &spanconfig.TestingKnobs{
 					ManagerDisableJobCreation: true, // disable the automatic job creation.
@@ -541,6 +549,8 @@ func TestWatcherReceivesNoopCheckpoints(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Test already runs from a tenant.
+			DefaultTestTenant: base.TestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				SpanConfig: &spanconfig.TestingKnobs{
 					ManagerDisableJobCreation: true, // disable the automatic job creation.

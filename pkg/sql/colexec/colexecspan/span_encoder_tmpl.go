@@ -99,8 +99,7 @@ type spanEncoder interface {
 }
 
 type spanEncoderBase struct {
-	allocator    *colmem.Allocator
-	encodeColIdx int
+	allocator *colmem.Allocator
 
 	// outputBytes contains the encoding for each row of the key column. It is
 	// reused between calls to next().
@@ -109,6 +108,8 @@ type spanEncoderBase struct {
 	// A scratch bytes slice used to hold each encoding before it is appended to
 	// the output column. It is reused to avoid allocating for every row.
 	scratch []byte
+
+	encodeColIdx int
 }
 
 // {{range .}}
@@ -167,7 +168,7 @@ func (op *_OP_STRING) next(batch coldata.Batch, startIdx, endIdx int) *coldata.B
 		}
 	}
 
-	op.allocator.AdjustMemoryUsage(op.outputBytes.Size() - oldBytesSize)
+	op.allocator.AdjustMemoryUsageAfterAllocation(op.outputBytes.Size() - oldBytesSize)
 	return op.outputBytes
 }
 

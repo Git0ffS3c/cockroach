@@ -19,6 +19,10 @@ ElementState:
     isTemporary: false
     sequenceId: 104
   Status: PUBLIC
+- TableData:
+    databaseId: 100
+    tableId: 104
+  Status: PUBLIC
 - Namespace:
     databaseId: 100
     descriptorId: 104
@@ -31,17 +35,19 @@ ElementState:
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
-    privileges: 2
+    privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
-    privileges: 2
+    privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 104
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 104
+    schemaId: 101
   Status: PUBLIC
 
 setup
@@ -58,6 +64,10 @@ ElementState:
     isTemporary: false
     sequenceId: 106
   Status: PUBLIC
+- TableData:
+    databaseId: 100
+    tableId: 106
+  Status: PUBLIC
 - Namespace:
     databaseId: 100
     descriptorId: 106
@@ -70,17 +80,19 @@ ElementState:
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 106
-    privileges: 2
+    privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 106
-    privileges: 2
+    privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 106
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 106
+    schemaId: 101
   Status: PUBLIC
 
 decompose
@@ -103,6 +115,7 @@ ElementState:
     generatedAsIdentityType: 0
     isHidden: false
     isInaccessible: false
+    isSystemColumn: false
     pgAttributeNum: 1
     tableId: 105
   Status: PUBLIC
@@ -112,32 +125,50 @@ ElementState:
     generatedAsIdentityType: 0
     isHidden: false
     isInaccessible: false
+    isSystemColumn: false
     pgAttributeNum: 2
     tableId: 105
   Status: PUBLIC
+- Column:
+    columnId: 4.294967294e+09
+    generatedAsIdentitySequenceOption: ""
+    generatedAsIdentityType: 0
+    isHidden: true
+    isInaccessible: false
+    isSystemColumn: true
+    pgAttributeNum: 4.294967294e+09
+    tableId: 105
+  Status: PUBLIC
+- Column:
+    columnId: 4.294967295e+09
+    generatedAsIdentitySequenceOption: ""
+    generatedAsIdentityType: 0
+    isHidden: true
+    isInaccessible: false
+    isSystemColumn: true
+    pgAttributeNum: 4.294967295e+09
+    tableId: 105
+  Status: PUBLIC
 - PrimaryIndex:
-    embeddedIndex:
-      compositeColumnIds: []
-      constraintId: 1
-      indexId: 1
-      isConcurrently: false
-      isCreatedExplicitly: false
-      isInverted: false
-      isUnique: true
-      keyColumnDirections:
-      - ASC
-      keyColumnIds:
-      - 1
-      keySuffixColumnIds: []
-      sharding: null
-      sourceIndexId: 0
-      storingColumnIds:
-      - 2
-      tableId: 105
-      temporaryIndexId: 0
+    constraintId: 1
+    geoConfig: null
+    indexId: 1
+    isConcurrently: false
+    isCreatedExplicitly: false
+    isInverted: false
+    isNotVisible: false
+    isUnique: true
+    sharding: null
+    sourceIndexId: 0
+    tableId: 105
+    temporaryIndexId: 0
   Status: PUBLIC
 - TableComment:
     comment: tbl is good table
+    tableId: 105
+  Status: PUBLIC
+- TableData:
+    databaseId: 100
     tableId: 105
   Status: PUBLIC
 - ColumnName:
@@ -150,76 +181,142 @@ ElementState:
     name: cexpr
     tableId: 105
   Status: PUBLIC
-- ColumnType:
-    columnId: 1
-    computeExpr: null
-    embeddedTypeT:
-      closedTypeIds: []
-      type:
-        arrayContents: null
-        arrayDimensions: []
-        arrayElemType: null
-        family: IntFamily
-        geoMetadata: null
-        intervalDurationField: null
-        locale: null
-        oid: 20
-        precision: 0
-        timePrecisionIsSet: false
-        tupleContents: []
-        tupleLabels: []
-        udtMetadata: null
-        visibleType: 0
-        width: 64
-    familyId: 0
-    isNullable: false
-    isRelationBeingDropped: false
-    isVirtual: false
+- ColumnName:
+    columnId: 4.294967294e+09
+    name: tableoid
+    tableId: 105
+  Status: PUBLIC
+- ColumnName:
+    columnId: 4.294967295e+09
+    name: crdb_internal_mvcc_timestamp
     tableId: 105
   Status: PUBLIC
 - ColumnType:
-    columnId: 2
+    closedTypeIds: []
+    columnId: 1
     computeExpr: null
-    embeddedTypeT:
-      closedTypeIds: []
-      type:
-        arrayContents: null
-        arrayDimensions: []
-        arrayElemType: null
-        family: IntFamily
-        geoMetadata: null
-        intervalDurationField: null
-        locale: null
-        oid: 20
-        precision: 0
-        timePrecisionIsSet: false
-        tupleContents: []
-        tupleLabels: []
-        udtMetadata: null
-        visibleType: 0
-        width: 64
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
-    isNullable: true
-    isRelationBeingDropped: false
+    isNullable: false
     isVirtual: false
     tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: IntFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 20
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 64
+  Status: PUBLIC
+- ColumnType:
+    closedTypeIds: []
+    columnId: 2
+    computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
+    familyId: 0
+    isNullable: true
+    isVirtual: false
+    tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: IntFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 20
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 64
+  Status: PUBLIC
+- ColumnType:
+    closedTypeIds: []
+    columnId: 4.294967294e+09
+    computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
+    familyId: 0
+    isNullable: true
+    isVirtual: false
+    tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: OidFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 26
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 0
+  Status: PUBLIC
+- ColumnType:
+    closedTypeIds: []
+    columnId: 4.294967295e+09
+    computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
+    familyId: 0
+    isNullable: true
+    isVirtual: false
+    tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: DecimalFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 1700
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 0
   Status: PUBLIC
 - ColumnDefaultExpression:
     columnId: 2
-    embeddedExpr:
-      expr: nextval(104:::REGCLASS)
-      usesSequenceIds:
-      - 104
-      usesTypeIds: []
+    expr: nextval(104:::REGCLASS)
+    referencedColumnIds: []
     tableId: 105
+    usesFunctionIds: []
+    usesSequenceIds:
+    - 104
+    usesTypeIds: []
   Status: PUBLIC
 - ColumnOnUpdateExpression:
     columnId: 2
-    embeddedExpr:
-      expr: 123:::INT8
-      usesSequenceIds: []
-      usesTypeIds: []
+    expr: 123:::INT8
+    referencedColumnIds: []
     tableId: 105
+    usesFunctionIds: []
+    usesSequenceIds: []
+    usesTypeIds: []
   Status: PUBLIC
 - SequenceOwner:
     columnId: 2
@@ -232,6 +329,11 @@ ElementState:
     pgAttributeNum: 1
     tableId: 105
   Status: PUBLIC
+- ColumnNotNull:
+    columnId: 1
+    indexIdForValidation: 0
+    tableId: 105
+  Status: PUBLIC
 - IndexName:
     indexId: 1
     name: tbl_pkey
@@ -239,6 +341,30 @@ ElementState:
   Status: PUBLIC
 - IndexComment:
     comment: tbl_pkey is a primary key
+    indexId: 1
+    tableId: 105
+  Status: PUBLIC
+- IndexColumn:
+    columnId: 1
+    direction: ASC
+    implicit: false
+    indexId: 1
+    invertedKind: 0
+    kind: KEY
+    ordinalInKind: 0
+    tableId: 105
+  Status: PUBLIC
+- IndexColumn:
+    columnId: 2
+    direction: ASC
+    implicit: false
+    indexId: 1
+    invertedKind: 0
+    kind: STORED
+    ordinalInKind: 0
+    tableId: 105
+  Status: PUBLIC
+- IndexData:
     indexId: 1
     tableId: 105
   Status: PUBLIC
@@ -254,17 +380,19 @@ ElementState:
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 105
-    privileges: 2
+    privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 105
-    privileges: 2
+    privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 105
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 105
+    schemaId: 101
   Status: PUBLIC
 
 setup
@@ -293,6 +421,7 @@ ElementState:
     generatedAsIdentityType: 0
     isHidden: false
     isInaccessible: false
+    isSystemColumn: false
     pgAttributeNum: 1
     tableId: 105
   Status: PUBLIC
@@ -302,32 +431,50 @@ ElementState:
     generatedAsIdentityType: 0
     isHidden: false
     isInaccessible: false
+    isSystemColumn: false
     pgAttributeNum: 2
     tableId: 105
   Status: PUBLIC
+- Column:
+    columnId: 4.294967294e+09
+    generatedAsIdentitySequenceOption: ""
+    generatedAsIdentityType: 0
+    isHidden: true
+    isInaccessible: false
+    isSystemColumn: true
+    pgAttributeNum: 4.294967294e+09
+    tableId: 105
+  Status: PUBLIC
+- Column:
+    columnId: 4.294967295e+09
+    generatedAsIdentitySequenceOption: ""
+    generatedAsIdentityType: 0
+    isHidden: true
+    isInaccessible: false
+    isSystemColumn: true
+    pgAttributeNum: 4.294967295e+09
+    tableId: 105
+  Status: PUBLIC
 - PrimaryIndex:
-    embeddedIndex:
-      compositeColumnIds: []
-      constraintId: 1
-      indexId: 1
-      isConcurrently: false
-      isCreatedExplicitly: false
-      isInverted: false
-      isUnique: true
-      keyColumnDirections:
-      - ASC
-      keyColumnIds:
-      - 1
-      keySuffixColumnIds: []
-      sharding: null
-      sourceIndexId: 0
-      storingColumnIds:
-      - 2
-      tableId: 105
-      temporaryIndexId: 0
+    constraintId: 1
+    geoConfig: null
+    indexId: 1
+    isConcurrently: false
+    isCreatedExplicitly: false
+    isInverted: false
+    isNotVisible: false
+    isUnique: true
+    sharding: null
+    sourceIndexId: 0
+    tableId: 105
+    temporaryIndexId: 0
   Status: PUBLIC
 - TableComment:
     comment: tbl is good table
+    tableId: 105
+  Status: PUBLIC
+- TableData:
+    databaseId: 100
     tableId: 105
   Status: PUBLIC
 - ColumnName:
@@ -340,64 +487,133 @@ ElementState:
     name: cexpr
     tableId: 105
   Status: PUBLIC
-- ColumnType:
-    columnId: 1
-    computeExpr: null
-    embeddedTypeT:
-      closedTypeIds: []
-      type:
-        arrayContents: null
-        arrayDimensions: []
-        arrayElemType: null
-        family: IntFamily
-        geoMetadata: null
-        intervalDurationField: null
-        locale: null
-        oid: 20
-        precision: 0
-        timePrecisionIsSet: false
-        tupleContents: []
-        tupleLabels: []
-        udtMetadata: null
-        visibleType: 0
-        width: 64
-    familyId: 0
-    isNullable: false
-    isRelationBeingDropped: false
-    isVirtual: false
+- ColumnName:
+    columnId: 4.294967294e+09
+    name: tableoid
+    tableId: 105
+  Status: PUBLIC
+- ColumnName:
+    columnId: 4.294967295e+09
+    name: crdb_internal_mvcc_timestamp
     tableId: 105
   Status: PUBLIC
 - ColumnType:
-    columnId: 2
+    closedTypeIds: []
+    columnId: 1
     computeExpr: null
-    embeddedTypeT:
-      closedTypeIds: []
-      type:
-        arrayContents: null
-        arrayDimensions: []
-        arrayElemType: null
-        family: IntFamily
-        geoMetadata: null
-        intervalDurationField: null
-        locale: null
-        oid: 20
-        precision: 0
-        timePrecisionIsSet: false
-        tupleContents: []
-        tupleLabels: []
-        udtMetadata: null
-        visibleType: 0
-        width: 64
+    elementCreationMetadata:
+      in231OrLater: true
     familyId: 0
-    isNullable: true
-    isRelationBeingDropped: false
+    isNullable: false
     isVirtual: false
     tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: IntFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 20
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 64
+  Status: PUBLIC
+- ColumnType:
+    closedTypeIds: []
+    columnId: 2
+    computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
+    familyId: 0
+    isNullable: true
+    isVirtual: false
+    tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: IntFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 20
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 64
+  Status: PUBLIC
+- ColumnType:
+    closedTypeIds: []
+    columnId: 4.294967294e+09
+    computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
+    familyId: 0
+    isNullable: true
+    isVirtual: false
+    tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: OidFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 26
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 0
+  Status: PUBLIC
+- ColumnType:
+    closedTypeIds: []
+    columnId: 4.294967295e+09
+    computeExpr: null
+    elementCreationMetadata:
+      in231OrLater: true
+    familyId: 0
+    isNullable: true
+    isVirtual: false
+    tableId: 105
+    type:
+      arrayContents: null
+      arrayDimensions: []
+      arrayElemType: null
+      family: DecimalFamily
+      geoMetadata: null
+      intervalDurationField: null
+      locale: null
+      oid: 1700
+      precision: 0
+      timePrecisionIsSet: false
+      tupleContents: []
+      tupleLabels: []
+      udtMetadata: null
+      visibleType: 0
+      width: 0
   Status: PUBLIC
 - ColumnComment:
     columnId: 1
     comment: id is a identifier
     pgAttributeNum: 1
+    tableId: 105
+  Status: PUBLIC
+- ColumnNotNull:
+    columnId: 1
+    indexIdForValidation: 0
     tableId: 105
   Status: PUBLIC
 - IndexName:
@@ -407,6 +623,30 @@ ElementState:
   Status: PUBLIC
 - IndexComment:
     comment: tbl_pkey is a primary key
+    indexId: 1
+    tableId: 105
+  Status: PUBLIC
+- IndexColumn:
+    columnId: 1
+    direction: ASC
+    implicit: false
+    indexId: 1
+    invertedKind: 0
+    kind: KEY
+    ordinalInKind: 0
+    tableId: 105
+  Status: PUBLIC
+- IndexColumn:
+    columnId: 2
+    direction: ASC
+    implicit: false
+    indexId: 1
+    invertedKind: 0
+    kind: STORED
+    ordinalInKind: 0
+    tableId: 105
+  Status: PUBLIC
+- IndexData:
     indexId: 1
     tableId: 105
   Status: PUBLIC
@@ -422,17 +662,19 @@ ElementState:
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 105
-    privileges: 2
+    privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 105
-    privileges: 2
+    privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 105
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 105
+    schemaId: 101
   Status: PUBLIC
 
 decompose
@@ -443,6 +685,10 @@ ElementState:
 - Sequence:
     isTemporary: false
     sequenceId: 104
+  Status: PUBLIC
+- TableData:
+    databaseId: 100
+    tableId: 104
   Status: PUBLIC
 - Namespace:
     databaseId: 100
@@ -456,15 +702,17 @@ ElementState:
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
-    privileges: 2
+    privileges: "2"
     userName: admin
+    withGrantOption: "2"
   Status: PUBLIC
 - UserPrivileges:
     descriptorId: 104
-    privileges: 2
+    privileges: "2"
     userName: root
+    withGrantOption: "2"
   Status: PUBLIC
-- ObjectParent:
-    objectId: 104
-    parentSchemaId: 101
+- SchemaChild:
+    childObjectId: 104
+    schemaId: 101
   Status: PUBLIC

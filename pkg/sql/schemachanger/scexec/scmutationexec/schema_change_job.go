@@ -19,24 +19,41 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func (m *visitor) CreateSchemaChangerJob(
+func (i *immediateVisitor) UndoAllInTxnImmediateMutationOpSideEffects(
+	ctx context.Context, _ scop.UndoAllInTxnImmediateMutationOpSideEffects,
+) error {
+	i.Reset()
+	return nil
+}
+
+func (d *deferredVisitor) CreateSchemaChangerJob(
 	ctx context.Context, job scop.CreateSchemaChangerJob,
 ) error {
-	return m.s.AddNewSchemaChangerJob(
-		job.JobID, job.Statements, job.NonCancelable, job.Authorization, job.DescriptorIDs, job.RunningStatus,
+	return d.AddNewSchemaChangerJob(
+		job.JobID,
+		job.Statements,
+		job.NonCancelable,
+		job.Authorization,
+		catalog.MakeDescriptorIDSet(job.DescriptorIDs...),
+		job.RunningStatus,
 	)
 }
 
-func (m *visitor) UpdateSchemaChangerJob(
+func (d *deferredVisitor) UpdateSchemaChangerJob(
 	ctx context.Context, op scop.UpdateSchemaChangerJob,
 ) error {
-	return m.s.UpdateSchemaChangerJob(op.JobID, op.IsNonCancelable, op.RunningStatus)
+	return d.DeferredMutationStateUpdater.UpdateSchemaChangerJob(
+		op.JobID,
+		op.IsNonCancelable,
+		op.RunningStatus,
+		catalog.MakeDescriptorIDSet(op.DescriptorIDsToRemove...),
+	)
 }
 
-func (m *visitor) SetJobStateOnDescriptor(
+func (i *immediateVisitor) SetJobStateOnDescriptor(
 	ctx context.Context, op scop.SetJobStateOnDescriptor,
 ) error {
-	mut, err := m.s.CheckOutDescriptor(ctx, op.DescriptorID)
+	mut, err := i.checkOutDescriptor(ctx, op.DescriptorID)
 	if err != nil {
 		return err
 	}
@@ -62,28 +79,10 @@ func (m *visitor) SetJobStateOnDescriptor(
 	return nil
 }
 
-func (m *visitor) RemoveJobStateFromDescriptor(
+func (i *immediateVisitor) RemoveJobStateFromDescriptor(
 	ctx context.Context, op scop.RemoveJobStateFromDescriptor,
 ) error {
-	{
-		_, err := m.s.GetDescriptor(ctx, op.DescriptorID)
-
-		// If we're clearing the status, we might have already deleted the
-		// descriptor. Permit that by detecting the prior deletion and
-		// short-circuiting.
-		//
-		// TODO(ajwerner): Ideally we'd model the clearing of the job dependency as
-		// an operation which has to happen before deleting the descriptor. If that
-		// were the case, this error would become unexpected.
-		if errors.Is(err, catalog.ErrDescriptorNotFound) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	mut, err := m.s.CheckOutDescriptor(ctx, op.DescriptorID)
+	mut, err := i.checkOutDescriptor(ctx, op.DescriptorID)
 	if err != nil {
 		return err
 	}

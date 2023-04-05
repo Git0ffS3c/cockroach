@@ -24,18 +24,18 @@ import "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 //
 // This mechanism can be used to provide a "window" of compatibility when new
 // features are added. Example:
-//  - we start with Version=1; distsql servers with version 1 only accept
-//    requests with version 1.
-//  - a new distsql feature is added; Version is bumped to 2. The
-//    planner does not yet use this feature by default; it still issues
-//    requests with version 1.
-//  - MinAcceptedVersion is still 1, i.e. servers with version 2
-//    accept both versions 1 and 2.
-//  - after an upgrade cycle, we can enable the feature in the planner,
-//    requiring version 2.
-//  - at some later point, we can choose to deprecate version 1 and have
-//    servers only accept versions >= 2 (by setting
-//    MinAcceptedVersion to 2).
+//   - we start with Version=1; distsql servers with version 1 only accept
+//     requests with version 1.
+//   - a new distsql feature is added; Version is bumped to 2. The
+//     planner does not yet use this feature by default; it still issues
+//     requests with version 1.
+//   - MinAcceptedVersion is still 1, i.e. servers with version 2
+//     accept both versions 1 and 2.
+//   - after an upgrade cycle, we can enable the feature in the planner,
+//     requiring version 2.
+//   - at some later point, we can choose to deprecate version 1 and have
+//     servers only accept versions >= 2 (by setting
+//     MinAcceptedVersion to 2).
 //
 // Why does this all matter? Because of rolling upgrades, distsql servers across
 // nodes may not have an overlapping window of compatibility, so only a subset
@@ -64,11 +64,11 @@ import "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 //
 // ATTENTION: When updating these fields, add a brief description of what
 // changed to the version history below.
-const Version execinfrapb.DistSQLVersion = 68
+const Version execinfrapb.DistSQLVersion = 71
 
 // MinAcceptedVersion is the oldest version that the server is compatible with.
 // A server will not accept flows with older versions.
-const MinAcceptedVersion execinfrapb.DistSQLVersion = 68
+const MinAcceptedVersion execinfrapb.DistSQLVersion = 71
 
 /*
 
@@ -76,12 +76,22 @@ const MinAcceptedVersion execinfrapb.DistSQLVersion = 68
 
 Please add new entries at the top.
 
+- Version: 71 (MinAcceptedVersion: 71)
+  - On-wire representation of booleans and bytes-like values in the Arrow format
+    has changed.
+
+- Version: 70 (MinAcceptedVersion: 70)
+  - HashGroupJoinerSpec has been introduced.
+
+- Version: 69 (MinAcceptedVersion: 69)
+  - ProducerMessage no longer includes the typing information.
+
 - Version: 68 (MinAcceptedVersion: 68)
-  - ZigzagJoinerSpec now uses descpb.IndexFetchSpec instead of table and
+  - ZigzagJoinerSpec now uses fetchpb.IndexFetchSpec instead of table and
     index descriptors.
 
 - Version: 67 (MinAcceptedVersion: 67)
-  - InvertedJoinerSpec now uses descpb.IndexFetchSpec instead of table and
+  - InvertedJoinerSpec now uses fetchpb.IndexFetchSpec instead of table and
     index descriptors.
 
 - Version: 66 (MinAcceptedVersion: 66)
@@ -100,11 +110,11 @@ Please add new entries at the top.
     running v63, thus the MinAcceptedVersion is kept at 63.
 
 - Version: 63 (MinAcceptedVersion: 63):
- - Changed JoinReaderSpec to use a descpb.IndexFetchSpec and a list of family
+ - Changed JoinReaderSpec to use a fetchpb.IndexFetchSpec and a list of family
    IDs instead of table and index descriptors.
 
 - Version: 62 (MinAcceptedVersion: 62):
- - Changed TableReaderSpec to use a descpb.IndexFetchSpec instead of table and
+ - Changed TableReaderSpec to use a fetchpb.IndexFetchSpec instead of table and
    index descriptors.
 
 - Version: 61 (MinAcceptedVersion: 60)

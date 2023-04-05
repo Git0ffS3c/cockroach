@@ -67,23 +67,22 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 			Metrics:  &mt,
 			NodeID:   base.TestingIDContainer,
 		},
-		flowinfra.NewFlowScheduler(log.MakeTestingAmbientCtxWithNewTracer(), stopper, st),
+		flowinfra.NewRemoteFlowRunner(log.MakeTestingAmbientCtxWithNewTracer(), stopper, nil /* acc */),
 	)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 
 	// We're going to serve multiple node IDs with that one context. Disable node ID checks.
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
-	rpcSrv := rpc.NewServer(rpcContext)
+	rpcSrv, err := rpc.NewServer(rpcContext)
+	require.NoError(t, err)
 	defer rpcSrv.Stop()
 
 	execinfrapb.RegisterDistSQLServer(rpcSrv, srv)
 	ln, err := netutil.ListenAndServeGRPC(stopper, rpcSrv, util.IsolatedTestAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	// The outbox uses this stopper to run a goroutine.
 	outboxStopper := stop.NewStopper()
@@ -92,7 +91,6 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
 			Settings:      st,
-			NodeDialer:    nodeDialer,
 			PodNodeDialer: nodeDialer,
 			Stopper:       outboxStopper,
 		},
@@ -100,7 +98,7 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	}
 
 	streamID := execinfrapb.StreamID(1)
-	outbox := flowinfra.NewOutbox(&flowCtx, execinfra.StaticSQLInstanceID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
+	outbox := flowinfra.NewOutbox(&flowCtx, 0 /* processorID */, execinfra.StaticSQLInstanceID, streamID, nil /* numOutboxes */, false /* isGatewayNode */)
 	outbox.Init(types.OneIntCol)
 
 	// WaitGroup for the outbox and inbound stream. If the WaitGroup is done, no
@@ -112,7 +110,10 @@ func TestOutboxInboundStreamIntegration(t *testing.T) {
 	consumer := distsqlutils.NewRowBuffer(types.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{})
 	connectionInfo := map[execinfrapb.StreamID]*flowinfra.InboundStreamInfo{
 		streamID: flowinfra.NewInboundStreamInfo(
-			flowinfra.RowInboundStreamHandler{RowReceiver: consumer},
+			flowinfra.RowInboundStreamHandler{
+				RowReceiver: consumer,
+				Types:       types.OneIntCol,
+			},
 			wg,
 		),
 	}

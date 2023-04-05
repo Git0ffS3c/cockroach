@@ -31,8 +31,22 @@ type target struct {
 type transition struct {
 	from, to   scpb.Status
 	revertible bool
+	canFail    bool
 	ops        opsFunc
-	minPhase   scop.Phase
+	opType     scop.Type
+	isEquiv    bool // True if this transition comes from a `equiv` spec.
+}
+
+func (t transition) OpType() scop.Type {
+	return t.opType
+}
+
+func (t transition) From() scpb.Status {
+	return t.from
+}
+
+func (t transition) To() scpb.Status {
+	return t.to
 }
 
 func makeTarget(e scpb.Element, spec targetSpec) (t target, err error) {
@@ -52,7 +66,6 @@ func makeTarget(e scpb.Element, spec targetSpec) (t target, err error) {
 	var element, target, node, targetStatus rel.Var = "element", "target", "node", "target-status"
 	q, err := rel.NewQuery(screl.Schema,
 		element.Type(e),
-		element.AttrEqVar(screl.DescID, "descID"), // this is to allow the index on elements to work
 		targetStatus.Eq(spec.to),
 		screl.JoinTargetNode(element, target, node),
 		target.AttrEqVar(screl.TargetStatus, targetStatus),
@@ -69,46 +82,83 @@ func makeTarget(e scpb.Element, spec targetSpec) (t target, err error) {
 	return t, nil
 }
 
+// makeTransitions constructs a slice of transitions from the transition spec, as specified in `opgen_xx.go` file.
+// An example can nicely explain how it works.
+// Example 1:
+//
+//	Input: toAbsent(PUBLIC, equiv(VALIDATED), to(WRITE_ONLY), to(ABSENT))
+//	Output: [VALIDATED, PUBLIC], [PUBLIC, WRITE_ONLY], [WRITE_ONLY, ABSENT]
+//
+// Example 2:
+//
+//	Input: toPublic(ABSENT, to(DELETE_ONLY), to(WRITE_ONLY), to(PUBLIC))
+//	Output: [ABSENT, DELETE_ONLY], [DELETE_ONLY, WRITE_ONLY], [WRITE_ONLY, PUBLIC].
+//
+// Right, nothing too surprising except that the trick we use for `equiv(s)` is to encode it
+// as a transition from `s` to whatever the current status is.
 func makeTransitions(e scpb.Element, spec targetSpec) (ret []transition, err error) {
 	tbs := makeTransitionBuildState(spec.from)
-	for _, s := range spec.transitionSpecs {
+
+	// lastTransitionWhichCanFail tracks the index in ret of the last transition
+	// corresponding to a backfill or validation. We'll use this to add an
+	// annotation to the transitions indicating whether such an operation exists
+	// in the current or any subsequent transitions.
+	lastTransitionWhichCanFail := -1
+	for i, s := range spec.transitionSpecs {
 		var t transition
 		if s.from == scpb.Status_UNKNOWN {
+			// Construct a transition `tbs.from --> s.to`, which comes from a `to(...)` spec.
 			t.from = tbs.from
 			t.to = s.to
-			if err := tbs.withTransition(s); err != nil {
-				return nil, errors.Wrapf(err, "invalid transition %s -> %s", t.from, t.to)
+			if err := tbs.withTransition(s, i == 0 /* isFirst */); err != nil {
+				return nil, errors.Wrapf(
+					err, "invalid transition %s -> %s", t.from, t.to,
+				)
 			}
 			if len(s.emitFns) > 0 {
-				t.ops, err = makeOpsFunc(e, s.emitFns)
+				t.ops, t.opType, err = makeOpsFunc(e, s.emitFns)
 				if err != nil {
-					return nil, errors.Wrapf(err, "making ops func for transition %s -> %s", t.from, t.to)
+					return nil, errors.Wrapf(
+						err, "making ops func for transition %s -> %s", t.from, t.to,
+					)
 				}
 			}
 		} else {
+			// Construct a transition `s.from --> tbs.from`, which comes from a `equiv(...)` spec.
 			t.from = s.from
 			t.to = tbs.from
 			if err := tbs.withEquivTransition(s); err != nil {
-				return nil, errors.Wrapf(err, "invalid no-op transition %s -> %s", t.from, t.to)
+				return nil, errors.Wrapf(
+					err, "invalid no-op transition %s -> %s", t.from, t.to,
+				)
 			}
+			t.isEquiv = true
 		}
 		t.revertible = tbs.isRevertible
-		t.minPhase = tbs.currentMinPhase
+		if t.opType != scop.MutationType && t.opType != 0 {
+			lastTransitionWhichCanFail = i
+		}
 		ret = append(ret, t)
+	}
+
+	// Mark the transitions which can fail or precede something which can fail.
+	for i := 0; i <= lastTransitionWhichCanFail; i++ {
+		ret[i].canFail = true
 	}
 
 	// Check that the final status has been reached.
 	if tbs.from != spec.to {
-		return nil, errors.Errorf("expected %s as the final status, instead found %s", spec.to, tbs.from)
+		return nil, errors.Errorf(
+			"expected %s as the final status, instead found %s", spec.to, tbs.from,
+		)
 	}
 
 	return ret, nil
 }
 
 type transitionBuildState struct {
-	from            scpb.Status
-	currentMinPhase scop.Phase
-	isRevertible    bool
+	from         scpb.Status
+	isRevertible bool
 
 	isEquivMapped map[scpb.Status]bool
 	isTo          map[scpb.Status]bool
@@ -125,7 +175,7 @@ func makeTransitionBuildState(from scpb.Status) transitionBuildState {
 	}
 }
 
-func (tbs *transitionBuildState) withTransition(s transitionSpec) error {
+func (tbs *transitionBuildState) withTransition(s transitionSpec, isFirst bool) error {
 	// Check validity of target status.
 	if s.to == scpb.Status_UNKNOWN {
 		return errors.Errorf("invalid 'to' status")
@@ -136,16 +186,7 @@ func (tbs *transitionBuildState) withTransition(s transitionSpec) error {
 		return errors.Errorf("%s was featured as 'from' in a previous equivalence mapping", s.to)
 	}
 
-	// Check that the minimum phase is monotonically increasing.
-	if s.minPhase > 0 && s.minPhase < tbs.currentMinPhase {
-		return errors.Errorf("minimum phase %s is less than inherited minimum phase %s",
-			s.minPhase.String(), tbs.currentMinPhase.String())
-	}
-
 	tbs.isRevertible = tbs.isRevertible && s.revertible
-	if s.minPhase > tbs.currentMinPhase {
-		tbs.currentMinPhase = s.minPhase
-	}
 	tbs.isEquivMapped[tbs.from] = true
 	tbs.isTo[s.to] = true
 	tbs.isFrom[tbs.from] = true
@@ -169,9 +210,6 @@ func (tbs *transitionBuildState) withEquivTransition(s transitionSpec) error {
 	// Check for absence of phase and revertibility constraints
 	if !s.revertible {
 		return errors.Errorf("must be revertible")
-	}
-	if s.minPhase > 0 {
-		return errors.Errorf("must not set a minimum phase")
 	}
 
 	tbs.isEquivMapped[s.from] = true

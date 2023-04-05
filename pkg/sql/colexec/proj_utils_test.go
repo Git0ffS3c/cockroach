@@ -67,7 +67,7 @@ func assertProjOpAgainstRowByRow(
 ) {
 	ctx := context.Background()
 	input := execinfra.NewRepeatableRowSource(inputTypes, inputRows)
-	columnarizer := NewBufferingColumnarizer(testAllocator, flowCtx, 1 /* processorID */, input)
+	columnarizer := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 1 /* processorID */, input)
 	projOp, err := colexectestutils.CreateTestProjectingOperator(
 		ctx, flowCtx, columnarizer, inputTypes, projExpr, testMemAcc,
 	)
@@ -76,6 +76,7 @@ func assertProjOpAgainstRowByRow(
 	// column of the projection operator.
 	op := colexecbase.NewSimpleProjectOp(projOp, len(inputTypes)+1, []uint32{uint32(len(inputTypes))})
 	materializer := NewMaterializer(
+		nil, /* allocator */
 		flowCtx,
 		1, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: op},

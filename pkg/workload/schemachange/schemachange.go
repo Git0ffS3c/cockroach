@@ -54,32 +54,36 @@ import (
 //For example, an attempt to do something we don't support should be swallowed (though if we can detect that maybe we should just not do it, e.g). It will be hard to use this test for anything more than liveness detection until we go through the tedious process of classifying errors.:
 
 const (
-	defaultMaxOpsPerWorker    = 5
-	defaultErrorRate          = 10
-	defaultEnumPct            = 10
-	defaultMaxSourceTables    = 3
-	defaultSequenceOwnedByPct = 25
-	defaultFkParentInvalidPct = 5
-	defaultFkChildInvalidPct  = 5
+	defaultMaxOpsPerWorker                 = 5
+	defaultErrorRate                       = 10
+	defaultEnumPct                         = 10
+	defaultMaxSourceTables                 = 3
+	defaultSequenceOwnedByPct              = 25
+	defaultFkParentInvalidPct              = 5
+	defaultFkChildInvalidPct               = 5
+	defaultDeclarativeSchemaChangerPct     = 25
+	defaultDeclarativeSchemaMaxStmtsPerTxn = 1
 )
 
 type schemaChange struct {
-	flags              workload.Flags
-	dbOverride         string
-	concurrency        int
-	maxOpsPerWorker    int
-	errorRate          int
-	enumPct            int
-	verbose            int
-	dryRun             bool
-	maxSourceTables    int
-	sequenceOwnedByPct int
-	logFilePath        string
-	logFile            *os.File
-	dumpLogsOnce       *sync.Once
-	workers            []*schemaChangeWorker
-	fkParentInvalidPct int
-	fkChildInvalidPct  int
+	flags                           workload.Flags
+	dbOverride                      string
+	concurrency                     int
+	maxOpsPerWorker                 int
+	errorRate                       int
+	enumPct                         int
+	verbose                         int
+	dryRun                          bool
+	maxSourceTables                 int
+	sequenceOwnedByPct              int
+	logFilePath                     string
+	logFile                         *os.File
+	dumpLogsOnce                    *sync.Once
+	workers                         []*schemaChangeWorker
+	fkParentInvalidPct              int
+	fkChildInvalidPct               int
+	declarativeSchemaChangerPct     int
+	declarativeSchemaMaxStmtsPerTxn int
 }
 
 var schemaChangeMeta = workload.Meta{
@@ -111,6 +115,13 @@ var schemaChangeMeta = workload.Meta{
 			`Percentage of times to choose an invalid parent column in a fk constraint.`)
 		s.flags.IntVar(&s.fkChildInvalidPct, `fk-child-invalid-pct`, defaultFkChildInvalidPct,
 			`Percentage of times to choose an invalid child column in a fk constraint.`)
+		s.flags.IntVar(&s.declarativeSchemaChangerPct, `declarative-schema-changer-pct`,
+			defaultDeclarativeSchemaChangerPct,
+			`Percentage of the declarative schema changer is used.`)
+		s.flags.IntVar(&s.declarativeSchemaMaxStmtsPerTxn, `declarative-schema-changer-stmt-per-txn`,
+			defaultDeclarativeSchemaMaxStmtsPerTxn,
+			`Number of statements per-txn used by the declarative schema changer.`)
+
 		return s
 	},
 }
@@ -163,7 +174,22 @@ func (s *schemaChange) Ops(
 		return workload.QueryLoad{}, err
 	}
 
+	err = adjustOpWeightsForCockroachVersion(ctx, pool, opWeights)
+	if err != nil {
+		return workload.QueryLoad{}, err
+	}
 	ops := newDeck(rand.New(rand.NewSource(timeutil.Now().UnixNano())), opWeights...)
+	// A separate deck is constructed of only schema changes supported
+	// by the declarative schema changer. This deck has equal weights,
+	// only for supported schema changes.
+	declarativeOpWeights := make([]int, len(opWeights))
+	for idx, weight := range opWeights {
+		if opDeclarative[idx] {
+			declarativeOpWeights[idx] = weight
+		}
+	}
+	declarativeOps := newDeck(rand.New(rand.NewSource(timeutil.Now().UnixNano())), declarativeOpWeights...)
+
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
 
 	stdoutLog := makeAtomicLog(os.Stdout)
@@ -186,6 +212,7 @@ func (s *schemaChange) Ops(
 			enumPct:            s.enumPct,
 			rng:                rand.New(rand.NewSource(timeutil.Now().UnixNano())),
 			ops:                ops,
+			declarativeOps:     declarativeOps,
 			maxSourceTables:    s.maxSourceTables,
 			sequenceOwnedByPct: s.sequenceOwnedByPct,
 			fkParentInvalidPct: s.fkParentInvalidPct,
@@ -281,13 +308,14 @@ var (
 
 // LogEntry and its fields must be public so that the json package can encode this struct.
 type LogEntry struct {
-	WorkerID             int      `json:"workerId"`
-	ClientTimestamp      string   `json:"clientTimestamp"`
-	Ops                  []string `json:"ops"`
-	ExpectedExecErrors   string   `json:"expectedExecErrors"`
-	ExpectedCommitErrors string   `json:"expectedCommitErrors"`
+	WorkerID             int           `json:"workerId"`
+	ClientTimestamp      string        `json:"clientTimestamp"`
+	Ops                  []interface{} `json:"ops"`
+	ExpectedExecErrors   string        `json:"expectedExecErrors"`
+	ExpectedCommitErrors string        `json:"expectedCommitErrors"`
 	// Optional message for errors or if a hook was called.
-	Message string `json:"message"`
+	Message    string      `json:"message"`
+	ErrorState *ErrorState `json:"errorState,omitempty"`
 }
 
 type histBin int
@@ -307,22 +335,29 @@ func (w *schemaChangeWorker) recordInHist(elapsed time.Duration, bin histBin) {
 	w.hists.Get(bin.String()).Record(elapsed)
 }
 
-func (w *schemaChangeWorker) getErrorState() string {
-	return fmt.Sprintf("Dumping state before death:\n"+
-		"Expected errors: %s"+
-		"==========================="+
-		"Executed queries for generating errors: %s"+
-		"==========================="+
-		"Previous statements %s",
-		w.opGen.expectedExecErrors.String(),
-		w.opGen.GetOpGenLog(),
-		w.opGen.stmtsInTxt)
+func (w *schemaChangeWorker) WrapWithErrorState(err error) error {
+	previousStmts := make([]string, 0, len(w.opGen.stmtsInTxt))
+	for _, stmt := range w.opGen.stmtsInTxt {
+		previousStmts = append(previousStmts, stmt.sql)
+	}
+	return &ErrorState{
+		cause:                      err,
+		PotentialCommitErrors:      w.opGen.potentialCommitErrors.StringSlice(),
+		ExpectedCommitErrors:       w.opGen.expectedCommitErrors.StringSlice(),
+		QueriesForGeneratingErrors: w.opGen.GetOpGenLog(),
+		PreviousStatements:         previousStmts,
+	}
 }
 
-func (w *schemaChangeWorker) runInTxn(ctx context.Context, tx pgx.Tx) error {
-	w.logger.startLog()
+func (w *schemaChangeWorker) runInTxn(
+	ctx context.Context, tx pgx.Tx, useDeclarativeSchemaChanger bool,
+) error {
+	w.logger.startLog(w.id)
 	w.logger.writeLog("BEGIN")
 	opsNum := 1 + w.opGen.randIntn(w.maxOpsPerWorker)
+	if useDeclarativeSchemaChanger && opsNum > w.workload.declarativeSchemaMaxStmtsPerTxn {
+		opsNum = w.workload.declarativeSchemaMaxStmtsPerTxn
+	}
 
 	for i := 0; i < opsNum; i++ {
 		// Terminating this loop early if there are expected commit errors prevents unexpected commit behavior from being
@@ -336,33 +371,34 @@ func (w *schemaChangeWorker) runInTxn(ctx context.Context, tx pgx.Tx) error {
 			break
 		}
 
-		op, err := w.opGen.randOp(ctx, tx)
-
-		if pgErr := new(pgconn.PgError); errors.As(err, &pgErr) && pgcode.MakeCode(pgErr.Code) == pgcode.SerializationFailure {
+		op, err := w.opGen.randOp(ctx, tx, useDeclarativeSchemaChanger)
+		if pgErr := new(pgconn.PgError); errors.As(err, &pgErr) &&
+			pgcode.MakeCode(pgErr.Code) == pgcode.SerializationFailure {
+			return errors.Mark(err, errRunInTxnRbkSentinel)
+		} else if err != nil && errors.Is(err, errRunInTxnRbkSentinel) {
+			// Error was already marked for us.
+			return err
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			// Deadline was encountered while generating the operation, so bail out.
 			return errors.Mark(err, errRunInTxnRbkSentinel)
 		} else if err != nil {
 			return errors.Mark(
-				errors.Wrapf(err, "***UNEXPECTED ERROR; Failed to generate a random operation\n OpGen log: \n%s",
-					w.opGen.GetOpGenLog(),
-				),
+				w.WrapWithErrorState(
+					errors.Wrap(err, "***UNEXPECTED ERROR; Failed to generate a random operation")),
 				errRunInTxnFatalSentinel,
 			)
 		}
 
-		w.logger.addExpectedErrors(w.opGen.expectedExecErrors, w.opGen.expectedCommitErrors)
-		w.logger.writeLog(op)
+		w.logger.addExpectedErrors(op.expectedExecErrors, w.opGen.expectedCommitErrors)
+		w.logger.writeLogOp(op)
 		if !w.dryRun {
 			start := timeutil.Now()
-
-			if _, err = tx.Exec(ctx, op); err != nil {
+			err := op.executeStmt(ctx, tx, w.opGen)
+			if err != nil {
 				// If the error not an instance of pgconn.PgError, then it is unexpected.
 				pgErr := new(pgconn.PgError)
 				if !errors.As(err, &pgErr) {
-					return errors.Mark(
-						errors.Wrapf(err, "***UNEXPECTED ERROR; Received a non pg error. %s",
-							w.getErrorState()),
-						errRunInTxnFatalSentinel,
-					)
+					return err
 				}
 
 				// Transaction retry errors are acceptable. Allow the transaction
@@ -374,30 +410,7 @@ func (w *schemaChangeWorker) runInTxn(ctx context.Context, tx pgx.Tx) error {
 						errRunInTxnRbkSentinel,
 					)
 				}
-
-				// Screen for any unexpected errors.
-				if !w.opGen.expectedExecErrors.contains(pgcode.MakeCode(pgErr.Code)) {
-					return errors.Mark(
-						errors.Wrapf(err, "***UNEXPECTED ERROR; Received an unexpected execution error. %s",
-							w.getErrorState()),
-						errRunInTxnFatalSentinel,
-					)
-				}
-
-				// Rollback because the error was anticipated.
-				w.recordInHist(timeutil.Since(start), txnRollback)
-				return errors.Mark(
-					errors.Wrapf(err, "ROLLBACK; Successfully got expected execution error. %s",
-						w.getErrorState()),
-					errRunInTxnRbkSentinel,
-				)
-			}
-			if !w.opGen.expectedExecErrors.empty() {
-				return errors.Mark(
-					errors.Newf("***FAIL; Failed to receive an execution error when errors were expected. %s",
-						w.getErrorState()),
-					errRunInTxnFatalSentinel,
-				)
+				return err
 			}
 			w.recordInHist(timeutil.Since(start), operationOk)
 		}
@@ -406,7 +419,22 @@ func (w *schemaChangeWorker) runInTxn(ctx context.Context, tx pgx.Tx) error {
 }
 
 func (w *schemaChangeWorker) run(ctx context.Context) error {
-	tx, err := w.pool.Get().Begin(ctx)
+	conn, err := w.pool.Get().Acquire(ctx)
+	defer conn.Release()
+	if err != nil {
+		return errors.Wrap(err, "cannot get a connection")
+	}
+	useDeclarativeSchemaChanger := w.opGen.randIntn(100) > w.workload.declarativeSchemaChangerPct
+	if useDeclarativeSchemaChanger {
+		if _, err := conn.Exec(ctx, "SET use_declarative_schema_changer='unsafe_always';"); err != nil {
+			return err
+		}
+	} else {
+		if _, err := conn.Exec(ctx, "SET use_declarative_schema_changer='off';"); err != nil {
+			return err
+		}
+	}
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return errors.Wrap(err, "cannot get a connection and begin a txn")
 	}
@@ -415,9 +443,14 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 	defer w.releaseLocksIfHeld()
 
 	// Run between 1 and maxOpsPerWorker schema change operations.
+	watchDog := newSchemaChangeWatchDog(w.pool.Get(), w.logger)
+	if err := watchDog.Start(ctx, tx); err != nil {
+		return errors.Wrapf(err, "unable to start watch dog")
+	}
+	defer watchDog.Stop()
 	start := timeutil.Now()
 	w.opGen.resetTxnState()
-	err = w.runInTxn(ctx, tx)
+	err = w.runInTxn(ctx, tx, useDeclarativeSchemaChanger)
 
 	if err != nil {
 		// Rollback in all cases to release the txn object and its conn pool. Wrap the original
@@ -429,7 +462,7 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 			)
 		}
 
-		w.logger.flushLog(tx, err.Error())
+		w.logger.flushLogWithError(tx, err)
 		switch {
 		case errors.Is(err, errRunInTxnFatalSentinel):
 			w.preErrorHook()
@@ -443,7 +476,6 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 			return errors.Wrapf(err, "***UNEXPECTED ERROR")
 		}
 	}
-
 	w.logger.writeLog("COMMIT")
 	if err = tx.Commit(ctx); err != nil {
 		// If the error not an instance of pgconn.PgError, then it is unexpected.
@@ -453,7 +485,7 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 				errors.Wrap(err, "***UNEXPECTED COMMIT ERROR; Received a non pg error"),
 				errRunInTxnFatalSentinel,
 			)
-			w.logger.flushLog(tx, err.Error())
+			w.logger.flushLogWithError(tx, err)
 			w.preErrorHook()
 			return err
 		}
@@ -477,12 +509,14 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 		}
 
 		// Check for any expected errors.
-		if !w.opGen.expectedCommitErrors.contains(pgcode.MakeCode(pgErr.Code)) {
+		if !w.opGen.expectedCommitErrors.contains(pgcode.MakeCode(pgErr.Code)) &&
+			!w.opGen.potentialCommitErrors.contains(pgcode.MakeCode(pgErr.Code)) {
 			err = errors.Mark(
-				errors.Wrap(err, "***UNEXPECTED COMMIT ERROR; Received an unexpected commit error"),
+				w.WrapWithErrorState(
+					errors.Wrapf(err, "***UNEXPECTED COMMIT ERROR; Received an unexpected commit error")),
 				errRunInTxnFatalSentinel,
 			)
-			w.logger.flushLog(tx, err.Error())
+			w.logger.flushLogWithError(tx, err)
 			w.preErrorHook()
 			return err
 		}
@@ -492,10 +526,9 @@ func (w *schemaChangeWorker) run(ctx context.Context) error {
 		w.logger.flushLog(tx, "COMMIT; Successfully got expected commit error")
 		return nil
 	}
-
 	if !w.opGen.expectedCommitErrors.empty() {
-		err := errors.New("***FAIL; Failed to receive a commit error when at least one commit error was expected")
-		w.logger.flushLog(tx, err.Error())
+		err := w.WrapWithErrorState(errors.Newf("***FAIL; Failed to receive a commit error when at least one commit error was expected"))
+		w.logger.flushLogWithError(tx, err)
 		w.preErrorHook()
 		return errors.Mark(err, errRunInTxnFatalSentinel)
 	}
@@ -539,13 +572,14 @@ func (w *schemaChangeWorker) releaseLocksIfHeld() {
 
 // startLog initializes the currentLogEntry of the schemaChangeWorker. It is a noop
 // if l.verbose < 1.
-func (l *logger) startLog() {
+func (l *logger) startLog(workerID int) {
 	if l.verbose < 1 {
 		return
 	}
 	l.currentLogEntry.mu.Lock()
 	defer l.currentLogEntry.mu.Unlock()
 	l.currentLogEntry.mu.entry = &LogEntry{
+		WorkerID:        workerID,
 		ClientTimestamp: timeutil.Now().Format("15:04:05.999999"),
 	}
 }
@@ -553,6 +587,19 @@ func (l *logger) startLog() {
 // writeLog appends an op statement to the currentLogEntry of the schemaChangeWorker.
 // It is a noop if l.verbose < 1.
 func (l *logger) writeLog(op string) {
+	if l.verbose < 1 {
+		return
+	}
+	l.currentLogEntry.mu.Lock()
+	defer l.currentLogEntry.mu.Unlock()
+	if l.currentLogEntry.mu.entry != nil {
+		l.currentLogEntry.mu.entry.Ops = append(l.currentLogEntry.mu.entry.Ops, op)
+	}
+}
+
+// writeLog appends an op statement to the currentLogEntry of the schemaChangeWorker.
+// It is a noop if l.verbose < 1.
+func (l *logger) writeLogOp(op *opStmt) {
 	if l.verbose < 1 {
 		return
 	}
@@ -575,6 +622,30 @@ func (l *logger) addExpectedErrors(execErrors errorCodeSet, commitErrors errorCo
 		l.currentLogEntry.mu.entry.ExpectedExecErrors = execErrors.String()
 		l.currentLogEntry.mu.entry.ExpectedCommitErrors = commitErrors.String()
 	}
+}
+
+// flushLogWithError outputs the currentLogEntry of the schemaChangeWorker, with
+// an error message (any available error state information is also added).
+// It is a noop if l.verbose < 0.
+func (l *logger) flushLogWithError(tx pgx.Tx, err error) {
+	if l.verbose < 1 {
+		return
+	}
+
+	// Fetch and apply the error state to the log entry.
+	func() {
+		l.currentLogEntry.mu.Lock()
+		defer l.currentLogEntry.mu.Unlock()
+		if l.currentLogEntry.mu.entry != nil {
+			var state *ErrorState
+			if errors.As(err, &state) {
+				l.currentLogEntry.mu.entry.ErrorState = state
+			}
+		}
+	}()
+
+	l.flushLogAndLock(tx, err.Error(), true)
+	l.currentLogEntry.mu.Unlock()
 }
 
 // flushLog outputs the currentLogEntry of the schemaChangeWorker.
@@ -619,6 +690,29 @@ func (l *logger) flushLogAndLock(_ pgx.Tx, message string, stdout bool) {
 		l.artifactsLog.printLn(jsonBuf.String())
 	}
 	l.currentLogEntry.mu.entry = nil
+}
+
+// logWatchDog used by the watch dog to log entries on behalf of the current
+// worker.
+func (l *logger) logWatchDog(entry string) {
+	logEntry := LogEntry{
+		ClientTimestamp: timeutil.Now().Format("15:04:05.999999"),
+		Ops:             nil,
+		Message:         fmt.Sprintf("WATCH DOG: %s", entry),
+	}
+	jsonBytes, err := json.MarshalIndent(logEntry, "", " ")
+	if err != nil {
+		return
+	}
+	l.stdoutLog.printLn(string(jsonBytes))
+	if l.artifactsLog != nil {
+		var jsonBuf bytes.Buffer
+		err = json.Compact(&jsonBuf, jsonBytes)
+		if err != nil {
+			return
+		}
+		l.artifactsLog.printLn(jsonBuf.String())
+	}
 }
 
 type logger struct {

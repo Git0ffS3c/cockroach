@@ -19,37 +19,30 @@ func init() {
 	opRegistry.register((*scpb.Schema)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_TXN_DROPPED),
-			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.Schema) scop.Op {
+			to(scpb.Status_DROPPED,
+				emit(func(this *scpb.Schema) *scop.NotImplemented {
 					return notImplemented(this)
+				}),
+			),
+			to(scpb.Status_PUBLIC,
+				emit(func(this *scpb.Schema) *scop.MarkDescriptorAsPublic {
+					return &scop.MarkDescriptorAsPublic{
+						DescriptorID: this.SchemaID,
+					}
 				}),
 			),
 		),
 		toAbsent(scpb.Status_PUBLIC,
-			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.Schema) scop.Op {
-					return &scop.MarkDescriptorAsDroppedSynthetically{
-						DescID: this.SchemaID,
-					}
-				}),
-			),
 			to(scpb.Status_DROPPED,
-				minPhase(scop.PreCommitPhase),
 				revertible(false),
-				emit(func(this *scpb.Schema) scop.Op {
+				emit(func(this *scpb.Schema) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.SchemaID,
+						DescriptorID: this.SchemaID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PostCommitPhase),
-				emit(func(this *scpb.Schema, md *targetsWithElementMap) scop.Op {
-					return newLogEventOp(this, md)
-				}),
-				emit(func(this *scpb.Schema) scop.Op {
+				emit(func(this *scpb.Schema) *scop.DeleteDescriptor {
 					return &scop.DeleteDescriptor{
 						DescriptorID: this.SchemaID,
 					}

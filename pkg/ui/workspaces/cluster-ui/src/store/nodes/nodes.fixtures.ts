@@ -14,8 +14,8 @@ import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 
 type INodesResponse = cockroach.server.serverpb.INodesResponse;
 
-export const getNodeStatus = () => {
-  const nodeResp: INodeStatus = {
+export const getNodeStatus = (): INodeStatus => {
+  return {
     desc: {
       node_id: 1,
       address: {
@@ -405,6 +405,10 @@ export const getNodeStatus = () => {
       "sql.feature_flag_denial": 0,
       "sql.hydrated_table_cache.hits": 0,
       "sql.hydrated_table_cache.misses": 0,
+      "sql.hydrated_udf_cache.hits": 0,
+      "sql.hydrated_udf_cache.misses": 0,
+      "sql.hydrated_schema_cache.hits": 0,
+      "sql.hydrated_schema_cache.misses": 0,
       "sql.insert.count": 0,
       "sql.insert.count.internal": 343,
       "sql.insert.started.count": 0,
@@ -802,7 +806,6 @@ export const getNodeStatus = () => {
           "queue.tsmaintenance.process.success": 3,
           "queue.tsmaintenance.processingnanos": 174301000,
           "raft.commandsapplied": 0,
-          "raft.enqueued.pending": 0,
           "raft.entrycache.accesses": 485,
           "raft.entrycache.bytes": 217172,
           "raft.entrycache.hits": 331,
@@ -895,7 +898,6 @@ export const getNodeStatus = () => {
           "requests.slow.raft": 0,
           "rocksdb.block.cache.hits": 52720,
           "rocksdb.block.cache.misses": 4276,
-          "rocksdb.block.cache.pinned-usage": 0,
           "rocksdb.block.cache.usage": 2034335,
           "rocksdb.bloom.filter.prefix.checked": 916,
           "rocksdb.bloom.filter.prefix.useful": 839,
@@ -966,7 +968,6 @@ export const getNodeStatus = () => {
     total_system_memory: Long.fromString("17179869184"),
     num_cpus: 4,
   };
-  return nodeResp;
 };
 
 export const getNodesResponse = (): INodesResponse => {

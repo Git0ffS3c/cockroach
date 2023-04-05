@@ -14,23 +14,23 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testfixtures"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -124,20 +124,22 @@ func runRefreshRangeBenchmark(b *testing.B, emk engineMaker, opts benchOptions) 
 	startKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(0)))
 	endKey := roachpb.Key(encoding.EncodeUvarintAscending([]byte("key-"), uint64(opts.dataOpts.numKeys)))
 
+	var refreshErr *kvpb.RefreshFailedError
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		func() {
-			var resp roachpb.RefreshRangeResponse
+			var resp kvpb.RefreshRangeResponse
 			_, err := batcheval.RefreshRange(ctx, eng, batcheval.CommandArgs{
 				EvalCtx: evalCtx,
-				Args: &roachpb.RefreshRangeRequest{
-					RequestHeader: roachpb.RequestHeader{
+				Args: &kvpb.RefreshRangeRequest{
+					RequestHeader: kvpb.RequestHeader{
 						Key:    startKey,
 						EndKey: endKey,
 					},
 					RefreshFrom: opts.refreshFrom,
 				},
-				Header: roachpb.Header{
+				Header: kvpb.Header{
 					Txn: &roachpb.Transaction{
 						TxnMeta: enginepb.TxnMeta{
 							WriteTimestamp: opts.refreshTo,
@@ -156,7 +158,7 @@ func runRefreshRangeBenchmark(b *testing.B, emk engineMaker, opts benchOptions) 
 				require.NoError(b, err)
 			} else {
 				require.Error(b, err)
-				require.Regexp(b, "encountered recently written committed value", err)
+				require.ErrorAs(b, err, &refreshErr)
 			}
 		}()
 	}
@@ -183,7 +185,6 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 	opts.FS = vfs.Default
 	opts.LBaseMaxBytes = lBaseMaxBytes
 	opts.ReadOnly = readOnly
-	opts.FormatMajorVersion = pebble.FormatBlockPropertyCollector
 	peb, err := storage.NewPebble(
 		context.Background(),
 		storage.PebbleConfig{
@@ -202,16 +203,19 @@ func setupMVCCPebble(b testing.TB, dir string, lBaseMaxBytes int64, readOnly boo
 // and continuing to t=5ns*(numKeys+1). The goal of this is to
 // approximate an append-only type workload.
 //
-// A read-only engine can be returned if opts.readOnlyEngine is
-// set. The goal of this is to prevent read-triggered compactions that
-// might change the distribution of data across levels.
+// A read-only engine is returned if opts.readOnlyEngine is set. The goal of
+// this is to prevent read-triggered compactions that might change the
+// distribution of data across levels.
 //
-// The creation of the database is time consuming, especially for
-// larger numbers of versions. The database is persisted between runs
-// and stored in the current directory.
+// The creation of the database is time-consuming, especially for larger numbers
+// of versions. The database is persisted between runs using
+// testfixtures.ReuseOrGenerate.
 func setupData(
 	ctx context.Context, b *testing.B, emk engineMaker, opts benchDataOptions,
 ) (storage.Engine, string) {
+	// Include the current version in the fixture name, or we may inadvertently
+	// run against a left-over fixture that is no longer supported.
+	verStr := fmt.Sprintf("v%s", clusterversion.TestingBinaryVersion.String())
 	orderStr := "linear"
 	if opts.randomKeyOrder {
 		orderStr = "random"
@@ -220,81 +224,70 @@ func setupData(
 	if opts.readOnlyEngine {
 		readOnlyStr = "_readonly"
 	}
-	loc := fmt.Sprintf("refresh_range_bench_data_%s%s_%d_%d_%d",
-		orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes)
-	exists := true
-	if _, err := os.Stat(loc); oserror.IsNotExist(err) {
-		exists = false
-	} else if err != nil {
-		b.Fatal(err)
-	}
+	name := fmt.Sprintf("refresh_range_bench_data_%s_%s%s_%d_%d_%d",
+		verStr, orderStr, readOnlyStr, opts.numKeys, opts.valueBytes, opts.lBaseMaxBytes)
 
-	if exists {
-		testutils.ReadAllFiles(filepath.Join(loc, "*"))
-		return emk(b, loc, opts.lBaseMaxBytes, opts.readOnlyEngine), loc
-	}
+	dir := testfixtures.ReuseOrGenerate(b, name, func(dir string) {
+		eng := emk(b, dir, opts.lBaseMaxBytes, false)
+		log.Infof(ctx, "creating refresh range benchmark data: %s", dir)
 
-	eng := emk(b, loc, opts.lBaseMaxBytes, false)
-	log.Infof(ctx, "creating refresh range benchmark data: %s", loc)
+		// Generate the same data every time.
+		rng := rand.New(rand.NewSource(1449168817))
 
-	// Generate the same data every time.
-	rng := rand.New(rand.NewSource(1449168817))
+		keys := make([]roachpb.Key, opts.numKeys)
+		order := make([]int, 0, opts.numKeys)
+		for i := 0; i < opts.numKeys; i++ {
+			keys[i] = encoding.EncodeUvarintAscending([]byte("key-"), uint64(i))
+			order = append(order, i)
+		}
 
-	keys := make([]roachpb.Key, opts.numKeys)
-	order := make([]int, 0, opts.numKeys)
-	for i := 0; i < opts.numKeys; i++ {
-		keys[i] = encoding.EncodeUvarintAscending([]byte("key-"), uint64(i))
-		order = append(order, i)
-	}
+		if opts.randomKeyOrder {
+			rng.Shuffle(len(order), func(i, j int) {
+				order[i], order[j] = order[j], order[i]
+			})
+		}
 
-	if opts.randomKeyOrder {
-		rng.Shuffle(len(order), func(i, j int) {
-			order[i], order[j] = order[j], order[i]
-		})
-	}
+		writeKey := func(batch storage.Batch, idx int, pos int) {
+			key := keys[idx]
+			value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, opts.valueBytes))
+			value.InitChecksum(key)
+			ts := hlc.Timestamp{WallTime: int64((pos + 1) * 5)}
+			if err := storage.MVCCPut(ctx, batch, nil /* ms */, key, ts, hlc.ClockTimestamp{}, value, nil); err != nil {
+				b.Fatal(err)
+			}
+		}
 
-	writeKey := func(batch storage.Batch, idx int, pos int) {
-		key := keys[idx]
-		value := roachpb.MakeValueFromBytes(randutil.RandBytes(rng, opts.valueBytes))
-		value.InitChecksum(key)
-		ts := hlc.Timestamp{WallTime: int64((pos + 1) * 5)}
-		if err := storage.MVCCPut(ctx, batch, nil /* ms */, key, ts, value, nil); err != nil {
+		batch := eng.NewBatch()
+		for i, idx := range order {
+			// Output the keys in ~20 batches. If we used a single batch to output all
+			// of the keys rocksdb would create a single sstable. We want multiple
+			// sstables in order to exercise filtering of which sstables are examined
+			// during iterator seeking. We fix the number of batches we output so that
+			// optimizations which change the data size result in the same number of
+			// sstables.
+			if scaled := len(order) / 20; i > 0 && (i%scaled) == 0 {
+				log.Infof(ctx, "committing (%d/~%d) (%d/%d)", i/scaled, 20, i, len(order))
+				if err := batch.Commit(false /* sync */); err != nil {
+					b.Fatal(err)
+				}
+				batch.Close()
+				batch = eng.NewBatch()
+				if err := eng.Flush(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			writeKey(batch, idx, i)
+		}
+		if err := batch.Commit(false /* sync */); err != nil {
 			b.Fatal(err)
 		}
-	}
-
-	batch := eng.NewBatch()
-	for i, idx := range order {
-		// Output the keys in ~20 batches. If we used a single batch to output all
-		// of the keys rocksdb would create a single sstable. We want multiple
-		// sstables in order to exercise filtering of which sstables are examined
-		// during iterator seeking. We fix the number of batches we output so that
-		// optimizations which change the data size result in the same number of
-		// sstables.
-		if scaled := len(order) / 20; i > 0 && (i%scaled) == 0 {
-			log.Infof(ctx, "committing (%d/~%d) (%d/%d)", i/scaled, 20, i, len(order))
-			if err := batch.Commit(false /* sync */); err != nil {
-				b.Fatal(err)
-			}
-			batch.Close()
-			batch = eng.NewBatch()
-			if err := eng.Flush(); err != nil {
-				b.Fatal(err)
-			}
+		batch.Close()
+		if err := eng.Flush(); err != nil {
+			b.Fatal(err)
 		}
-		writeKey(batch, idx, i)
-	}
-	if err := batch.Commit(false /* sync */); err != nil {
-		b.Fatal(err)
-	}
-	batch.Close()
-	if err := eng.Flush(); err != nil {
-		b.Fatal(err)
-	}
-
-	if opts.readOnlyEngine {
 		eng.Close()
-		eng = emk(b, loc, opts.lBaseMaxBytes, opts.readOnlyEngine)
-	}
-	return eng, loc
+	})
+
+	testutils.ReadAllFiles(filepath.Join(dir, "*"))
+	return emk(b, dir, opts.lBaseMaxBytes, opts.readOnlyEngine), dir
 }

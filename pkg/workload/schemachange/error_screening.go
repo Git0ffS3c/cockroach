@@ -13,6 +13,7 @@ package schemachange
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -75,14 +76,29 @@ func (og *operationGenerator) tableHasRows(
 	return og.scanBool(ctx, tx, fmt.Sprintf(`SELECT EXISTS (SELECT * FROM %s)`, tableName.String()))
 }
 
+func (og *operationGenerator) scanInt(
+	ctx context.Context, tx pgx.Tx, query string, args ...interface{},
+) (i int, err error) {
+	err = tx.QueryRow(ctx, query, args...).Scan(&i)
+	if err == nil {
+		og.LogQueryResults(
+			query,
+			i,
+			args...,
+		)
+	}
+	return i, errors.Wrapf(err, "scanBool: %q %q", query, args)
+}
+
 func (og *operationGenerator) scanBool(
 	ctx context.Context, tx pgx.Tx, query string, args ...interface{},
 ) (b bool, err error) {
 	err = tx.QueryRow(ctx, query, args...).Scan(&b)
 	if err == nil {
 		og.LogQueryResults(
-			fmt.Sprintf("%q %q", query, args),
-			fmt.Sprintf("%t", b),
+			query,
+			b,
+			args...,
 		)
 	}
 	return b, errors.Wrapf(err, "scanBool: %q %q", query, args)
@@ -304,7 +320,7 @@ func (og *operationGenerator) valuesViolateUniqueConstraints(
 GROUP BY name;
 `, tableName.String())
 	if err != nil {
-		return false, nil, err
+		return false, nil, og.checkAndAdjustForUnknownSchemaErrors(err)
 	}
 	// Determine if the tuples are unique for a given constraint, where the index
 	// will be the constraint.
@@ -312,8 +328,8 @@ GROUP BY name;
 	for range constraints {
 		constraintTuples = append(constraintTuples, make(map[string]struct{}))
 	}
-
 	for _, row := range rows {
+		hasGenerationError := false
 		// Put values to be inserted into a column name to value map to simplify lookups.
 		columnsToValues := map[string]string{}
 		for i := 0; i < len(columns); i++ {
@@ -325,7 +341,32 @@ GROUP BY name;
 			if !colInfo.generated {
 				continue
 			}
+			evalTxn, err := tx.Begin(ctx)
+			if err != nil {
+				return false, nil, err
+			}
 			newCols[colInfo.name], err = og.generateColumn(ctx, tx, colInfo, columnsToValues)
+			if err != nil {
+				if rbkErr := evalTxn.Rollback(ctx); rbkErr != nil {
+					return false, nil, errors.WithSecondaryError(err, rbkErr)
+				}
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) {
+					return false, nil, err
+				}
+				// Only accept know error types for generated expressions.
+				if !isValidGenerationError(pgErr.Code) {
+					return false, nil, err
+				}
+				generatedCodes = append(generatedCodes,
+					codesWithConditions{
+						{code: pgcode.MakeCode(pgErr.Code), condition: true},
+					}...,
+				)
+				hasGenerationError = true
+				continue
+			}
+			err = evalTxn.Commit(ctx)
 			if err != nil {
 				return false, nil, err
 			}
@@ -333,8 +374,23 @@ GROUP BY name;
 		for k, v := range newCols {
 			columnsToValues[k] = v
 		}
+		// Skip over constraint validation, since we know an expression is bad here.
+		if hasGenerationError {
+			continue
+		}
 		// Next validate the uniqueness of both constraints and index expressions.
 		for constraintIdx, constraint := range constraints {
+			nonTupleConstraint := constraint[0]
+			if len(nonTupleConstraint) > 2 &&
+				nonTupleConstraint[0] == '(' &&
+				nonTupleConstraint[len(nonTupleConstraint)-1] == ')' {
+				nonTupleConstraint = nonTupleConstraint[1 : len(nonTupleConstraint)-1]
+			}
+			hasNullsQuery := strings.Builder{}
+			hasNullsQuery.WriteString("SELECT num_nulls(")
+			hasNullsQuery.WriteString(nonTupleConstraint)
+			hasNullsQuery.WriteString(") > 0 FROM (VALUES(")
+
 			tupleSelectQuery := strings.Builder{}
 			tupleSelectQuery.WriteString("SELECT array[(")
 			tupleSelectQuery.WriteString(constraint[0])
@@ -348,7 +404,7 @@ GROUP BY name;
 			}
 			collector := newExprColumnCollector(colInfo)
 			t.Walk(collector)
-			query.WriteString("SELECT EXISTS ( SELECT * FROM ")
+			query.WriteString("SELECT COUNT (*) > 0 FROM (SELECT * FROM ")
 			query.WriteString(tableName.String())
 			query.WriteString(" WHERE ")
 			query.WriteString(constraint[0])
@@ -357,30 +413,23 @@ GROUP BY name;
 			query.WriteString(constraint[0])
 			query.WriteString(" FROM (VALUES( ")
 			colIdx := 0
-			nullValueEncountered := false
 			for col := range collector.columnsObserved {
 				value := columnsToValues[col]
 				if colIdx != 0 {
 					query.WriteString(",")
 					columns.WriteString(",")
 					tupleSelectQuery.WriteString(",")
-				}
-				if value == "NULL" {
-					nullValueEncountered = true
-					break
+					hasNullsQuery.WriteString(",")
 				}
 				query.WriteString(value)
 				columns.WriteString(col)
+				hasNullsQuery.WriteString(value)
 				tupleSelectQuery.WriteString(value)
 				colIdx++
 			}
-			// Row is not comparable to others for unique constraints, since it has a
-			// NULL value.
-			// TODO (fqazi): In the future for check constraints we should evaluate
-			// things for them.
-			if nullValueEncountered {
-				continue
-			}
+			hasNullsQuery.WriteString(") ) AS T(")
+			hasNullsQuery.WriteString(columns.String())
+			hasNullsQuery.WriteString(")")
 			tupleSelectQuery.WriteString(") ) AS T(")
 			tupleSelectQuery.WriteString(columns.String())
 			tupleSelectQuery.WriteString(")")
@@ -391,24 +440,53 @@ GROUP BY name;
 			if err != nil {
 				return false, nil, err
 			}
-			exists, err := og.scanBool(ctx, evalTxn, query.String())
-			if err != nil {
+			// Detect if any null values exist.
+			handleEvalTxnError := func(err error) (bool, error) {
+				// No choice but to rollback, expression is malformed.
+				rollbackErr := evalTxn.Rollback(ctx)
+				if rollbackErr != nil {
+					return false, err
+				}
 				var pgErr *pgconn.PgError
 				if !errors.As(err, &pgErr) {
-					return false, nil, err
+					return false, err
 				}
 				// Only accept known error types for generated expressions.
 				if !isValidGenerationError(pgErr.Code) {
-					return false, nil, err
+					return false, err
 				}
 				generatedCodes = append(generatedCodes,
 					codesWithConditions{
 						{code: pgcode.MakeCode(pgErr.Code), condition: true},
 					}...,
 				)
+				return true, nil
+			}
+			hasNullValues, err := og.scanBool(ctx, evalTxn, hasNullsQuery.String())
+			if err != nil {
+				skipConstraint, err := handleEvalTxnError(err)
+				if err != nil {
+					return false, generatedCodes, err
+				}
+				if skipConstraint {
+					continue
+				}
+			}
+			// Skip if any null values exist in the expression
+			if hasNullValues {
 				continue
 			}
-			err = evalTxn.Rollback(ctx)
+			exists, err := og.scanBool(ctx, evalTxn, query.String())
+			if err != nil {
+				skipConstraint, err := handleEvalTxnError(err)
+				if err != nil {
+					return false, generatedCodes, err
+				}
+				if skipConstraint {
+					continue
+				}
+			}
+			err = evalTxn.Commit(ctx)
 			if err != nil {
 				return false, nil, err
 			}
@@ -484,14 +562,20 @@ SELECT count(*) > 0
 	return nil
 }
 
+func getValidGenerationErrors() errorCodeSet {
+	return errorCodeSet{
+		pgcode.NumericValueOutOfRange:    true,
+		pgcode.FloatingPointException:    true,
+		pgcode.InvalidTextRepresentation: true,
+	}
+}
+
 // isValidGenerationError these codes can be observed when evaluating values
 // for generated expressions. These are errors are not ignored, but added into
 // the expected set of errors.
 func isValidGenerationError(code string) bool {
 	pgCode := pgcode.MakeCode(code)
-	return pgCode == pgcode.NumericValueOutOfRange ||
-		pgCode == pgcode.FloatingPointException ||
-		pgCode == pgcode.InvalidTextRepresentation
+	return getValidGenerationErrors().contains(pgCode)
 }
 
 // validateGeneratedExpressionsForInsert goes through generated expressions and
@@ -503,17 +587,9 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 	columns []string,
 	colInfos []column,
 	row []string,
-) (bool, codesWithConditions, error) {
+) (bool, codesWithConditions, codesWithConditions, error) {
+	var expectedErrors codesWithConditions
 	var potentialErrors codesWithConditions
-	appendPotentialError := func(code pgcode.Code) {
-		potentialErrors = append(potentialErrors,
-			codesWithConditions{
-				{
-					code:      code,
-					condition: true,
-				},
-			}...)
-	}
 	// Put values to be inserted into a column name to value map to simplify lookups.
 	columnsToValues := map[string]string{}
 	for i := 0; i < len(columns); i++ {
@@ -532,14 +608,29 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 		query.WriteString(typ)
 		query.WriteString(") IS NULL ")
 		query.WriteString("AS c FROM ( VALUES(")
+		// Second builder to ensure that no evaluating arithmetic doesn't lead
+		// to overflows, if the order during runtime is different.
+		queryEvalOrderCheck := strings.Builder{}
+		queryEvalOrderCheck.WriteString(query.String())
 		cols := strings.Builder{}
 		colIdx := 0
 		for colName, value := range columnsToValues {
 			if colIdx != 0 {
 				query.WriteString(",")
+				queryEvalOrderCheck.WriteString(",")
 				cols.WriteString(",")
 			}
+			nonNullValue := value
+			if value == "NULL" {
+				if colInfos[colIdx].typ.IsNumeric() {
+					// We intentionally use NULL in case any division operations are encountered.
+					// This reduces odds of extra overflows, but these will be evaluated as
+					// potential errors not expected ones.
+					nonNullValue = fmt.Sprintf("1::%s", colInfos[colIdx].typ.SQLString())
+				}
+			}
 			query.WriteString(value)
+			queryEvalOrderCheck.WriteString(nonNullValue)
 			cols.WriteString(colName)
 			colIdx++
 		}
@@ -555,9 +646,11 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 				}
 				if colIdx != 0 {
 					query.WriteString(",")
+					queryEvalOrderCheck.WriteString(",")
 					cols.WriteString(",")
 				}
 				query.WriteString(col)
+				queryEvalOrderCheck.WriteString(col)
 				cols.WriteString(colInfo.name)
 				colIdx++
 			}
@@ -565,6 +658,9 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 		query.WriteString(")) AS t(")
 		query.WriteString(cols.String())
 		query.WriteString(");")
+		queryEvalOrderCheck.WriteString(")) AS t(")
+		queryEvalOrderCheck.WriteString(cols.String())
+		queryEvalOrderCheck.WriteString(");")
 		isNull, err := og.scanBool(ctx, evalTx, query.String())
 		// Evaluating the expression generated a value, which can be either arithmetic
 		// or overflow errors.
@@ -577,11 +673,28 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 			if !isValidGenerationError(pgErr.Code) {
 				return err
 			}
-			appendPotentialError(pgcode.MakeCode(pgErr.Code))
+			expectedErrors = expectedErrors.append(pgcode.MakeCode(pgErr.Code))
 		}
 		if isNull && !isNullable && !nullViolationAdded {
 			nullViolationAdded = true
-			appendPotentialError(pgcode.NotNullViolation)
+			expectedErrors = expectedErrors.append(pgcode.NotNullViolation)
+		}
+		// Re-run the another variant in case we have NULL values in arithmetic
+		// of expression, the evaluation order can differ depending on how variables
+		// get bound during the actual insert.
+		if err == nil && isNull {
+			if _, err := og.scanBool(ctx, evalTx, queryEvalOrderCheck.String()); err != nil {
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) {
+					_ = evalTx.Rollback(ctx)
+					return err
+				}
+				// Note: Invalid errors are allowed, since this is a heuristic. We replaced
+				// random NULL values with zero.
+				if isValidGenerationError(pgErr.Code) {
+					potentialErrors = potentialErrors.append(pgcode.MakeCode(pgErr.Code))
+				}
+			}
 		}
 		// Always rollback the context used to validate the expression, so the
 		// main transaction doesn't stall.
@@ -600,12 +713,12 @@ func (og *operationGenerator) validateGeneratedExpressionsForInsert(
 		}
 		err := validateExpression(colInfo.generatedExpression, colInfo.typ.SQLString(), colInfo.nullable, false)
 		if err != nil {
-			return false, nil, err
+			return false, nil, nil, err
 		}
 	}
 	// Any bad generated expression means we don't have to bother with indexes next,
 	// since we expect the insert to fail earlier.
-	if potentialErrors == nil {
+	if expectedErrors == nil {
 		// Validate unique constraint expressions that are backed by indexes.
 		constraints, err := og.scanStringArrayRows(ctx, tx, `
 WITH tab_json AS (
@@ -651,17 +764,17 @@ WITH tab_json AS (
 GROUP BY name;
 		`, tableName.String())
 		if err != nil {
-			return false, nil, err
+			return false, nil, nil, og.checkAndAdjustForUnknownSchemaErrors(err)
 		}
 
 		for _, constraint := range constraints {
 			err := validateExpression(constraint[0], "STRING", true, true)
 			if err != nil {
-				return false, nil, err
+				return false, nil, nil, err
 			}
 		}
 	}
-	return len(potentialErrors) > 0, potentialErrors, nil
+	return len(expectedErrors) > 0, expectedErrors, potentialErrors, nil
 }
 
 // generateColumn generates values for columns that are generated.
@@ -750,8 +863,9 @@ func (og *operationGenerator) scanStringArrayNullableRows(
 			humanReadableResults = append(humanReadableResults, humanReadableRes)
 		}
 		og.LogQueryResults(
-			fmt.Sprintf("%q %q", query, args),
-			fmt.Sprintf("%q", humanReadableResults))
+			query,
+			humanReadableResults,
+			args...)
 	}
 	return results, nil
 }
@@ -780,8 +894,9 @@ func (og *operationGenerator) scanStringArrayRows(
 	}
 
 	og.LogQueryResults(
-		fmt.Sprintf("%q %q", query, args),
-		fmt.Sprintf("%q", results))
+		query,
+		results,
+		args...)
 	return results, nil
 }
 
@@ -802,9 +917,10 @@ func (og *operationGenerator) scanStringArray(
 ) (b []string, err error) {
 	err = tx.QueryRow(ctx, query, args...).Scan(&b)
 	if err == nil {
-		og.LogQueryResultArray(
-			fmt.Sprintf("%q %q", query, args),
+		og.LogQueryResults(
+			query,
 			b,
+			args...,
 		)
 	}
 	return b, errors.Wrapf(err, "scanStringArray %q %q", query, args)
@@ -878,6 +994,10 @@ func (og *operationGenerator) constraintIsPrimary(
 func (og *operationGenerator) columnHasSingleUniqueConstraint(
 	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
 ) (bool, error) {
+	// Rowid will always be unique, though the index is hidden.
+	if columnName == "rowid" {
+		return true, nil
+	}
 	return og.scanBool(ctx, tx, `
 	SELECT EXISTS(
 	        SELECT column_name
@@ -930,7 +1050,7 @@ SELECT COALESCE(
 `, tableName.String(), columnName)
 }
 
-func (og *operationGenerator) columnIsComputed(
+func (og *operationGenerator) columnIsVirtualComputed(
 	ctx context.Context, tx pgx.Tx, tableName *tree.TableName, columnName string,
 ) (bool, error) {
 	// Note that we COALESCE because the column may not exist.
@@ -941,7 +1061,7 @@ SELECT COALESCE(
               FROM pg_catalog.pg_attribute
              WHERE attrelid = $1:::REGCLASS AND attname = $2
         )
-        != '',
+        = 'v',
         false
        );
 `, tableName.String(), columnName)
@@ -968,17 +1088,65 @@ func (og *operationGenerator) rowsSatisfyFkConstraint(
 	childColumn *column,
 ) (bool, error) {
 	// Self referential foreign key constraints are acceptable.
-	if parentTable.Schema() == childTable.Schema() && parentTable.Object() == childTable.Object() && parentColumn.name == childColumn.name {
+	selfReferential, err := og.scanBool(ctx, tx,
+		`SELECT $1:::REGCLASS=$2:::REGCLASS`,
+		parentTable.String(), childTable.String())
+	if err != nil {
+		return false, err
+	}
+	if selfReferential && parentColumn.name == childColumn.name {
 		return true, nil
 	}
-	return og.scanBool(ctx, tx, fmt.Sprintf(`
-	SELECT NOT EXISTS(
-	  SELECT *
+
+	// Validate the parent table has rows.
+	childRows, err := og.scanInt(ctx, tx,
+		fmt.Sprintf(`
+SELECT count(*) FROM %s
+		`, childTable.String()),
+	)
+	if err != nil {
+		return false, err
+	}
+
+	// If child table is empty then no violation can exist.
+	if childRows == 0 {
+		return true, nil
+	}
+
+	numJoinRows, err := og.scanInt(ctx, tx, fmt.Sprintf(`
+	  SELECT count(*)
 	    FROM %s as t1
 		  LEFT JOIN %s as t2
 				     ON t1.%s = t2.%s
-	   WHERE t2.%s IS NULL
-  )`, childTable.String(), parentTable.String(), childColumn.name, parentColumn.name, parentColumn.name))
+			WHERE t2.%s IS NOT NULL
+`, childTable.String(), parentTable.String(), childColumn.name, parentColumn.name, parentColumn.name))
+	if err != nil {
+		return false, err
+	}
+	return numJoinRows == childRows, err
+}
+
+var (
+	// regexpUnknownSchemaErr matches unknown schema errors with
+	// a descriptor ID, which will have the form: unknown schema "[123]"
+	regexpUnknownSchemaErr = regexp.MustCompile(`unknown schema "\[\d+]"`)
+)
+
+// checkAndAdjustForUnknownSchemaErrors in certain contexts we will attempt to
+// bind descriptors without leasing them, since we are using crdb_internal tables,
+// so it's possible for said descriptor to be dropped before we bind it. This
+// method will allow for "unknown schema [xx]" in those contexts.
+func (og *operationGenerator) checkAndAdjustForUnknownSchemaErrors(err error) error {
+	if pgErr := new(pgconn.PgError); errors.As(err, &pgErr) &&
+		pgcode.MakeCode(pgErr.Code) == pgcode.InvalidSchemaName {
+		if regexpUnknownSchemaErr.MatchString(pgErr.Message) {
+			og.LogMessage(fmt.Sprintf("Rolling back due to unknown schema error %v",
+				err))
+			// Force a rollback and log inside the operation generator.
+			return errors.Mark(err, errRunInTxnRbkSentinel)
+		}
+	}
+	return err
 }
 
 // violatesFkConstraints checks if the rows to be inserted will result in a foreign key violation.
@@ -988,11 +1156,16 @@ func (og *operationGenerator) violatesFkConstraints(
 	fkConstraints, err := og.scanStringArrayRows(ctx, tx, fmt.Sprintf(`
 		SELECT array[parent.table_schema, parent.table_name, parent.column_name, child.column_name]
 		  FROM (
-		        SELECT conkey, confkey, conrelid, confrelid
+		        SELECT conname, conkey, confkey, conrelid, confrelid
 		          FROM pg_constraint
 		         WHERE contype = 'f'
 		           AND conrelid = '%s'::REGCLASS::INT8
 		       ) AS con
+			JOIN ( SELECT CONSTRAINT_NAME from information_schema.table_constraints 
+				      WHERE table_schema ='%s' AND
+								    table_name='%s' AND
+										(crdb_internal.is_constraint_active('%s', constraint_name) = true)
+           ) AS tc ON conname = tc.CONSTRAINT_NAME
 		  JOIN (
 		        SELECT column_name, ordinal_position, column_default
 		          FROM information_schema.columns
@@ -1013,9 +1186,9 @@ func (og *operationGenerator) violatesFkConstraints(
 		                       AND con.confrelid = parent.oid
 		                      )
 		 WHERE child.column_name != 'rowid';
-`, tableName.String(), tableName.Schema(), tableName.Object()))
+`, tableName.String(), tableName.Schema(), tableName.Object(), tableName.String(), tableName.Schema(), tableName.Object()))
 	if err != nil {
-		return false, err
+		return false, og.checkAndAdjustForUnknownSchemaErrors(err)
 	}
 
 	// Maps a column name to its index. This way, the value of a column in a row can be looked up
@@ -1032,17 +1205,17 @@ func (og *operationGenerator) violatesFkConstraints(
 			childColumnName := constraint[3]
 
 			// If self referential, there cannot be a violation.
-			if parentTableSchema == tableName.Schema() && parentTableName == tableName.Object() && parentColumnName == childColumnName {
+			parentAndChildAreSame := parentTableSchema == tableName.Schema() && parentTableName == tableName.Object()
+			if parentAndChildAreSame && parentColumnName == childColumnName {
 				continue
 			}
 
 			violation, err := og.violatesFkConstraintsHelper(
-				ctx, tx, columnNameToIndexMap, parentTableSchema, parentTableName, parentColumnName, childColumnName, row,
+				ctx, tx, columnNameToIndexMap, parentTableSchema, parentTableName, parentColumnName, tableName.String(), childColumnName, parentAndChildAreSame, row, rows,
 			)
 			if err != nil {
 				return false, err
 			}
-
 			if violation {
 				return true, nil
 			}
@@ -1058,8 +1231,10 @@ func (og *operationGenerator) violatesFkConstraintsHelper(
 	ctx context.Context,
 	tx pgx.Tx,
 	columnNameToIndexMap map[string]int,
-	parentTableSchema, parentTableName, parentColumn, childColumn string,
+	parentTableSchema, parentTableName, parentColumn, childTableName, childColumn string,
+	parentAndChildAreSameTable bool,
 	row []string,
+	allRows [][]string,
 ) (bool, error) {
 
 	// If the value to insert in the child column is NULL and the column default is NULL, then it is not possible to have a fk violation.
@@ -1067,13 +1242,54 @@ func (og *operationGenerator) violatesFkConstraintsHelper(
 	if childValue == "NULL" {
 		return false, nil
 	}
-
+	// If the parent and child are the same table, then any rows in an existing
+	// insert may satisfy the same constraint.
+	var parentAndChildSameQueryColumns []string
+	if parentAndChildAreSameTable {
+		colsInfo, err := og.getTableColumns(ctx, tx, childTableName, false)
+		if err != nil {
+			return false, err
+		}
+		// Put values to be inserted into a column name to value map to simplify lookups.
+		columnsToValues := map[string]string{}
+		for name, idx := range columnNameToIndexMap {
+			columnsToValues[name] = row[idx]
+		}
+		colIdx := 0
+		for idx, colInfo := range colsInfo {
+			if colInfo.name == parentColumn {
+				colIdx = idx
+				break
+			}
+		}
+		for _, otherRow := range allRows {
+			parentValueInSameInsert := otherRow[columnNameToIndexMap[parentColumn]]
+			// If the parent column is generated, spend time to generate the value.
+			if colsInfo[colIdx].generated {
+				var err error
+				parentValueInSameInsert, err = og.generateColumn(ctx, tx, colsInfo[colIdx], columnsToValues)
+				if err != nil {
+					return false, err
+				}
+			}
+			// Skip over NULL values.
+			if parentValueInSameInsert == "NULL" {
+				continue
+			}
+			parentAndChildSameQueryColumns = append(parentAndChildSameQueryColumns,
+				fmt.Sprintf("%s = %s", parentValueInSameInsert, childValue))
+		}
+	}
+	checkSharedParentChildRows := ""
+	if len(parentAndChildSameQueryColumns) > 0 {
+		checkSharedParentChildRows = fmt.Sprintf("false = ANY (ARRAY [%s]) AND",
+			strings.Join(parentAndChildSameQueryColumns, ","))
+	}
 	return og.scanBool(ctx, tx, fmt.Sprintf(`
-	SELECT NOT EXISTS (
-	    SELECT * from %s.%s
-	    WHERE %s = %s
-	)
-	`, parentTableSchema, parentTableName, parentColumn, childValue))
+	    SELECT %s count(*) = 0 from %s.%s
+	    WHERE %s = (%s)
+	`,
+		checkSharedParentChildRows, parentTableSchema, parentTableName, parentColumn, childValue))
 }
 
 func (og *operationGenerator) columnIsInDroppingIndex(

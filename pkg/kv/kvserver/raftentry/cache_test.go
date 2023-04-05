@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 const noLimit = math.MaxUint64
@@ -584,14 +584,14 @@ func TestConcurrentUpdates(t *testing.T) {
 			var wg sync.WaitGroup
 			wg.Add(N)
 			for i := 0; i < N; i++ {
-				go func(i int) {
+				go func(i int, clearFunc func()) {
 					if i%2 == 1 {
 						c.Add(r1, ents, true)
 					} else {
-						clearMethod.clear()
+						clearFunc()
 					}
 					wg.Done()
-				}(i)
+				}(i, clearMethod.clear)
 			}
 			wg.Wait()
 			clearMethod.clear()

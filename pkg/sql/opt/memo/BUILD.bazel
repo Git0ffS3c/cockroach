@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
@@ -37,15 +38,18 @@ go_library(
         "//pkg/sql/rowenc/keyside",
         "//pkg/sql/rowenc/valueside",
         "//pkg/sql/sem/cast",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treewindow",
+        "//pkg/sql/sem/volatility",
         "//pkg/sql/stats",
         "//pkg/sql/types",
-        "//pkg/util",
         "//pkg/util/buildutil",
         "//pkg/util/duration",
         "//pkg/util/encoding",
+        "//pkg/util/intsets",
+        "//pkg/util/iterutil",
         "//pkg/util/json",
         "//pkg/util/log",
         "//pkg/util/timeutil/pgdate",
@@ -68,6 +72,7 @@ go_test(
         "statistics_builder_test.go",
         "typing_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]) + [
         "//c-deps:libgeos",
         "//pkg/sql/opt/testutils/opttester:testfixtures",
@@ -90,19 +95,20 @@ go_test(
         "//pkg/sql/parser",
         "//pkg/sql/randgen",
         "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/builtins/builtinsregistry",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/types",
         "//pkg/testutils",
-        "//pkg/util",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/duration",
+        "//pkg/util/intsets",
         "//pkg/util/leaktest",
         "//pkg/util/timeofday",
         "//pkg/util/timeutil/pgdate",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
-        "@org_golang_x_tools//container/intsets",
     ],
 )
 
@@ -122,3 +128,5 @@ disallowed_imports_test(
     "memo",
     ["//pkg/sql/sem/builtins"],
 )
+
+get_x_data(name = "get_x_data")

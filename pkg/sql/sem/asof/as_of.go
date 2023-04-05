@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/normalize"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -46,8 +47,10 @@ const WithMaxStalenessFunctionName = "with_max_staleness"
 
 // IsFollowerReadTimestampFunction determines whether the AS OF SYSTEM TIME
 // clause contains a simple invocation of the follower_read_timestamp function.
-func IsFollowerReadTimestampFunction(asOf tree.AsOfClause, searchPath tree.SearchPath) bool {
-	return resolveFuncType(asOf, searchPath) == funcTypeFollowerRead
+func IsFollowerReadTimestampFunction(
+	ctx context.Context, asOf tree.AsOfClause, searchPath tree.SearchPath,
+) bool {
+	return resolveFuncType(ctx, asOf, searchPath) == funcTypeFollowerRead
 }
 
 type funcType int
@@ -58,12 +61,19 @@ const (
 	funcTypeBoundedStaleness
 )
 
-func resolveFuncType(asOf tree.AsOfClause, searchPath tree.SearchPath) funcType {
+func resolveFuncType(
+	ctx context.Context, asOf tree.AsOfClause, searchPath tree.SearchPath,
+) funcType {
 	fe, ok := asOf.Expr.(*tree.FuncExpr)
 	if !ok {
 		return funcTypeInvalid
 	}
-	def, err := fe.Func.Resolve(searchPath)
+	// We don't need a resolver here because we do not allow user-defined
+	// functions to be called in AOST clauses. Only the limited set of functions
+	// with names matching below are allowed. If a user defined a user-defined
+	// function with the same name, we'll assume references to the function
+	// within an AOST clause refer to the built-in overload.
+	def, err := fe.Func.Resolve(ctx, searchPath, nil /* resolver */)
 	if err != nil {
 		return funcTypeInvalid
 	}
@@ -137,7 +147,7 @@ func Eval(
 	// string.
 	var te tree.TypedExpr
 	if asOfFuncExpr, ok := asOf.Expr.(*tree.FuncExpr); ok {
-		switch resolveFuncType(asOf, semaCtx.SearchPath) {
+		switch resolveFuncType(ctx, asOf, semaCtx.SearchPath) {
 		case funcTypeFollowerRead:
 		case funcTypeBoundedStaleness:
 			if !o.allowBoundedStaleness {
@@ -151,7 +161,7 @@ func Eval(
 				if err != nil {
 					return eval.AsOfSystemTime{}, err
 				}
-				nearestOnlyEval, err := eval.Expr(evalCtx, nearestOnlyExpr)
+				nearestOnlyEval, err := eval.Expr(ctx, evalCtx, nearestOnlyExpr)
 				if err != nil {
 					return eval.AsOfSystemTime{}, err
 				}
@@ -183,23 +193,44 @@ func Eval(
 			return eval.AsOfSystemTime{}, newInvalidExprError()
 		}
 	}
-
-	d, err := eval.Expr(evalCtx, te)
+	var err error
+	if te, err = normalize.Expr(ctx, evalCtx, te); err != nil {
+		return eval.AsOfSystemTime{}, err
+	}
+	d, err := eval.Expr(ctx, evalCtx, te)
 	if err != nil {
 		return eval.AsOfSystemTime{}, err
 	}
 
 	stmtTimestamp := evalCtx.GetStmtTimestamp()
-	ret.Timestamp, err = DatumToHLC(evalCtx, stmtTimestamp, d)
+	ret.Timestamp, err = DatumToHLC(evalCtx, stmtTimestamp, d, AsOf)
 	if err != nil {
 		return eval.AsOfSystemTime{}, errors.Wrap(err, "AS OF SYSTEM TIME")
 	}
 	return ret, nil
 }
 
+// DatumToHLCUsage specifies which statement DatumToHLC() is used for.
+type DatumToHLCUsage int64
+
+const (
+	// AsOf is when the DatumToHLC() is used for an AS OF SYSTEM TIME statement.
+	// In this case, if the interval is not synthetic, its value has to be negative
+	// and last longer than a nanosecond.
+	AsOf DatumToHLCUsage = iota
+	// Split is when the DatumToHLC() is used for a SPLIT statement.
+	// In this case, if the interval is not synthetic, its value has to be positive
+	// and last longer than a nanosecond.
+	Split
+
+	// ReplicationCutover is when the DatumToHLC() is used for an
+	// ALTER TENANT ... COMPLETE REPLICATION statement.
+	ReplicationCutover
+)
+
 // DatumToHLC performs the conversion from a Datum to an HLC timestamp.
 func DatumToHLC(
-	evalCtx *eval.Context, stmtTimestamp time.Time, d tree.Datum,
+	evalCtx *eval.Context, stmtTimestamp time.Time, d tree.Datum, usage DatumToHLCUsage,
 ) (hlc.Timestamp, error) {
 	ts := hlc.Timestamp{}
 	var convErr error
@@ -213,7 +244,7 @@ func DatumToHLC(
 			syn = true
 		}
 		// Attempt to parse as timestamp.
-		if dt, _, err := tree.ParseDTimestamp(evalCtx, s, time.Nanosecond); err == nil {
+		if dt, _, err := tree.ParseDTimestampTZ(evalCtx, s, time.Nanosecond); err == nil {
 			ts.WallTime = dt.Time.UnixNano()
 			ts.Synthetic = syn
 			break
@@ -228,6 +259,12 @@ func DatumToHLC(
 		if iv, err := tree.ParseDInterval(evalCtx.GetIntervalStyle(), s); err == nil {
 			if (iv.Duration == duration.Duration{}) {
 				convErr = errors.Errorf("interval value %v too small, absolute value must be >= %v", d, time.Microsecond)
+			} else if (usage == AsOf && iv.Duration.Compare(duration.Duration{}) > 0 && !syn) {
+				convErr = errors.Errorf("interval value %v too large, AS OF interval must be <= -%v", d, time.Microsecond)
+			} else if (usage == Split && iv.Duration.Compare(duration.Duration{}) < 0) {
+				// Do we need to consider if the timestamp is synthetic (see
+				// hlc.Timestamp.Synthetic), as for AS OF stmt?
+				convErr = errors.Errorf("interval value %v too small, SPLIT AT interval must be >= %v", d, time.Microsecond)
 			}
 			ts.WallTime = duration.Add(stmtTimestamp, iv.Duration).UnixNano()
 			ts.Synthetic = syn
@@ -243,6 +280,11 @@ func DatumToHLC(
 	case *tree.DDecimal:
 		ts, convErr = hlc.DecimalToHLC(&d.Decimal)
 	case *tree.DInterval:
+		if (usage == AsOf && d.Duration.Compare(duration.Duration{}) > 0) {
+			convErr = errors.Errorf("interval value %v too large, AS OF interval must be <= -%v", d, time.Microsecond)
+		} else if (usage == Split && d.Duration.Compare(duration.Duration{}) < 0) {
+			convErr = errors.Errorf("interval value %v too small, SPLIT interval must be >= %v", d, time.Microsecond)
+		}
 		ts.WallTime = duration.Add(stmtTimestamp, d.Duration).UnixNano()
 	default:
 		convErr = errors.WithSafeDetails(

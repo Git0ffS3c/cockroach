@@ -11,6 +11,7 @@
 package rowenc_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -63,7 +64,8 @@ func TestRandParseDatumStringAs(t *testing.T) {
 		const testsForTyp = 100
 		t.Run(typ.String(), func(t *testing.T) {
 			for i := 0; i < testsForTyp; i++ {
-				datum := randgen.RandDatumWithNullChance(rng, typ, 0)
+				datum := randgen.RandDatumWithNullChance(rng, typ, 0, /* nullChance */
+					false /* favorCommonData */, false /* targetColumnIsUnique */)
 				ds := tree.AsStringWithFlags(datum, tree.FmtExport)
 
 				// Because of how RandDatumWithNullChanceWorks, we might
@@ -96,7 +98,7 @@ func TestRandParseDatumStringAs(t *testing.T) {
 					t.Fatal(ds, err)
 				}
 
-				parsed, err := rowenc.ParseDatumStringAs(typ, ds, evalCtx)
+				parsed, err := rowenc.ParseDatumStringAs(context.Background(), typ, ds, evalCtx)
 				if err != nil {
 					t.Fatal(ds, err)
 				}
@@ -292,7 +294,7 @@ func TestParseDatumStringAs(t *testing.T) {
 		t.Run(typ.String(), func(t *testing.T) {
 			for _, s := range exprs {
 				t.Run(fmt.Sprintf("%q", s), func(t *testing.T) {
-					d, err := rowenc.ParseDatumStringAs(typ, s, evalCtx)
+					d, err := rowenc.ParseDatumStringAs(context.Background(), typ, s, evalCtx)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -300,7 +302,7 @@ func TestParseDatumStringAs(t *testing.T) {
 						t.Fatalf("unexpected type: %s", d.ResolvedType())
 					}
 					ds := tree.AsStringWithFlags(d, tree.FmtExport)
-					parsed, err := rowenc.ParseDatumStringAs(typ, ds, evalCtx)
+					parsed, err := rowenc.ParseDatumStringAs(context.Background(), typ, ds, evalCtx)
 					if err != nil {
 						t.Fatal(err)
 					}

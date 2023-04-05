@@ -32,7 +32,8 @@ var timezoneOffsetRegex = regexp.MustCompile(`(?i)^(GMT|UTC)?([+-])?(\d{1,3}(:[0
 // FixedTimeZoneOffsetToLocation creates a time.Location with an offset and a
 // time zone string.
 func FixedTimeZoneOffsetToLocation(offset int, origRepr string) *time.Location {
-	return time.FixedZone(origRepr, offset)
+	// The offset name always should be normalized to upper-case for UTC/GMT.
+	return time.FixedZone(strings.ToUpper(origRepr), offset)
 }
 
 // TimeZoneOffsetToLocation takes an offset and name that can be marshaled by
@@ -204,9 +205,10 @@ func timeZoneOffsetStringConversion(
 }
 
 // The timestamp must be of one of the following formats:
-//   HH
-//   HH:MM
-//   HH:MM:SS
+//
+//	HH
+//	HH:MM
+//	HH:MM:SS
 func hoursMinutesSecondsToSeconds(timeString string) int {
 	var (
 		hoursString   = "0"
@@ -230,9 +232,10 @@ func hoursMinutesSecondsToSeconds(timeString string) int {
 }
 
 // secondsToHoursMinutesSeconds converts seconds to a timestamp of the format
-//   HH
-//   HH:MM
-//   HH:MM:SS
+//
+//	HH
+//	HH:MM
+//	HH:MM:SS
 func secondsToHoursMinutesSeconds(totalSeconds int) string {
 	secondsPerHour := 60 * 60
 	secondsPerMinute := 60
@@ -257,9 +260,10 @@ func secondsToHoursMinutesSeconds(totalSeconds int) string {
 // The minutes and seconds sections are only included in the precision is
 // necessary.
 // For example:
-//    11.00 -> 11
-//    11.5 -> 11:30
-//    11.51 -> 11:30:36
+//
+//	11.00 -> 11
+//	11.5 -> 11:30
+//	11.51 -> 11:30:36
 func floatToHoursMinutesSeconds(f float64) string {
 	hours := int(f)
 	remaining := f - float64(hours)

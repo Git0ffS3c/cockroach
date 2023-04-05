@@ -55,7 +55,9 @@ export class Logs extends React.Component<LogProps & RouteComponentProps, {}> {
         title: "Time",
         name: "time",
         cell: (logEntry: LogEntries) =>
-          util.LongToMoment(logEntry.time).format("YYYY-MM-DD HH:mm:ss"),
+          util
+            .LongToMoment(logEntry.time)
+            .format(util.DATE_WITH_SECONDS_FORMAT_24_UTC),
       },
       {
         title: "Severity",

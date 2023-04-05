@@ -22,6 +22,7 @@ import { AdminUIState } from "src/redux/state";
 import { selectEnterpriseEnabled } from "src/redux/license";
 import { Dropdown } from "src/components/dropdown";
 import { parseSplatParams } from "src/util/parseSplatParams";
+import { refreshCluster } from "src/redux/apiReducers";
 
 const NodeCanvasContent = swapByLicense(
   NeedEnterpriseLicense,
@@ -32,6 +33,7 @@ interface ClusterVisualizationProps {
   licenseDataExists: boolean;
   enterpriseEnabled: boolean;
   clusterDataError: Error | null;
+  refreshCluster: typeof refreshCluster;
 }
 
 export class ClusterVisualization extends React.Component<
@@ -52,6 +54,14 @@ export class ClusterVisualization extends React.Component<
     return parseLocalityRoute(splat);
   }
 
+  componentDidMount() {
+    this.props.refreshCluster();
+  }
+
+  componentDidUpdate() {
+    this.props.refreshCluster();
+  }
+
   render() {
     const tiers = this.getTiers();
 
@@ -66,7 +76,8 @@ export class ClusterVisualization extends React.Component<
     const contentItemClasses = cn(
       "cluster-visualization-layout__content-item",
       {
-        "cluster-visualization-layout__content-item--show-license": showingLicensePage,
+        "cluster-visualization-layout__content-item--show-license":
+          showingLicensePage,
       },
     );
 
@@ -105,4 +116,8 @@ function mapStateToProps(state: AdminUIState) {
   };
 }
 
-export default withRouter(connect(mapStateToProps)(ClusterVisualization));
+export default withRouter(
+  connect(mapStateToProps, {
+    refreshCluster,
+  })(ClusterVisualization),
+);

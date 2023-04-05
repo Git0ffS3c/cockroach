@@ -25,9 +25,9 @@ import (
 // the name implies, the details from the chain of causes is projected
 // into a single struct. This is useful in at least two places:
 //
-// - to generate Error objects suitable for 19.1 nodes, which
-//   only recognize this type of payload.
-// - to generate an error packet on pgwire.
+//   - to generate Error objects suitable for 19.1 nodes, which
+//     only recognize this type of payload.
+//   - to generate an error packet on pgwire.
 //
 // Additionally, this can be used in the remainder of the code
 // base when an Error object is expected, until that code
@@ -93,7 +93,7 @@ func Flatten(err error) *Error {
 
 // serializationFailureReasonRegexp captures known failure reasons for
 // the serialization failure error messages.
-// We cannot use roachpb.TransactionRetryReason or roachpb.TransactionAbortedReason
+// We cannot use kvpb.TransactionRetryReason or kvpb.TransactionAbortedReason
 // as this introduces a circular dependency.
 var serializationFailureReasonRegexp = regexp.MustCompile(
 	`((?:ABORT_|RETRY_)[A-Z_]*|ReadWithinUncertaintyInterval)`,

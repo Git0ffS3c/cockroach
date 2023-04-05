@@ -24,12 +24,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 )
@@ -44,11 +45,12 @@ func TestTrace(t *testing.T) {
 	// These are always appended, even without the test specifying it.
 	alwaysOptionalSpans := []string{
 		"drain",
-		"storage.pendingLeaseRequest: requesting lease",
-		"storage.Store: gossip on capacity change",
+		"pendingLeaseRequest: requesting lease",
+		"gossip on capacity change",
 		"outbox",
 		"request range lease",
 		"range lookup",
+		"local proposal",
 	}
 
 	testData := []struct {
@@ -80,6 +82,7 @@ func TestTrace(t *testing.T) {
 			},
 			expSpans: []string{
 				"sql query",
+				"optimizer",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -141,6 +144,7 @@ func TestTrace(t *testing.T) {
 				"session recording",
 				"sql txn",
 				"sql query",
+				"optimizer",
 				"flow",
 				"table reader",
 				"consuming rows",
@@ -152,7 +156,9 @@ func TestTrace(t *testing.T) {
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
 			optionalSpans: []string{
+				"setup-flow-async",
 				"/cockroach.sql.distsqlrun.DistSQL/SetupFlow",
+				"/cockroach.sql.distsqlrun.DistSQL/FlowStream",
 				"noop",
 			},
 		},
@@ -177,6 +183,7 @@ func TestTrace(t *testing.T) {
 			},
 			expSpans: []string{
 				"sql query",
+				"optimizer",
 				"flow",
 				"session recording",
 				"sql txn",
@@ -211,6 +218,7 @@ func TestTrace(t *testing.T) {
 				"session recording",
 				"sql txn",
 				"sql query",
+				"optimizer",
 				"flow",
 				"table reader",
 				"consuming rows",
@@ -222,7 +230,9 @@ func TestTrace(t *testing.T) {
 			// Depending on whether the data is local or not, we may not see these
 			// spans.
 			optionalSpans: []string{
+				"setup-flow-async",
 				"/cockroach.sql.distsqlrun.DistSQL/SetupFlow",
+				"/cockroach.sql.distsqlrun.DistSQL/FlowStream",
 				"noop",
 			},
 		},
@@ -233,6 +243,11 @@ func TestTrace(t *testing.T) {
 					t.Fatal(err)
 				}
 				if _, err := sqlDB.Exec("SET vectorize = on"); err != nil {
+					t.Fatal(err)
+				}
+				// Disable the direct columnar scans to make the vectorized
+				// planning deterministic.
+				if _, err := sqlDB.Exec(`SET direct_columnar_scans_enabled = false`); err != nil {
 					t.Fatal(err)
 				}
 				if _, err := sqlDB.Exec("SET tracing = on; SELECT * FROM test.foo; SET tracing = off"); err != nil {
@@ -246,6 +261,7 @@ func TestTrace(t *testing.T) {
 				"session recording",
 				"sql txn",
 				"sql query",
+				"optimizer",
 				"flow",
 				"batch flow coordinator",
 				"colbatchscan",
@@ -349,17 +365,22 @@ func TestTrace(t *testing.T) {
 							}
 							defer rows.Close()
 
-							ignoreSpans := make(map[string]bool)
-							for _, s := range test.optionalSpans {
-								ignoreSpans[s] = true
+							ignoreSpan := func(op string) bool {
+								for _, s := range test.optionalSpans {
+									if strings.Contains(op, s) {
+										return true
+									}
+								}
+								return false
 							}
+
 							r := 0
 							for rows.Next() {
 								var op string
 								if err := rows.Scan(&op); err != nil {
 									t.Fatal(err)
 								}
-								if ignoreSpans[op] {
+								if ignoreSpan(op) {
 									continue
 								}
 
@@ -376,7 +397,7 @@ func TestTrace(t *testing.T) {
 										if err := rows.Scan(&op); err != nil {
 											t.Fatal(err)
 										}
-										if ignoreSpans[op] {
+										if ignoreSpan(op) {
 											continue
 										}
 										t.Errorf("remaining span: %q", op)
@@ -407,7 +428,7 @@ func TestTraceFieldDecomposition(t *testing.T) {
 	params := base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			SQLExecutor: &sql.ExecutorTestingKnobs{
-				BeforeExecute: func(ctx context.Context, stmt string) {
+				BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
 					if strings.Contains(stmt, query) {
 						// We need to check a tag containing brackets (e.g. an
 						// IPv6 address).  See #18558.
@@ -595,7 +616,7 @@ func TestTraceDistSQL(t *testing.T) {
 
 	ctx := context.Background()
 	countStmt := "SELECT count(1) FROM test.a"
-	recCh := make(chan tracing.Recording, 2)
+	recCh := make(chan tracingpb.Recording, 2)
 
 	const numNodes = 2
 	cluster := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
@@ -604,7 +625,7 @@ func TestTraceDistSQL(t *testing.T) {
 			UseDatabase: "test",
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
-					WithStatementTrace: func(trace tracing.Recording, stmt string) {
+					WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
 						if stmt == countStmt {
 							recCh <- trace
 						}
@@ -638,7 +659,11 @@ func TestTraceDistSQL(t *testing.T) {
 	require.True(t, ok, "table reader span not found")
 	require.Empty(t, rec.OrphanSpans())
 	// Check that the table reader indeed came from a remote note.
-	require.Equal(t, "2", sp.Tags["node"])
+	anonTagGroup := sp.FindTagGroup(tracingpb.AnonymousTagGroupName)
+	require.NotNil(t, anonTagGroup)
+	val, ok := anonTagGroup.FindTag("node")
+	require.True(t, ok)
+	require.Equal(t, "2", val)
 }
 
 // Test the sql.trace.stmt.enable_threshold cluster setting.

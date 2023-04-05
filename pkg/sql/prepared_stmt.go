@@ -15,10 +15,12 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
@@ -67,8 +69,7 @@ type PreparedStatement struct {
 	createdAt time.Time
 	// origin is the protocol in which this prepare statement was created.
 	// Used for reporting on `pg_prepared_statements`.
-	origin           PreparedStatementOrigin
-	StatementSummary string
+	origin PreparedStatementOrigin
 }
 
 // MemoryEstimate returns a rough estimate of the PreparedStatement's memory
@@ -107,9 +108,10 @@ type preparedStatementsAccessor interface {
 	// List returns all prepared statements as a map keyed by name.
 	// The map itself is a copy of the prepared statements.
 	List() map[string]*PreparedStatement
-	// Get returns the prepared statement with the given name. The returned bool
-	// is false if a statement with the given name doesn't exist.
-	Get(name string) (*PreparedStatement, bool)
+	// Get returns the prepared statement with the given name. If touchLRU is
+	// true, this counts as an access for LRU bookkeeping. The returned bool is
+	// false if a statement with the given name doesn't exist.
+	Get(name string, touchLRU bool) (*PreparedStatement, bool)
 	// Delete removes the PreparedStatement with the provided name from the
 	// collection. If a portal exists for that statement, it is also removed.
 	// The method returns true if statement with that name was found and removed,
@@ -119,9 +121,28 @@ type preparedStatementsAccessor interface {
 	DeleteAll(ctx context.Context)
 }
 
+// PortalPausablity mark if the portal is pausable and the reason. This is
+// needed to give the correct error for usage of multiple active portals.
+type PortalPausablity int64
+
+const (
+	// PortalPausabilityDisabled is the default status of a portal when
+	// sql.pgwire.multiple_active_portals.enabled is false.
+	PortalPausabilityDisabled PortalPausablity = iota
+	// PausablePortal is set when sql.pgwire.multiple_active_portals.enabled is
+	// set to true and the underlying statement is a read-only SELECT query with
+	// no sub-queries or post-queries.
+	PausablePortal
+	// NotPausablePortalForUnsupportedStmt is used when the cluster setting
+	// sql.pgwire.multiple_active_portals.enabled is set to true, while we don't
+	// support underlying statement.
+	NotPausablePortalForUnsupportedStmt
+)
+
 // PreparedPortal is a PreparedStatement that has been bound with query
 // arguments.
 type PreparedPortal struct {
+	Name  string
 	Stmt  *PreparedStatement
 	Qargs tree.QueryArguments
 
@@ -132,6 +153,14 @@ type PreparedPortal struct {
 	// meaning that any additional attempts to execute it should return no
 	// rows.
 	exhausted bool
+
+	// portalPausablity is used to log the correct error message when user pause
+	// a portal.
+	// See comments for PortalPausablity for more details.
+	portalPausablity PortalPausablity
+
+	// pauseInfo is the saved info needed for a pausable portal.
+	pauseInfo *portalPauseInfo
 }
 
 // makePreparedPortal creates a new PreparedPortal.
@@ -145,30 +174,54 @@ func (ex *connExecutor) makePreparedPortal(
 	outFormats []pgwirebase.FormatCode,
 ) (PreparedPortal, error) {
 	portal := PreparedPortal{
+		Name:       name,
 		Stmt:       stmt,
 		Qargs:      qargs,
 		OutFormats: outFormats,
+	}
+
+	if EnableMultipleActivePortals.Get(&ex.server.cfg.Settings.SV) {
+		portal.pauseInfo = &portalPauseInfo{}
+		portal.portalPausablity = PausablePortal
 	}
 	return portal, portal.accountForCopy(ctx, &ex.extraTxnState.prepStmtsNamespaceMemAcc, name)
 }
 
 // accountForCopy updates the state to account for the copy of the
 // PreparedPortal (p is the copy).
-func (p PreparedPortal) accountForCopy(
+func (p *PreparedPortal) accountForCopy(
 	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount, portalName string,
 ) error {
+	if err := prepStmtsNamespaceMemAcc.Grow(ctx, p.size(portalName)); err != nil {
+		return err
+	}
+	// Only increment the reference if we're going to keep it.
 	p.Stmt.incRef(ctx)
-	return prepStmtsNamespaceMemAcc.Grow(ctx, p.size(portalName))
+	return nil
 }
 
 // close closes this portal.
-func (p PreparedPortal) close(
+func (p *PreparedPortal) close(
 	ctx context.Context, prepStmtsNamespaceMemAcc *mon.BoundAccount, portalName string,
 ) {
 	prepStmtsNamespaceMemAcc.Shrink(ctx, p.size(portalName))
 	p.Stmt.decRef(ctx)
 }
 
-func (p PreparedPortal) size(portalName string) int64 {
+func (p *PreparedPortal) size(portalName string) int64 {
 	return int64(uintptr(len(portalName)) + unsafe.Sizeof(p))
+}
+
+// portalPauseInfo stores info that enables the pause of a portal. After pausing
+// the portal, execute any other statement, and come back to re-execute it or
+// close it.
+type portalPauseInfo struct {
+	// outputTypes are the types of the result columns produced by the physical plan.
+	// We need this as when re-executing the portal, we are reusing the flow
+	// with the new receiver, but not re-generating the physical plan.
+	outputTypes []*types.T
+	// We need to store the flow for a portal so that when re-executing it, we
+	// continue from the previous execution. It lives along with the portal, and
+	// will be cleaned-up when the portal is closed.
+	flow flowinfra.Flow
 }

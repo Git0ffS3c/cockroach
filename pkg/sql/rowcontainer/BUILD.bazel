@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,10 +15,11 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv/kvclient/kvstreamer",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/diskmap",
         "//pkg/roachpb",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/colinfo",
-        "//pkg/sql/catalog/descpb",
         "//pkg/sql/memsize",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
@@ -27,6 +29,7 @@ go_library(
         "//pkg/sql/sqlerrors",
         "//pkg/sql/types",
         "//pkg/util",
+        "//pkg/util/bufalloc",
         "//pkg/util/cancelchecker",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
@@ -49,10 +52,12 @@ go_test(
         "numbered_row_container_test.go",
         "row_container_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":rowcontainer"],
     deps = [
         "//pkg/base",
         "//pkg/kv/kvclient/kvstreamer",
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/diskmap",
         "//pkg/roachpb",
         "//pkg/settings/cluster",
@@ -76,3 +81,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

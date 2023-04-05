@@ -20,23 +20,18 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.SchemaComment) scop.Op {
+				emit(func(this *scpb.SchemaComment) *scop.UpsertSchemaComment {
 					return &scop.UpsertSchemaComment{
 						SchemaID: this.SchemaID,
 						Comment:  this.Comment,
 					}
 				}),
-				// TODO(Chengxiong): add schema event log (need to add proto for schema
-				// comment)
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
-				// TODO(postamar): remove revertibility constraint when possible
-				revertible(false),
-				emit(func(this *scpb.SchemaComment) scop.Op {
+				emit(func(this *scpb.SchemaComment) *scop.RemoveSchemaComment {
 					return &scop.RemoveSchemaComment{
 						SchemaID: this.SchemaID,
 					}

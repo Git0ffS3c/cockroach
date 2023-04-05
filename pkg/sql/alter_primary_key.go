@@ -14,13 +14,15 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catsessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -121,7 +123,17 @@ func (p *planner) AlterPrimaryKey(
 	}
 
 	for _, elem := range alterPKNode.Columns {
-		col, err := tableDesc.FindColumnWithName(elem.Column)
+		if elem.Column == "" && elem.Expr != nil {
+			return errors.WithHint(
+				pgerror.Newf(
+					pgcode.InvalidColumnDefinition,
+					"expressions such as %q are not allowed in primary index definition",
+					elem.Expr.String(),
+				),
+				"use columns instead",
+			)
+		}
+		col, err := catalog.MustFindColumnByTreeName(tableDesc, elem.Column)
 		if err != nil {
 			return err
 		}
@@ -134,11 +146,6 @@ func (p *planner) AlterPrimaryKey(
 		}
 		if col.IsNullable() {
 			return pgerror.Newf(pgcode.InvalidSchemaDefinition, "cannot use nullable column %q in primary key", col.GetName())
-		}
-		if !p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.Start22_1) {
-			if col.IsVirtual() {
-				return pgerror.Newf(pgcode.FeatureNotSupported, "cannot use virtual column %q in primary key", col.GetName())
-			}
 		}
 	}
 
@@ -156,8 +163,7 @@ func (p *planner) AlterPrimaryKey(
 	}
 
 	nameExists := func(name string) bool {
-		_, err := tableDesc.FindIndexWithName(name)
-		return err == nil
+		return catalog.FindIndexByName(tableDesc, name) != nil
 	}
 
 	// Make a new index that is suitable to be a primary index.
@@ -175,7 +181,7 @@ func (p *planner) AlterPrimaryKey(
 		Name:              name,
 		Unique:            true,
 		CreatedExplicitly: true,
-		EncodingType:      descpb.PrimaryIndexEncoding,
+		EncodingType:      catenumpb.PrimaryIndexEncoding,
 		Type:              descpb.IndexDescriptor_FORWARD,
 		// TODO(postamar): bump version to LatestIndexDescriptorVersion in 22.2
 		// This is not possible until then because of a limitation in 21.2 which
@@ -238,7 +244,9 @@ func (p *planner) AlterPrimaryKey(
 		}
 	}
 
-	if err := tableDesc.AddIndexMutation(ctx, newPrimaryIndexDesc, descpb.DescriptorMutation_ADD, p.ExecCfg().Settings); err != nil {
+	if err := tableDesc.AddIndexMutationMaybeWithTempIndex(
+		newPrimaryIndexDesc, descpb.DescriptorMutation_ADD,
+	); err != nil {
 		return err
 	}
 	version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
@@ -288,7 +296,7 @@ func (p *planner) AlterPrimaryKey(
 			if err != nil {
 				return err
 			}
-			partitionAllBy = partitionByForRegionalByRow(
+			partitionAllBy = multiregion.PartitionByForRegionalByRow(
 				regionConfig,
 				colName,
 			)
@@ -339,7 +347,29 @@ func (p *planner) AlterPrimaryKey(
 		if err != nil {
 			return err
 		}
-		tabledesc.UpdateIndexPartitioning(newPrimaryIndexDesc, true /* isIndexPrimary */, newImplicitCols, newPartitioning)
+		tabledesc.UpdateIndexPartitioning(
+			newPrimaryIndexDesc, true, /* isIndexPrimary */
+			newImplicitCols, newPartitioning,
+		)
+
+		// We need to now also update the partitioning for the new temp primary
+		// index. If we didn't, it wouldn't be partitioned, and writes which
+		// were merged into the new primary index will be wrong.
+		//
+		// We know that the temp index will have the subsequent index ID.
+		// This is hacky, sure, but it's about as good of an invariant
+		// as most of this code relies upon for correctness. This code will
+		// all be replaced by code in the declarative schema changer before
+		// too long where we'll model this all correctly.
+		newTempPrimaryIndex, err := catalog.MustFindIndexByID(tableDesc, newPrimaryIndexDesc.ID+1)
+		if err != nil {
+			return errors.NewAssertionErrorWithWrappedErrf(err,
+				"failed to find newly created temporary index for backfill")
+		}
+		tabledesc.UpdateIndexPartitioning(
+			newTempPrimaryIndex.IndexDesc(), true, /* isIndexPrimary */
+			newImplicitCols, newPartitioning,
+		)
 	}
 
 	// Create a new index that indexes everything the old primary index
@@ -360,7 +390,7 @@ func (p *planner) AlterPrimaryKey(
 		// This is not possible until then because of a limitation in 21.2 which
 		// affects mixed-21.2-22.1-version clusters (issue #78426).
 		newUniqueIdx.Version = descpb.StrictIndexColumnIDGuaranteesVersion
-		newUniqueIdx.EncodingType = descpb.SecondaryIndexEncoding
+		newUniqueIdx.EncodingType = catenumpb.SecondaryIndexEncoding
 		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, &newUniqueIdx, newPrimaryIndexDesc, p.ExecCfg().Settings); err != nil {
 			return err
 		}
@@ -394,10 +424,15 @@ func (p *planner) AlterPrimaryKey(
 				return true, nil
 			}
 		}
+		if !idx.Primary() && catalog.MakeTableColSet(newPrimaryIndexDesc.KeyColumnIDs...).SubsetOf(
+			catalog.MakeTableColSet(tableDesc.PrimaryIndex.KeyColumnIDs...)) {
+			// Always rewrite a secondary index if the new PK columns is a (strict) subset of the old PK columns.
+			return true, nil
+		}
 		if idx.IsUnique() {
 			for i := 0; i < idx.NumKeyColumns(); i++ {
 				colID := idx.GetKeyColumnID(i)
-				col, err := tableDesc.FindColumnWithID(colID)
+				col, err := catalog.MustFindColumnByID(tableDesc, colID)
 				if err != nil {
 					return false, err
 				}
@@ -415,7 +450,7 @@ func (p *planner) AlterPrimaryKey(
 			newPrimaryKeyColIDs := catalog.MakeTableColSet(newPrimaryIndexDesc.KeyColumnIDs...)
 			for i := 0; i < idx.NumKeySuffixColumns(); i++ {
 				colID := idx.GetKeySuffixColumnID(i)
-				col, err := tableDesc.FindColumnWithID(colID)
+				col, err := catalog.MustFindColumnByID(tableDesc, colID)
 				if err != nil {
 					return false, err
 				}
@@ -490,7 +525,7 @@ func (p *planner) AlterPrimaryKey(
 		// This is not possible until then because of a limitation in 21.2 which
 		// affects mixed-21.2-22.1-version clusters (issue #78426).
 		newIndex.Version = descpb.StrictIndexColumnIDGuaranteesVersion
-		newIndex.EncodingType = descpb.SecondaryIndexEncoding
+		newIndex.EncodingType = catenumpb.SecondaryIndexEncoding
 		if err := addIndexMutationWithSpecificPrimaryKey(ctx, tableDesc, &newIndex, newPrimaryIndexDesc, p.ExecCfg().Settings); err != nil {
 			return err
 		}
@@ -501,22 +536,14 @@ func (p *planner) AlterPrimaryKey(
 
 	// Determine if removing this index would lead to the uniqueness for a foreign
 	// key back reference, which will cause this swap operation to be blocked.
-	nonDropIndexes := tableDesc.NonDropIndexes()
-	remainingIndexes := make([]descpb.UniqueConstraint, 0, len(nonDropIndexes))
-	for i := range nonDropIndexes {
-		// We can't copy directly because of the interface conversion.
-		if nonDropIndexes[i].GetID() == tableDesc.GetPrimaryIndex().GetID() {
-			continue
-		}
-		remainingIndexes = append(remainingIndexes, nonDropIndexes[i])
-	}
-	remainingIndexes = append(remainingIndexes, newPrimaryIndexDesc)
+	const withSearchForReplacement = true
 	err = p.tryRemoveFKBackReferences(
 		ctx,
 		tableDesc,
 		tableDesc.GetPrimaryIndex(),
 		tree.DropRestrict,
-		remainingIndexes)
+		withSearchForReplacement,
+	)
 	if err != nil {
 		return err
 	}
@@ -533,7 +560,8 @@ func (p *planner) AlterPrimaryKey(
 	}
 	tableDesc.AddPrimaryKeySwapMutation(swapArgs)
 
-	if err := descbuilder.ValidateSelf(tableDesc, version); err != nil {
+	dvmp := catsessiondata.NewDescriptorSessionDataProvider(p.SessionData())
+	if err := descs.ValidateSelf(tableDesc, version, dvmp); err != nil {
 		return err
 	}
 
@@ -551,18 +579,14 @@ func (p *planner) AlterPrimaryKey(
 
 	// Send a notice to users about how this job is asynchronous.
 	// TODO(knz): Mention the job ID in the client notice.
-	noticeStr := "primary key changes are finalized asynchronously"
 	if alterPrimaryKeyLocalitySwap != nil {
-		noticeStr = "LOCALITY changes will be finalized asynchronously"
+		p.BufferClientNotice(
+			ctx,
+			pgnotice.Newf(
+				"LOCALITY changes will be finalized asynchronously; "+
+					"further schema changes on this table may be restricted until the job completes"),
+		)
 	}
-	p.BufferClientNotice(
-		ctx,
-		pgnotice.Newf(
-			"%s; further schema changes on this table may be restricted "+
-				"until the job completes",
-			noticeStr,
-		),
-	)
 
 	return nil
 }
@@ -604,7 +628,7 @@ func (p *planner) shouldCreateIndexes(
 
 	// Validate the columns on the indexes
 	for idx, elem := range alterPKNode.Columns {
-		col, err := desc.FindColumnWithName(elem.Column)
+		col, err := catalog.MustFindColumnByTreeName(desc, elem.Column)
 		if err != nil {
 			return true, err
 		}
@@ -613,9 +637,9 @@ func (p *planner) shouldCreateIndexes(
 			return true, nil
 		}
 		if (elem.Direction == tree.Ascending &&
-			oldPK.GetKeyColumnDirection(idx) != descpb.IndexDescriptor_ASC) ||
+			oldPK.GetKeyColumnDirection(idx) != catenumpb.IndexColumn_ASC) ||
 			(elem.Direction == tree.Descending &&
-				oldPK.GetKeyColumnDirection(idx) != descpb.IndexDescriptor_DESC) {
+				oldPK.GetKeyColumnDirection(idx) != catenumpb.IndexColumn_DESC) {
 			return true, nil
 		}
 	}
@@ -638,13 +662,13 @@ func (p *planner) shouldCreateIndexes(
 
 // We only recreate the old primary key of the table as a unique secondary
 // index if:
-// * The table has a primary key (no DROP PRIMARY KEY statements have
-//   been executed).
-// * The primary key is not the default rowid primary key.
-// * The new primary key isn't the same set of columns and directions
-//   other than hash sharding.
-// * There is no partitioning change.
-// * There is no existing secondary index on the old primary key columns.
+//   - The table has a primary key (no DROP PRIMARY KEY statements have
+//     been executed).
+//   - The primary key is not the default rowid primary key.
+//   - The new primary key isn't the same set of columns and directions
+//     other than hash sharding.
+//   - There is no partitioning change.
+//   - There is no existing secondary index on the old primary key columns.
 func shouldCopyPrimaryKey(
 	desc *tabledesc.Mutable,
 	newPK *descpb.IndexDescriptor,
@@ -653,7 +677,7 @@ func shouldCopyPrimaryKey(
 
 	columnIDsAndDirsWithoutSharded := func(idx *descpb.IndexDescriptor) (
 		columnIDs descpb.ColumnIDs,
-		columnDirs []descpb.IndexDescriptor_Direction,
+		columnDirs []catenumpb.IndexColumn_Direction,
 	) {
 		for i, colName := range idx.KeyColumnNames {
 			if colName != idx.Sharded.Name {
@@ -728,32 +752,55 @@ func addIndexMutationWithSpecificPrimaryKey(
 ) error {
 	// Reset the ID so that a call to AllocateIDs will set up the index.
 	toAdd.ID = 0
-	if err := table.AddIndexMutation(ctx, toAdd, descpb.DescriptorMutation_ADD, settings); err != nil {
+	toAdd.ConstraintID = 0
+	if err := table.AddIndexMutationMaybeWithTempIndex(toAdd, descpb.DescriptorMutation_ADD); err != nil {
 		return err
 	}
 	if err := table.AllocateIDsWithoutValidation(ctx); err != nil {
 		return err
 	}
 
-	setKeySuffixColumnIDsFromPrimary(toAdd, primary)
-	if tempIdx := catalog.FindCorrespondingTemporaryIndexByID(table, toAdd.ID); tempIdx != nil {
-		setKeySuffixColumnIDsFromPrimary(tempIdx.IndexDesc(), primary)
+	if err := setKeySuffixColumnIDsFromPrimary(table, toAdd, primary); err != nil {
+		return err
 	}
-
+	if tempIdx := catalog.FindCorrespondingTemporaryIndexByID(table, toAdd.ID); tempIdx != nil {
+		if err := setKeySuffixColumnIDsFromPrimary(table, tempIdx.IndexDesc(), primary); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // setKeySuffixColumnIDsFromPrimary uses the columns in the given
 // primary index to construct this toAdd's KeySuffixColumnIDs list.
 func setKeySuffixColumnIDsFromPrimary(
-	toAdd *descpb.IndexDescriptor, primary *descpb.IndexDescriptor,
-) {
+	table *tabledesc.Mutable, toAdd *descpb.IndexDescriptor, primary *descpb.IndexDescriptor,
+) error {
 	presentColIDs := catalog.MakeTableColSet(toAdd.KeyColumnIDs...)
 	presentColIDs.UnionWith(catalog.MakeTableColSet(toAdd.StoreColumnIDs...))
 	toAdd.KeySuffixColumnIDs = nil
+	invIdx := toAdd.Type == descpb.IndexDescriptor_INVERTED
 	for _, colID := range primary.KeyColumnIDs {
 		if !presentColIDs.Contains(colID) {
 			toAdd.KeySuffixColumnIDs = append(toAdd.KeySuffixColumnIDs, colID)
+		} else if invIdx && colID == toAdd.InvertedColumnID() {
+			// In an inverted index, the inverted column's value is not equal to the
+			// actual data in the row for that column. As a result, if the inverted
+			// column happens to also be in the primary key, it's crucial that
+			// the index key still be suffixed with that full primary key value to
+			// preserve the index semantics.
+			// toAdd.KeySuffixColumnIDs = append(toAdd.KeySuffixColumnIDs, colID)
+			// However, this functionality is not supported by the execution engine,
+			// so prevent it by returning an error.
+			col, err := catalog.MustFindColumnByID(table, colID)
+			if err != nil {
+				return err
+			}
+			return unimplemented.NewWithIssuef(84405,
+				"primary key column %s cannot be present in an inverted index",
+				col.GetName(),
+			)
 		}
 	}
+	return nil
 }

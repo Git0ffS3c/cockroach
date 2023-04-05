@@ -15,27 +15,35 @@ import (
 	"fmt"
 	"go/constant"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+var issueLinkRE = regexp.MustCompile("https://go.crdb.dev/issue-v/([0-9]+)/.*")
 
 // TestParseDataDriven verifies that we can parse the supplied SQL and regenerate the SQL
 // string from the syntax tree.
 func TestParseDatadriven(t *testing.T) {
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "parse":
@@ -98,6 +106,7 @@ func TestParseDatadriven(t *testing.T) {
 				if pgerr.Hint != "" {
 					msg += "\nHINT: " + pgerr.Hint
 				}
+				msg = issueLinkRE.ReplaceAllString(msg, "https://go.crdb.dev/issue-v/$1/")
 				return msg
 			}
 			d.Fatalf(t, "unsupported command: %s", d.Cmd)
@@ -402,16 +411,19 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`COPY t FROM STDIN OIDS`, 41608, `oids`, ``},
 		{`COPY t FROM STDIN FREEZE`, 41608, `freeze`, ``},
-		{`COPY t FROM STDIN HEADER`, 41608, `header`, ``},
 		{`COPY t FROM STDIN ENCODING 'utf-8'`, 41608, `encoding`, ``},
-		{`COPY t FROM STDIN QUOTE 'x'`, 41608, `quote`, ``},
 		{`COPY t FROM STDIN FORCE QUOTE *`, 41608, `quote`, ``},
-		{`COPY t FROM STDIN FORCE NULL *`, 41608, `force null`, ``},
-		{`COPY t FROM STDIN FORCE NOT NULL *`, 41608, `force not null`, ``},
+		{`COPY t FROM STDIN FORCE NULL *`, 41608, `force_null`, ``},
+		{`COPY t FROM STDIN FORCE NOT NULL *`, 41608, `force_not_null`, ``},
+		{`COPY t FROM STDIN WITH (OIDS)`, 41608, `oids`, ``},
+		{`COPY t FROM STDIN (FREEZE)`, 41608, `freeze`, ``},
+		{`COPY t FROM STDIN WITH (ESCAPE ',', ENCODING 'utf-8')`, 41608, `encoding`, ``},
+		{`COPY t FROM STDIN WITH (FORCE_QUOTE) *`, 41608, `quote`, ``},
+		{`COPY t FROM STDIN (FORCE_NULL) *`, 41608, `force_null`, ``},
+		{`COPY t FROM STDIN (HEADER, FORCE_NOT_NULL) *`, 41608, `force_not_null`, ``},
 		{`COPY x FROM STDIN WHERE a = b`, 54580, ``, ``},
 
 		{`ALTER AGGREGATE a`, 74775, `alter aggregate`, ``},
-		{`ALTER FUNCTION a`, 17511, `alter function`, ``},
 
 		{`CREATE AGGREGATE a`, 74775, `create aggregate`, ``},
 		{`CREATE CAST a`, 0, `create cast`, ``},
@@ -422,8 +434,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE EXTENSION IF NOT EXISTS a WITH schema = 'public'`, 74777, `create extension if not exists with`, ``},
 		{`CREATE FOREIGN DATA WRAPPER a`, 0, `create fdw`, ``},
 		{`CREATE FOREIGN TABLE a`, 0, `create foreign table`, ``},
-		{`CREATE FUNCTION a`, 17511, `create`, ``},
-		{`CREATE OR REPLACE FUNCTION a`, 17511, `create`, ``},
 		{`CREATE LANGUAGE a`, 17511, `create language a`, ``},
 		{`CREATE OPERATOR a`, 65017, ``, ``},
 		{`CREATE PUBLICATION a`, 0, `create publication`, ``},
@@ -444,7 +454,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`DROP EXTENSION IF EXISTS a`, 74777, `drop extension if exists`, ``},
 		{`DROP FOREIGN TABLE a`, 0, `drop foreign table`, ``},
 		{`DROP FOREIGN DATA WRAPPER a`, 0, `drop fdw`, ``},
-		{`DROP FUNCTION a`, 17511, `drop `, ``},
 		{`DROP LANGUAGE a`, 17511, `drop language a`, ``},
 		{`DROP OPERATOR a`, 0, `drop operator`, ``},
 		{`DROP PUBLICATION a`, 0, `drop publication`, ``},
@@ -455,14 +464,9 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`DROP TRIGGER a`, 28296, `drop`, ``},
 
 		{`DISCARD PLANS`, 0, `discard plans`, ``},
-		{`DISCARD SEQUENCES`, 0, `discard sequences`, ``},
-		{`DISCARD TEMP`, 0, `discard temp`, ``},
-		{`DISCARD TEMPORARY`, 0, `discard temp`, ``},
 
 		{`SET CONSTRAINTS foo`, 0, `set constraints`, ``},
 		{`SET foo FROM CURRENT`, 0, `set from current`, ``},
-
-		{`CREATE MATERIALIZED VIEW a AS SELECT 1 WITH NO DATA`, 74083, ``, ``},
 
 		{`CREATE TABLE a(x INT[][])`, 32552, ``, ``},
 		{`CREATE TABLE a(x INT[1][2])`, 32552, ``, ``},
@@ -501,7 +505,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 
 		{`CREATE RECURSIVE VIEW a AS SELECT b`, 0, `create recursive view`, ``},
 
-		{`CREATE TYPE a AS (b)`, 27792, ``, ``},
 		{`CREATE TYPE a AS RANGE b`, 27791, ``, ``},
 		{`CREATE TYPE a (b)`, 27793, `base`, ``},
 		{`CREATE TYPE a`, 27793, `shell`, ``},
@@ -525,16 +528,11 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE INDEX a ON b USING SPGIST (c)`, 0, `index using spgist`, ``},
 		{`CREATE INDEX a ON b USING BRIN (c)`, 0, `index using brin`, ``},
 
-		{`CREATE INDEX a ON b(c gin_trgm_ops)`, 41285, `index using gin_trgm_ops`, ``},
-		{`CREATE INDEX a ON b(c gist_trgm_ops)`, 41285, `index using gist_trgm_ops`, ``},
-		{`CREATE INDEX a ON b(c bobby)`, 47420, ``, ``},
 		{`CREATE INDEX a ON b(a NULLS LAST)`, 6224, ``, ``},
 		{`CREATE INDEX a ON b(a ASC NULLS LAST)`, 6224, ``, ``},
 		{`CREATE INDEX a ON b(a DESC NULLS FIRST)`, 6224, ``, ``},
 
 		{`INSERT INTO foo(a, a.b) VALUES (1,2)`, 27792, ``, ``},
-
-		{`SELECT * FROM ROWS FROM (a(b) AS (d))`, 0, `ROWS FROM with col_def_list`, ``},
 
 		{`SELECT a(b) 'c'`, 0, `a(...) SCONST`, ``},
 		{`SELECT UNIQUE (SELECT b)`, 0, `UNIQUE predicate`, ``},
@@ -561,8 +559,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`CREATE TABLE a(b PG_LSN)`, 0, `pg_lsn`, ``},
 		{`CREATE TABLE a(b POINT)`, 21286, `point`, ``},
 		{`CREATE TABLE a(b POLYGON)`, 21286, `polygon`, ``},
-		{`CREATE TABLE a(b TSQUERY)`, 7821, `tsquery`, ``},
-		{`CREATE TABLE a(b TSVECTOR)`, 7821, `tsvector`, ``},
 		{`CREATE TABLE a(b TXID_SNAPSHOT)`, 0, `txid_snapshot`, ``},
 		{`CREATE TABLE a(b XML)`, 43355, `xml`, ``},
 
@@ -574,8 +570,6 @@ func TestUnimplementedSyntax(t *testing.T) {
 		{`UPDATE foo SET (a, a.b) = (1, 2)`, 27792, ``, ``},
 		{`UPDATE foo SET a.b = 1`, 27792, ``, ``},
 		{`UPDATE Foo SET x.y = z`, 27792, ``, ``},
-
-		{`GRANT SELECT ON SEQUENCE a`, 74780, `grant privileges on sequence`, ``},
 
 		{`REINDEX INDEX a`, 0, `reindex index`, `CockroachDB does not require reindexing.`},
 		{`REINDEX INDEX CONCURRENTLY a`, 0, `reindex index`, `CockroachDB does not require reindexing.`},
@@ -656,10 +650,12 @@ func TestParseSQL(t *testing.T) {
 		{in: ``, exp: nil},
 		{in: `SELECT 1`, exp: []string{`SELECT 1`}},
 		{in: `SELECT 1;`, exp: []string{`SELECT 1`}},
-		{in: `SELECT 1 /* comment */`, exp: []string{`SELECT 1`}},
+		// We currently chop off beginning-of-line comments.
+		{in: `/* comment */ SELECT 1`, exp: []string{`SELECT 1`}},
+		{in: `SELECT 1 /* comment */`, exp: []string{`SELECT 1 /* comment */`}},
 		{in: `SELECT 1;SELECT 2`, exp: []string{`SELECT 1`, `SELECT 2`}},
-		{in: `SELECT 1 /* comment */ ;SELECT 2`, exp: []string{`SELECT 1`, `SELECT 2`}},
-		{in: `SELECT 1 /* comment */ ; /* comment */ SELECT 2`, exp: []string{`SELECT 1`, `SELECT 2`}},
+		{in: `SELECT 1 /* comment */ ;SELECT 2`, exp: []string{`SELECT 1 /* comment */ `, `SELECT 2`}},
+		{in: `SELECT 1 /* comment */ ; SELECT 2`, exp: []string{`SELECT 1 /* comment */ `, `SELECT 2`}},
 	}
 	var p parser.Parser // Verify that the same parser can be reused.
 	for _, d := range testData {
@@ -673,7 +669,7 @@ func TestParseSQL(t *testing.T) {
 				res = append(res, stmts[i].SQL)
 			}
 			if !reflect.DeepEqual(res, d.exp) {
-				t.Errorf("expected \n%v\n, but found %v", res, d.exp)
+				t.Errorf("expected \n%v\n, but found %v", d.exp, res)
 			}
 		})
 	}
@@ -758,5 +754,89 @@ func BenchmarkParse(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestGetTypeFromValidSQLSyntax(t *testing.T) {
+	rng, _ := randutil.NewTestRand()
+
+	const numRuns = 1000
+	for i := 0; i < numRuns; i++ {
+		orig := randgen.RandType(rng)
+		typeRef, err := parser.GetTypeFromValidSQLSyntax(orig.SQLString())
+		require.NoError(t, err)
+		actual, ok := tree.GetStaticallyKnownType(typeRef)
+		require.True(t, ok)
+		// TODO(yuzefovich): ideally, we'd assert that the returned type is
+		// equal to the original one; however, there are some subtle differences
+		// at the moment (like the width might only be set on the returned
+		// type), so we simply assert that the OIDs are the same.
+		require.Equal(t, orig.Oid(), actual.Oid())
+	}
+}
+
+// nonBareLabelKeywords contains all the keywords that cannot be used as
+// bare column labels in Postgres. Only add an entry to this map if the
+// following query cannot be parsed in Postgres:
+// `SELECT 1 <keyword>;`
+var nonBareLabelKeywords = map[string]struct{}{
+	"ARRAY":     {},
+	"AS":        {},
+	"CHAR":      {},
+	"CHARACTER": {},
+	"CREATE":    {},
+	"DAY":       {},
+	"EXCEPT":    {},
+	"FETCH":     {},
+	"FILTER":    {},
+	"FOR":       {},
+	"FROM":      {},
+	"GRANT":     {},
+	"GROUP":     {},
+	"HAVING":    {},
+	"HOUR":      {},
+	"INTERSECT": {},
+	"INTO":      {},
+	"LIMIT":     {},
+	"MINUTE":    {},
+	"MONTH":     {},
+	"OFFSET":    {},
+	"ON":        {},
+	"ORDER":     {},
+	"OVER":      {},
+	"OVERLAPS":  {},
+	"PRECISION": {},
+	"RETURNING": {},
+	"SECOND":    {},
+	"TO":        {},
+	"UNION":     {},
+	"VARYING":   {},
+	"WHERE":     {},
+	"WINDOW":    {},
+	"WITH":      {},
+	"WITHIN":    {},
+	"WITHOUT":   {},
+	"YEAR":      {},
+
+	// COLLATE actually is an allowed bare_label_keyword in Postgres, but fixing
+	// it in CRDB requires some pretty big grammar rewrites.
+	"COLLATE": {},
+}
+
+// TestColumnBareLabels checks all the keywords to see if they can be used as
+// a bare column label. If this test fails, then run `SELECT 1 <keyword>;` in
+// Postgres. Then:
+// - If it succeeds, add the keyword to bare_label_keywords in sql.y.
+// - If it fails, add the keyword to the nonBareLabelKeywords list above.
+func TestBareLabelKeywords(t *testing.T) {
+	for _, k := range lexbase.KeywordNames {
+		k = strings.ToUpper(k)
+		_, shouldFail := nonBareLabelKeywords[k]
+		_, err := parser.ParseOne(fmt.Sprintf("SELECT 1 %s", k))
+		if err != nil && !shouldFail {
+			require.NoErrorf(t, err, "expected %s to succeed parsing as a bare column label", k)
+		} else if err == nil && shouldFail {
+			require.Errorf(t, err, "expected %s to fail parsing as a bare column label", k)
+		}
 	}
 }

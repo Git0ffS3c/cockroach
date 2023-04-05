@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/types"
 )
@@ -31,18 +32,26 @@ func BenchmarkTracer_StartSpanCtx(b *testing.B) {
 
 	staticLogTags := logtags.Buffer{}
 	staticLogTags.Add("foo", "bar")
+	mockListener := &mockEventListener{}
 
 	for _, tc := range []struct {
-		name        string
-		defaultMode TracingMode
-		parent      bool
-		opts        []SpanOption
+		name              string
+		defaultMode       TracingMode
+		parent            bool
+		withEventListener bool
+		opts              []SpanOption
 	}{
-		{"none", TracingModeOnDemand, false, nil},
-		{"real", TracingModeActiveSpansRegistry, false, nil},
-		{"real,logtag", TracingModeActiveSpansRegistry, false, []SpanOption{WithLogTags(&staticLogTags)}},
-		{"real,autoparent", TracingModeActiveSpansRegistry, true, nil},
-		{"real,manualparent", TracingModeActiveSpansRegistry, true, []SpanOption{WithDetachedRecording()}},
+		{name: "none", defaultMode: TracingModeOnDemand},
+		{name: "real", defaultMode: TracingModeActiveSpansRegistry},
+		{name: "real,logtag", defaultMode: TracingModeActiveSpansRegistry,
+			opts: []SpanOption{WithLogTags(&staticLogTags)}},
+		{name: "real,autoparent", defaultMode: TracingModeActiveSpansRegistry, parent: true},
+		{name: "real,manualparent", defaultMode: TracingModeActiveSpansRegistry, parent: true,
+			opts: []SpanOption{WithDetachedRecording()}},
+		{name: "real,autoparent,withEventListener", defaultMode: TracingModeActiveSpansRegistry,
+			parent: true, withEventListener: true},
+		{name: "real,manualparent,withEventListener", defaultMode: TracingModeActiveSpansRegistry, parent: true,
+			withEventListener: true, opts: []SpanOption{WithDetachedRecording()}},
 	} {
 		b.Run(fmt.Sprintf("opts=%s", tc.name), func(b *testing.B) {
 			tr := NewTracerWithOpt(ctx,
@@ -53,7 +62,11 @@ func BenchmarkTracer_StartSpanCtx(b *testing.B) {
 			var parent *Span
 			var numOpts = len(tc.opts)
 			if tc.parent {
-				parent = tr.StartSpan("one-off")
+				if tc.withEventListener {
+					parent = tr.StartSpan("one-off", WithEventListeners(mockListener))
+				} else {
+					parent = tr.StartSpan("one-off")
+				}
 				defer parent.Finish()
 				numOpts++
 			}
@@ -85,7 +98,7 @@ func BenchmarkSpan_GetRecording(b *testing.B) {
 	run := func(b *testing.B, sp *Span) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_ = sp.GetRecording(RecordingStructured)
+			_ = sp.GetRecording(tracingpb.RecordingStructured)
 		}
 	}
 
@@ -106,19 +119,40 @@ func BenchmarkSpan_GetRecording(b *testing.B) {
 
 func BenchmarkRecordingWithStructuredEvent(b *testing.B) {
 	skip.UnderDeadlock(b, "span reuse triggers false-positives in the deadlock detector")
-	tr := NewTracerWithOpt(context.Background(),
-		WithTracingMode(TracingModeActiveSpansRegistry),
-		WithSpanReusePercent(100))
-
 	ev := &types.Int32Value{Value: 5}
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		root := tr.StartSpan("foo", WithRecording(RecordingStructured))
-		root.RecordStructured(ev)
-		child := tr.StartSpan("bar", WithParent(root))
-		child.RecordStructured(ev)
-		child.Finish()
-		_ = root.FinishAndGetRecording(RecordingStructured)
+	mockListener := &mockEventListener{}
+
+	for _, tc := range []struct {
+		name              string
+		withEventListener bool
+	}{
+		{name: "with-event-listener", withEventListener: true},
+		{name: "without-event-listener"},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			tr := NewTracerWithOpt(context.Background(),
+				WithTracingMode(TracingModeActiveSpansRegistry),
+				WithSpanReusePercent(100))
+
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var root *Span
+				if tc.withEventListener {
+					root = tr.StartSpan("foo", WithRecording(tracingpb.RecordingStructured),
+						WithEventListeners(mockListener))
+				} else {
+					root = tr.StartSpan("foo", WithRecording(tracingpb.RecordingStructured))
+				}
+
+				root.RecordStructured(ev)
+
+				// The child span will also inherit the root span's event listener.
+				child := tr.StartSpan("bar", WithParent(root))
+				child.RecordStructured(ev)
+				child.Finish()
+				_ = root.FinishAndGetRecording(tracingpb.RecordingStructured)
+			}
+		})
 	}
 }
 

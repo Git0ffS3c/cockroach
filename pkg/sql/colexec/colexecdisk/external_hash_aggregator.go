@@ -11,12 +11,14 @@
 package colexecdisk
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
-	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/marusama/semaphore"
@@ -32,45 +34,51 @@ const (
 // the in-memory hash aggregator as the "main" strategy for the hash-based
 // partitioner and the external sort + ordered aggregator as the "fallback".
 func NewExternalHashAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	args *colexecargs.NewColOperatorArgs,
-	newAggArgs *colexecagg.NewAggregatorArgs,
+	newHashAggArgs *colexecagg.NewHashAggregatorArgs,
 	createDiskBackedSorter DiskBackedSorterConstructor,
 	diskAcc *mon.BoundAccount,
-	outputUnlimitedAllocator *colmem.Allocator,
-	maxOutputBatchMemSize int64,
-) colexecop.Operator {
+	converterMemAcc *mon.BoundAccount,
+	outputOrdering execinfrapb.Ordering,
+) (colexecop.Operator, colexecop.Closer) {
 	inMemMainOpConstructor := func(partitionedInputs []*partitionerToOperator) colexecop.ResettableOperator {
-		newAggArgs := *newAggArgs
+		newAggArgs := *newHashAggArgs.NewAggregatorArgs
 		newAggArgs.Input = partitionedInputs[0]
+		newHashAggArgs := *newHashAggArgs
+		newHashAggArgs.NewAggregatorArgs = &newAggArgs
 		// We don't need to track the input tuples when we have already spilled.
 		// TODO(yuzefovich): it might be worth increasing the number of buckets.
-		return colexec.NewHashAggregator(&newAggArgs, nil /* newSpillingQueueArgs */, outputUnlimitedAllocator, maxOutputBatchMemSize)
+		return colexec.NewHashAggregator(
+			ctx, &newHashAggArgs, nil, /* newSpillingQueueArgs */
+		)
 	}
-	spec := newAggArgs.Spec
+	spec := newHashAggArgs.Spec
 	diskBackedFallbackOpConstructor := func(
 		partitionedInputs []*partitionerToOperator,
 		maxNumberActivePartitions int,
 		_ semaphore.Semaphore,
 	) colexecop.ResettableOperator {
-		newAggArgs := *newAggArgs
+		newAggArgs := *newHashAggArgs.NewAggregatorArgs
 		newAggArgs.Input = createDiskBackedSorter(
 			partitionedInputs[0], newAggArgs.InputTypes,
 			makeOrdering(spec.GroupCols), maxNumberActivePartitions,
 		)
-		return colexec.NewOrderedAggregator(&newAggArgs)
+		return colexec.NewOrderedAggregator(ctx, &newAggArgs)
 	}
 	eha := newHashBasedPartitioner(
-		newAggArgs.Allocator,
+		newHashAggArgs.Allocator,
 		flowCtx,
 		args,
 		"external hash aggregator", /* name */
-		[]colexecop.Operator{newAggArgs.Input},
-		[][]*types.T{newAggArgs.InputTypes},
+		[]colexecop.Operator{newHashAggArgs.Input},
+		[][]*types.T{newHashAggArgs.InputTypes},
 		[][]uint32{spec.GroupCols},
 		inMemMainOpConstructor,
 		diskBackedFallbackOpConstructor,
 		diskAcc,
+		converterMemAcc,
 		ehaNumRequiredActivePartitions,
 	)
 	// The last thing we need to do is making sure that the output has the
@@ -80,14 +88,13 @@ func NewExternalHashAggregator(
 	// the ordering of tuples. However, that is not that the case with the
 	// hash-based partitioner, so we might need to plan an external sort on top
 	// of it.
-	outputOrdering := args.Spec.Core.Aggregator.OutputOrdering
 	if len(outputOrdering.Columns) == 0 {
 		// No particular output ordering is required.
-		return eha
+		return eha, eha
 	}
 	// TODO(yuzefovich): the fact that we're planning an additional external
 	// sort isn't accounted for when considering the number file descriptors to
 	// acquire. Not urgent, but it should be fixed.
 	maxNumberActivePartitions := calculateMaxNumberActivePartitions(flowCtx, args, ehaNumRequiredActivePartitions)
-	return createDiskBackedSorter(eha, newAggArgs.OutputTypes, outputOrdering.Columns, maxNumberActivePartitions)
+	return createDiskBackedSorter(eha, newHashAggArgs.OutputTypes, outputOrdering.Columns, maxNumberActivePartitions), eha
 }

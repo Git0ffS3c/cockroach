@@ -20,7 +20,7 @@ import {
   requestMetrics as requestMetricsAction,
 } from "src/redux/metrics";
 import { AdminUIState } from "src/redux/state";
-import { toDateRange, util } from "@cockroachlabs/cluster-ui";
+import { util } from "@cockroachlabs/cluster-ui";
 import { findChildrenOfType } from "src/util/find";
 import {
   Metric,
@@ -37,6 +37,11 @@ import {
 } from "@cockroachlabs/cluster-ui";
 import { History } from "history";
 import { refreshSettings } from "src/redux/apiReducers";
+import { adjustTimeScale, selectMetricsTime } from "src/redux/timeScale";
+import {
+  selectResolution10sStorageTTL,
+  selectResolution30mStorageTTL,
+} from "src/redux/clusterSettings";
 
 /**
  * queryFromProps is a helper method which generates a TimeSeries Query data
@@ -48,7 +53,7 @@ function queryFromProps(
 ): protos.cockroach.ts.tspb.IQuery {
   let derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NONE;
   let sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.SUM;
-  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
+  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
 
   // Compute derivative function.
   if (!_.isNil(metricProps.derivative)) {
@@ -155,9 +160,8 @@ class MetricsDataProvider extends React.Component<
     ({ children }: MetricsDataProviderProps) => children,
     children => {
       // MetricsDataProvider should contain only one direct child.
-      const child: React.ReactElement<MetricsDataComponentProps> = React.Children.only(
-        this.props.children,
-      );
+      const child: React.ReactElement<MetricsDataComponentProps> =
+        React.Children.only(this.props.children);
       // Perform a simple DFS to find all children which are Metric objects.
       const selectors: React.ReactElement<MetricProps>[] = findChildrenOfType(
         children,
@@ -172,7 +176,7 @@ class MetricsDataProvider extends React.Component<
     (props: MetricsDataProviderProps) => props.timeInfo,
     this.queriesSelector,
     (timeInfo, queries) => {
-      if (!timeInfo) {
+      if (!timeInfo || queries.length === 0) {
         return undefined;
       }
       return new protos.cockroach.ts.tspb.TimeSeriesQueryRequest({
@@ -249,25 +253,35 @@ class MetricsDataProvider extends React.Component<
 // timeInfoSelector converts the current global time window into a set of Long
 // timestamps, which can be sent with requests to the server.
 const timeInfoSelector = createSelector(
-  (state: AdminUIState) => state.timeScale,
-  tw => {
-    if (!_.isObject(tw.scale)) {
+  selectResolution10sStorageTTL,
+  selectResolution30mStorageTTL,
+  selectMetricsTime,
+  (sTTL, mTTL, metricsTime) => {
+    if (!_.isObject(metricsTime.currentWindow)) {
       return null;
     }
-
-    const [startMoment, endMoment] = toDateRange(tw.scale);
+    const { start: startMoment, end: endMoment } = metricsTime.currentWindow;
     const start = startMoment.valueOf();
     const end = endMoment.valueOf();
     const syncedScale = findClosestTimeScale(
       defaultTimeScaleOptions,
       util.MilliToSeconds(end - start),
     );
+    // Call adjustTimeScale to handle the case where the sample size
+    // (also known as resolution) is too small for a start and end time
+    // that is before the data's ttl.
+    const adjusted = adjustTimeScale(
+      { ...syncedScale, fixedWindowEnd: false },
+      { start: startMoment, end: endMoment },
+      sTTL,
+      mTTL,
+    );
 
     return {
       start: Long.fromNumber(util.MilliToNano(start)),
       end: Long.fromNumber(util.MilliToNano(end)),
       sampleDuration: Long.fromNumber(
-        util.MilliToNano(syncedScale.sampleSize.asMilliseconds()),
+        util.MilliToNano(adjusted.timeScale.sampleSize.asMilliseconds()),
       ),
     };
   },
@@ -279,12 +293,7 @@ const current = () => {
   now = moment(Math.floor(now.valueOf() / 10000) * 10000);
   return {
     start: Long.fromNumber(
-      util.MilliToNano(
-        now
-          .clone()
-          .subtract(30, "s")
-          .valueOf(),
-      ),
+      util.MilliToNano(now.clone().subtract(30, "s").valueOf()),
     ),
     end: Long.fromNumber(util.MilliToNano(now.valueOf())),
     sampleDuration: Long.fromNumber(

@@ -28,8 +28,8 @@ var (
 		catconstants.ProtectedTimestampsRecordsTableName,
 		catconstants.StatementStatisticsTableName,
 		catconstants.TransactionStatisticsTableName,
-		// TODO(postamar): remove in 21.2
-		catconstants.PreMigrationNamespaceTableName,
+		catconstants.StatementActivityTableName,
+		catconstants.TransactionActivityTableName,
 	}
 
 	readWriteSystemTables = []catconstants.SystemTableName{
@@ -62,8 +62,21 @@ var (
 		catconstants.TenantUsageTableName,
 		catconstants.SQLInstancesTableName,
 		catconstants.SpanConfigurationsTableName,
+		catconstants.TaskPayloadsTableName,
 		catconstants.TenantSettingsTableName,
+		catconstants.TenantTasksTableName,
 		catconstants.SpanCountTableName,
+		catconstants.SystemPrivilegeTableName,
+		catconstants.SystemExternalConnectionsTableName,
+		catconstants.SystemJobInfoTableName,
+		catconstants.SpanStatsUniqueKeys,
+		catconstants.SpanStatsBuckets,
+		catconstants.SpanStatsSamples,
+		catconstants.SpanStatsTenantBoundaries,
+	}
+
+	readWriteSystemSequences = []catconstants.SystemTableName{
+		catconstants.RoleIDSequenceName,
 	}
 
 	systemSuperuserPrivileges = func() map[descpb.NameInfo]privilege.List {
@@ -79,6 +92,10 @@ var (
 		for _, r := range readSystemTables {
 			tableKey.Name = string(r)
 			m[tableKey] = privilege.ReadData
+		}
+		for _, r := range readWriteSystemSequences {
+			tableKey.Name = string(r)
+			m[tableKey] = privilege.ReadWriteSequenceData
 		}
 		m[descpb.NameInfo{Name: catconstants.SystemDatabaseName}] = privilege.List{privilege.CONNECT}
 		return m

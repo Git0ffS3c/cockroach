@@ -19,11 +19,14 @@ import { refreshMetricMetadata, refreshNodes } from "src/redux/apiReducers";
 import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { LineGraph } from "src/views/cluster/components/linegraph";
-import TimeScaleDropdown from "src/views/cluster/containers/timeScaleDropdownWithSearchParams";
 import { DropdownOption } from "src/views/shared/components/dropdown";
 import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 import { Metric, Axis } from "src/views/shared/components/metricQuery";
-import { AxisUnits } from "@cockroachlabs/cluster-ui";
+import {
+  AxisUnits,
+  TimeScaleDropdown,
+  TimeScale,
+} from "@cockroachlabs/cluster-ui";
 import {
   PageConfig,
   PageConfigItem,
@@ -40,8 +43,8 @@ import { queryByName } from "src/util/query";
 import { PayloadAction } from "src/interfaces/action";
 import {
   TimeWindow,
-  TimeScale,
   setMetricsFixedWindow,
+  selectTimeScale,
   setTimeScale,
 } from "src/redux/timeScale";
 
@@ -52,6 +55,7 @@ export interface CustomChartProps {
   refreshMetricMetadata: typeof refreshMetricMetadata;
   metricsMetadata: MetricsMetadata;
   setMetricsFixedWindow: (tw: TimeWindow) => PayloadAction<TimeWindow>;
+  timeScale: TimeScale;
   setTimeScale: (ts: TimeScale) => PayloadAction<TimeScale>;
 }
 
@@ -206,7 +210,7 @@ export class CustomChart extends React.Component<
         setTimeScale={this.props.setTimeScale}
         history={this.props.history}
       >
-        <LineGraph>
+        <LineGraph title={metrics.map(m => m.metric).join(", ")}>
           <Axis units={units} label={AxisUnits[units]}>
             {metrics.map((m, i) => {
               if (m.metric !== "") {
@@ -293,7 +297,10 @@ export class CustomChart extends React.Component<
         </section>
         <PageConfig>
           <PageConfigItem>
-            <TimeScaleDropdown />
+            <TimeScaleDropdown
+              currentScale={this.props.timeScale}
+              setTimeScale={this.props.setTimeScale}
+            />
           </PageConfigItem>
           <button
             className="edit-button chart-edit-button chart-edit-button--add"
@@ -307,7 +314,7 @@ export class CustomChart extends React.Component<
             <div className="chart-group l-columns__left">
               {this.renderCharts()}
             </div>
-            <div className="l-columns__right"></div>
+            <div className="l-columns__right" />
           </div>
         </section>
         <section className="section">{this.renderChartTables()}</section>
@@ -320,13 +327,14 @@ const mapStateToProps = (state: AdminUIState) => ({
   nodesSummary: nodesSummarySelector(state),
   nodesQueryValid: state.cachedData.nodes.valid,
   metricsMetadata: metricsMetadataSelector(state),
+  timeScale: selectTimeScale(state),
 });
 
 const mapDispatchToProps = {
   refreshNodes,
   refreshMetricMetadata,
   setMetricsFixedWindow: setMetricsFixedWindow,
-  setTimeScale,
+  setTimeScale: setTimeScale,
 };
 
 export default withRouter(

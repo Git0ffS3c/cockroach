@@ -11,8 +11,10 @@ package workloadccl_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,8 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/spf13/pflag"
@@ -83,6 +87,8 @@ func (g fixtureTestGen) Tables() []workload.Table {
 
 func TestFixture(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	// This test is brittle and requires manual intervention to run.
@@ -165,6 +171,8 @@ func TestFixture(t *testing.T) {
 
 func TestImportFixture(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	defer func(oldRefreshInterval, oldAsOf time.Duration) {
@@ -185,6 +193,10 @@ func TestImportFixture(t *testing.T) {
 	if err := gen.Flags().Parse([]string{"--" + flag}); err != nil {
 		t.Fatalf(`%+v`, err)
 	}
+	// Wait for the `ensureAllTables` unconditional auto stats to run before
+	// starting the test, so we don't hit a timing window where 2 sets of auto
+	// stats are collected.
+	time.Sleep(2 * time.Second)
 
 	const filesPerNode = 1
 
@@ -210,11 +222,17 @@ func TestImportFixture(t *testing.T) {
 
 func TestImportFixtureCSVServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 	ts := httptest.NewServer(workload.CSVMux(workload.Registered()))
 	defer ts.Close()
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{UseDatabase: `d`})
+	s, db, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			UseDatabase: `d`,
+		},
+	)
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
@@ -233,4 +251,40 @@ func TestImportFixtureCSVServer(t *testing.T) {
 	require.NoError(t, err)
 	sqlDB.CheckQueryResults(t,
 		`SELECT count(*) FROM d.fx`, [][]string{{strconv.Itoa(fixtureTestGenRows)}})
+}
+
+func TestImportFixtureNodeCount(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	const (
+		nodes        = 3
+		filesPerNode = 1
+	)
+
+	tc := testcluster.StartTestCluster(t, nodes, base.TestClusterArgs{})
+	defer tc.Stopper().Stop(ctx)
+
+	db := tc.Conns[0]
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	gen := makeTestWorkload()
+	flag := fmt.Sprintf("--val=%d", timeutil.Now().UnixNano())
+	require.NoError(t, gen.Flags().Parse([]string{flag}))
+
+	sqlDB.Exec(t, "CREATE DATABASE ingest")
+	_, err := workloadccl.ImportFixture(
+		ctx, db, gen, "ingest", filesPerNode, false, /* injectStats */
+		``, /* csvServer */
+	)
+	require.NoError(t, err)
+
+	var desc string
+	sqlDB.QueryRow(t, "SELECT description FROM crdb_internal.jobs WHERE job_type = 'IMPORT'").Scan(&desc)
+
+	expectedFiles := math.Ceil(float64(fixtureTestGenRows) / float64(nodes))
+	actualFiles := strings.Count(desc, "workload://")
+	require.Equal(t, int(expectedFiles), actualFiles)
 }

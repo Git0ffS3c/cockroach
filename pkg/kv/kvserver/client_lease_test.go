@@ -23,27 +23,30 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	raft "go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 // TestStoreRangeLease verifies that regular ranges (not some special ones at
@@ -53,10 +56,15 @@ func TestStoreRangeLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
 	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
 						DisableMergeQueue: true,
@@ -65,7 +73,7 @@ func TestStoreRangeLease(t *testing.T) {
 			},
 		},
 	)
-	defer tc.Stopper().Stop(context.Background())
+	defer tc.Stopper().Stop(ctx)
 
 	store := tc.GetFirstStoreFromServer(t, 0)
 	// NodeLivenessKeyMax is a static split point, so this is always
@@ -94,135 +102,6 @@ func TestStoreRangeLease(t *testing.T) {
 			t.Fatalf("expected lease type epoch; got %d", lt)
 		}
 	}
-}
-
-// TestStoreGossipSystemData verifies that the system-config and node-liveness
-// data is gossiped at startup in the mixed version state.
-//
-// TODO(ajwerner): Delete this test in 22.2.
-func TestStoreGossipSystemData(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	zcfg := zonepb.DefaultZoneConfig()
-	version := clusterversion.ByKey(clusterversion.DisableSystemConfigGossipTrigger - 1)
-	settings := cluster.MakeTestingClusterSettingsWithVersions(
-		version, version, false, /* initializeVersion */
-	)
-	serverArgs := base.TestServerArgs{
-		Settings: settings,
-		Knobs: base.TestingKnobs{
-			Store: &kvserver.StoreTestingKnobs{
-				DisableMergeQueue: true,
-			},
-			Server: &server.TestingKnobs{
-				DefaultZoneConfigOverride:      &zcfg,
-				BinaryVersionOverride:          version,
-				DisableAutomaticVersionUpgrade: make(chan struct{}),
-			},
-		},
-	}
-	tc := testcluster.StartTestCluster(t, 1,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs:      serverArgs,
-		},
-	)
-	defer tc.Stopper().Stop(context.Background())
-
-	store := tc.GetFirstStoreFromServer(t, 0)
-	splitKey := keys.SystemConfigSplitKey
-	tc.SplitRangeOrFatal(t, splitKey)
-	if _, err := store.DB().Inc(context.Background(), splitKey, 1); err != nil {
-		t.Fatalf("failed to increment: %+v", err)
-	}
-
-	getSystemConfig := func(s *kvserver.Store) *config.SystemConfig {
-		systemConfig := s.Gossip().DeprecatedGetSystemConfig()
-		return systemConfig
-	}
-	getNodeLiveness := func(s *kvserver.Store) livenesspb.Liveness {
-		var liveness livenesspb.Liveness
-		if err := s.Gossip().GetInfoProto(gossip.MakeNodeLivenessKey(1), &liveness); err == nil {
-			return liveness
-		}
-		return livenesspb.Liveness{}
-	}
-
-	// Restart the store and verify that both the system-config and node-liveness
-	// data is gossiped.
-	tc.AddAndStartServer(t, serverArgs)
-	tc.StopServer(0)
-
-	testutils.SucceedsSoon(t, func() error {
-		if !getSystemConfig(tc.GetFirstStoreFromServer(t, 1)).DefaultZoneConfig.Equal(zcfg) {
-			return errors.New("system config not gossiped")
-		}
-		if getNodeLiveness(tc.GetFirstStoreFromServer(t, 1)) == (livenesspb.Liveness{}) {
-			return errors.New("node liveness not gossiped")
-		}
-		return nil
-	})
-}
-
-// TestGossipSystemConfigOnLeaseChange verifies that the system-config gets
-// re-gossiped on lease transfer even if it hasn't changed. This helps prevent
-// situations where a previous leaseholder can restart and not receive the
-// system config because it was the original source of it within the gossip
-// network. This test only applies in the mixed version state.
-//
-// TODO(ajwerner): Remove this test in 22.2.
-func TestGossipSystemConfigOnLeaseChange(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	const numStores = 3
-	tc := testcluster.StartTestCluster(t, numStores,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs: base.TestServerArgs{
-				Knobs: base.TestingKnobs{
-					Store: &kvserver.StoreTestingKnobs{
-						DisableMergeQueue: true,
-					},
-					Server: &server.TestingKnobs{
-						BinaryVersionOverride: clusterversion.ByKey(
-							clusterversion.DisableSystemConfigGossipTrigger - 1,
-						),
-						DisableAutomaticVersionUpgrade: make(chan struct{}),
-					},
-				},
-			},
-		},
-	)
-	defer tc.Stopper().Stop(context.Background())
-
-	key := keys.SystemConfigSpan.Key
-	tc.AddVotersOrFatal(t, key, tc.Target(1), tc.Target(2))
-
-	initialStoreIdx := -1
-	for i := range tc.Servers {
-		if tc.GetFirstStoreFromServer(t, i).Gossip().InfoOriginatedHere(gossip.KeyDeprecatedSystemConfig) {
-			initialStoreIdx = i
-		}
-	}
-	if initialStoreIdx == -1 {
-		t.Fatalf("no store has gossiped system config; gossip contents: %+v", tc.GetFirstStoreFromServer(t, 0).Gossip().GetInfoStatus())
-	}
-
-	newStoreIdx := (initialStoreIdx + 1) % numStores
-	if err := tc.TransferRangeLease(tc.LookupRangeOrFatal(t, key), tc.Target(newStoreIdx)); err != nil {
-		t.Fatalf("Unexpected error %v", err)
-	}
-	testutils.SucceedsSoon(t, func() error {
-		if tc.GetFirstStoreFromServer(t, initialStoreIdx).Gossip().InfoOriginatedHere(gossip.KeyDeprecatedSystemConfig) {
-			return errors.New("system config still most recently gossiped by original leaseholder")
-		}
-		if !tc.GetFirstStoreFromServer(t, newStoreIdx).Gossip().InfoOriginatedHere(gossip.KeyDeprecatedSystemConfig) {
-			return errors.New("system config not most recently gossiped by new leaseholder")
-		}
-		return nil
-	})
 }
 
 func TestGossipNodeLivenessOnLeaseChange(t *testing.T) {
@@ -296,8 +175,9 @@ func TestGossipNodeLivenessOnLeaseChange(t *testing.T) {
 }
 
 // TestCannotTransferLeaseToVoterOutgoing ensures that the evaluation of lease
-// requests for nodes which are already in the VOTER_OUTGOING state will fail.
-func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
+// requests for nodes which are already in the VOTER_DEMOTING_LEARNER state will fail
+// (in this test, there is no VOTER_INCOMING node).
+func TestCannotTransferLeaseToVoterDemoting(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
@@ -305,16 +185,15 @@ func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
 	knobs, ltk := makeReplicationTestKnobs()
 	// Add a testing knob to allow us to block the change replicas command
 	// while it is being proposed. When we detect that the change replicas
-	// command to move n3 to VOTER_OUTGOING has been evaluated, we'll send
-	// the request to transfer the lease to n3. The hope is that it will
-	// get past the sanity above latch acquisition prior to change replicas
-	// command committing.
-	var scratchRangeID atomic.Value
-	scratchRangeID.Store(roachpb.RangeID(0))
+	// command to move n3 to VOTER_DEMOTING_LEARNER has been evaluated, we'll
+	// send the request to transfer the lease to n3. The hope is that it will
+	// get past the sanity check above latch acquisition prior to the change
+	// replicas command committing.
+	var scratchRangeID int64
 	changeReplicasChan := make(chan chan struct{}, 1)
 	shouldBlock := func(args kvserverbase.ProposalFilterArgs) bool {
 		// Block if a ChangeReplicas command is removing a node from our range.
-		return args.Req.RangeID == scratchRangeID.Load().(roachpb.RangeID) &&
+		return args.Req.RangeID == roachpb.RangeID(atomic.LoadInt64(&scratchRangeID)) &&
 			args.Cmd.ReplicatedEvalResult.ChangeReplicas != nil &&
 			len(args.Cmd.ReplicatedEvalResult.ChangeReplicas.Removed()) > 0
 	}
@@ -325,7 +204,7 @@ func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
 			<-ch
 		}
 	}
-	knobs.Store.(*kvserver.StoreTestingKnobs).TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
+	knobs.Store.(*kvserver.StoreTestingKnobs).TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
 		blockIfShould(args)
 		return nil
 	}
@@ -337,7 +216,7 @@ func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
 
 	scratchStartKey := tc.ScratchRange(t)
 	desc := tc.AddVotersOrFatal(t, scratchStartKey, tc.Targets(1, 2)...)
-	scratchRangeID.Store(desc.RangeID)
+	atomic.StoreInt64(&scratchRangeID, int64(desc.RangeID))
 	// Make sure n1 has the lease to start with.
 	err := tc.Server(0).DB().AdminTransferLease(context.Background(),
 		scratchStartKey, tc.Target(0).StoreID)
@@ -346,7 +225,7 @@ func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
 	// The test proceeds as follows:
 	//
 	//  - Send an AdminChangeReplicasRequest to remove n3 and add n4
-	//  - Block the step that moves n3 to VOTER_OUTGOING on changeReplicasChan
+	//  - Block the step that moves n3 to VOTER_DEMOTING_LEARNER on changeReplicasChan
 	//  - Send an AdminLeaseTransfer to make n3 the leaseholder
 	//  - Try really hard to make sure that the lease transfer at least gets to
 	//    latch acquisition before unblocking the ChangeReplicas.
@@ -359,9 +238,8 @@ func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_, err = tc.Server(0).DB().AdminChangeReplicas(ctx,
-				scratchStartKey, desc, []roachpb.ReplicationChange{
+				scratchStartKey, desc, []kvpb.ReplicationChange{
 					{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(2)},
-					{ChangeType: roachpb.ADD_VOTER, Target: tc.Target(3)},
 				})
 			require.NoError(t, err)
 		}()
@@ -394,7 +272,322 @@ func TestCannotTransferLeaseToVoterOutgoing(t *testing.T) {
 		close(ch)
 		wg.Wait()
 	})
+}
 
+// TestTransferLeaseToVoterDemotingFails ensures that the evaluation of lease
+// requests for nodes which are already in the VOTER_DEMOTING_LEARNER state fails
+// if they weren't previously holding the lease, even if there is a VOTER_INCOMING..
+func TestTransferLeaseToVoterDemotingFails(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	knobs, ltk := makeReplicationTestKnobs()
+	// Add a testing knob to allow us to block the change replicas command
+	// while it is being proposed. When we detect that the change replicas
+	// command to move n3 to VOTER_DEMOTING_LEARNER has been evaluated, we'll
+	// send the request to transfer the lease to n3. The hope is that it will
+	// get past the sanity check above latch acquisition prior to the change
+	// replicas command committing.
+	var scratchRangeID int64
+	changeReplicasChan := make(chan chan struct{}, 1)
+	shouldBlock := func(args kvserverbase.ProposalFilterArgs) bool {
+		// Block if a ChangeReplicas command is removing a node from our range.
+		return args.Req.RangeID == roachpb.RangeID(atomic.LoadInt64(&scratchRangeID)) &&
+			args.Cmd.ReplicatedEvalResult.ChangeReplicas != nil &&
+			len(args.Cmd.ReplicatedEvalResult.ChangeReplicas.Removed()) > 0
+	}
+	blockIfShould := func(args kvserverbase.ProposalFilterArgs) {
+		if shouldBlock(args) {
+			ch := make(chan struct{})
+			changeReplicasChan <- ch
+			<-ch
+		}
+	}
+	knobs.Store.(*kvserver.StoreTestingKnobs).TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+		blockIfShould(args)
+		return nil
+	}
+	tc := testcluster.StartTestCluster(t, 4, base.TestClusterArgs{
+		ServerArgs:      base.TestServerArgs{Knobs: knobs},
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	scratchStartKey := tc.ScratchRange(t)
+	desc := tc.AddVotersOrFatal(t, scratchStartKey, tc.Targets(1, 2)...)
+	atomic.StoreInt64(&scratchRangeID, int64(desc.RangeID))
+	// Make sure n1 has the lease to start with.
+	err := tc.Server(0).DB().AdminTransferLease(context.Background(),
+		scratchStartKey, tc.Target(0).StoreID)
+	require.NoError(t, err)
+
+	// The test proceeds as follows:
+	//
+	//  - Send an AdminChangeReplicasRequest to remove n3 and add n4
+	//  - Block the step that moves n3 to VOTER_DEMOTING_LEARNER on changeReplicasChan
+	//  - Send an AdminLeaseTransfer to make n3 the leaseholder
+	//  - Make sure that this request fails (since n3 is VOTER_DEMOTING_LEARNER and
+	//    wasn't previously leaseholder)
+	//  - Unblock the ChangeReplicas.
+	//  - Make sure the lease transfer succeeds.
+
+	ltk.withStopAfterJointConfig(func() {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err = tc.Server(0).DB().AdminChangeReplicas(ctx,
+				scratchStartKey, desc, []kvpb.ReplicationChange{
+					{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(2)},
+					{ChangeType: roachpb.ADD_VOTER, Target: tc.Target(3)},
+				})
+			require.NoError(t, err)
+		}()
+		ch := <-changeReplicasChan
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Make sure the lease is currently on n1.
+			desc, err := tc.LookupRange(scratchStartKey)
+			require.NoError(t, err)
+			leaseHolder, err := tc.FindRangeLeaseHolder(desc, nil)
+			require.NoError(t, err)
+			require.Equal(t, tc.Target(0), leaseHolder,
+				errors.Errorf("Leaseholder supposed to be on n1."))
+			// Try to move the lease to n3, the VOTER_DEMOTING_LEARNER.
+			// This should fail since the last leaseholder wasn't n3
+			// (wasLastLeaseholder = false in CheckCanReceiveLease).
+			err = tc.Server(0).DB().AdminTransferLease(context.Background(),
+				scratchStartKey, tc.Target(2).StoreID)
+			require.EqualError(t, err, `replica cannot hold lease`)
+			// Make sure the lease is still on n1.
+			leaseHolder, err = tc.FindRangeLeaseHolder(desc, nil)
+			require.NoError(t, err)
+			require.Equal(t, tc.Target(0), leaseHolder,
+				errors.Errorf("Leaseholder supposed to be on n1."))
+		}()
+		// Try really hard to make sure that our request makes it past the
+		// sanity check error to the evaluation error.
+		for i := 0; i < 100; i++ {
+			runtime.Gosched()
+			time.Sleep(time.Microsecond)
+		}
+		close(ch)
+		wg.Wait()
+	})
+}
+
+// TestTransferLeaseDuringJointConfigWithDeadIncomingVoter ensures that the
+// lease transfer performed during a joint config replication change that is
+// replacing the existing leaseholder does not get stuck even if the existing
+// leaseholder cannot prove that the incoming leaseholder is caught up on its
+// log. It does so by killing the incoming leaseholder before it receives the
+// lease and ensuring that the range is able to exit the joint configuration.
+//
+// Currently, the range exits by bypassing safety checks during the lease
+// transfer, sending the lease to the dead incoming voter, letting the lease
+// expire, acquiring the lease on one of the non-demoting voters, and exiting.
+// The details here may change in the future, but the goal of this test will
+// not.
+func TestTransferLeaseDuringJointConfigWithDeadIncomingVoter(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	// The lease request timeout depends on the Raft election timeout, so we set
+	// it low to get faster lease expiration (800 ms) and speed up the test.
+	var raftCfg base.RaftConfig
+	raftCfg.SetDefaults()
+	raftCfg.RaftHeartbeatIntervalTicks = 1
+	raftCfg.RaftElectionTimeoutTicks = 2
+
+	knobs, ltk := makeReplicationTestKnobs()
+	tc := testcluster.StartTestCluster(t, 4, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			RaftConfig: raftCfg,
+			Knobs:      knobs,
+		},
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	key := tc.ScratchRange(t)
+	desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+	// Make sure n1 has the lease to start with.
+	err := tc.Server(0).DB().AdminTransferLease(ctx, key, tc.Target(0).StoreID)
+	require.NoError(t, err)
+	store0, repl0 := getFirstStoreReplica(t, tc.Server(0), key)
+
+	// The test proceeds as follows:
+	//
+	//  - Send an AdminChangeReplicasRequest to remove n1 (leaseholder) and add n4
+	//  - Stop the replication change after entering the joint configuration
+	//  - Kill n4 and wait until n1 notices
+	//  - Complete the replication change
+
+	// Enter joint config.
+	ltk.withStopAfterJointConfig(func() {
+		tc.RebalanceVoterOrFatal(ctx, t, key, tc.Target(0), tc.Target(3))
+	})
+	desc = tc.LookupRangeOrFatal(t, key)
+	require.Len(t, desc.Replicas().Descriptors(), 4)
+	require.True(t, desc.Replicas().InAtomicReplicationChange(), desc)
+
+	// Kill n4.
+	tc.StopServer(3)
+
+	// Wait for n1 to notice.
+	testutils.SucceedsSoon(t, func() error {
+		// Manually report n4 as unreachable to speed up the test.
+		require.NoError(t, repl0.RaftReportUnreachable(4))
+		// Check the Raft progress.
+		s := repl0.RaftStatus()
+		require.Equal(t, raft.StateLeader, s.RaftState)
+		p := s.Progress
+		require.Len(t, p, 4)
+		require.Contains(t, p, uint64(4))
+		if p[4].State != tracker.StateProbe {
+			return errors.Errorf("dead replica not state probe")
+		}
+		return nil
+	})
+
+	// Run the range through the replicate queue on n1.
+	trace, processErr, err := store0.Enqueue(
+		ctx, "replicate", repl0, true /* skipShouldQueue */, false /* async */)
+	require.NoError(t, err)
+	require.NoError(t, processErr)
+	formattedTrace := trace.String()
+	expectedMessages := []string{
+		`transitioning out of joint configuration`,
+		`leaseholder .* is being removed through an atomic replication change, transferring lease to`,
+		`lease transfer to .* complete`,
+	}
+	require.NoError(t, testutils.MatchInOrder(formattedTrace, expectedMessages...))
+
+	// Verify that the joint configuration has completed.
+	desc = tc.LookupRangeOrFatal(t, key)
+	require.Len(t, desc.Replicas().VoterDescriptors(), 3)
+	require.False(t, desc.Replicas().InAtomicReplicationChange(), desc)
+}
+
+// internalTransferLeaseFailureDuringJointConfig reproduces
+// https://github.com/cockroachdb/cockroach/issues/83687
+// and makes sure that if lease transfer fails during a joint configuration
+// the previous leaseholder will successfully re-aquire the lease.
+// The test proceeds as follows:
+//   - Creates a range with 3 replicas n1, n2, n3, and makes sure the lease is on n1
+//   - Makes sure lease transfers on this range fail from now on
+//   - Invokes AdminChangeReplicas to remove n1 and add n4
+//   - This causes the range to go into a joint configuration. A lease transfer
+//     is attempted to move the lease from n1 to n4 before exiting the joint config,
+//     but that fails, causing us to remain in the joint configuration with the original
+//     leaseholder having revoked its lease, but everyone else thinking it's still
+//     the leaseholder. In this situation, only n1 can re-aquire the lease as long as it is live.
+//   - We re-enable lease transfers on this range.
+//   - n1 is able to re-aquire the lease, due to the fix in #83686 which enables a
+//     VOTER_DEMOTING_LEARNER (n1) replica to get the lease if there's also a VOTER_INCOMING
+//     which is the case here (n4) and since n1 was the last leaseholder.
+//   - n1 transfers the lease away and the range leaves the joint configuration.
+func internalTransferLeaseFailureDuringJointConfig(t *testing.T, isManual bool) {
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	knobs := base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{}}
+	// Add a testing knob to allow us to fail all lease transfer commands on this
+	// range when they are being proposed.
+	var scratchRangeID int64
+	shouldFailProposal := func(args kvserverbase.ProposalFilterArgs) bool {
+		return args.Req.RangeID == roachpb.RangeID(atomic.LoadInt64(&scratchRangeID)) &&
+			args.Req.IsSingleTransferLeaseRequest()
+	}
+	const failureMsg = "injected lease transfer"
+	knobs.Store.(*kvserver.StoreTestingKnobs).TestingProposalFilter = func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+		if shouldFailProposal(args) {
+			// The lease transfer should be configured to bypass safety checks.
+			// See maybeTransferLeaseDuringLeaveJoint for an explanation.
+			require.True(t, args.Req.Requests[0].GetTransferLease().BypassSafetyChecks)
+			return kvpb.NewErrorf(failureMsg)
+		}
+		return nil
+	}
+	tc := testcluster.StartTestCluster(t, 4, base.TestClusterArgs{
+		ServerArgs:      base.TestServerArgs{Knobs: knobs},
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	scratchStartKey := tc.ScratchRange(t)
+	desc := tc.AddVotersOrFatal(t, scratchStartKey, tc.Targets(1, 2)...)
+	// Make sure n1 has the lease to start with.
+	err := tc.Server(0).DB().AdminTransferLease(context.Background(),
+		scratchStartKey, tc.Target(0).StoreID)
+	require.NoError(t, err)
+
+	// The next lease transfer should fail.
+	atomic.StoreInt64(&scratchRangeID, int64(desc.RangeID))
+
+	_, err = tc.Server(0).DB().AdminChangeReplicas(ctx,
+		scratchStartKey, desc, []kvpb.ReplicationChange{
+			{ChangeType: roachpb.REMOVE_VOTER, Target: tc.Target(0)},
+			{ChangeType: roachpb.ADD_VOTER, Target: tc.Target(3)},
+		})
+	require.Error(t, err)
+	require.Regexp(t, failureMsg, err)
+
+	// We're now in a joint configuration, n1 already revoked its lease but all
+	// other replicas think n1 is the leaseholder. As long as n1 is alive, it is
+	// the only one that can get the lease. It will retry and be able to do that
+	// thanks to the fix in #83686.
+	desc, err = tc.LookupRange(scratchStartKey)
+	require.NoError(t, err)
+	require.True(t, desc.Replicas().InAtomicReplicationChange())
+
+	// Allow further lease transfers to succeed.
+	atomic.StoreInt64(&scratchRangeID, 0)
+
+	if isManual {
+		// Manually transfer the lease to n1 (VOTER_DEMOTING_LEARNER).
+		err = tc.Server(0).DB().AdminTransferLease(context.Background(),
+			scratchStartKey, tc.Target(0).StoreID)
+		require.NoError(t, err)
+		// Make sure n1 has the lease
+		leaseHolder, err := tc.FindRangeLeaseHolder(desc, nil)
+		require.NoError(t, err)
+		require.Equal(t, tc.Target(0), leaseHolder,
+			errors.Errorf("Leaseholder supposed to be on n1."))
+	}
+
+	// Complete the replication change.
+	atomic.StoreInt64(&scratchRangeID, 0)
+	store := tc.GetFirstStoreFromServer(t, 0)
+	repl := store.LookupReplica(roachpb.RKey(scratchStartKey))
+	_, _, err = store.Enqueue(
+		ctx, "replicate", repl, true /* skipShouldQueue */, false, /* async */
+	)
+	require.NoError(t, err)
+	desc, err = tc.LookupRange(scratchStartKey)
+	require.NoError(t, err)
+	require.False(t, desc.Replicas().InAtomicReplicationChange())
+}
+
+// TestTransferLeaseFailureDuringJointConfig is using
+// internalTransferLeaseFailureDuringJointConfig and
+// completes the lease transfer to n1 “automatically”
+// by relying on replicate queue.
+func TestTransferLeaseFailureDuringJointConfigAuto(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	internalTransferLeaseFailureDuringJointConfig(t, false)
+}
+
+// TestTransferLeaseFailureDuringJointConfigManual is using
+// internalTransferLeaseFailureDuringJointConfig and
+// completes the lease transfer to n1 “manually” using
+// AdminTransferLease.
+func TestTransferLeaseFailureDuringJointConfigManual(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	internalTransferLeaseFailureDuringJointConfig(t, true)
 }
 
 // TestStoreLeaseTransferTimestampCacheRead verifies that the timestamp cache on
@@ -411,7 +604,7 @@ func TestStoreLeaseTransferTimestampCacheRead(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -443,7 +636,7 @@ func TestStoreLeaseTransferTimestampCacheRead(t *testing.T) {
 
 		// Read the key at readTS.
 		// NB: don't use SendWrapped because we want access to br.Timestamp.
-		var ba roachpb.BatchRequest
+		ba := &kvpb.BatchRequest{}
 		ba.Timestamp = readTS
 		ba.Add(getArgs(key))
 		br, pErr := tc.Servers[0].DistSender().Send(ctx, ba)
@@ -461,7 +654,7 @@ func TestStoreLeaseTransferTimestampCacheRead(t *testing.T) {
 		// Attempt to write under the read on the new leaseholder. The batch
 		// should get forwarded to a timestamp after the read.
 		// NB: don't use SendWrapped because we want access to br.Timestamp.
-		ba = roachpb.BatchRequest{}
+		ba = &kvpb.BatchRequest{}
 		ba.Timestamp = readTS
 		ba.Add(incrementArgs(key, 1))
 		br, pErr = tc.Servers[0].DistSender().Send(ctx, ba)
@@ -624,7 +817,7 @@ func TestLeaseholderRelocate(t *testing.T) {
 			Locality: localities[i],
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					ClockSource:          manualClock.UnixNano,
+					WallClock:            manualClock,
 					StickyEngineRegistry: stickyRegistry,
 				},
 			},
@@ -648,7 +841,7 @@ func TestLeaseholderRelocate(t *testing.T) {
 	// We start with having the range under test on (1,2,3).
 	tc.AddVotersOrFatal(t, rhsDesc.StartKey.AsRawKey(), tc.Targets(1, 2)...)
 
-	// Make sure the lease is on 3
+	// Make sure the lease is on 3 and is fully upgraded.
 	tc.TransferRangeLeaseOrFatal(t, rhsDesc, tc.Target(2))
 
 	// Check that the lease moved to 3.
@@ -677,19 +870,29 @@ func TestLeaseholderRelocate(t *testing.T) {
 		return nil
 	})
 
-	// Make sure lease moved to the preferred region, if .
+	// Make sure lease moved to the preferred region.
 	leaseHolder, err = tc.FindRangeLeaseHolder(rhsDesc, nil)
 	require.NoError(t, err)
 	require.Equal(t, tc.Target(3), leaseHolder)
 
-	// Double check that lease moved directly.
+	// Double check that lease moved directly. The tail of the lease history
+	// should all be on leaseHolder.NodeID. We may metamorphically enable
+	// kv.expiration_leases_only.enabled, in which case there will be a single
+	// expiration lease, but otherwise we'll have transferred an expiration lease
+	// and then upgraded to an epoch lease.
 	repl := tc.GetFirstStoreFromServer(t, 3).
 		LookupReplica(roachpb.RKey(rhsDesc.StartKey.AsRawKey()))
 	history := repl.GetLeaseHistory()
-	require.Equal(t, leaseHolder.NodeID,
-		history[len(history)-1].Replica.NodeID)
-	require.Equal(t, tc.Target(2).NodeID,
-		history[len(history)-2].Replica.NodeID)
+
+	require.Equal(t, leaseHolder.NodeID, history[len(history)-1].Replica.NodeID)
+	var prevLeaseHolder roachpb.NodeID
+	for i := len(history) - 1; i >= 0; i-- {
+		if id := history[i].Replica.NodeID; id != leaseHolder.NodeID {
+			prevLeaseHolder = id
+			break
+		}
+	}
+	require.Equal(t, tc.Target(2).NodeID, prevLeaseHolder)
 }
 
 func gossipLiveness(t *testing.T, tc *testcluster.TestCluster) {
@@ -721,9 +924,8 @@ func gossipLiveness(t *testing.T, tc *testcluster.TestCluster) {
 // lease in a single cycle of the replicate_queue.
 func TestLeasePreferencesDuringOutage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 88769, "flaky test")
 	defer log.Scope(t).Close(t)
-
-	skip.UnderStress(t, "https://github.com/cockroachdb/cockroach/issues/70113")
 
 	stickyRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyRegistry.CloseAllStickyInMemEngines()
@@ -760,9 +962,14 @@ func TestLeasePreferencesDuringOutage(t *testing.T) {
 			Locality: localities[i],
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					ClockSource:               manualClock.UnixNano,
+					WallClock:                 manualClock,
 					DefaultZoneConfigOverride: &zcfg,
 					StickyEngineRegistry:      stickyRegistry,
+				},
+				Store: &kvserver.StoreTestingKnobs{
+					// The Raft leadership may not end up on the eu node, but it needs to
+					// be able to acquire the lease anyway.
+					AllowLeaseRequestProposalsWhenNotLeader: true,
 				},
 			},
 			StoreSpecs: []base.StoreSpec{
@@ -837,7 +1044,7 @@ func TestLeasePreferencesDuringOutage(t *testing.T) {
 		return nil
 	})
 	_, _, enqueueError := tc.GetFirstStoreFromServer(t, 0).
-		ManuallyEnqueue(ctx, "replicate", repl, true)
+		Enqueue(ctx, "replicate", repl, true /* skipShouldQueue */, false /* async */)
 
 	require.NoError(t, enqueueError)
 
@@ -903,19 +1110,24 @@ func TestLeasesDontThrashWhenNodeBecomesSuspect(t *testing.T) {
 		locality("us-west"),
 		locality("us-west"),
 	}
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
 	// Speed up lease transfers.
 	stickyRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyRegistry.CloseAllStickyInMemEngines()
-	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 	serverArgs := make(map[int]base.TestServerArgs)
 	numNodes := 4
 	for i := 0; i < numNodes; i++ {
 		serverArgs[i] = base.TestServerArgs{
+			Settings: st,
 			Locality: localities[i],
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					ClockSource:               manualClock.UnixNano,
+					WallClock:                 manualClock,
 					DefaultZoneConfigOverride: &zcfg,
 					StickyEngineRegistry:      stickyRegistry,
 				},
@@ -1035,9 +1247,10 @@ func TestLeasesDontThrashWhenNodeBecomesSuspect(t *testing.T) {
 		for _, i := range []int{2, 3} {
 			repl := tc.GetFirstStoreFromServer(t, i).LookupReplica(roachpb.RKey(key))
 			require.NotNil(t, repl)
-			_, _, enqueueError := tc.GetFirstStoreFromServer(t, i).
-				ManuallyEnqueue(ctx, "replicate", repl, true)
-			require.NoError(t, enqueueError)
+			// We don't know who the leaseholder might be, so ignore errors.
+			_, _, _ = tc.GetFirstStoreFromServer(t, i).Enqueue(
+				ctx, "replicate", repl, true /* skipShouldQueue */, false, /* async */
+			)
 		}
 	}
 
@@ -1119,7 +1332,253 @@ func TestAlterRangeRelocate(t *testing.T) {
 	})
 
 	// Move lease 3 -> 5.
-	_, err = db.Exec("ALTER RANGE RELOCATE FROM $1 TO $2 FOR (SELECT range_id from crdb_internal.ranges where range_id = $3)", 3, 5, rhsDesc.RangeID)
+	_, err = db.Exec("ALTER RANGE RELOCATE FROM $1 TO $2 FOR (SELECT range_id from crdb_internal.ranges_no_leases where range_id = $3)", 3, 5, rhsDesc.RangeID)
 	require.NoError(t, err)
 	require.NoError(t, tc.WaitForVoters(rhsDesc.StartKey.AsRawKey(), tc.Targets(0, 3, 4)...))
+}
+
+// TestAcquireLeaseTimeout is a regression test that lease acquisition timeouts
+// always return a NotLeaseHolderError.
+func TestAcquireLeaseTimeout(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Set a timeout for the test context, to guard against the test getting stuck.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	// blockRangeID, when non-zero, will signal the replica to delay lease
+	// requests for the given range until the request's context is cancelled, and
+	// return the context error.
+	var blockRangeID int32
+
+	maybeBlockLeaseRequest := func(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+		if ba.IsSingleRequestLeaseRequest() && int32(ba.RangeID) == atomic.LoadInt32(&blockRangeID) {
+			t.Logf("blocked lease request for r%d", ba.RangeID)
+			<-ctx.Done()
+			return kvpb.NewError(ctx.Err())
+		}
+		return nil
+	}
+
+	manualClock := hlc.NewHybridManualClock()
+
+	// Start a two-node cluster.
+	const numNodes = 2
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			RaftConfig: base.RaftConfig{
+				// Lease request timeout depends on Raft election timeout, speed it up.
+				RaftHeartbeatIntervalTicks: 1,
+				RaftElectionTimeoutTicks:   2,
+			},
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					WallClock: manualClock,
+				},
+				Store: &kvserver.StoreTestingKnobs{
+					TestingRequestFilter:                    maybeBlockLeaseRequest,
+					AllowLeaseRequestProposalsWhenNotLeader: true,
+				},
+			},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	// Split off a range, upreplicate it to both servers, and move the lease
+	// from n1 to n2.
+	splitKey := roachpb.Key("a")
+	_, desc := tc.SplitRangeOrFatal(t, splitKey)
+	tc.AddVotersOrFatal(t, splitKey, tc.Target(1))
+	tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(1))
+	repl, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
+	require.NoError(t, err)
+
+	// Stop n2 and invalidate its leases by forwarding the clock.
+	tc.StopServer(1)
+	leaseDuration := tc.GetFirstStoreFromServer(t, 0).GetStoreConfig().RangeLeaseDuration
+	manualClock.Increment(leaseDuration.Nanoseconds())
+	require.False(t, repl.CurrentLeaseStatus(ctx).IsValid())
+
+	// Trying to acquire the lease should error with an empty NLHE, since the
+	// range doesn't have quorum.
+	var nlhe *kvpb.NotLeaseHolderError
+	_, err = repl.TestingAcquireLease(ctx)
+	require.Error(t, err)
+	require.IsType(t, &kvpb.NotLeaseHolderError{}, err) // check exact type
+	require.ErrorAs(t, err, &nlhe)
+	require.Empty(t, nlhe.Lease)
+
+	// Now for the real test: block lease requests for the range, and send off a
+	// bunch of sequential lease requests with a small delay, which should join
+	// onto the same lease request internally. All of these should return a NLHE
+	// when they time out, regardless of the internal mechanics.
+	atomic.StoreInt32(&blockRangeID, int32(desc.RangeID))
+
+	const attempts = 20
+	var wg sync.WaitGroup
+	errC := make(chan error, attempts)
+	wg.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		time.Sleep(10 * time.Millisecond)
+		go func() {
+			_, err := repl.TestingAcquireLease(ctx)
+			errC <- err
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	close(errC)
+
+	for err := range errC {
+		require.Error(t, err)
+		require.IsType(t, &kvpb.NotLeaseHolderError{}, err) // check exact type
+		require.ErrorAs(t, err, &nlhe)
+		require.Empty(t, nlhe.Lease)
+	}
+}
+
+// TestLeaseTransfersUseExpirationLeasesAndBumpToEpochBasedOnes does what it
+// says on the tin.
+func TestLeaseTransfersUseExpirationLeasesAndBumpToEpochBasedOnes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	mu := struct {
+		syncutil.Mutex
+		lease *roachpb.Lease
+	}{}
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
+	manualClock := hlc.NewHybridManualClock()
+	tci := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			Settings: st,
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					// Never ticked -- demonstrating that we're not relying on
+					// internal timers to upgrade leases.
+					WallClock: manualClock,
+				},
+				Store: &kvserver.StoreTestingKnobs{
+					// Outlandishly high to disable proactive renewal of
+					// expiration based leases. Lease upgrades happen
+					// immediately after applying without needing active
+					// renewal.
+					LeaseRenewalDurationOverride: 100 * time.Hour,
+					LeaseUpgradeInterceptor: func(lease *roachpb.Lease) {
+						mu.Lock()
+						defer mu.Unlock()
+						mu.lease = lease
+					},
+				},
+			},
+		},
+	})
+	tc := tci.(*testcluster.TestCluster)
+	defer tc.Stopper().Stop(ctx)
+
+	scratchKey := tc.ScratchRange(t)
+	// Add a replica; we're going to move the lease to it below.
+	desc := tc.AddVotersOrFatal(t, scratchKey, tc.Target(1))
+
+	n2 := tc.Server(1)
+	n2Target := tc.Target(1)
+
+	// Transfer the lease from n1 to n2.
+	tc.TransferRangeLeaseOrFatal(t, desc, n2Target)
+	testutils.SucceedsSoon(t, func() error {
+		li, _, err := tc.FindRangeLeaseEx(ctx, desc, nil)
+		require.NoError(t, err)
+		if !li.Current().OwnedBy(n2.GetFirstStoreID()) {
+			return errors.New("lease still owned by n1")
+		}
+		return nil
+	})
+
+	// Expect it to be upgraded to an epoch based lease.
+	tc.WaitForLeaseUpgrade(ctx, t, desc)
+
+	// Expect it to have been upgraded from an expiration based lease.
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, roachpb.LeaseExpiration, mu.lease.Type())
+}
+
+// TestLeaseUpgradeVersionGate tests the version gating for the lease-upgrade
+// process.
+//
+// TODO(irfansharif): Delete this in 23.1 (or whenever we get rid of the
+// clusterversion.EnableLeaseUpgrade).
+func TestLeaseUpgradeVersionGate(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettingsWithVersions(
+		clusterversion.TestingBinaryVersion,
+		clusterversion.ByKey(clusterversion.TODODelete_V22_2EnableLeaseUpgrade-1),
+		false, /* initializeVersion */
+	)
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
+	tci := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			Settings: st,
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
+					BinaryVersionOverride:          clusterversion.ByKey(clusterversion.TODODelete_V22_2EnableLeaseUpgrade - 1),
+				},
+			},
+		},
+	})
+	tc := tci.(*testcluster.TestCluster)
+	defer tc.Stopper().Stop(ctx)
+
+	scratchKey := tc.ScratchRange(t)
+	n1, n1Target := tc.Server(0), tc.Target(0)
+	n2, n2Target := tc.Server(1), tc.Target(1)
+
+	// Add a replica; we're going to move the lease to and from it below.
+	desc := tc.AddVotersOrFatal(t, scratchKey, n2Target)
+
+	// Transfer the lease from n1 to n2. It should be transferred as an
+	// epoch-based one since we've not upgraded past
+	// clusterversion.EnableLeaseUpgrade yet.
+	tc.TransferRangeLeaseOrFatal(t, desc, n2Target)
+	testutils.SucceedsSoon(t, func() error {
+		li, _, err := tc.FindRangeLeaseEx(ctx, desc, nil)
+		require.NoError(t, err)
+		if !li.Current().OwnedBy(n2.GetFirstStoreID()) {
+			return errors.New("lease still owned by n1")
+		}
+		require.Equal(t, roachpb.LeaseEpoch, li.Current().Type())
+		return nil
+	})
+
+	// Enable the version gate.
+	_, err := tc.Conns[0].ExecContext(ctx, `SET CLUSTER SETTING version = $1`,
+		clusterversion.ByKey(clusterversion.TODODelete_V22_2EnableLeaseUpgrade).String())
+	require.NoError(t, err)
+
+	// Transfer the lease back from n2 to n1. It should be transferred as an
+	// expiration-based lease that's later upgraded to an epoch based one now
+	// that we're past the version gate.
+	tc.TransferRangeLeaseOrFatal(t, desc, n1Target)
+	testutils.SucceedsSoon(t, func() error {
+		li, _, err := tc.FindRangeLeaseEx(ctx, desc, nil)
+		require.NoError(t, err)
+		if !li.Current().OwnedBy(n1.GetFirstStoreID()) {
+			return errors.New("lease still owned by n2")
+		}
+		return nil
+	})
+	tc.WaitForLeaseUpgrade(ctx, t, desc)
 }

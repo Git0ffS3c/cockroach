@@ -66,7 +66,8 @@ const (
 //
 // For each tuple with the ordinal 'i' (the ordinal among all tuples in the
 // hash table or within a single probing batch), keyID is calculated as:
-//   keyID = i + 1.
+//
+//	keyID = i + 1.
 //
 // keyID of 0 is reserved to indicate the end of the hash chain.
 type keyID = uint64
@@ -235,16 +236,20 @@ type HashTable struct {
 	// currently being probed.
 	Keys []coldata.Vec
 
-	// Same and Visited are only used when the HashTable contains non-distinct
-	// keys (in HashTableFullBuildMode mode).
-	//
 	// Same is a densely-packed list that stores the keyID of the next key in
 	// the hash table that has the same value as the current key. The HeadID of
 	// the key is the first key of that value found in the next linked list.
 	// This field will be lazily populated by the prober.
+	//
+	// Same is only used when the HashTable contains non-distinct keys (in
+	// HashTableFullBuildMode mode) and is probed via HashTableDefaultProbeMode
+	// mode.
 	Same []keyID
 	// Visited represents whether each of the corresponding keys have been
 	// touched by the prober.
+	//
+	// Visited is only used by the hash joiner when the HashTable contains
+	// non-distinct keys or when performing set-operation joins.
 	Visited []bool
 
 	// Vals stores columns of the build source that are specified in colsToStore
@@ -276,6 +281,9 @@ type HashTable struct {
 var _ colexecop.Resetter = &HashTable{}
 
 // NewHashTable returns a new HashTable.
+//
+// - allocator must be the allocator that is owned by the hash table and not
+// shared with any other components.
 //
 // - loadFactor determines the average number of tuples per bucket which, if
 // exceeded, will trigger resizing the hash table. This number can have a
@@ -387,6 +395,22 @@ func (ht *HashTable) shouldResize(numTuples int) bool {
 	return float64(numTuples)/float64(ht.numBuckets) > ht.loadFactor
 }
 
+// probeBufferInternalMaxMemUsed returns the maximum memory used by the slices
+// of hashTableProbeBuffer that are limited by coldata.BatchSize() in size.
+func probeBufferInternalMaxMemUsed() int64 {
+	// probeBufferInternalMaxMemUsed accounts for:
+	// - five uint64 slices:
+	//   - hashTableProbeBuffer.hashChains.Next
+	//   - hashTableProbeBuffer.ToCheck
+	//   - hashTableProbeBuffer.ToCheckID
+	//   - hashTableProbeBuffer.HeadID
+	//   - hashTableProbeBuffer.HashBuffer
+	// - two bool slices:
+	//   - hashTableProbeBuffer.differs
+	//   - hashTableProbeBuffer.distinct.
+	return memsize.Uint64*int64(5*coldata.BatchSize()) + memsize.Bool*int64(2*coldata.BatchSize())
+}
+
 // accountForLimitedSlices checks whether we have already accounted for the
 // memory used by the slices that are limited by coldata.BatchSize() in size
 // and adjusts the allocator accordingly if we haven't.
@@ -394,9 +418,13 @@ func (p *hashTableProbeBuffer) accountForLimitedSlices(allocator *colmem.Allocat
 	if p.limitedSlicesAreAccountedFor {
 		return
 	}
-	internalMemMaxUsed := memsize.Int64*int64(5*coldata.BatchSize()) + memsize.Bool*int64(2*coldata.BatchSize())
-	allocator.AdjustMemoryUsage(internalMemMaxUsed)
+	allocator.AdjustMemoryUsage(probeBufferInternalMaxMemUsed())
 	p.limitedSlicesAreAccountedFor = true
+}
+
+func (ht *HashTable) unlimitedSlicesCapacity() int64 {
+	// Note that if ht.ProbeScratch.First is nil, it'll have zero capacity.
+	return int64(cap(ht.BuildScratch.First) + cap(ht.ProbeScratch.First) + cap(ht.BuildScratch.Next))
 }
 
 // buildFromBufferedTuples builds the hash table from already buffered tuples
@@ -406,24 +434,47 @@ func (ht *HashTable) buildFromBufferedTuples() {
 	for ht.shouldResize(ht.Vals.Length()) {
 		ht.numBuckets *= 2
 	}
+	// Account for memory used by the internal auxiliary slices that are limited
+	// in size.
+	ht.ProbeScratch.accountForLimitedSlices(ht.allocator)
+	// Figure out the minimum capacities of the unlimited slices before actually
+	// allocating then.
+	needCapacity := int64(ht.numBuckets) + int64(ht.Vals.Length()+1) // ht.BuildScratch.First + ht.BuildScratch.Next
+	if ht.ProbeScratch.First != nil {
+		needCapacity += int64(ht.numBuckets) // ht.ProbeScratch.First
+	}
+	if needCapacity > ht.unlimitedSlicesCapacity() {
+		// We'll need to allocate larger slices then we currently have, so
+		// perform the memory accounting for the anticipated memory usage. Note
+		// that it might not be precise, so we'll reconcile after the
+		// allocations below.
+		ht.allocator.AdjustMemoryUsage(memsize.Uint64 * (needCapacity - ht.unlimitedSlicesNumUint64AccountedFor))
+		ht.unlimitedSlicesNumUint64AccountedFor = needCapacity
+	}
+	// Perform the actual build.
+	ht.buildFromBufferedTuplesNoAccounting()
+	// Now ensure that the accounting is precise (cap's of the slices might
+	// exceed len's that we've accounted for).
+	ht.allocator.AdjustMemoryUsageAfterAllocation(memsize.Uint64 * (ht.unlimitedSlicesCapacity() - ht.unlimitedSlicesNumUint64AccountedFor))
+	ht.unlimitedSlicesNumUint64AccountedFor = ht.unlimitedSlicesCapacity()
+}
+
+// buildFromBufferedTuples builds the hash table from already buffered tuples in
+// ht.Vals according to the current number of buckets. No memory accounting is
+// performed, so this function is guaranteed to not throw a memory error.
+func (ht *HashTable) buildFromBufferedTuplesNoAccounting() {
 	ht.BuildScratch.First = colexecutils.MaybeAllocateUint64Array(ht.BuildScratch.First, int(ht.numBuckets))
 	if ht.ProbeScratch.First != nil {
 		ht.ProbeScratch.First = colexecutils.MaybeAllocateUint64Array(ht.ProbeScratch.First, int(ht.numBuckets))
 	}
+	// ht.BuildScratch.Next is used to store the computed hash value of each key.
+	ht.BuildScratch.Next = colexecutils.MaybeAllocateUint64Array(ht.BuildScratch.Next, ht.Vals.Length()+1)
+
 	for i, keyCol := range ht.keyCols {
 		ht.Keys[i] = ht.Vals.ColVec(int(keyCol))
 	}
-	// ht.BuildScratch.Next is used to store the computed hash value of each key.
-	ht.BuildScratch.Next = colexecutils.MaybeAllocateUint64Array(ht.BuildScratch.Next, ht.Vals.Length()+1)
 	ht.ComputeBuckets(ht.BuildScratch.Next[1:], ht.Keys, ht.Vals.Length(), nil /* sel */)
 	ht.buildNextChains(ht.BuildScratch.First, ht.BuildScratch.Next, 1 /* offset */, uint64(ht.Vals.Length()))
-	// Account for memory used by the internal auxiliary slices that are
-	// limited in size.
-	ht.ProbeScratch.accountForLimitedSlices(ht.allocator)
-	// Note that if ht.ProbeScratch.First is nil, it'll have zero capacity.
-	newUint64Count := int64(cap(ht.BuildScratch.First) + cap(ht.ProbeScratch.First) + cap(ht.BuildScratch.Next))
-	ht.allocator.AdjustMemoryUsage(memsize.Int64 * (newUint64Count - ht.unlimitedSlicesNumUint64AccountedFor))
-	ht.unlimitedSlicesNumUint64AccountedFor = newUint64Count
 }
 
 // FullBuild executes the entirety of the hash table build phase using the input
@@ -462,114 +513,118 @@ func (ht *HashTable) FullBuild(input colexecop.Operator) {
 //
 // Let's go through an example of how this function works: our input stream
 // contains the following tuples:
-//   {-6}, {-6}, {-7}, {-5}, {-8}, {-5}, {-5}, {-8}.
+//
+//	{-6}, {-6}, {-7}, {-5}, {-8}, {-5}, {-5}, {-8}.
+//
 // (Note that negative values are chosen in order to visually distinguish them
 // from the IDs that we'll be working with below.)
 // We will use coldata.BatchSize() == 4 and let's assume that we will use a
 // hash function
-//   h(-5) = 1, h(-6) = 1, h(-7) = 0, h(-8) = 0
+//
+//	h(-5) = 1, h(-6) = 1, h(-7) = 0, h(-8) = 0
+//
 // with two buckets in the hash table.
 //
 // I. we get a batch [-6, -6, -7, -5].
-//   1. ComputeHashAndBuildChains:
-//      a) compute hash buckets:
-//           HashBuffer = [1, 1, 0, 1]
-//           ProbeScratch.Next = [reserved, 1, 1, 0, 1]
-//      b) build 'Next' chains between hash buckets:
-//           ProbeScratch.First = [3, 1] (length of First == # of hash buckets)
-//           ProbeScratch.Next  = [reserved, 2, 4, 0, 0]
-//         (Note that we have a hash collision in the bucket with hash 1.)
-//   2. RemoveDuplicates within the batch:
-//      1) first iteration in FindBuckets:
-//         a) all 4 tuples included to be checked against heads of their hash
-//            chains:
-//              ToCheck = [0, 1, 2, 3]
-//              ToCheckID = [1, 1, 3, 1]
-//         b) after performing the equality check using CheckProbeForDistinct,
-//            tuples 0, 1, 2 are found to be equal to the heads of their hash
-//            chains while tuple 3 (-5) has a hash collision with tuple 0 (-6),
-//            so it is kept for another iteration:
-//              ToCheck = [3]
-//              ToCheckID = [x, x, x, 2]
-//              HeadID  = [1, 1, 3, x]
-//      2) second iteration in FindBuckets finds that tuple 3 (-5) again has a
-//         hash collision with tuple 1 (-6), so it is kept for another
-//         iteration:
-//              ToCheck = [3]
-//              ToCheckID = [x, x, x, 4]
-//              HeadID  = [1, 1, 3, x]
-//      3) third iteration finds a match for tuple (the tuple itself), no more
-//         tuples to check, so the iterations stop:
-//              ToCheck = []
-//              HeadID  = [1, 1, 3, 4]
-//      4) the duplicates are represented by having the same HeadID values, and
-//         all duplicates are removed in updateSel:
-//           batch = [-6, -6, -7, -5]
-//           length = 3, sel = [0, 2, 3]
-//         Notably, HashBuffer is compacted accordingly:
-//           HashBuffer = [1, 0, 1]
-//   3. The hash table is empty, so RemoveDuplicates against the hash table is
-//      skipped.
-//   4. All 3 tuples still present in the batch are distinct, they are appended
-//      to the hash table and will be emitted to the output:
-//        Vals = [-6, -7, -5]
-//        BuildScratch.First = [2, 1]
-//        BuildScratch.Next  = [reserved, 3, 0, 0]
-//   We have fully processed the first batch.
+//  1. ComputeHashAndBuildChains:
+//     a) compute hash buckets:
+//     HashBuffer = [1, 1, 0, 1]
+//     ProbeScratch.Next = [reserved, 1, 1, 0, 1]
+//     b) build 'Next' chains between hash buckets:
+//     ProbeScratch.First = [3, 1] (length of First == # of hash buckets)
+//     ProbeScratch.Next  = [reserved, 2, 4, 0, 0]
+//     (Note that we have a hash collision in the bucket with hash 1.)
+//  2. RemoveDuplicates within the batch:
+//  1. first iteration in FindBuckets:
+//     a) all 4 tuples included to be checked against heads of their hash
+//     chains:
+//     ToCheck = [0, 1, 2, 3]
+//     ToCheckID = [1, 1, 3, 1]
+//     b) after performing the equality check using CheckProbeForDistinct,
+//     tuples 0, 1, 2 are found to be equal to the heads of their hash
+//     chains while tuple 3 (-5) has a hash collision with tuple 0 (-6),
+//     so it is kept for another iteration:
+//     ToCheck = [3]
+//     ToCheckID = [x, x, x, 2]
+//     HeadID  = [1, 1, 3, x]
+//  2. second iteration in FindBuckets finds that tuple 3 (-5) again has a
+//     hash collision with tuple 1 (-6), so it is kept for another
+//     iteration:
+//     ToCheck = [3]
+//     ToCheckID = [x, x, x, 4]
+//     HeadID  = [1, 1, 3, x]
+//  3. third iteration finds a match for tuple (the tuple itself), no more
+//     tuples to check, so the iterations stop:
+//     ToCheck = []
+//     HeadID  = [1, 1, 3, 4]
+//  4. the duplicates are represented by having the same HeadID values, and
+//     all duplicates are removed in updateSel:
+//     batch = [-6, -6, -7, -5]
+//     length = 3, sel = [0, 2, 3]
+//     Notably, HashBuffer is compacted accordingly:
+//     HashBuffer = [1, 0, 1]
+//  3. The hash table is empty, so RemoveDuplicates against the hash table is
+//     skipped.
+//  4. All 3 tuples still present in the batch are distinct, they are appended
+//     to the hash table and will be emitted to the output:
+//     Vals = [-6, -7, -5]
+//     BuildScratch.First = [2, 1]
+//     BuildScratch.Next  = [reserved, 3, 0, 0]
+//     We have fully processed the first batch.
 //
 // II. we get a batch [-8, -5, -5, -8].
-//   1. ComputeHashAndBuildChains:
-//      a) compute hash buckets:
-//           HashBuffer = [0, 1, 1, 0]
-//           ProbeScratch.Next = [reserved, 0, 1, 1, 0]
-//      b) build 'Next' chains between hash buckets:
-//           ProbeScratch.First = [1, 2]
-//           ProbeScratch.Next  = [reserved, 4, 3, 0, 0]
-//   2. RemoveDuplicates within the batch:
-//      1) first iteration in FindBuckets:
-//         a) all 4 tuples included to be checked against heads of their hash
-//            chains:
-//              ToCheck = [0, 1, 2, 3]
-//              ToCheckID = [1, 2, 2, 1]
-//         b) after performing the equality check using CheckProbeForDistinct,
-//            all tuples are found to be equal to the heads of their hash
-//            chains, no more tuples to check, so the iterations stop:
-//              ToCheck = []
-//              HeadID  = [1, 2, 2, 1]
-//      2) the duplicates are represented by having the same HeadID values, and
-//         all duplicates are removed in updateSel:
-//           batch = [-8, -5, -5, -8]
-//           length = 2, sel = [0, 1]
-//         Notably, HashBuffer is compacted accordingly:
-//           HashBuffer = [0, 1]
-//   3. RemoveDuplicates against the hash table:
-//      1) first iteration in FindBuckets:
-//         a) both tuples included to be checked against heads of their hash
-//            chains of the hash table (meaning BuildScratch.First and
-//            BuildScratch.Next are used to populate ToCheckID values):
-//              ToCheck = [0, 1]
-//              ToCheckID = [2, 1]
-//         b) after performing the equality check using CheckBuildForDistinct,
-//            both tuples are found to have hash collisions (-8 with -7 and -5
-//            with -6), so both are kept for another iteration:
-//              ToCheck = [0, 1]
-//              ToCheckID = [0, 2]
-//      2) second iteration in FindBuckets finds that tuple 1 (-5) has a match
-//         whereas tuple 0 (-8) is distinct (because its ToCheckID is 0), no
-//         more tuples to check:
-//              ToCheck = []
-//              HeadID  = [1, 0]
-//      3) duplicates are represented by having HeadID value of 0, so the batch
-//         is updated to only include tuple -8:
-//           batch = [-8, -5, -5, -8]
-//           length = 1, sel = [0]
-//           HashBuffer = [0]
-//   4. The single tuple still present in the batch is distinct, it is appended
-//      to the hash table and will be emitted to the output:
-//        Vals = [-6, -7, -5, -8]
-//        BuildScratch.First = [2, 1]
-//        BuildScratch.Next  = [reserved, 3, 4, 0, 0]
-//   We have fully processed the second batch and the input as a whole.
+//  1. ComputeHashAndBuildChains:
+//     a) compute hash buckets:
+//     HashBuffer = [0, 1, 1, 0]
+//     ProbeScratch.Next = [reserved, 0, 1, 1, 0]
+//     b) build 'Next' chains between hash buckets:
+//     ProbeScratch.First = [1, 2]
+//     ProbeScratch.Next  = [reserved, 4, 3, 0, 0]
+//  2. RemoveDuplicates within the batch:
+//  1. first iteration in FindBuckets:
+//     a) all 4 tuples included to be checked against heads of their hash
+//     chains:
+//     ToCheck = [0, 1, 2, 3]
+//     ToCheckID = [1, 2, 2, 1]
+//     b) after performing the equality check using CheckProbeForDistinct,
+//     all tuples are found to be equal to the heads of their hash
+//     chains, no more tuples to check, so the iterations stop:
+//     ToCheck = []
+//     HeadID  = [1, 2, 2, 1]
+//  2. the duplicates are represented by having the same HeadID values, and
+//     all duplicates are removed in updateSel:
+//     batch = [-8, -5, -5, -8]
+//     length = 2, sel = [0, 1]
+//     Notably, HashBuffer is compacted accordingly:
+//     HashBuffer = [0, 1]
+//  3. RemoveDuplicates against the hash table:
+//  1. first iteration in FindBuckets:
+//     a) both tuples included to be checked against heads of their hash
+//     chains of the hash table (meaning BuildScratch.First and
+//     BuildScratch.Next are used to populate ToCheckID values):
+//     ToCheck = [0, 1]
+//     ToCheckID = [2, 1]
+//     b) after performing the equality check using CheckBuildForDistinct,
+//     both tuples are found to have hash collisions (-8 with -7 and -5
+//     with -6), so both are kept for another iteration:
+//     ToCheck = [0, 1]
+//     ToCheckID = [0, 2]
+//  2. second iteration in FindBuckets finds that tuple 1 (-5) has a match
+//     whereas tuple 0 (-8) is distinct (because its ToCheckID is 0), no
+//     more tuples to check:
+//     ToCheck = []
+//     HeadID  = [1, 0]
+//  3. duplicates are represented by having HeadID value of 0, so the batch
+//     is updated to only include tuple -8:
+//     batch = [-8, -5, -5, -8]
+//     length = 1, sel = [0]
+//     HashBuffer = [0]
+//  4. The single tuple still present in the batch is distinct, it is appended
+//     to the hash table and will be emitted to the output:
+//     Vals = [-6, -7, -5, -8]
+//     BuildScratch.First = [2, 1]
+//     BuildScratch.Next  = [reserved, 3, 4, 0, 0]
+//     We have fully processed the second batch and the input as a whole.
 //
 // NOTE: b *must* be a non-zero length batch.
 func (ht *HashTable) DistinctBuild(batch coldata.Batch) {
@@ -688,20 +743,18 @@ func (ht *HashTable) AppendAllDistinct(batch coldata.Batch) {
 	}
 }
 
-// MaybeRepairAfterDistinctBuild checks whether the hash table built via
-// DistinctBuild is in an inconsistent state and repairs it if so.
-func (ht *HashTable) MaybeRepairAfterDistinctBuild() {
-	// BuildScratch.Next has an extra 0th element not used by the tuples
-	// reserved for the end of the chain.
-	if len(ht.BuildScratch.Next) < ht.Vals.Length()+1 {
-		// The hash table in such a state that some distinct tuples were
-		// appended to ht.Vals, but 'Next' and 'First' slices were not updated
-		// accordingly.
-		numConsistentTuples := len(ht.BuildScratch.Next) - 1
-		lastBatchNumDistinctTuples := ht.Vals.Length() - numConsistentTuples
-		ht.BuildScratch.Next = append(ht.BuildScratch.Next, ht.ProbeScratch.HashBuffer[:lastBatchNumDistinctTuples]...)
-		ht.buildNextChains(ht.BuildScratch.First, ht.BuildScratch.Next, uint64(numConsistentTuples)+1, uint64(lastBatchNumDistinctTuples))
-	}
+// RepairAfterDistinctBuild rebuilds the hash table populated via DistinctBuild
+// in the case a memory error was thrown.
+func (ht *HashTable) RepairAfterDistinctBuild() {
+	// Note that we don't try to be smart and "repair" the already built hash
+	// table in which only the most recently added tuples might need to be
+	// "built". We do it this way because the memory error could have occurred
+	// in several spots making it harder to reason about what are the
+	// "consistent" tuples and what are those that need to be repaired. This is
+	// a minor performance hit, but it is done only once throughout the lifetime
+	// of the unordered distinct when it just spilled to disk, so the regression
+	// is ok.
+	ht.buildFromBufferedTuplesNoAccounting()
 }
 
 // checkCols performs a column by column checkCol on the key columns.
@@ -948,4 +1001,20 @@ func (ht *HashTable) Reset(_ context.Context) {
 		// so we make the length 1).
 		ht.BuildScratch.Next = ht.BuildScratch.Next[:1]
 	}
+}
+
+// Release releases all of the slices used by the hash table as well as the
+// corresponding memory reservations.
+//
+// The hash table becomes unusable, so any method calls after Release() will
+// result in an undefined behavior.
+//
+// Note that this happens to implement the execreleasable.Releasable interface,
+// but this method serves a different purpose (namely we want to release the
+// hash table mid-execution, when the spilling to disk occurs), so the hash
+// table is not added to the slice of objects that are released on the flow
+// cleanup.
+func (ht *HashTable) Release() {
+	ht.allocator.ReleaseAll()
+	*ht = HashTable{}
 }

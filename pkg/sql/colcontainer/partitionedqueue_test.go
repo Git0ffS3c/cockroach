@@ -19,16 +19,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/marusama/semaphore"
 	"github.com/stretchr/testify/require"
 )
 
 type fdCountingFSFile struct {
-	fs.File
+	vfs.File
 	onCloseCb func()
 }
 
@@ -41,7 +41,7 @@ func (f *fdCountingFSFile) Close() error {
 }
 
 type fdCountingFS struct {
-	fs.FS
+	vfs.FS
 	writeFDs int
 	readFDs  int
 }
@@ -58,7 +58,7 @@ func (f *fdCountingFS) assertOpenFDs(
 	require.Equal(t, expectedReadFDs, f.readFDs)
 }
 
-func (f *fdCountingFS) Create(name string) (fs.File, error) {
+func (f *fdCountingFS) Create(name string) (vfs.File, error) {
 	file, err := f.FS.Create(name)
 	if err != nil {
 		return nil, err
@@ -67,16 +67,7 @@ func (f *fdCountingFS) Create(name string) (fs.File, error) {
 	return &fdCountingFSFile{File: file, onCloseCb: func() { f.writeFDs-- }}, nil
 }
 
-func (f *fdCountingFS) CreateWithSync(name string, bytesPerSync int) (fs.File, error) {
-	file, err := f.FS.CreateWithSync(name, bytesPerSync)
-	if err != nil {
-		return nil, err
-	}
-	f.writeFDs++
-	return &fdCountingFSFile{File: file, onCloseCb: func() { f.writeFDs-- }}, nil
-}
-
-func (f *fdCountingFS) Open(name string) (fs.File, error) {
+func (f *fdCountingFS) Open(name string, opts ...vfs.OpenOption) (vfs.File, error) {
 	file, err := f.FS.Open(name)
 	if err != nil {
 		return nil, err
@@ -113,7 +104,7 @@ func TestPartitionedDiskQueue(t *testing.T) {
 	queueCfg.FS = countingFS
 
 	t.Run("ReopenReadPartition", func(t *testing.T) {
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc, testMemAcc)
 
 		countingFS.assertOpenFDs(t, sem, 0, 0)
 		require.NoError(t, p.Enqueue(ctx, 0, batch))
@@ -177,7 +168,7 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 		// new partition being written to when closedForWrites from maxPartitions
 		// and writing the merged result to a single new partition.
 		sem := colexecop.NewTestingSemaphore(maxPartitions + 1)
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyCloseOnNewPartition, testDiskAcc)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyCloseOnNewPartition, testDiskAcc, testMemAcc)
 
 		// Define sortRepartition to be able to call this helper function
 		// recursively.
@@ -256,7 +247,7 @@ func TestPartitionedDiskQueueSimulatedExternal(t *testing.T) {
 		// number of partitions partitioned to and 2 represents the file descriptors
 		// for the left and right side in the case of a repartition.
 		sem := colexecop.NewTestingSemaphore(maxPartitions + 2)
-		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc)
+		p := colcontainer.NewPartitionedDiskQueue(typs, queueCfg, sem, colcontainer.PartitionerStrategyDefault, testDiskAcc, testMemAcc)
 
 		// joinRepartition will perform the partitioning that happens during a hash
 		// join. expectedRepartitionReadFDs are the read file descriptors that are

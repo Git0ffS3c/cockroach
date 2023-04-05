@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 )
 
@@ -125,18 +125,18 @@ const (
 type TableColumnOrdinal int32
 
 // TableColumnOrdinalSet contains a set of TableColumnOrdinal values.
-type TableColumnOrdinalSet = util.FastIntSet
+type TableColumnOrdinalSet = intsets.Fast
 
 // NodeColumnOrdinal is the 0-based ordinal index of a column produced by a
 // Node. It is used when referring to a column in an input to an operator.
 type NodeColumnOrdinal int32
 
 // NodeColumnOrdinalSet contains a set of NodeColumnOrdinal values.
-type NodeColumnOrdinalSet = util.FastIntSet
+type NodeColumnOrdinalSet = intsets.Fast
 
 // CheckOrdinalSet contains the ordinal positions of a set of check constraints
 // taken from the opt.Table.Check collection.
-type CheckOrdinalSet = util.FastIntSet
+type CheckOrdinalSet = intsets.Fast
 
 // AggInfo represents an aggregation (see ConstructGroupBy).
 type AggInfo struct {
@@ -207,7 +207,7 @@ type RecursiveCTEIterationFn func(ef Factory, bufferRef Node) (Plan, error)
 // ApplyJoinPlanRightSideFn creates a plan for an iteration of ApplyJoin, given
 // a row produced from the left side. The plan is guaranteed to produce the
 // rightColumns passed to ConstructApplyJoin (in order).
-type ApplyJoinPlanRightSideFn func(ef Factory, leftRow tree.Datums) (Plan, error)
+type ApplyJoinPlanRightSideFn func(ctx context.Context, ef Factory, leftRow tree.Datums) (Plan, error)
 
 // Cascade describes a cascading query. The query uses a node created by
 // ConstructBuffer as an input; it should only be triggered if this buffer is
@@ -310,6 +310,12 @@ type EstimatedStats struct {
 	// LimitHint is the "soft limit" of the number of result rows that may be
 	// required. See physical.Required for details.
 	LimitHint float64
+	// Forecast is set only for scans; it is true if the stats for the scan were
+	// forecasted rather than collected.
+	Forecast bool
+	// ForecastAt is set only for scans with forecasted stats; it is the time the
+	// forecast was for (which could be in the past, present, or future).
+	ForecastAt time.Time
 }
 
 // ExecutionStats contain statistics about a given operator gathered from the
@@ -324,10 +330,79 @@ type ExecutionStats struct {
 	// operator.
 	VectorizedBatchCount optional.Uint
 
-	KVTime           optional.Duration
-	KVContentionTime optional.Duration
-	KVBytesRead      optional.Uint
-	KVRowsRead       optional.Uint
+	KVTime                optional.Duration
+	KVContentionTime      optional.Duration
+	KVBytesRead           optional.Uint
+	KVRowsRead            optional.Uint
+	KVBatchRequestsIssued optional.Uint
+
+	// Storage engine iterator statistics
+	//
+	// These statistics provide observability into the work performed by
+	// low-level iterators during the execution of a query. Interpreting these
+	// statistics requires some context on the mechanics of MVCC and LSMs.
+	//
+	//
+	// SeekCount and StepCount record the cumulative number of seeks and steps
+	// performed on Pebble iterators while servicing a query. Every scan or
+	// point lookup within a KV range requires reading from two distinct
+	// keyspaces within the storage engine: the MVCC row data keyspace and the
+	// lock table. As an example, a typical point lookup will seek once within
+	// the MVCC row data and once within the lock table, yielding SeekCount=2.
+	//
+	// Cockroach's MVCC layer is implemented (mostly) above Pebble, so the keys
+	// returned by Pebble iterators can be MVCC garbage. An accumulation of MVCC
+	// garbage amplifies the number of top-level Pebble iterator operations
+	// performed, inflating {Seek,Step}Count relative to RowCount.
+	//
+	//
+	// InternalSeekCount and InternalStepCount record the cumulative number of
+	// low-level seeks and steps performed among LSM internal keys while
+	// servicing a query. These internal keys have a many-to-one relationship
+	// with the visible keys returned by the Pebble iterator due to the
+	// mechanics of a LSM. When mutating the LSM, deleted or overwritten keys
+	// are not updated in-place. Instead new 'internal keys' are recorded, and
+	// Pebble iterators are responsible for ignoring obsolete, shadowed internal
+	// keys. Asynchronous background compactions are responsible for eventually
+	// removing obsolete internal keys to reclaim storage space and reduce the
+	// amount of work iterators must perform.
+	//
+	// Internal keys that must be seeked or stepped through can originate from a
+	// few sources:
+	//   - Tombstones: Pebble models deletions as tombstone internal keys. An
+	//     iterator observing a tombstone must skip both the tombstone itself
+	//     and any shadowed keys. In Cockroach, these tombstones may be written
+	//     within the MVCC keyspace due to transaction aborts and MVCC garbage
+	//     collection. These tombstones may be written within the lock table
+	//     during intent resolution.
+	//   - Overwritten keys: Overwriting existing keys adds new internal keys,
+	//     again requiring iterators to skip the obsolete shadowed keys.
+	//     Overwritten keys should be rare since (a) CockroachDB's MVCC layer
+	//     creates new KV versions (across different transactions) (b)
+	//     transactions that write the same key multiple times will cause
+	//     overwrites to the MVCC key and the lock table key, but they should be
+	//     rare.
+	//   - Concurrent writes: While a Pebble iterator is open, new keys may be
+	//     committed to the LSM. The internal Pebble iterator will observe these
+	//     new keys but skip over them to ensure the Pebble iterator provides a
+	//     consistent view of the LSM state.
+	//   - LSM snapshots: Cockroach's KV layer sometimes opens a 'LSM snapshot,'
+	//     which provides a long-lived consistent view of the LSM at a
+	//     particular moment. LSM snapshots prevent compactions from deleting
+	//     obsolete keys if they're required for the LSM snapshot's consistent
+	//     view. Snapshots don't introduce new obsolete internal keys, just
+	//     postpone their reclamation during compactions.
+	//   - MVCC range tombstones: Although the MVCC layer is mostly implemented
+	//     above the Pebble interface, Pebble iterators perform a role in the
+	//     implementation of MVCC range tombstones used for bulk deletions (eg,
+	//     table drops, truncates, import cancellation) in 23.1+. In some cases,
+	//     Pebble iterators will skip over garbage MVCC keys if they're marked
+	//     as garbage by a MVCC range tombstone. Since stepping over these
+	//     skipped keys is performed internally within Pebble, these steps are
+	//     recorded within InternalStepCounts.
+	//
+	// Typically, a large amplification of internal iterator seeks/steps
+	// relative to top-level seeks/steps is unexpected.
 
 	StepCount         optional.Uint
 	InternalStepCount optional.Uint
@@ -336,6 +411,7 @@ type ExecutionStats struct {
 
 	MaxAllocatedMem  optional.Uint
 	MaxAllocatedDisk optional.Uint
+	SQLCPUTime       optional.Duration
 
 	// Nodes on which this operator was executed.
 	Nodes []string
@@ -362,4 +438,35 @@ const (
 	PartialStreaming
 	// Streaming means that the grouping columns are fully ordered.
 	Streaming
+)
+
+// JoinAlgorithm is the type of join algorithm used.
+type JoinAlgorithm int8
+
+// The following are all the supported join algorithms.
+const (
+	HashJoin JoinAlgorithm = iota
+	CrossJoin
+	IndexJoin
+	LookupJoin
+	MergeJoin
+	InvertedJoin
+	ApplyJoin
+	ZigZagJoin
+	NumJoinAlgorithms
+)
+
+// ScanCountType is the type of count of scan operations in a query.
+type ScanCountType int
+
+const (
+	// ScanCount is the count of all scans in a query.
+	ScanCount ScanCountType = iota
+	// ScanWithStatsCount is the count of scans with statistics in a query.
+	ScanWithStatsCount
+	// ScanWithStatsForecastCount is the count of scans which used forecasted
+	// statistics in a query.
+	ScanWithStatsForecastCount
+	// NumScanCountTypes is the total number of types of counts of scans.
+	NumScanCountTypes
 )

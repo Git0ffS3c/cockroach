@@ -16,7 +16,6 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/password"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -65,16 +64,13 @@ var SCRAMCost = settings.RegisterIntSetting(
 		"the hashing cost to use when storing passwords supplied as cleartext by SQL clients "+
 			"with the hashing method scram-sha-256 (allowed range: %d-%d)",
 		password.ScramMinCost, password.ScramMaxCost),
-	// The minimum value 4096 incurs a password check latency of ~2ms on AMD 3950X 3.7GHz.
-	//
-	// The default value 119680 incurs ~60ms latency on the same hw.
+	// The minimum value 4096 incurs a password check latency of ~18ms when
+	// connecting from a e2-standard-2 instance.
+	// The default value 10610 incurs ~60ms latency on the same hw.
 	// This default was calibrated to incur a similar check latency as the
 	// default value for BCryptCost above.
 	// For further discussion, see the explanation on bcryptCostToSCRAMIterCount
 	// below.
-	//
-	// For reference, value 250000 incurs ~125ms latency on the same hw,
-	// value 1000000 incurs ~500ms.
 	password.DefaultSCRAMCost,
 	func(i int64) error {
 		if i < password.ScramMinCost || i > password.ScramMaxCost {
@@ -117,18 +113,6 @@ var PasswordHashMethod = settings.RegisterEnumSetting(
 	},
 ).WithPublic()
 
-// hasClusterVersion verifies that all nodes have been upgraded to
-// support the given target version key.
-func hasClusterVersion(
-	ctx context.Context, values *settings.Values, versionkey clusterversion.Key,
-) bool {
-	var vh clusterversion.Handle
-	if values != nil {
-		vh = values.Opaque().(clusterversion.Handle)
-	}
-	return vh != nil && vh.IsActive(ctx, versionkey)
-}
-
 // GetConfiguredPasswordCost returns the configured hashing cost
 // for the given method.
 func GetConfiguredPasswordCost(
@@ -148,16 +132,8 @@ func GetConfiguredPasswordCost(
 
 // GetConfiguredPasswordHashMethod returns the configured hash method
 // to use before storing passwords provided in cleartext from clients.
-func GetConfiguredPasswordHashMethod(
-	ctx context.Context, sv *settings.Values,
-) (method password.HashMethod) {
-	method = password.HashMethod(PasswordHashMethod.Get(sv))
-	if method == password.HashSCRAMSHA256 && !hasClusterVersion(ctx, sv, clusterversion.SCRAMAuthentication) {
-		// Not all nodes are upgraded to understand SCRAM yet. Force
-		// Bcrypt for now, otherwise previous-version nodes will get confused.
-		method = password.HashBCrypt
-	}
-	return method
+func GetConfiguredPasswordHashMethod(sv *settings.Values) (method password.HashMethod) {
+	return password.HashMethod(PasswordHashMethod.Get(sv))
 }
 
 // AutoDetectPasswordHashes is the cluster setting that configures whether
@@ -185,7 +161,30 @@ var MinPasswordLength = settings.RegisterIntSetting(
 var AutoUpgradePasswordHashes = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"server.user_login.upgrade_bcrypt_stored_passwords_to_scram.enabled",
-	"whether to automatically re-encode stored passwords using crdb-bcrypt to scram-sha-256",
+	"if server.user_login.password_encryption=scram-sha-256, this controls "+
+		"whether to automatically re-encode stored passwords using crdb-bcrypt to scram-sha-256",
+	true,
+).WithPublic()
+
+// AutoDowngradePasswordHashes is the cluster setting that configures whether to
+// automatically re-encode stored passwords using scram-sha-256 to crdb-bcrypt.
+var AutoDowngradePasswordHashes = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"server.user_login.downgrade_scram_stored_passwords_to_bcrypt.enabled",
+	"if server.user_login.password_encryption=crdb-bcrypt, this controls "+
+		"whether to automatically re-encode stored passwords using scram-sha-256 to crdb-bcrypt",
+	true,
+).WithPublic()
+
+// AutoRehashOnSCRAMCostChange is the cluster setting that configures whether to
+// automatically re-encode stored passwords using scram-sha-256 to use a new
+// default cost setting.
+var AutoRehashOnSCRAMCostChange = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"server.user_login.rehash_scram_stored_passwords_on_cost_change.enabled",
+	"if server.user_login.password_hashes.default_cost.scram_sha_256 differs from, "+
+		"the cost in a stored hash, this controls whether to automatically re-encode "+
+		"stored passwords using scram-sha-256 with the new default cost",
 	true,
 ).WithPublic()
 

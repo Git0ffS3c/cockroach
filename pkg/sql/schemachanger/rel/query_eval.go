@@ -14,6 +14,7 @@ import (
 	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -24,19 +25,44 @@ type evalContext struct {
 	db *Database
 	ri ResultIterator
 
-	facts             []fact
-	depth, cur        int
+	facts []fact
+
+	// depth and cur relate to the join depth in the entities list.
+	depth, cur queryDepth
+
 	slots             []slot
 	filterSliceCaches map[int][]reflect.Value
+	curSubQuery       int
 }
 
 func newEvalContext(q *Query) *evalContext {
 	return &evalContext{
 		q:     q,
-		depth: len(q.entities),
-		slots: append(make([]slot, 0, len(q.slots)), q.slots...),
+		depth: queryDepth(len(q.entities)),
+		slots: cloneSlots(q.slots),
 		facts: q.facts,
 	}
+}
+
+// cloneSlots clones the slots of a query for use in an evalContext.
+func cloneSlots(slots []slot) []slot {
+	clone := append(make([]slot, 0, len(slots)), slots...)
+	for i := range clone {
+		// If there are any slots which map to a set of allowed values, we need
+		// to clone those values because during query evaluation, we'll fill in
+		// inline values in the context of the current entity set. This matters
+		// in particular for constraints related to entities or strings; their
+		// inline values depend on the entitySet.
+		if clone[i].any != nil {
+			vals := clone[i].any
+			clone[i].any = append(make([]typedValue, 0, len(vals)), vals...)
+		}
+		if clone[i].not != nil {
+			cloned := *clone[i].not
+			clone[i].not = &cloned
+		}
+	}
+	return clone
 }
 
 type evalResult evalContext
@@ -72,7 +98,14 @@ func (ec *evalContext) Iterate(db *Database, ri ResultIterator) error {
 // filters and pass along the result or that we need to go on and
 // join the next entity.
 func (ec *evalContext) iterateNext() error {
-
+	nextSubQuery, done, err := ec.maybeVisitSubqueries()
+	if done || err != nil {
+		return err
+	}
+	if curSubQuery := ec.curSubQuery; nextSubQuery != curSubQuery {
+		defer func() { ec.curSubQuery = curSubQuery }()
+		ec.curSubQuery = nextSubQuery
+	}
 	// We're at the bottom of the iteration, check if all conditions have
 	// been satisfied, and then invoke the iterator.
 	if ec.cur == ec.depth {
@@ -122,11 +155,9 @@ func (ec *evalContext) iterateNext() error {
 func (ec *evalContext) visit(e entity) error {
 	// Keep track of which slots were filled as part of this step in the
 	// evaluation and then unset them when we pop out of this stack frame.
-	var slotsFilled util.FastIntSet
+	var slotsFilled intsets.Fast
 	defer func() {
-		slotsFilled.ForEach(func(i int) {
-			ec.slots[i].typedValue = typedValue{}
-		})
+		slotsFilled.ForEach(func(i int) { ec.slots[i].reset() })
 	}()
 
 	// Fill in the slot corresponding to this entity. It should not be filled
@@ -281,7 +312,7 @@ func (ec *evalContext) buildWhere() (
 }
 
 // unify is like unifyReturningContradiction but it does not return the fact.
-func unify(facts []fact, s []slot, slotsFilled *util.FastIntSet) (contradictionFound bool) {
+func unify(facts []fact, s []slot, slotsFilled *intsets.Fast) (contradictionFound bool) {
 	contradictionFound, _ = unifyReturningContradiction(facts, s, slotsFilled)
 	return contradictionFound
 }
@@ -291,7 +322,7 @@ func unify(facts []fact, s []slot, slotsFilled *util.FastIntSet) (contradictionF
 // contradiction is returned. Any slots set in the process of unification
 // are recorded into the set.
 func unifyReturningContradiction(
-	facts []fact, s []slot, slotsFilled *util.FastIntSet,
+	facts []fact, s []slot, slotsFilled *intsets.Fast,
 ) (contradictionFound bool, contradicted fact) {
 	// TODO(ajwerner): As we unify we could determine that some facts are no
 	// longer relevant. When we do that we could move them to the front and keep
@@ -378,3 +409,69 @@ func (ec *evalContext) getFilterInput(i int) (ins []reflect.Value) {
 	}
 	return c
 }
+
+func (ec *evalContext) maybeVisitSubqueries() (nextSubQuery int, done bool, error error) {
+	nextSubQuery = ec.curSubQuery
+	for nextSubQuery < len(ec.q.notJoins) &&
+		ec.q.notJoins[nextSubQuery].depth <= ec.cur {
+		if done, err := ec.visitSubquery(nextSubQuery); done || err != nil {
+			return ec.curSubQuery, done, err
+		}
+		nextSubQuery++
+	}
+	return nextSubQuery, false, nil
+}
+
+func (ec *evalContext) visitSubquery(query int) (done bool, _ error) {
+	sub := ec.q.notJoins[query]
+	sec := sub.query.getEvalContext()
+	defer sub.query.putEvalContext(sec)
+	defer func() { // reset the slots populated to run the subquery
+		sub.inputSlotMappings.ForEach(func(_, subSlot int) {
+			sec.slots[subSlot].reset()
+		})
+	}()
+	if err := ec.bindSubQuerySlots(sub.inputSlotMappings, sec); err != nil {
+		return false, err
+	}
+	err := sec.Iterate(ec.db, func(r Result) error {
+		return errResultSetNotEmpty
+	})
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, errResultSetNotEmpty):
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
+func (ec *evalContext) bindSubQuerySlots(mapping util.FastIntMap, sec *evalContext) (err error) {
+	mapping.ForEach(func(src, dst int) {
+		if err != nil {
+			return
+		}
+		if ec.slots[src].empty() {
+			// TODO(ajwerner): Find a way to prove statically that this cannot
+			// happen and make it an assertion failure.
+			err = errors.Errorf(
+				"subquery invocation references unbound variable %q",
+				ec.findSlotVariable(src),
+			)
+		}
+		sec.slots[dst].typedValue = ec.slots[src].typedValue
+	})
+	return err
+}
+
+func (ec *evalContext) findSlotVariable(src int) Var {
+	for v, slot := range ec.q.variableSlots {
+		if src == int(slot) {
+			return v
+		}
+	}
+	return ""
+}
+
+var errResultSetNotEmpty = errors.New("result set not empty")

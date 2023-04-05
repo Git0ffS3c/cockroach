@@ -58,8 +58,8 @@ var drop = initFlags.Bool("drop", false, "Drop the existing database, if it exis
 
 var sharedFlags = pflag.NewFlagSet(`shared`, pflag.ContinueOnError)
 var pprofport = sharedFlags.Int("pprofport", 33333, "Port for pprof endpoint.")
-var dataLoader = sharedFlags.String("data-loader", `INSERT`,
-	"How to load initial table data. Options are INSERT and IMPORT")
+var dataLoader = sharedFlags.String("data-loader", `AUTO`,
+	"How to load initial table data. All workloads support INSERT; some support IMPORT, which AUTO prefers if available.")
 var initConns = sharedFlags.Int("init-conns", 16,
 	"The number of connections to use during INSERT init")
 
@@ -115,8 +115,8 @@ func init() {
 			genInitCmd.Flags().AddFlagSet(genFlags)
 			genInitCmd.Flags().AddFlagSet(securityFlags)
 			genInitCmd.Run = CmdHelper(gen, runInit)
-			if userFacing && !meta.PublicFacing {
-				genInitCmd.Hidden = true
+			if meta.TestInfraOnly {
+				genInitCmd.Long = "THIS COMMAND WAS DEVELOPED FOR INTERNAL TESTING ONLY.\n\n" + genInitCmd.Long
 			}
 			initCmd.AddCommand(genInitCmd)
 		}
@@ -156,10 +156,10 @@ func init() {
 				f.Usage += ` (implies --init)`
 				genRunCmd.Flags().AddFlag(&f)
 			})
-			genRunCmd.Run = CmdHelper(gen, runRun)
-			if userFacing && !meta.PublicFacing {
-				genRunCmd.Hidden = true
+			if meta.TestInfraOnly {
+				genRunCmd.Long = "THIS COMMAND WAS DEVELOPED FOR INTERNAL TESTING ONLY.\n\n" + genRunCmd.Long
 			}
+			genRunCmd.Run = CmdHelper(gen, runRun)
 			runCmd.AddCommand(genRunCmd)
 		}
 		return runCmd
@@ -303,6 +303,7 @@ func runInit(gen workload.Generator, urls []string, dbName string) error {
 	}
 
 	startPProfEndPoint(ctx)
+	maybeLogRandomSeed(ctx, gen)
 	return runInitImpl(ctx, gen, initDB, dbName)
 }
 
@@ -318,8 +319,21 @@ func runInitImpl(
 		return err
 	}
 
+	lc := strings.ToLower(*dataLoader)
+	if lc == "auto" {
+		lc = "insert"
+		// Even if it does support fixtures, the CRDB cluster needs to know the
+		// workload. This can only be expected if the workload is public-facing.
+		// For example, at the time of writing, neither roachmart and ledger are
+		// public-facing, but both support fixtures. However, returning true here
+		// would result in "pq: unknown generator: roachmart" from the cluster.
+		if workload.SupportsFixtures(gen) {
+			lc = "import"
+		}
+	}
+
 	var l workload.InitialDataLoader
-	switch strings.ToLower(*dataLoader) {
+	switch lc {
 	case `insert`, `inserts`:
 		l = workloadsql.InsertsDataLoader{
 			Concurrency: *initConns,
@@ -391,6 +405,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		limiter = rate.NewLimiter(rate.Limit(*maxRate), 1)
 	}
 
+	maybeLogRandomSeed(ctx, gen)
 	o, ok := gen.(workload.Opser)
 	if !ok {
 		return errors.Errorf(`no operations defined for %s`, gen.Meta().Name)
@@ -412,7 +427,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	var ops workload.QueryLoad
 	prepareStart := timeutil.Now()
 	log.Infof(ctx, "creating load generator...")
-	const prepareTimeout = 60 * time.Minute
+	const prepareTimeout = 90 * time.Minute
 	prepareCtx, cancel := context.WithTimeout(ctx, prepareTimeout)
 	defer cancel()
 	if prepareErr := func(ctx context.Context) error {
@@ -597,5 +612,13 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 
 			return nil
 		}
+	}
+}
+
+// maybeLogRandomSeed will log the random seed used by the generator,
+// if a seed is being used.
+func maybeLogRandomSeed(ctx context.Context, gen workload.Generator) {
+	if randomSeed := gen.Meta().RandomSeed; randomSeed != nil {
+		log.Infof(ctx, "%s", randomSeed.LogMessage())
 	}
 }

@@ -15,15 +15,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // Default value used to designate the maximum frequency at which events
 // are logged to the telemetry channel.
 const defaultMaxEventFrequency = 8
 
-var telemetryMaxEventFrequency = settings.RegisterIntSetting(
+var TelemetryMaxEventFrequency = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"sql.telemetry.query_sampling.max_event_frequency",
 	"the max event frequency at which we sample queries for telemetry, "+
@@ -53,6 +55,23 @@ type TelemetryLoggingTestingKnobs struct {
 	// getTimeNow allows tests to override the timeutil.Now() function used
 	// when updating rolling query counts.
 	getTimeNow func() time.Time
+	// getQueryLevelMetrics allows tests to override the recorded query level stats.
+	getQueryLevelStats func() execstats.QueryLevelStats
+	// getTracingStatus allows tests to override whether the current query has tracing
+	// enabled or not. Queries with tracing enabled are always sampled to telemetry.
+	getTracingStatus func() bool
+}
+
+func NewTelemetryLoggingTestingKnobs(
+	getTimeNowFunc func() time.Time,
+	getQueryLevelStatsFunc func() execstats.QueryLevelStats,
+	getTracingStatusFunc func() bool,
+) *TelemetryLoggingTestingKnobs {
+	return &TelemetryLoggingTestingKnobs{
+		getTimeNow:         getTimeNowFunc,
+		getQueryLevelStats: getQueryLevelStatsFunc,
+		getTracingStatus:   getTracingStatusFunc,
+	}
 }
 
 // ModuleTestingKnobs implements base.ModuleTestingKnobs interface.
@@ -81,6 +100,22 @@ func (t *TelemetryLoggingMetrics) maybeUpdateLastEmittedTime(
 	}
 
 	return false
+}
+
+func (t *TelemetryLoggingMetrics) getQueryLevelStats(
+	queryLevelStats execstats.QueryLevelStats,
+) execstats.QueryLevelStats {
+	if t.Knobs != nil && t.Knobs.getQueryLevelStats != nil {
+		return t.Knobs.getQueryLevelStats()
+	}
+	return queryLevelStats
+}
+
+func (t *TelemetryLoggingMetrics) isTracing(_ *tracing.Span, tracingEnabled bool) bool {
+	if t.Knobs != nil && t.Knobs.getTracingStatus != nil {
+		return t.Knobs.getTracingStatus()
+	}
+	return tracingEnabled
 }
 
 func (t *TelemetryLoggingMetrics) resetSkippedQueryCount() (res uint64) {

@@ -11,6 +11,10 @@
 package execbuilder
 
 import (
+	"context"
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
@@ -48,6 +52,7 @@ func getParallelScanResultThreshold(forceProductionValue bool) uint64 {
 // Builder constructs a tree of execution nodes (exec.Node) from an optimized
 // expression tree (opt.Expr).
 type Builder struct {
+	ctx              context.Context
 	factory          exec.Factory
 	optimizer        *xform.Optimizer
 	mem              *memo.Memo
@@ -97,6 +102,13 @@ type Builder struct {
 	// by scans. See forUpdateLocking.
 	forceForUpdateLocking bool
 
+	// planLazySubqueries is true if the builder should plan subqueries that are
+	// lazily evaluated as routines instead of a subquery which is evaluated
+	// eagerly before the main query. This is required in cases that cannot be
+	// handled by the subquery execution machinery, e.g., when building
+	// subqueries for statements inside a UDF.
+	planLazySubqueries bool
+
 	// -- output --
 
 	// IsDDL is set to true if the statement contains DDL.
@@ -128,6 +140,60 @@ type Builder struct {
 
 	// ContainsMutation is set to true if the whole plan contains any mutations.
 	ContainsMutation bool
+
+	// ContainsNonDefaultKeyLocking is set to true if at least one node in the
+	// plan uses non-default key locking strength.
+	ContainsNonDefaultKeyLocking bool
+
+	// MaxFullScanRows is the maximum number of rows scanned by a full scan, as
+	// estimated by the optimizer.
+	MaxFullScanRows float64
+
+	// TotalScanRows is the total number of rows read by all scans in the query,
+	// as estimated by the optimizer.
+	TotalScanRows float64
+
+	// TotalScanRowsWithoutForecasts is the total number of rows read by all scans
+	// in the query, as estimated by the optimizer without using forecasts. (If
+	// forecasts were not used, this should be the same as TotalScanRows.)
+	TotalScanRowsWithoutForecasts float64
+
+	// NanosSinceStatsCollected is the maximum number of nanoseconds that have
+	// passed since stats were collected on any table scanned by this query.
+	NanosSinceStatsCollected time.Duration
+
+	// NanosSinceStatsForecasted is the greatest quantity of nanoseconds that have
+	// passed since the forecast time (or until the forecast time, if the it is in
+	// the future, in which case it will be negative) for any table with
+	// forecasted stats scanned by this query.
+	NanosSinceStatsForecasted time.Duration
+
+	// JoinTypeCounts records the number of times each type of logical join was
+	// used in the query.
+	JoinTypeCounts map[descpb.JoinType]int
+
+	// JoinAlgorithmCounts records the number of times each type of join algorithm
+	// was used in the query.
+	JoinAlgorithmCounts map[exec.JoinAlgorithm]int
+
+	// ScanCounts records the number of times scans were used in the query.
+	ScanCounts [exec.NumScanCountTypes]int
+
+	// builtScans collects all scans in the operation tree so post-build checking
+	// for non-local execution can be done.
+	builtScans []*memo.ScanExpr
+
+	// doScanExprCollection, when true, causes buildScan to add any ScanExprs it
+	// processes to the builtScans slice.
+	doScanExprCollection bool
+
+	// IsANSIDML is true if the AST the execbuilder is working on is one of the
+	// 4 DML statements, SELECT, UPDATE, INSERT, DELETE, or an EXPLAIN of one of
+	// these statements.
+	IsANSIDML bool
+
+	// IndexesUsed list the indexes used in query with the format tableID@indexID.
+	IndexesUsed []string
 }
 
 // New constructs an instance of the execution node builder using the
@@ -141,6 +207,7 @@ type Builder struct {
 // `transaction_rows_read_err` guardrail is disabled.). It should be false if
 // the statement is executed as part of an explicit transaction.
 func New(
+	ctx context.Context,
 	factory exec.Factory,
 	optimizer *xform.Optimizer,
 	mem *memo.Memo,
@@ -148,6 +215,7 @@ func New(
 	e opt.Expr,
 	evalCtx *eval.Context,
 	allowAutoCommit bool,
+	isANSIDML bool,
 ) *Builder {
 	b := &Builder{
 		factory:                factory,
@@ -155,9 +223,11 @@ func New(
 		mem:                    mem,
 		catalog:                catalog,
 		e:                      e,
+		ctx:                    ctx,
 		evalCtx:                evalCtx,
 		allowAutoCommit:        allowAutoCommit,
 		initialAllowAutoCommit: allowAutoCommit,
+		IsANSIDML:              isANSIDML,
 	}
 	if evalCtx != nil {
 		sd := evalCtx.SessionData()
@@ -189,8 +259,21 @@ func (b *Builder) Build() (_ exec.Plan, err error) {
 		return nil, err
 	}
 
-	rootRowCount := int64(b.e.(memo.RelExpr).Relational().Stats.RowCountIfAvailable())
+	rootRowCount := int64(b.e.(memo.RelExpr).Relational().Statistics().RowCountIfAvailable())
 	return b.factory.ConstructPlan(plan.root, b.subqueries, b.cascades, b.checks, rootRowCount)
+}
+
+func (b *Builder) wrapFunction(fnName string) (tree.ResolvableFunctionReference, error) {
+	if b.evalCtx != nil && b.catalog != nil { // Some tests leave those unset.
+		unresolved := tree.MakeUnresolvedName(fnName)
+		fnDef, err := b.catalog.ResolveFunction(
+			context.Background(), &unresolved, &b.evalCtx.SessionData().SearchPath)
+		if err != nil {
+			return tree.ResolvableFunctionReference{}, err
+		}
+		return tree.ResolvableFunctionReference{FunctionReference: fnDef}, nil
+	}
+	return tree.WrapFunction(fnName), nil
 }
 
 func (b *Builder) build(e opt.Expr) (_ execPlan, err error) {
@@ -246,6 +329,10 @@ func (b *Builder) decorrelationError() error {
 	return errors.Errorf("could not decorrelate subquery")
 }
 
+func (b *Builder) decorrelationMutationError() error {
+	return errors.Errorf("could not decorrelate subquery with mutation")
+}
+
 // builtWithExpr is metadata regarding a With expression which has already been
 // added to the set of subqueries for the query.
 type builtWithExpr struct {
@@ -275,20 +362,21 @@ func (b *Builder) findBuiltWithExpr(id opt.WithID) *builtWithExpr {
 
 // boundedStaleness returns true if this query uses bounded staleness.
 func (b *Builder) boundedStaleness() bool {
-	return b.evalCtx != nil && b.evalCtx.AsOfSystemTime != nil &&
-		b.evalCtx.AsOfSystemTime.BoundedStaleness
+	return b.evalCtx != nil && b.evalCtx.BoundedStaleness()
 }
 
-// mdVarContainer is an IndexedVarContainer implementation used by BuildScalar -
-// it maps indexed vars to columns in the metadata.
+// mdVarContainer is an eval.IndexedVarContainer implementation used by
+// BuildScalar - it maps indexed vars to columns in the metadata.
 type mdVarContainer struct {
 	md *opt.Metadata
 }
 
-var _ tree.IndexedVarContainer = &mdVarContainer{}
+var _ eval.IndexedVarContainer = &mdVarContainer{}
 
-// IndexedVarEval is part of the IndexedVarContainer interface.
-func (c *mdVarContainer) IndexedVarEval(idx int, e tree.ExprEvaluator) (tree.Datum, error) {
+// IndexedVarEval is part of the eval.IndexedVarContainer interface.
+func (c *mdVarContainer) IndexedVarEval(
+	ctx context.Context, idx int, e tree.ExprEvaluator,
+) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("no eval allowed in mdVarContainer")
 }
 

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -6,10 +7,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/keys",
-        "//pkg/kv",
         "//pkg/sql/catalog",
-        "//pkg/sql/catalog/catalogkeys",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/catalog/typedesc",
@@ -20,7 +18,6 @@ go_library(
         "//pkg/sql/sessiondata",
         "//pkg/sql/sqlerrors",
         "//pkg/util/hlc",
-        "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
@@ -32,11 +29,11 @@ go_test(
         "resolver_bench_test.go",
         "resolver_test.go",
     ],
+    args = ["-test.timeout=295s"],
     deps = [
         ":resolver",
         "//pkg/base",
-        "//pkg/kv",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
@@ -47,6 +44,7 @@ go_test(
         "//pkg/sql/catalog/descs",
         "//pkg/sql/catalog/schemadesc",
         "//pkg/sql/catalog/tabledesc",
+        "//pkg/sql/isql",
         "//pkg/sql/parser",
         "//pkg/sql/schemachanger/scbuild",
         "//pkg/sql/sem/catconstants",
@@ -65,3 +63,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

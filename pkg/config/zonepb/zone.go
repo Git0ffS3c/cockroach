@@ -16,11 +16,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
@@ -164,17 +164,10 @@ func ResolveZoneSpecifier(
 	if err != nil {
 		return 0, err
 	}
-	// TODO(richardjcai): Remove version gating logic in 22.2.
-	var schemaID uint32
-	if !version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) && tn.SchemaName == tree.PublicSchemaName {
-		// If we're not on version PublicSchemasWithDescriptors, we're guaranteed
-		// databases are not backed by descriptors, thus we use keys.PublicSchemaID.
-		schemaID = keys.PublicSchemaID
-	} else {
-		schemaID, err = resolveName(databaseID, keys.RootNamespaceID, tn.Schema())
-		if err != nil {
-			return 0, err
-		}
+
+	schemaID, err := resolveName(databaseID, keys.RootNamespaceID, tn.Schema())
+	if err != nil {
+		return 0, err
 	}
 	tableID, err := resolveName(databaseID, schemaID, tn.Table())
 	if err != nil {
@@ -242,15 +235,7 @@ func DefaultZoneConfig() ZoneConfig {
 		RangeMinBytes: proto.Int64(128 << 20), // 128 MB
 		RangeMaxBytes: proto.Int64(512 << 20), // 512 MB
 		GC: &GCPolicy{
-			// Use 25 hours instead of the previous 24 to make users successful by
-			// default. Users desiring to take incremental backups every 24h may
-			// incorrectly assume that the previous default 24h was sufficient to do
-			// that. But the equation for incremental backups is:
-			// 	GC TTLSeconds >= (desired backup interval) + (time to perform incremental backup)
-			// We think most new users' incremental backups will complete within an
-			// hour, and larger clusters will have more experienced operators and will
-			// understand how to change these settings if needed.
-			TTLSeconds: 25 * 60 * 60,
+			TTLSeconds: 4 * 60 * 60, // 4 hrs
 		},
 		// The default zone is supposed to have empty VoterConstraints.
 		NullVoterConstraintsIsEmpty: true,
@@ -294,6 +279,30 @@ func (z *ZoneConfig) InheritedVoterConstraints() bool {
 	return len(z.VoterConstraints) == 0 && !z.NullVoterConstraintsIsEmpty
 }
 
+// ShouldInheritGC returns true if the zone config should inherit the GC policy
+// from the parent.
+func (z *ZoneConfig) ShouldInheritGC(parent *ZoneConfig) bool {
+	return z.GC == nil && parent.GC != nil
+}
+
+// ShouldInheritLeasePreferences returns true if the zone config should
+// inherit the lease preferences from the parent.
+func (z *ZoneConfig) ShouldInheritLeasePreferences(parent *ZoneConfig) bool {
+	return z.InheritedLeasePreferences && !parent.InheritedLeasePreferences
+}
+
+// ShouldInheritConstraints returns true if the zone config should
+// inherit the constraints from the parent.
+func (z *ZoneConfig) ShouldInheritConstraints(parent *ZoneConfig) bool {
+	return z.InheritedConstraints && !parent.InheritedConstraints
+}
+
+// ShouldInheritVoterConstraints returns true if the zone config should
+// inherit the voter constraints from the parent.
+func (z *ZoneConfig) ShouldInheritVoterConstraints(parent *ZoneConfig) bool {
+	return z.InheritedVoterConstraints() && !parent.InheritedVoterConstraints()
+}
+
 // ValidateTandemFields returns an error if the ZoneConfig to be written
 // specifies a configuration that could cause problems with the introduction
 // of cascading zone configs.
@@ -331,6 +340,11 @@ func (z *ZoneConfig) ValidateTandemFields() error {
 	}
 	return nil
 }
+
+// MinRangeMaxBytes is the minimum value for range max bytes.
+// The default, 64 MiB, is half of the default range_min_bytes
+var minRangeMaxBytes = envutil.EnvOrDefaultInt64("COCKROACH_MIN_RANGE_MAX_BYTES",
+	64<<20 /* 64 MiB */)
 
 // Validate returns an error if the ZoneConfig specifies a known-dangerous or
 // disallowed configuration.
@@ -373,9 +387,9 @@ func (z *ZoneConfig) Validate() error {
 		}
 	}
 
-	if z.RangeMaxBytes != nil && *z.RangeMaxBytes < base.MinRangeMaxBytes {
+	if z.RangeMaxBytes != nil && *z.RangeMaxBytes < minRangeMaxBytes {
 		return fmt.Errorf("RangeMaxBytes %d less than minimum allowed %d",
-			*z.RangeMaxBytes, base.MinRangeMaxBytes)
+			*z.RangeMaxBytes, minRangeMaxBytes)
 	}
 
 	if z.RangeMinBytes != nil && *z.RangeMinBytes < 0 {
@@ -554,29 +568,23 @@ func (z *ZoneConfig) InheritFromParent(parent *ZoneConfig) {
 			z.RangeMaxBytes = proto.Int64(*parent.RangeMaxBytes)
 		}
 	}
-	if z.GC == nil {
-		if parent.GC != nil {
-			tempGC := *parent.GC
-			z.GC = &tempGC
-		}
+
+	if z.ShouldInheritGC(parent) {
+		tempGC := *parent.GC
+		z.GC = &tempGC
 	}
-	if z.InheritedConstraints {
-		if !parent.InheritedConstraints {
-			z.Constraints = parent.Constraints
-			z.InheritedConstraints = false
-		}
+	if z.ShouldInheritConstraints(parent) {
+		z.Constraints = parent.Constraints
+		z.InheritedConstraints = false
 	}
-	if z.InheritedVoterConstraints() {
-		if !parent.InheritedVoterConstraints() {
-			z.VoterConstraints = parent.VoterConstraints
-			z.NullVoterConstraintsIsEmpty = parent.NullVoterConstraintsIsEmpty
-		}
+	if z.ShouldInheritVoterConstraints(parent) {
+		z.VoterConstraints = parent.VoterConstraints
+		z.NullVoterConstraintsIsEmpty = parent.NullVoterConstraintsIsEmpty
+
 	}
-	if z.InheritedLeasePreferences {
-		if !parent.InheritedLeasePreferences {
-			z.LeasePreferences = parent.LeasePreferences
-			z.InheritedLeasePreferences = false
-		}
+	if z.ShouldInheritLeasePreferences(parent) {
+		z.LeasePreferences = parent.LeasePreferences
+		z.InheritedLeasePreferences = false
 	}
 }
 

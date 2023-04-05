@@ -122,6 +122,10 @@ func TestMVCCAndEngineKeyEncodeDecode(t *testing.T) {
 			require.True(t, ok)
 			require.Equal(t, k3, []byte(test.key.Key))
 			require.Equal(t, ts, encodedTS)
+			k, ok := DecodeEngineKey(b3)
+			require.True(t, ok)
+			require.Equal(t, k.Key, test.key.Key)
+			require.Equal(t, k.Version, encodedTS)
 		})
 	}
 }
@@ -180,5 +184,12 @@ func TestEngineKeyValidate(t *testing.T) {
 			}
 			require.False(t, tc.invalid)
 		})
+	}
+}
+
+func engineKey(key string, ts int) EngineKey {
+	return EngineKey{
+		Key:     roachpb.Key(key),
+		Version: encodeMVCCTimestamp(wallTS(ts)),
 	}
 }

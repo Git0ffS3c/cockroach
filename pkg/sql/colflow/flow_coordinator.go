@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // FlowCoordinator is the execinfra.Processor that is responsible for shutting
@@ -59,7 +58,6 @@ func NewFlowCoordinator(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 	cancelFlow context.CancelFunc,
 ) *FlowCoordinator {
 	f := flowCoordinatorPool.Get().(*FlowCoordinator)
@@ -68,11 +66,11 @@ func NewFlowCoordinator(
 	f.Init(
 		f,
 		flowCtx,
-		// FlowCoordinator doesn't modify the eval context, so it is safe to
-		// reuse the one from the flow context.
-		flowCtx.EvalCtx,
+		// The FlowCoordinator will update the eval context when closed, so we
+		// give it a copy of the eval context to preserve the "global" eval
+		// context from being mutated.
+		flowCtx.NewEvalCtx(),
 		processorID,
-		output,
 		execinfra.ProcStateOpts{
 			// We append input to inputs to drain below in order to reuse
 			// the same underlying slice from the pooled FlowCoordinator.
@@ -117,7 +115,7 @@ func (f *FlowCoordinator) OutputTypes() []*types.T {
 
 // Start is part of the execinfra.RowSource interface.
 func (f *FlowCoordinator) Start(ctx context.Context) {
-	ctx = f.StartInternalNoSpan(ctx)
+	ctx = f.StartInternal(ctx, "flow coordinator" /* name */)
 	if err := colexecerror.CatchVectorizedRuntimeError(func() {
 		f.input.Start(ctx)
 	}); err != nil {
@@ -150,7 +148,17 @@ func (f *FlowCoordinator) nextAdapter() {
 // Next is part of the execinfra.RowSource interface.
 func (f *FlowCoordinator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	if err := colexecerror.CatchVectorizedRuntimeError(f.nextAdapter); err != nil {
-		f.MoveToDraining(err)
+		if f.State == execinfra.StateRunning {
+			f.MoveToDraining(err)
+		} else {
+			// We have encountered an error during draining, so we will just
+			// return the error as metadata directly. This could occur, for
+			// example, when accounting for the metadata footprint and exceeding
+			// the limit.
+			meta := execinfrapb.GetProducerMeta()
+			meta.Err = err
+			return nil, meta
+		}
 		return nil, f.DrainHelper()
 	}
 	return f.row, f.meta
@@ -257,24 +265,13 @@ func (f *BatchFlowCoordinator) pushError(err error) execinfra.ConsumerStatus {
 func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 	status := execinfra.NeedMoreRows
 
-	ctx, span := execinfra.ProcessorSpan(ctx, "batch flow coordinator")
-	if span != nil {
-		if span.IsVerbose() {
-			span.SetTag(execinfrapb.FlowIDTagKey, attribute.StringValue(f.flowCtx.ID.String()))
-			span.SetTag(execinfrapb.ProcessorIDTagKey, attribute.IntValue(int(f.processorID)))
-		}
-	}
+	ctx, span := execinfra.ProcessorSpan(ctx, f.flowCtx, "batch flow coordinator", f.processorID)
 
 	// Make sure that we close the coordinator and notify the batch receiver in
 	// all cases.
 	defer func() {
-		if err := f.close(ctx); err != nil && status != execinfra.ConsumerClosed {
-			f.pushError(err)
-		}
+		f.cancelFlow()
 		f.output.ProducerDone()
-		// Note that f.close is only safe to call before finishing the tracing
-		// span because some components might still use the span when they are
-		// being closed.
 		span.Finish()
 	}()
 
@@ -309,7 +306,7 @@ func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 		for _, s := range f.input.StatsCollectors {
 			span.RecordStructured(s.GetStats())
 		}
-		if meta := execinfra.GetTraceDataAsMetadata(span); meta != nil {
+		if meta := execinfra.GetTraceDataAsMetadata(f.flowCtx, span); meta != nil {
 			status = f.output.PushBatch(nil /* batch */, meta)
 			if status == execinfra.ConsumerClosed {
 				return
@@ -330,19 +327,6 @@ func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// close cancels the flow and closes all colexecop.Closers the coordinator is
-// responsible for.
-func (f *BatchFlowCoordinator) close(ctx context.Context) error {
-	f.cancelFlow()
-	var lastErr error
-	for _, toClose := range f.input.ToClose {
-		if err := toClose.Close(ctx); err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
 }
 
 // Release implements the execinfra.Releasable interface.

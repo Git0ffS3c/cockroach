@@ -1,8 +1,10 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "sqlutils",
     srcs = [
+        "fingerprint.go",
         "inject.go",
         "pg_url.go",
         "pretty.go",
@@ -18,7 +20,7 @@ go_library(
     deps = [
         "//pkg/config/zonepb",
         "//pkg/keys",
-        "//pkg/security",
+        "//pkg/security/certnames",
         "//pkg/security/securitytest",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/lexbase",
@@ -31,6 +33,7 @@ go_library(
         "@com_github_cockroachdb_cockroach_go_v2//crdb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_jackc_pgx_v4//:pgx",
+        "@com_github_lib_pq//:pq",
         "@com_github_stretchr_testify//require",
     ],
 )
@@ -44,10 +47,11 @@ go_test(
         "sql_runner_test.go",
         "table_gen_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":sqlutils"],
     deps = [
         "//pkg/base",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/catalog/descpb",
@@ -60,3 +64,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -16,20 +16,32 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 )
 
 // OnlyFollowerReads looks through all the RPCs and asserts that every single
 // one resulted in a follower read. Returns false if no RPCs are found.
-func OnlyFollowerReads(rec tracing.Recording) bool {
+func OnlyFollowerReads(rec tracingpb.Recording) bool {
 	foundFollowerRead := false
 	for _, sp := range rec {
-		if sp.Operation == "/cockroach.roachpb.Internal/Batch" &&
-			sp.Tags["span.kind"] == "server" {
-			if tracing.LogsContainMsg(sp, kvbase.FollowerReadServingMsg) {
-				foundFollowerRead = true
-			} else {
-				return false
-			}
+		if sp.Operation != "/cockroach.roachpb.Internal/Batch" {
+			continue
+		}
+		anonTagGroup := sp.FindTagGroup(tracingpb.AnonymousTagGroupName)
+		if anonTagGroup == nil {
+			continue
+		}
+		val, ok := anonTagGroup.FindTag("span.kind")
+		if !ok {
+			continue
+		}
+		if val != "server" {
+			continue
+		}
+		if tracing.LogsContainMsg(sp, kvbase.FollowerReadServingMsg) {
+			foundFollowerRead = true
+		} else {
+			return false
 		}
 	}
 	return foundFollowerRead

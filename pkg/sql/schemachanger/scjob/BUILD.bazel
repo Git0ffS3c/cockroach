@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -16,8 +17,15 @@ go_library(
         "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/sql",
+        "//pkg/sql/catalog/descs",
+        "//pkg/sql/descmetadata",
+        "//pkg/sql/isql",
         "//pkg/sql/schemachanger/scdeps",
         "//pkg/sql/schemachanger/scexec",
+        "//pkg/sql/schemachanger/scexec/backfiller",
         "//pkg/sql/schemachanger/scrun",
+        "//pkg/util/log",
     ],
 )
+
+get_x_data(name = "get_x_data")

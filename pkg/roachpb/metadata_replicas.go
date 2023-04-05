@@ -15,50 +15,8 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
-
-// ReplicaTypeVoterFull returns a VOTER_FULL pointer suitable for use in a
-// nullable proto field.
-func ReplicaTypeVoterFull() *ReplicaType {
-	t := VOTER_FULL
-	return &t
-}
-
-// ReplicaTypeVoterIncoming returns a VOTER_INCOMING pointer suitable
-// for use in a nullable proto field.
-func ReplicaTypeVoterIncoming() *ReplicaType {
-	t := VOTER_INCOMING
-	return &t
-}
-
-// ReplicaTypeVoterOutgoing returns a VOTER_OUTGOING pointer suitable
-// for use in a nullable proto field.
-func ReplicaTypeVoterOutgoing() *ReplicaType {
-	t := VOTER_OUTGOING
-	return &t
-}
-
-// ReplicaTypeVoterDemotingLearner returns a VOTER_DEMOTING_LEARNER pointer
-// suitable for use in a nullable proto field.
-func ReplicaTypeVoterDemotingLearner() *ReplicaType {
-	t := VOTER_DEMOTING_LEARNER
-	return &t
-}
-
-// ReplicaTypeLearner returns a LEARNER pointer suitable for use in
-// a nullable proto field.
-func ReplicaTypeLearner() *ReplicaType {
-	t := LEARNER
-	return &t
-}
-
-// ReplicaTypeNonVoter returns a NON_VOTER pointer suitable for use in
-// a nullable proto field.
-func ReplicaTypeNonVoter() *ReplicaType {
-	t := NON_VOTER
-	return &t
-}
 
 // ReplicaSet is a set of replicas, usually the nodes/stores on which
 // replicas of a range are stored.
@@ -97,7 +55,7 @@ func (d ReplicaSet) Descriptors() []ReplicaDescriptor {
 }
 
 func predVoterFull(rDesc ReplicaDescriptor) bool {
-	switch rDesc.GetType() {
+	switch rDesc.Type {
 	case VOTER_FULL:
 		return true
 	default:
@@ -106,7 +64,7 @@ func predVoterFull(rDesc ReplicaDescriptor) bool {
 }
 
 func predVoterFullOrIncoming(rDesc ReplicaDescriptor) bool {
-	switch rDesc.GetType() {
+	switch rDesc.Type {
 	case VOTER_FULL, VOTER_INCOMING:
 		return true
 	default:
@@ -114,12 +72,21 @@ func predVoterFullOrIncoming(rDesc ReplicaDescriptor) bool {
 	return false
 }
 
+func predVoterIncoming(rDesc ReplicaDescriptor) bool {
+	switch rDesc.Type {
+	case VOTER_INCOMING:
+		return true
+	default:
+	}
+	return false
+}
+
 func predLearner(rDesc ReplicaDescriptor) bool {
-	return rDesc.GetType() == LEARNER
+	return rDesc.Type == LEARNER
 }
 
 func predNonVoter(rDesc ReplicaDescriptor) bool {
-	return rDesc.GetType() == NON_VOTER
+	return rDesc.Type == NON_VOTER
 }
 
 func predVoterOrNonVoter(rDesc ReplicaDescriptor) bool {
@@ -152,6 +119,10 @@ func (d ReplicaSet) VoterDescriptors() []ReplicaDescriptor {
 	return d.FilterToDescriptors(predVoterFullOrIncoming)
 }
 
+func (d ReplicaSet) containsVoterIncoming() bool {
+	return len(d.FilterToDescriptors(predVoterIncoming)) > 0
+}
+
 // LearnerDescriptors returns a slice of ReplicaDescriptors corresponding to
 // learner replicas in `d`. This may allocate, but it also may return the
 // underlying slice as a performance optimization, so it's not safe to modify
@@ -173,16 +144,16 @@ func (d ReplicaSet) VoterDescriptors() []ReplicaDescriptor {
 // For simplicity, CockroachDB treats learner replicas the same as voter
 // replicas as much as possible, but there are a few exceptions:
 //
-// - Learner replicas are not considered when calculating quorum size, and thus
-//   do not affect the computation of which ranges are under-replicated for
-//   upreplication/alerting/debug/etc purposes. Ditto for over-replicated.
-// - Learner replicas cannot become raft leaders, so we also don't allow them to
-//   become leaseholders. As a result, DistSender and the various oracles don't
-//   try to send them traffic.
-// - The raft snapshot queue tries to avoid sending snapshots to ephemeral
-//   learners (but not to non-voting replicas, which are also etcd learners) for
-//   reasons described below.
-// - Merges won't run while a learner replica is present.
+//   - Learner replicas are not considered when calculating quorum size, and thus
+//     do not affect the computation of which ranges are under-replicated for
+//     upreplication/alerting/debug/etc purposes. Ditto for over-replicated.
+//   - Learner replicas cannot become raft leaders, so we also don't allow them to
+//     become leaseholders. As a result, DistSender and the various oracles don't
+//     try to send them traffic.
+//   - The raft snapshot queue tries to avoid sending snapshots to ephemeral
+//     learners (but not to non-voting replicas, which are also etcd learners) for
+//     reasons described below.
+//   - Merges won't run while a learner replica is present.
 //
 // Replicas are now added in two ConfChange transactions. The first creates the
 // learner and the second promotes it to a voter. If the node that is
@@ -347,13 +318,13 @@ func (d *ReplicaSet) RemoveReplica(nodeID NodeID, storeID StoreID) (ReplicaDescr
 // an atomic replication change.
 func (d ReplicaSet) InAtomicReplicationChange() bool {
 	for _, rDesc := range d.wrapped {
-		switch rDesc.GetType() {
+		switch rDesc.Type {
 		case VOTER_INCOMING, VOTER_OUTGOING, VOTER_DEMOTING_LEARNER,
 			VOTER_DEMOTING_NON_VOTER:
 			return true
 		case VOTER_FULL, LEARNER, NON_VOTER:
 		default:
-			panic(fmt.Sprintf("unknown replica type %d", rDesc.GetType()))
+			panic(fmt.Sprintf("unknown replica type %d", rDesc.Type))
 		}
 	}
 	return false
@@ -368,8 +339,7 @@ func (d ReplicaSet) ConfState() raftpb.ConfState {
 	// category.
 	for _, rep := range d.wrapped {
 		id := uint64(rep.ReplicaID)
-		typ := rep.GetType()
-		switch typ {
+		switch rep.Type {
 		case VOTER_FULL:
 			cs.Voters = append(cs.Voters, id)
 			if joint {
@@ -387,17 +357,28 @@ func (d ReplicaSet) ConfState() raftpb.ConfState {
 		case NON_VOTER:
 			cs.Learners = append(cs.Learners, id)
 		default:
-			panic(fmt.Sprintf("unknown ReplicaType %d", typ))
+			panic(fmt.Sprintf("unknown ReplicaType %d", rep.Type))
 		}
 	}
 	return cs
+}
+
+// HasReplicaOnNode returns true iff the given nodeID is present in the
+// ReplicaSet.
+func (d ReplicaSet) HasReplicaOnNode(nodeID NodeID) bool {
+	for _, rep := range d.wrapped {
+		if rep.NodeID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 // CanMakeProgress reports whether the given descriptors can make progress at
 // the replication layer. This is more complicated than just counting the number
 // of replicas due to the existence of joint quorums.
 func (d ReplicaSet) CanMakeProgress(liveFunc func(descriptor ReplicaDescriptor) bool) bool {
-	return d.ReplicationStatus(liveFunc, 0 /* neededVoters */).Available
+	return d.ReplicationStatus(liveFunc, 0 /* neededVoters */, -1 /* neededNonVoters*/).Available
 }
 
 // RangeStatusReport contains info about a range's replication status. Returned
@@ -408,26 +389,33 @@ type RangeStatusReport struct {
 	Available bool
 	// UnderReplicated is set if the range is considered under-replicated
 	// according to the desired replication factor and the replica liveness info
-	// passed to ReplicationStatus. Dead replicas are considered to be missing.
+	// passed to ReplicationStatus. Only voting replicas are counted here. Dead
+	// replicas are considered to be missing.
 	UnderReplicated bool
-	// UnderReplicated is set if the range is considered under-replicated
+	// OverReplicated is set if the range is considered over-replicated
 	// according to the desired replication factor passed to ReplicationStatus.
-	// Replica liveness is not considered.
+	// Only voting replicas are counted here. Replica liveness is not
+	// considered.
 	//
 	// Note that a range can be under-replicated and over-replicated at the same
 	// time if it has many replicas, but sufficiently many of them are on dead
 	// nodes.
 	OverReplicated bool
+	// {Under,Over}ReplicatedNonVoters are like their {Under,Over}Replicated
+	// counterparts but applying only to non-voters.
+	UnderReplicatedNonVoters, OverReplicatedNonVoters bool
 }
 
 // ReplicationStatus returns availability and over/under-replication
 // determinations for the range.
 //
-// replicationFactor is the replica's desired replication for purposes of
-// determining over/under-replication. 0 can be passed if the caller is only
-// interested in availability and not interested in the other report fields.
+// neededVoters is the replica's desired replication for purposes of determining
+// over/under-replication of voters. If the caller is only interested in
+// availability of voting replicas, 0 can be passed in. neededNonVoters is the
+// counterpart for non-voting replicas but with -1 as the sentinel value (unlike
+// voters, it's possible to expect 0 non-voters).
 func (d ReplicaSet) ReplicationStatus(
-	liveFunc func(descriptor ReplicaDescriptor) bool, neededVoters int,
+	liveFunc func(descriptor ReplicaDescriptor) bool, neededVoters int, neededNonVoters int,
 ) RangeStatusReport {
 	var res RangeStatusReport
 	// isBoth takes two replica predicates and returns their conjunction.
@@ -459,13 +447,22 @@ func (d ReplicaSet) ReplicationStatus(
 
 	res.Available = availableIncomingGroup && availableOutgoingGroup
 
-	// Determine over/under-replication. Note that learners don't matter.
+	// Determine over/under-replication of voting replicas. Note that learners
+	// don't matter.
 	underReplicatedOldGroup := len(liveVotersOldGroup) < neededVoters
 	underReplicatedNewGroup := len(liveVotersNewGroup) < neededVoters
 	overReplicatedOldGroup := len(votersOldGroup) > neededVoters
 	overReplicatedNewGroup := len(votersNewGroup) > neededVoters
 	res.UnderReplicated = underReplicatedOldGroup || underReplicatedNewGroup
 	res.OverReplicated = overReplicatedOldGroup || overReplicatedNewGroup
+	if neededNonVoters == -1 {
+		return res
+	}
+
+	nonVoters := d.FilterToDescriptors(ReplicaDescriptor.IsNonVoter)
+	liveNonVoters := d.FilterToDescriptors(isBoth(ReplicaDescriptor.IsNonVoter, liveFunc))
+	res.UnderReplicatedNonVoters = len(liveNonVoters) < neededNonVoters
+	res.OverReplicatedNonVoters = len(nonVoters) > neededNonVoters
 	return res
 }
 
@@ -511,26 +508,49 @@ func (c ReplicaChangeType) IsRemoval() bool {
 }
 
 var errReplicaNotFound = errors.Errorf(`replica not found in RangeDescriptor`)
-var errReplicaCannotHoldLease = errors.Errorf("replica cannot hold lease")
+
+// ErrReplicaCannotHoldLease can be returned from CheckCanReceiveLease.
+//
+// See: https://github.com/cockroachdb/cockroach/issues/93163
+var ErrReplicaCannotHoldLease = errors.Errorf("replica cannot hold lease")
 
 // CheckCanReceiveLease checks whether `wouldbeLeaseholder` can receive a lease.
 // Returns an error if the respective replica is not eligible.
 //
-// An error is also returned is the replica is not part of `rngDesc`.
+// Previously, we were not allowed to enter a joint config where the
+// leaseholder is being removed (i.e., not a full voter). In the new version
+// we're allowed to enter such a joint config (if it has a VOTER_INCOMING),
+// but not to exit it in this state, i.e., the leaseholder must be some
+// kind of voter in the next new config (potentially VOTER_DEMOTING).
 //
-// For now, don't allow replicas of type LEARNER to be leaseholders. There's
-// no reason this wouldn't work in principle, but it seems inadvisable. In
-// particular, learners can't become raft leaders, so we wouldn't be able to
-// co-locate the leaseholder + raft leader, which is going to affect tail
-// latencies. Additionally, as of the time of writing, learner replicas are
-// only used for a short time in replica addition, so it's not worth working
-// out the edge cases.
-func CheckCanReceiveLease(wouldbeLeaseholder ReplicaDescriptor, rngDesc *RangeDescriptor) error {
-	repDesc, ok := rngDesc.GetReplicaDescriptorByID(wouldbeLeaseholder.ReplicaID)
+// It is possible (and sometimes needed) that while in the joint configuration,
+// the replica being removed will receive lease. This is allowed only if
+// a) there is a VOTER_INCOMING replica to which the lease will be trasferred
+// when transitioning out of the joint config, and b) the replica being removed
+// was the last leaseholder (as indictated by wasLastLeaseholder). The
+// information we use for (b) is potentially stale, but if it incorrect
+// the removed node either does not need to get the lease or will not be able
+// to get it. In particular, when we think we are the last leaseholder but we
+// aren't, the CAS call for extending the lease will fail (see
+// wasLastLeaseholder := isExtension in cmd_lease_request.go).
+//
+// An error is also returned is the replica is not part of `replDescs`.
+// NB: This logic should be in sync with constraint_stats_report as report
+// will check voter constraint violations. When changing this method, you need
+// to update replica filter in report to keep it correct.
+func CheckCanReceiveLease(
+	wouldbeLeaseholder ReplicaDescriptor, replDescs ReplicaSet, wasLastLeaseholder bool,
+) error {
+	repDesc, ok := replDescs.GetReplicaDescriptorByID(wouldbeLeaseholder.ReplicaID)
 	if !ok {
 		return errReplicaNotFound
-	} else if !repDesc.IsVoterNewConfig() {
-		return errReplicaCannotHoldLease
+	}
+	if !(repDesc.IsVoterNewConfig() ||
+		(repDesc.IsVoterOldConfig() && replDescs.containsVoterIncoming() && wasLastLeaseholder)) {
+		// We allow a demoting / incoming voter to receive the lease if there's an incoming voter.
+		// In this case, when exiting the joint config, we will transfer the lease to the incoming
+		// voter.
+		return ErrReplicaCannotHoldLease
 	}
 	return nil
 }

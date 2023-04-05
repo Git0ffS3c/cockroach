@@ -13,20 +13,27 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/interceptor"
 	"github.com/cockroachdb/cockroach/pkg/ccl/sqlproxyccl/throttler"
+	"github.com/cockroachdb/errors"
 	pgproto3 "github.com/jackc/pgproto3/v2"
 )
 
 // authenticate handles the startup of the pgwire protocol to the point where
 // the connections is considered authenticated. If that doesn't happen, it
 // returns an error.
-var authenticate = func(clientConn, crdbConn net.Conn, throttleHook func(throttler.AttemptStatus) error) error {
+var authenticate = func(
+	clientConn, crdbConn net.Conn,
+	proxyBackendKeyData *pgproto3.BackendKeyData,
+	throttleHook func(throttler.AttemptStatus) error,
+) (crdbBackendKeyData *pgproto3.BackendKeyData, _ error) {
 	fe := pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
 	be := pgproto3.NewFrontend(pgproto3.NewChunkReader(crdbConn), crdbConn)
 
 	feSend := func(msg pgproto3.BackendMessage) error {
 		err := fe.Send(msg)
 		if err != nil {
-			return newErrorf(codeClientWriteFailed, "unable to send message %v to client: %v", msg, err)
+			return withCode(
+				errors.Wrapf(err, "unable to send message %v to client", msg),
+				codeClientWriteFailed)
 		}
 		return nil
 	}
@@ -39,7 +46,9 @@ var authenticate = func(clientConn, crdbConn net.Conn, throttleHook func(throttl
 		// TODO(spaskob): in verbose mode, log these messages.
 		backendMsg, err := be.Receive()
 		if err != nil {
-			return newErrorf(codeBackendReadFailed, "unable to receive message from backend: %v", err)
+			return nil, withCode(
+				errors.Wrap(err, "unable to receive message from backend"),
+				codeBackendReadFailed)
 		}
 
 		// The cases in this switch are roughly sorted in the order the server will send them.
@@ -54,7 +63,7 @@ var authenticate = func(clientConn, crdbConn net.Conn, throttleHook func(throttl
 			*pgproto3.AuthenticationSASLFinal,
 			*pgproto3.AuthenticationSASL:
 			if err = feSend(backendMsg); err != nil {
-				return err
+				return nil, err
 			}
 			switch backendMsg.(type) {
 			case *pgproto3.AuthenticationCleartextPassword:
@@ -73,13 +82,15 @@ var authenticate = func(clientConn, crdbConn net.Conn, throttleHook func(throttl
 			}
 			fntMsg, err := fe.Receive()
 			if err != nil {
-				return newErrorf(codeClientReadFailed, "unable to receive message from client: %v", err)
+				return nil, withCode(
+					errors.Wrap(err, "unable to receive message from client"),
+					codeClientReadFailed)
 			}
 			err = be.Send(fntMsg)
 			if err != nil {
-				return newErrorf(
-					codeBackendWriteFailed, "unable to send message %v to backend: %v", fntMsg, err,
-				)
+				return nil, withCode(
+					errors.Wrapf(err, "unable to send message %v to backend", fntMsg),
+					codeBackendWriteFailed)
 			}
 
 		// Server has authenticated the connection; keep reading messages until
@@ -89,12 +100,12 @@ var authenticate = func(clientConn, crdbConn net.Conn, throttleHook func(throttl
 			throttleError := throttleHook(throttler.AttemptOK)
 			if throttleError != nil {
 				if err = feSend(toPgError(throttleError)); err != nil {
-					return err
+					return nil, err
 				}
-				return throttleError
+				return nil, throttleError
 			}
 			if err = feSend(backendMsg); err != nil {
-				return err
+				return nil, err
 			}
 
 		// Server has rejected the authentication response from the client and
@@ -103,36 +114,50 @@ var authenticate = func(clientConn, crdbConn net.Conn, throttleHook func(throttl
 			throttleError := throttleHook(throttler.AttemptInvalidCredentials)
 			if throttleError != nil {
 				if err = feSend(toPgError(throttleError)); err != nil {
-					return err
+					return nil, err
 				}
-				return throttleError
+				return nil, throttleError
 			}
 			if err = feSend(backendMsg); err != nil {
-				return err
+				return nil, err
 			}
-			return newErrorf(codeAuthFailed, "authentication failed: %s", tp.Message)
+			return nil, withCode(
+				errors.Newf("authentication failed: %s", tp.Message),
+				codeAuthFailed)
 
 		// Information provided by the server to the client before the connection is ready
 		// to accept queries. These are typically returned after AuthenticationOk and before
 		// ReadyForQuery.
-		case *pgproto3.ParameterStatus, *pgproto3.BackendKeyData:
+		case *pgproto3.ParameterStatus:
 			if err = feSend(backendMsg); err != nil {
-				return err
+				return nil, err
+			}
+
+		// BackendKeyData is part of the Postgres query cancellation protocol.
+		// sqlproxy saves it and returns a different one to the client.
+		case *pgproto3.BackendKeyData:
+			crdbBackendKeyData = tp
+			if err = feSend(proxyBackendKeyData); err != nil {
+				return nil, err
 			}
 
 		// Server has authenticated the connection successfully and is ready to
 		// serve queries.
 		case *pgproto3.ReadyForQuery:
 			if err = feSend(backendMsg); err != nil {
-				return err
+				return nil, err
 			}
-			return nil
+			return crdbBackendKeyData, nil
 
 		default:
-			return newErrorf(codeBackendDisconnected, "received unexpected backend message type: %v", tp)
+			return nil, withCode(
+				errors.Newf("received unexpected backend message type: %v", tp),
+				codeBackendDisconnected)
 		}
 	}
-	return newErrorf(codeBackendDisconnected, "authentication took more than %d iterations", i)
+	return nil, withCode(
+		errors.Newf("authentication took more than %d iterations", i),
+		codeBackendDisconnected)
 }
 
 // readTokenAuthResult reads the result for the token-based authentication, and
@@ -153,7 +178,7 @@ var authenticate = func(clientConn, crdbConn net.Conn, throttleHook func(throttl
 // we should merge them back in the future. Instead of having the writer as the
 // other end, the writer should be the same connection. That way, a
 // sqlproxyccl.Conn can be used to read-from, or write-to the same component.
-var readTokenAuthResult = func(conn net.Conn) error {
+var readTokenAuthResult = func(conn net.Conn) (*pgproto3.BackendKeyData, error) {
 	// This interceptor is discarded once this function returns. Just like
 	// pgproto3.NewFrontend, this serverConn object has an internal buffer.
 	// Discarding the buffer is fine since there won't be any other messages
@@ -161,29 +186,40 @@ var readTokenAuthResult = func(conn net.Conn) error {
 	// caller (i.e. proxy) does not forward client messages until then.
 	serverConn := interceptor.NewFrontendConn(conn)
 
+	var backendKeyData *pgproto3.BackendKeyData
 	// The auth step should require only a few back and forths so 20 iterations
 	// should be enough.
 	var i int
 	for ; i < 20; i++ {
 		backendMsg, err := serverConn.ReadMsg()
 		if err != nil {
-			return newErrorf(codeBackendReadFailed, "unable to receive message from backend: %v", err)
+			return nil, withCode(
+				errors.Wrap(err, "unable to receive message from backend"),
+				codeBackendReadFailed)
 		}
 
 		switch tp := backendMsg.(type) {
-		case *pgproto3.AuthenticationOk, *pgproto3.ParameterStatus, *pgproto3.BackendKeyData:
-			// Do nothing.
+		case *pgproto3.AuthenticationOk, *pgproto3.ParameterStatus:
+		// Do nothing.
+		case *pgproto3.BackendKeyData:
+			backendKeyData = tp
 
 		case *pgproto3.ErrorResponse:
-			return newErrorf(codeAuthFailed, "authentication failed: %s", tp.Message)
+			return nil, withCode(
+				errors.Newf("authentication failed: %s", tp.Message),
+				codeAuthFailed)
 
 		case *pgproto3.ReadyForQuery:
-			return nil
+			return backendKeyData, nil
 
 		default:
-			return newErrorf(codeBackendDisconnected, "received unexpected backend message type: %v", tp)
+			return nil, withCode(
+				errors.Newf("received unexpected backend message type: %v", tp),
+				codeBackendDisconnected)
 		}
 	}
 
-	return newErrorf(codeBackendDisconnected, "authentication took more than %d iterations", i)
+	return nil, withCode(
+		errors.Newf("authentication took more than %d iterations", i),
+		codeBackendDisconnected)
 }

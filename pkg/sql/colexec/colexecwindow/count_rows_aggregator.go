@@ -25,7 +25,7 @@ import (
 // aggregate window function.
 func NewCountRowsOperator(
 	args *WindowArgs, frame *execinfrapb.WindowerSpec_Frame, ordering *execinfrapb.Ordering,
-) colexecop.Operator {
+) colexecop.ClosableOperator {
 	// Because the buffer is potentially used multiple times per-row, it is
 	// important to prevent it from spilling to disk if possible. For this reason,
 	// we give the buffer half of the memory budget even though it will generally
@@ -35,8 +35,9 @@ func NewCountRowsOperator(
 	framer := newWindowFramer(args.EvalCtx, frame, ordering, args.InputTypes, args.PeersColIdx)
 	colsToStore := framer.getColsToStore(nil /* oldColsToStore */)
 	buffer := colexecutils.NewSpillingBuffer(
-		args.BufferAllocator, bufferMemLimit, args.QueueCfg,
-		args.FdSemaphore, args.InputTypes, args.DiskAcc, colsToStore...)
+		args.BufferAllocator, bufferMemLimit, args.QueueCfg, args.FdSemaphore,
+		args.InputTypes, args.DiskAcc, args.ConverterMemAcc, colsToStore...,
+	)
 	windower := &countRowsWindowAggregator{
 		partitionSeekerBase: partitionSeekerBase{
 			partitionColIdx: args.PartitionColIdx,

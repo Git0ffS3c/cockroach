@@ -12,7 +12,6 @@ vectorized: true
 ·
 • limit
 │ columns: (k, v, w)
-│ estimated row count: 2 (missing stats)
 │ count: 2
 │
 └── • filter
@@ -46,7 +45,6 @@ vectorized: true
 ·
 • limit
 │ columns: (w)
-│ estimated row count: 25 (missing stats)
 │ count: 25
 │
 └── • distinct
@@ -91,7 +89,6 @@ vectorized: true
 ·
 • limit
 │ columns: (k, v)
-│ estimated row count: 995 (missing stats)
 │ offset: 5
 │
 └── • scan
@@ -109,7 +106,6 @@ vectorized: true
 ·
 • limit
 │ columns: (k, v)
-│ estimated row count: 5 (missing stats)
 │ offset: 1
 │
 └── • scan
@@ -128,7 +124,6 @@ vectorized: true
 ·
 • limit
 │ columns: (k, v)
-│ estimated row count: 5 (missing stats)
 │ offset: 1
 │
 └── • revscan
@@ -151,7 +146,6 @@ vectorized: true
 └── • project
     │ columns: (any_not_null, sum)
     │ ordering: -any_not_null
-    │ estimated row count: 10 (missing stats)
     │
     └── • top-k
         │ columns: (k, sum, any_not_null)
@@ -183,7 +177,6 @@ vectorized: true
 ·
 • project
 │ columns: (k)
-│ estimated row count: 4 (missing stats)
 │
 └── • scan
       columns: (k, v)
@@ -200,7 +193,6 @@ vectorized: true
 ·
 • project
 │ columns: (k)
-│ estimated row count: 4 (missing stats)
 │
 └── • scan
       columns: (k, v)
@@ -235,11 +227,9 @@ vectorized: true
 ·
 • project
 │ columns: (k, w)
-│ estimated row count: 10 (missing stats)
 │
 └── • limit
     │ columns: (k, v, w)
-    │ estimated row count: 10 (missing stats)
     │ count: 10
     │
     └── • filter
@@ -251,7 +241,7 @@ vectorized: true
               columns: (k, v, w)
               estimated row count: 1,000 (missing stats)
               table: t@t_pkey
-              spans: FULL SCAN
+              spans: FULL SCAN (SOFT LIMIT)
 
 query T
 EXPLAIN (VERBOSE) SELECT k, w FROM t WHERE v >= 1 AND v <= 100 ORDER BY v LIMIT 10
@@ -294,7 +284,6 @@ vectorized: true
     │
     └── • limit
         │ columns: (k, v, w)
-        │ estimated row count: 10 (missing stats)
         │ count: 10
         │
         └── • filter
@@ -308,7 +297,7 @@ vectorized: true
                   ordering: +k
                   estimated row count: 1,000 (missing stats)
                   table: t@t_pkey
-                  spans: FULL SCAN
+                  spans: FULL SCAN (SOFT LIMIT)
 
 # Regression test for #47283: scan with both hard limit and soft limit.
 statement ok
@@ -323,7 +312,6 @@ vectorized: true
 ·
 • limit
 │ columns: (k, a)
-│ estimated row count: 1 (missing stats)
 │ count: 1
 │
 └── • filter
@@ -397,7 +385,6 @@ distribution: local
 vectorized: true
 ·
 • limit
-│ estimated row count: 5
 │ count: 5
 │
 └── • union all
@@ -515,7 +502,6 @@ distribution: local
 vectorized: true
 ·
 • limit
-│ estimated row count: 5
 │ count: 5
 │
 └── • lookup join
@@ -526,7 +512,7 @@ vectorized: true
     └── • scan
           estimated row count: 100 - 1,001 (100% of the table; stats collected <hidden> ago)
           table: a@a_i_j_idx
-          spans: FULL SCAN
+          spans: FULL SCAN (SOFT LIMIT)
 
 # A limit cannot be pushed into the scan of a virtual table with ORDER BY.
 query T
@@ -566,3 +552,44 @@ vectorized: true
 └── • virtual table
       table: pg_type@pg_type_oid_idx
       spans: [/1 - /1000]
+
+# Regression test for #69685 - a limit cannot be pushed below a window function
+# if its order-by references the window function.
+query T
+EXPLAIN SELECT * FROM generate_series(1, 10) ORDER BY row_number() OVER () LIMIT 1;
+----
+distribution: local
+vectorized: true
+·
+• top-k
+│ estimated row count: 1
+│ order: +row_number
+│ k: 1
+│
+└── • window
+    │ estimated row count: 10
+    │
+    └── • project set
+        │ estimated row count: 10
+        │
+        └── • emptyrow
+
+# Regression test for not incorporating the OFFSET value into the limit hint.
+statement ok
+CREATE TABLE t_offset (k INT PRIMARY KEY);
+
+statement ok
+INSERT INTO t_offset SELECT generate_series(1, 10)
+
+statement ok
+SET tracing = on,kv,results; SELECT * FROM t_offset LIMIT 1 OFFSET 3; SET tracing = off
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
+ WHERE message LIKE 'fetched:%'
+ ORDER BY message, ordinality ASC
+----
+fetched: /t_offset/t_offset_pkey/1 -> <undecoded>
+fetched: /t_offset/t_offset_pkey/2 -> <undecoded>
+fetched: /t_offset/t_offset_pkey/3 -> <undecoded>
+fetched: /t_offset/t_offset_pkey/4 -> <undecoded>

@@ -135,6 +135,7 @@ type hashBasedPartitioner struct {
 		fdSemaphore semaphore.Semaphore
 		acquiredFDs int
 	}
+	cancelChecker colexecutils.CancelChecker
 
 	partitioners      []*colcontainer.PartitionedDiskQueue
 	partitionedInputs []*partitionerToOperator
@@ -201,6 +202,11 @@ type hbpPartitionInfo struct {
 // a disk-backed sorter used in the fallback strategies.
 type DiskBackedSorterConstructor func(input colexecop.Operator, inputTypes []*types.T, orderingCols []execinfrapb.Ordering_Column, maxNumberPartitions int) colexecop.Operator
 
+// maxFDsForSingleOperator determines the maximum number of file descriptors
+// that a single operator can use. In turn, this limits the maximum number of
+// partitions.
+const maxFDsForSingleOperator = 16
+
 // newHashBasedPartitioner returns a disk-backed operator that utilizes
 // partitioning by hash approach to divide up the input set into separate
 // partitions which are then processed using the "main" in-memory operator if
@@ -222,6 +228,7 @@ func newHashBasedPartitioner(
 		fdSemaphore semaphore.Semaphore,
 	) colexecop.ResettableOperator,
 	diskAcc *mon.BoundAccount,
+	converterMemAcc *mon.BoundAccount,
 	numRequiredActivePartitions int,
 ) *hashBasedPartitioner {
 	// Make a copy of the DiskQueueCfg and set defaults for the partitioning
@@ -242,7 +249,8 @@ func newHashBasedPartitioner(
 	partitionedInputs := make([]*partitionerToOperator, numInputs)
 	for i := range inputs {
 		partitioners[i] = colcontainer.NewPartitionedDiskQueue(
-			inputTypes[i], diskQueueCfg, partitionedDiskQueueSemaphore, colcontainer.PartitionerStrategyDefault, diskAcc,
+			inputTypes[i], diskQueueCfg, partitionedDiskQueueSemaphore,
+			colcontainer.PartitionerStrategyDefault, diskAcc, converterMemAcc,
 		)
 		partitionedInputs[i] = newPartitionerToOperator(
 			unlimitedAllocator, inputTypes[i], partitioners[i],
@@ -297,6 +305,9 @@ func calculateMaxNumberActivePartitions(
 	// support the caches of this number of partitions.
 	// TODO(yuzefovich): this number should be tuned.
 	maxNumberActivePartitions := args.FDSemaphore.GetLimit() / 16
+	if maxNumberActivePartitions > maxFDsForSingleOperator {
+		maxNumberActivePartitions = maxFDsForSingleOperator
+	}
 	memoryLimit := execinfra.GetWorkMemLimit(flowCtx)
 	if args.DiskQueueCfg.BufferSizeBytes > 0 {
 		diskQueuesTotalMemLimit := int(float64(memoryLimit) * hbpDiskQueuesMemFraction)
@@ -308,6 +319,9 @@ func calculateMaxNumberActivePartitions(
 	if maxNumberActivePartitions < numRequiredActivePartitions {
 		maxNumberActivePartitions = numRequiredActivePartitions
 	}
+	if toAcquire := flowCtx.TestingKnobs().VecFDsToAcquire; toAcquire > 0 {
+		maxNumberActivePartitions = toAcquire
+	}
 	return maxNumberActivePartitions
 }
 
@@ -318,6 +332,7 @@ func (op *hashBasedPartitioner) Init(ctx context.Context) {
 	for i := range op.inputs {
 		op.inputs[i].Init(op.Ctx)
 	}
+	op.cancelChecker.Init(op.Ctx)
 	op.partitionsToProcessUsingMain = make(map[int]*hbpPartitionInfo)
 	// If we are initializing the hash-based partitioner, it means that we had
 	// to fallback from the in-memory one since the inputs had more tuples that
@@ -402,6 +417,7 @@ func (op *hashBasedPartitioner) Next() coldata.Batch {
 	var batches [2]coldata.Batch
 StateChanged:
 	for {
+		op.cancelChecker.CheckEveryCall()
 		switch op.state {
 		case hbpInitialPartitioning:
 			allZero := true
@@ -439,7 +455,7 @@ StateChanged:
 			if !op.testingKnobs.delegateFDAcquisitions && op.fdState.acquiredFDs == 0 {
 				toAcquire := op.maxNumberActivePartitions
 				if err := op.fdState.fdSemaphore.Acquire(op.Ctx, toAcquire); err != nil {
-					colexecerror.InternalError(err)
+					colexecerror.ExpectedError(err)
 				}
 				op.fdState.acquiredFDs = toAcquire
 			}

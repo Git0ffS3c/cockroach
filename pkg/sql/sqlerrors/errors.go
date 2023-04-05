@@ -13,9 +13,11 @@ package sqlerrors
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
@@ -27,6 +29,11 @@ const (
 	txnCommittedMsg = "current transaction is committed, commands ignored " +
 		"until end of transaction block"
 )
+
+// EnforceHomeRegionFurtherInfo is the suffix to append to every error returned
+// due to turning on the enforce_home_region session setting, and provides some
+// information for users or app developers.
+const EnforceHomeRegionFurtherInfo = "For more information, see https://www.cockroachlabs.com/docs/stable/cost-based-optimizer.html#control-whether-queries-are-limited-to-a-single-region"
 
 // NewTransactionAbortedError creates an error for trying to run a command in
 // the context of transaction that's in the aborted state. Any statement other
@@ -138,22 +145,15 @@ func NewInvalidWildcardError(name string) error {
 		"%q does not match any valid database or schema", name)
 }
 
-// NewUndefinedObjectError returns the correct undefined object error based on
-// the kind of object that was requested.
-func NewUndefinedObjectError(name tree.NodeFormatter, kind tree.DesiredObjectKind) error {
-	switch kind {
-	case tree.TableObject:
-		return NewUndefinedRelationError(name)
-	case tree.TypeObject:
-		return NewUndefinedTypeError(name)
-	default:
-		return errors.AssertionFailedf("unknown object kind %d", kind)
-	}
-}
-
 // NewUndefinedTypeError creates an error that represents a missing type.
 func NewUndefinedTypeError(name tree.NodeFormatter) error {
 	return pgerror.Newf(pgcode.UndefinedObject, "type %q does not exist", tree.ErrString(name))
+}
+
+// NewUndefinedFunctionError creates an error that represents a missing user
+// defined function.
+func NewUndefinedFunctionError(fn string) error {
+	return pgerror.Newf(pgcode.UndefinedFunction, "function %q does not exist", fn)
 }
 
 // NewUndefinedRelationError creates an error that represents a missing database table or view.
@@ -175,6 +175,11 @@ func NewDatabaseAlreadyExistsError(name string) error {
 // NewSchemaAlreadyExistsError creates an error for a preexisting schema.
 func NewSchemaAlreadyExistsError(name string) error {
 	return pgerror.Newf(pgcode.DuplicateSchema, "schema %q already exists", name)
+}
+
+func NewUnsupportedUnvalidatedConstraintError(constraintType catconstants.ConstraintType) error {
+	return pgerror.Newf(pgcode.FeatureNotSupported,
+		"%v constraints cannot be marked NOT VALID", constraintType)
 }
 
 // WrapErrorWhileConstructingObjectAlreadyExistsErr is used to wrap an error
@@ -232,6 +237,85 @@ func NewDependentObjectErrorf(format string, args ...interface{}) error {
 	return pgerror.Newf(pgcode.DependentObjectsStillExist, format, args...)
 }
 
+// NewColumnReferencedByPrimaryKeyError is returned when attempting to drop a
+// column which is a part of the table's primary key.
+//
+// Note that this limitation is not fundamental; in postgres when dropping a
+// primary key column, it would silently drop the primary key constraint. At
+// the time of writing, cockroach does not permit dropping a primary key
+// constraint as it may require populating a new implicit rowid column for the
+// implicit primary key we use.
+func NewColumnReferencedByPrimaryKeyError(colName string) error {
+	return pgerror.Newf(pgcode.InvalidColumnReference,
+		"column %q is referenced by the primary key", colName)
+}
+
+// NewColumnReferencedByComputedColumnError is returned when dropping a column
+// and that column being dropped is referenced by a computed column. Note that
+// the cockroach behavior where this error is returned does not match the
+// postgres behavior.
+func NewColumnReferencedByComputedColumnError(droppingColumn, computedColumn string) error {
+	return pgerror.Newf(
+		pgcode.InvalidColumnReference,
+		"column %q is referenced by computed column %q",
+		droppingColumn,
+		computedColumn,
+	)
+}
+
+// NewColumnReferencedByPartialIndex is returned when we drop a column that is
+// referenced in a partial index's predicate.
+func NewColumnReferencedByPartialIndex(droppingColumn, partialIndex string) error {
+	return errors.WithIssueLink(errors.WithHint(
+		pgerror.Newf(
+			pgcode.InvalidColumnReference,
+			"column %q cannot be dropped because it is referenced by partial index %q",
+			droppingColumn, partialIndex,
+		),
+		"drop the partial index first, then drop the column",
+	), errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/pull/97372"})
+}
+
+// NewColumnReferencedByPartialUniqueWithoutIndexConstraint is almost the same as
+// NewColumnReferencedByPartialIndex except it's used when dropping column that is
+// referenced in a partial unique without index constraint's predicate.
+func NewColumnReferencedByPartialUniqueWithoutIndexConstraint(
+	droppingColumn, partialUWIConstraint string,
+) error {
+	return errors.WithIssueLink(errors.WithHint(
+		pgerror.Newf(
+			pgcode.InvalidColumnReference,
+			"column %q cannot be dropped because it is referenced by partial unique constraint %q",
+			droppingColumn, partialUWIConstraint,
+		),
+		"drop the unique constraint first, then drop the column",
+	), errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/pull/97372"})
+}
+
+// NewUniqueConstraintReferencedByForeignKeyError generates an error to be
+// returned when dropping a unique constraint that is relied upon by an
+// inbound foreign key constraint.
+func NewUniqueConstraintReferencedByForeignKeyError(
+	uniqueConstraintOrIndexToDrop, tableName string,
+) error {
+	return pgerror.Newf(
+		pgcode.DependentObjectsStillExist,
+		"%q is referenced by foreign key from table %q",
+		uniqueConstraintOrIndexToDrop, tableName,
+	)
+}
+
+// NewUndefinedUserError returns an undefined user error.
+func NewUndefinedUserError(user username.SQLUsername) error {
+	return pgerror.Newf(pgcode.UndefinedObject, "role/user %q does not exist", user)
+}
+
+// NewUndefinedConstraintError returns a missing constraint error.
+func NewUndefinedConstraintError(constraintName, tableName string) error {
+	return pgerror.Newf(pgcode.UndefinedObject,
+		"constraint %q of relation %q does not exist", constraintName, tableName)
+}
+
 // NewRangeUnavailableError creates an unavailable range error.
 func NewRangeUnavailableError(rangeID roachpb.RangeID, origErr error) error {
 	return pgerror.Wrapf(origErr, pgcode.RangeUnavailable, "key range id:%d is unavailable", rangeID)
@@ -250,9 +334,19 @@ func NewAggInAggError() error {
 	return pgerror.New(pgcode.Grouping, "aggregate function calls cannot be nested")
 }
 
+// NewInvalidVolatilityError creates an error for the case when provided
+// volatility options are not valid through CREATE/REPLACE/ALTER FUNCTION.
+func NewInvalidVolatilityError(err error) error {
+	return pgerror.Wrap(err, pgcode.InvalidFunctionDefinition, "invalid volatility")
+}
+
 // QueryTimeoutError is an error representing a query timeout.
 var QueryTimeoutError = pgerror.New(
 	pgcode.QueryCanceled, "query execution canceled due to statement timeout")
+
+// TxnTimeoutError is an error representing a transasction timeout.
+var TxnTimeoutError = pgerror.New(
+	pgcode.QueryCanceled, "query execution canceled due to transaction timeout")
 
 // IsOutOfMemoryError checks whether this is an out of memory error.
 func IsOutOfMemoryError(err error) bool {
@@ -282,6 +376,21 @@ func IsUndefinedDatabaseError(err error) bool {
 // IsUndefinedSchemaError checks whether this is an undefined schema error.
 func IsUndefinedSchemaError(err error) bool {
 	return errHasCode(err, pgcode.UndefinedSchema)
+}
+
+// IsMissingDescriptorError checks whether the error has any indication
+// that it corresponds to a missing descriptor of any kind.
+//
+// Note that this does not deal with the lower-level
+// catalog.ErrDescriptorNotFound error. That error should be transformed
+// by this package for all uses in the SQL layer and coming out of
+// descs.Collection functions.
+func IsMissingDescriptorError(err error) bool {
+	return IsUndefinedRelationError(err) ||
+		IsUndefinedSchemaError(err) ||
+		IsUndefinedDatabaseError(err) ||
+		errHasCode(err, pgcode.UndefinedObject) ||
+		errHasCode(err, pgcode.UndefinedFunction)
 }
 
 func errHasCode(err error, code ...pgcode.Code) bool {

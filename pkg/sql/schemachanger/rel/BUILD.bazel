@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
 
@@ -24,6 +25,7 @@ go_library(
         "schema.go",
         "schema_attribute.go",
         "schema_mappings.go",
+        "schema_rules.go",
         "schema_value.go",
         "system_attributes.go",
         "values.go",
@@ -33,8 +35,10 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/util",
+        "//pkg/util/intsets",
         "//pkg/util/iterutil",
         "//pkg/util/syncutil",
+        "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_google_btree//:btree",
         "@in_gopkg_yaml_v2//:yaml_v2",
@@ -47,9 +51,11 @@ go_test(
     size = "small",
     srcs = [
         "bench_test.go",
+        "ordinal_set_test.go",
         "rel_internal_test.go",
         "rel_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":rel"],
     deps = [
@@ -57,7 +63,10 @@ go_test(
         "//pkg/sql/schemachanger/rel/internal/cyclegraphtest",
         "//pkg/sql/schemachanger/rel/internal/entitynodetest",
         "//pkg/sql/schemachanger/rel/reltest",
+        "//pkg/util/leaktest",
+        "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_x_sync//errgroup",
     ],
 )
 
@@ -66,3 +75,5 @@ stringer(
     src = "system_attributes.go",
     typ = "systemAttribute",
 )
+
+get_x_data(name = "get_x_data")

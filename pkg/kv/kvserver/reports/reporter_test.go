@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -458,7 +459,7 @@ func (it *erroryRangeIterator) Next(ctx context.Context) (roachpb.RangeDescripto
 		it.injectErrAfter = -1
 
 		var err error
-		err = roachpb.NewTransactionRetryWithProtoRefreshError(
+		err = kvpb.NewTransactionRetryWithProtoRefreshError(
 			"injected err", uuid.Nil, roachpb.Transaction{})
 		// Let's wrap the error to check the unwrapping.
 		err = errors.Wrap(err, "dummy wrapper")
@@ -486,7 +487,7 @@ func TestZoneChecker(t *testing.T) {
 		newRootZoneCfg *zonepb.ZoneConfig
 		newZoneKey     ZoneKey
 	}
-	// NB: IDs need to be beyond MaxSystemConfigDescID, otherwise special logic
+	// NB: IDs need to be beyond DeprecatedMaxSystemConfigDescID, otherwise special logic
 	// kicks in for mapping keys to zones. They also need to not overlap with any
 	// system table IDs.
 	dbID := int(bootstrap.TestingMinUserDescID())

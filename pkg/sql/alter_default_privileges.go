@@ -13,8 +13,9 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
@@ -22,18 +23,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
 )
 
-var targetObjectToPrivilegeObject = map[tree.AlterDefaultPrivilegesTargetObject]privilege.ObjectType{
-	tree.Tables:    privilege.Table,
-	tree.Sequences: privilege.Table,
-	tree.Types:     privilege.Type,
-	tree.Schemas:   privilege.Schema,
+var targetObjectToPrivilegeObject = map[privilege.TargetObjectType]privilege.ObjectType{
+	privilege.Tables:    privilege.Table,
+	privilege.Sequences: privilege.Table,
+	privilege.Types:     privilege.Type,
+	privilege.Schemas:   privilege.Schema,
+	privilege.Functions: privilege.Function,
 }
 
 type alterDefaultPrivilegesNode struct {
@@ -56,10 +58,12 @@ func (p *planner) alterDefaultPrivileges(
 	if n.Database != nil {
 		database = n.Database.Normalize()
 	}
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, database,
-		tree.DatabaseLookupFlags{Required: true})
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, database)
 	if err != nil {
 		return nil, err
+	}
+	if dbDesc.GetID() == keys.SystemDatabaseID {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "cannot alter system database")
 	}
 
 	objectType := n.Grant.Target
@@ -67,7 +71,7 @@ func (p *planner) alterDefaultPrivileges(
 		objectType = n.Revoke.Target
 	}
 
-	if len(n.Schemas) > 0 && objectType == tree.Schemas {
+	if len(n.Schemas) > 0 && objectType == privilege.Schemas {
 		return nil, pgerror.WithCandidateCode(errors.New(
 			"cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS"),
 			pgcode.InvalidGrantOperation,
@@ -76,11 +80,18 @@ func (p *planner) alterDefaultPrivileges(
 
 	var schemaDescs []*schemadesc.Mutable
 	for _, sc := range n.Schemas {
-		schemaDesc, err := p.Descriptors().GetMutableSchemaByName(ctx, p.txn, dbDesc, sc.Schema(), tree.SchemaLookupFlags{Required: true})
+		immSchema, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, dbDesc, sc.Schema())
 		if err != nil {
 			return nil, err
 		}
-		schemaDescs = append(schemaDescs, schemaDesc.(*schemadesc.Mutable))
+		if immSchema.SchemaKind() != catalog.SchemaUserDefined {
+			return nil, pgerror.Newf(pgcode.InvalidParameterValue, "%s is not a physical schema", immSchema.GetName())
+		}
+		mutableSchemaDesc, err := p.Descriptors().MutableByID(p.txn).Schema(ctx, immSchema.GetID())
+		if err != nil {
+			return nil, err
+		}
+		schemaDescs = append(schemaDescs, mutableSchemaDesc)
 	}
 
 	return &alterDefaultPrivilegesNode{
@@ -91,12 +102,6 @@ func (p *planner) alterDefaultPrivileges(
 }
 
 func (n *alterDefaultPrivilegesNode) startExec(params runParams) error {
-	if (n.n.Grant.WithGrantOption || n.n.Revoke.GrantOptionFor) &&
-		!params.p.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.ValidateGrantOption) {
-		return pgerror.Newf(pgcode.FeatureNotSupported,
-			"version %v must be finalized to use grant options",
-			clusterversion.ByKey(clusterversion.ValidateGrantOption))
-	}
 	targetRoles, err := decodeusername.FromRoleSpecList(
 		params.SessionData(), username.PurposeValidation, n.n.Roles,
 	)
@@ -130,7 +135,7 @@ func (n *alterDefaultPrivilegesNode) startExec(params runParams) error {
 		return err
 	}
 
-	if err := params.p.validateRoles(params.ctx, granteeSQLUsernames, true /* isPublicValid */); err != nil {
+	if err := params.p.preChangePrivilegesValidation(params.ctx, granteeSQLUsernames, grantOption, n.n.IsGrant); err != nil {
 		return err
 	}
 
@@ -172,12 +177,12 @@ func (n *alterDefaultPrivilegesNode) startExec(params runParams) error {
 func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForSchemas(
 	params runParams,
 	targetRoles []username.SQLUsername,
-	objectType tree.AlterDefaultPrivilegesTargetObject,
+	objectType privilege.TargetObjectType,
 	grantees tree.RoleSpecList,
 	privileges privilege.List,
 	grantOption bool,
 ) error {
-	var events []eventLogEntry
+	var events []logpb.EventPayload
 	for _, schemaDesc := range n.schemaDescs {
 		if schemaDesc.GetDefaultPrivileges() == nil {
 			schemaDesc.SetDefaultPrivilegeDescriptor(catprivilege.MakeDefaultPrivilegeDescriptor(catpb.DefaultPrivilegeDescriptor_SCHEMA))
@@ -206,40 +211,19 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForSchemas(
 			return err
 		}
 
-		grantPresent, allPresent := false, false
-		for _, priv := range privileges {
-			grantPresent = grantPresent || priv == privilege.GRANT
-			allPresent = allPresent || priv == privilege.ALL
-		}
-		if params.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.ValidateGrantOption) {
-			noticeMessage := ""
-			// we only output the message for ALL privilege if it is being granted without the WITH GRANT OPTION flag
-			// if GRANT privilege is involved, we must always output the message
-			if allPresent && n.n.IsGrant && !grantOption {
-				noticeMessage = "grant options were automatically applied but this behavior is deprecated"
-			} else if grantPresent {
-				noticeMessage = "the GRANT privilege is deprecated"
-			}
-			if len(noticeMessage) > 0 {
-				params.p.BufferClientNotice(
-					params.ctx,
-					errors.WithHint(
-						pgnotice.Newf("%s", noticeMessage),
-						"please use WITH GRANT OPTION",
-					),
-				)
-			}
-		}
-
 		for _, role := range roles {
 			if n.n.IsGrant {
-				defaultPrivs.GrantDefaultPrivileges(
-					role, privileges, granteeSQLUsernames, objectType, grantOption, grantPresent || allPresent,
-				)
+				if err := defaultPrivs.GrantDefaultPrivileges(
+					role, privileges, granteeSQLUsernames, objectType, grantOption,
+				); err != nil {
+					return err
+				}
 			} else {
-				defaultPrivs.RevokeDefaultPrivileges(
-					role, privileges, granteeSQLUsernames, objectType, grantOption, grantPresent || allPresent,
-				)
+				if err := defaultPrivs.RevokeDefaultPrivileges(
+					role, privileges, granteeSQLUsernames, objectType, grantOption,
+				); err != nil {
+					return err
+				}
 			}
 
 			eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
@@ -249,6 +233,9 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForSchemas(
 				eventDetails.RevokedPrivileges = privileges.SortedNames()
 			}
 			event := eventpb.AlterDefaultPrivileges{
+				CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+					DescriptorID: uint32(n.dbDesc.GetID()),
+				},
 				CommonSQLPrivilegeEventDetails: eventDetails,
 				SchemaName:                     schemaDesc.GetName(),
 			}
@@ -258,10 +245,7 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForSchemas(
 				event.RoleName = role.Role.Normalized()
 			}
 
-			events = append(events, eventLogEntry{
-				targetID: int32(n.dbDesc.GetID()),
-				event:    &event,
-			})
+			events = append(events, &event)
 
 			if err := params.p.writeSchemaDescChange(
 				params.ctx, schemaDesc, tree.AsStringWithFQNames(n.n, params.Ann()),
@@ -277,7 +261,7 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForSchemas(
 func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForDatabase(
 	params runParams,
 	targetRoles []username.SQLUsername,
-	objectType tree.AlterDefaultPrivilegesTargetObject,
+	objectType privilege.TargetObjectType,
 	grantees tree.RoleSpecList,
 	privileges privilege.List,
 	grantOption bool,
@@ -302,7 +286,7 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForDatabase(
 		}
 	}
 
-	var events []eventLogEntry
+	var events []logpb.EventPayload
 	granteeSQLUsernames, err := decodeusername.FromRoleSpecList(
 		params.SessionData(), username.PurposeValidation, grantees,
 	)
@@ -310,41 +294,19 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForDatabase(
 		return err
 	}
 
-	grantPresent, allPresent := false, false
-	for _, priv := range privileges {
-		grantPresent = grantPresent || priv == privilege.GRANT
-		allPresent = allPresent || priv == privilege.ALL
-	}
-	if params.ExecCfg().Settings.Version.IsActive(params.ctx, clusterversion.ValidateGrantOption) {
-		noticeMessage := ""
-		// we only output the message for ALL privilege if it is being granted without the WITH GRANT OPTION flag
-		// if GRANT privilege is involved, we must always output the message
-		if allPresent && n.n.IsGrant && !grantOption {
-			noticeMessage = "grant options were automatically applied but this behavior is deprecated"
-		} else if grantPresent {
-			noticeMessage = "the GRANT privilege is deprecated"
-		}
-
-		if len(noticeMessage) > 0 {
-			params.p.BufferClientNotice(
-				params.ctx,
-				errors.WithHint(
-					pgnotice.Newf("%s", noticeMessage),
-					"please use WITH GRANT OPTION",
-				),
-			)
-		}
-	}
-
 	for _, role := range roles {
 		if n.n.IsGrant {
-			defaultPrivs.GrantDefaultPrivileges(
-				role, privileges, granteeSQLUsernames, objectType, grantOption, grantPresent || allPresent,
-			)
+			if err := defaultPrivs.GrantDefaultPrivileges(
+				role, privileges, granteeSQLUsernames, objectType, grantOption,
+			); err != nil {
+				return err
+			}
 		} else {
-			defaultPrivs.RevokeDefaultPrivileges(
-				role, privileges, granteeSQLUsernames, objectType, grantOption, grantPresent || allPresent,
-			)
+			if err := defaultPrivs.RevokeDefaultPrivileges(
+				role, privileges, granteeSQLUsernames, objectType, grantOption,
+			); err != nil {
+				return err
+			}
 		}
 
 		eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
@@ -354,6 +316,9 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForDatabase(
 			eventDetails.RevokedPrivileges = privileges.SortedNames()
 		}
 		event := eventpb.AlterDefaultPrivileges{
+			CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+				DescriptorID: uint32(n.dbDesc.GetID()),
+			},
 			CommonSQLPrivilegeEventDetails: eventDetails,
 			DatabaseName:                   n.dbDesc.GetName(),
 		}
@@ -363,10 +328,7 @@ func (n *alterDefaultPrivilegesNode) alterDefaultPrivilegesForDatabase(
 			event.RoleName = role.Role.Normalized()
 		}
 
-		events = append(events, eventLogEntry{
-			targetID: int32(n.dbDesc.GetID()),
-			event:    &event,
-		})
+		events = append(events, &event)
 	}
 
 	if err := params.p.writeNonDropDatabaseChange(

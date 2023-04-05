@@ -22,30 +22,20 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-func initWindowBuiltins() {
+func init() {
 	// Add all windows to the builtins map after a few sanity checks.
 	for k, v := range windows {
-		if _, exists := builtins[k]; exists {
-			panic("duplicate builtin: " + k)
-		}
-
-		if v.props.Class != tree.WindowClass {
-			panic(errors.AssertionFailedf("%s: window functions should be marked with the tree.WindowClass "+
-				"function class, found %v", k, v))
-		}
 		for _, w := range v.overloads {
+			if w.Class != tree.WindowClass {
+				panic(errors.AssertionFailedf("%s: window functions should be marked with the tree.WindowClass "+
+					"function class, found %v", k, v))
+			}
 			if w.WindowFunc == nil {
 				panic(errors.AssertionFailedf("%s: window functions should have eval.WindowFunc constructors, "+
 					"found %v", k, w))
 			}
 		}
-		builtins[k] = v
-	}
-}
-
-func winProps() tree.FunctionProperties {
-	return tree.FunctionProperties{
-		Class: tree.WindowClass,
+		registerBuiltin(k, v)
 	}
 }
 
@@ -53,45 +43,45 @@ func winProps() tree.FunctionProperties {
 // as window functions using an OVER clause.
 // See `windowFuncHolder` in the sql package.
 var windows = map[string]builtinDefinition{
-	"row_number": makeBuiltin(winProps(),
+	"row_number": makeBuiltin(tree.FunctionProperties{},
 		makeWindowOverload(
-			tree.ArgTypes{},
+			tree.ParamTypes{},
 			types.Int,
 			newRowNumberWindow,
 			"Calculates the number of the current row within its partition, counting from 1.",
 			volatility.Immutable,
 		),
 	),
-	"rank": makeBuiltin(winProps(),
+	"rank": makeBuiltin(tree.FunctionProperties{},
 		makeWindowOverload(
-			tree.ArgTypes{},
+			tree.ParamTypes{},
 			types.Int,
 			newRankWindow,
 			"Calculates the rank of the current row with gaps; same as row_number of its first peer.",
 			volatility.Immutable,
 		),
 	),
-	"dense_rank": makeBuiltin(winProps(),
+	"dense_rank": makeBuiltin(tree.FunctionProperties{},
 		makeWindowOverload(
-			tree.ArgTypes{},
+			tree.ParamTypes{},
 			types.Int,
 			newDenseRankWindow,
 			"Calculates the rank of the current row without gaps; this function counts peer groups.",
 			volatility.Immutable,
 		),
 	),
-	"percent_rank": makeBuiltin(winProps(),
+	"percent_rank": makeBuiltin(tree.FunctionProperties{},
 		makeWindowOverload(
-			tree.ArgTypes{},
+			tree.ParamTypes{},
 			types.Float,
 			newPercentRankWindow,
 			"Calculates the relative rank of the current row: (rank - 1) / (total rows - 1).",
 			volatility.Immutable,
 		),
 	),
-	"cume_dist": makeBuiltin(winProps(),
+	"cume_dist": makeBuiltin(tree.FunctionProperties{},
 		makeWindowOverload(
-			tree.ArgTypes{},
+			tree.ParamTypes{},
 			types.Float,
 			newCumulativeDistWindow,
 			"Calculates the relative rank of the current row: "+
@@ -99,9 +89,9 @@ var windows = map[string]builtinDefinition{
 			volatility.Immutable,
 		),
 	),
-	"ntile": makeBuiltin(winProps(),
+	"ntile": makeBuiltin(tree.FunctionProperties{},
 		makeWindowOverload(
-			tree.ArgTypes{{"n", types.Int}},
+			tree.ParamTypes{{Name: "n", Typ: types.Int}},
 			types.Int,
 			newNtileWindow,
 			"Calculates an integer ranging from 1 to `n`, dividing the partition as equally as possible.",
@@ -109,11 +99,11 @@ var windows = map[string]builtinDefinition{
 		),
 	),
 	"lag": collectOverloads(
-		winProps(),
+		tree.FunctionProperties{},
 		types.Scalar,
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{{"val", t}},
+				tree.ParamTypes{{Name: "val", Typ: t}},
 				t,
 				makeLeadLagWindowConstructor(false, false, false),
 				"Returns `val` evaluated at the previous row within current row's partition; "+
@@ -123,7 +113,7 @@ var windows = map[string]builtinDefinition{
 		},
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{{"val", t}, {"n", types.Int}},
+				tree.ParamTypes{{Name: "val", Typ: t}, {Name: "n", Typ: types.Int}},
 				t,
 				makeLeadLagWindowConstructor(false, true, false),
 				"Returns `val` evaluated at the row that is `n` rows before the current row within its partition; "+
@@ -135,8 +125,8 @@ var windows = map[string]builtinDefinition{
 		// can be any types but must be the same (eg. lag(T, Int, T)).
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{
-					{"val", t}, {"n", types.Int}, {"default", t},
+				tree.ParamTypes{
+					{Name: "val", Typ: t}, {Name: "n", Typ: types.Int}, {Name: "default", Typ: t},
 				},
 				t,
 				makeLeadLagWindowConstructor(false, true, true),
@@ -147,10 +137,10 @@ var windows = map[string]builtinDefinition{
 			)
 		},
 	),
-	"lead": collectOverloads(winProps(), types.Scalar,
+	"lead": collectOverloads(tree.FunctionProperties{}, types.Scalar,
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{{"val", t}},
+				tree.ParamTypes{{Name: "val", Typ: t}},
 				t,
 				makeLeadLagWindowConstructor(true, false, false),
 				"Returns `val` evaluated at the following row within current row's partition; "+""+
@@ -160,7 +150,7 @@ var windows = map[string]builtinDefinition{
 		},
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{{"val", t}, {"n", types.Int}},
+				tree.ParamTypes{{Name: "val", Typ: t}, {Name: "n", Typ: types.Int}},
 				t,
 				makeLeadLagWindowConstructor(true, true, false),
 				"Returns `val` evaluated at the row that is `n` rows after the current row within its partition; "+
@@ -170,8 +160,8 @@ var windows = map[string]builtinDefinition{
 		},
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{
-					{"val", t}, {"n", types.Int}, {"default", t},
+				tree.ParamTypes{
+					{Name: "val", Typ: t}, {Name: "n", Typ: types.Int}, {Name: "default", Typ: t},
 				},
 				t,
 				makeLeadLagWindowConstructor(true, true, true),
@@ -183,11 +173,11 @@ var windows = map[string]builtinDefinition{
 		},
 	),
 	"first_value": collectOverloads(
-		winProps(),
+		tree.FunctionProperties{},
 		types.Scalar,
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{{"val", t}},
+				tree.ParamTypes{{Name: "val", Typ: t}},
 				t,
 				newFirstValueWindow,
 				"Returns `val` evaluated at the row that is the first row of the window frame.",
@@ -195,22 +185,22 @@ var windows = map[string]builtinDefinition{
 			)
 		}),
 	"last_value": collectOverloads(
-		winProps(),
+		tree.FunctionProperties{},
 		types.Scalar,
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{{"val", t}},
+				tree.ParamTypes{{Name: "val", Typ: t}},
 				t,
 				newLastValueWindow,
 				"Returns `val` evaluated at the row that is the last row of the window frame.",
 				volatility.Immutable,
 			)
 		}),
-	"nth_value": collectOverloads(winProps(), types.Scalar,
+	"nth_value": collectOverloads(tree.FunctionProperties{}, types.Scalar,
 		func(t *types.T) tree.Overload {
 			return makeWindowOverload(
-				tree.ArgTypes{
-					{"val", t}, {"n", types.Int},
+				tree.ParamTypes{
+					{Name: "val", Typ: t}, {Name: "n", Typ: types.Int},
 				},
 				t,
 				newNthValueWindow,
@@ -222,12 +212,13 @@ var windows = map[string]builtinDefinition{
 }
 
 func makeWindowOverload(
-	in tree.ArgTypes, ret *types.T, f eval.WindowOverload, info string, volatility volatility.V,
+	in tree.ParamTypes, ret *types.T, f eval.WindowOverload, info string, volatility volatility.V,
 ) tree.Overload {
 	return tree.Overload{
 		Types:      in,
 		ReturnType: tree.FixedReturnType(ret),
 		WindowFunc: f,
+		Class:      tree.WindowClass,
 		Info:       info,
 		Volatility: volatility,
 	}
@@ -515,7 +506,8 @@ func (w *denseRankWindow) Reset(context.Context) {
 func (w *denseRankWindow) Close(context.Context, *eval.Context) {}
 
 // percentRankWindow computes the relative rank of the current row using:
-//   (rank - 1) / (total rows - 1)
+//
+//	(rank - 1) / (total rows - 1)
 type percentRankWindow struct {
 	peerRes *tree.DFloat
 }
@@ -549,7 +541,8 @@ func (w *percentRankWindow) Reset(context.Context) {
 func (w *percentRankWindow) Close(context.Context, *eval.Context) {}
 
 // cumulativeDistWindow computes the relative rank of the current row using:
-//   (number of rows preceding or peer with current row) / (total rows)
+//
+//	(number of rows preceding or peer with current row) / (total rows)
 type cumulativeDistWindow struct {
 	peerRes *tree.DFloat
 }

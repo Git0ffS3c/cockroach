@@ -64,7 +64,7 @@ func UnderDeadlockWithIssue(t SkippableTest, githubIssueID int, args ...interfac
 	t.Helper()
 	if syncutil.DeadlockEnabled {
 		t.Skip(append([]interface{}{fmt.Sprintf(
-			"disabled under deadlock detector. issue: https://github.com/cockroachdb/cockroach/issue/%d",
+			"disabled under deadlock detector. issue: https://github.com/cockroachdb/cockroach/issues/%d",
 			githubIssueID,
 		)}, args...))
 	}
@@ -84,7 +84,7 @@ func UnderRaceWithIssue(t SkippableTest, githubIssueID int, args ...interface{})
 	t.Helper()
 	if util.RaceEnabled {
 		t.Skip(append([]interface{}{fmt.Sprintf(
-			"disabled under race. issue: https://github.com/cockroachdb/cockroach/issue/%d", githubIssueID,
+			"disabled under race. issue: https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID,
 		)}, args...))
 	}
 }
@@ -95,7 +95,7 @@ func UnderBazelWithIssue(t SkippableTest, githubIssueID int, args ...interface{}
 	t.Helper()
 	if bazel.BuiltWithBazel() {
 		t.Skip(append([]interface{}{fmt.Sprintf(
-			"disabled under bazel. issue: https://github.com/cockroachdb/cockroach/issue/%d", githubIssueID,
+			"disabled under bazel. issue: https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID,
 		)}, args...))
 	}
 }
@@ -114,8 +114,19 @@ func UnderShort(t SkippableTest, args ...interface{}) {
 // UnderStress skips this test when running under stress.
 func UnderStress(t SkippableTest, args ...interface{}) {
 	t.Helper()
-	if NightlyStress() {
+	if Stress() {
 		t.Skip(append([]interface{}{"disabled under stress"}, args...))
+	}
+}
+
+// UnderStressWithIssue skips this test when running under stress, logging the
+// given issue ID as the reason.
+func UnderStressWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
+	t.Helper()
+	if Stress() {
+		t.Skip(append([]interface{}{fmt.Sprintf(
+			"disabled under stress. issue: https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID,
+		)}, args...))
 	}
 }
 
@@ -123,7 +134,7 @@ func UnderStress(t SkippableTest, args ...interface{}) {
 // run under stress with the -race flag.
 func UnderStressRace(t SkippableTest, args ...interface{}) {
 	t.Helper()
-	if NightlyStress() && util.RaceEnabled {
+	if Stress() && util.RaceEnabled {
 		t.Skip(append([]interface{}{"disabled under stressrace"}, args...))
 	}
 }

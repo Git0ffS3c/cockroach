@@ -12,29 +12,26 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/backupccl/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/bulk"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -45,19 +42,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
-	gogotypes "github.com/gogo/protobuf/types"
-	"github.com/kr/pretty"
+	"github.com/cockroachdb/redact"
 )
 
 var backupOutputTypes = []*types.T{}
 
 var (
-	useTBI = settings.RegisterBoolSetting(
-		settings.TenantWritable,
-		"kv.bulk_io_write.experimental_incremental_export_enabled",
-		"use experimental time-bound file filter when exporting in BACKUP",
-		true,
-	)
 	priorityAfter = settings.RegisterDurationSetting(
 		settings.TenantWritable,
 		"bulkio.backup.read_with_priority_after",
@@ -86,20 +76,6 @@ var (
 		128<<20,
 	).WithPublic()
 
-	defaultSmallFileBuffer = util.ConstantWithMetamorphicTestRange(
-		"backup-merge-file-buffer-size",
-		128<<20, /* defaultValue */
-		1<<20,   /* metamorphic min */
-		16<<20,  /* metamorphic max */
-	)
-	smallFileBuffer = settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
-		"bulkio.backup.merge_file_buffer_size",
-		"size limit used when buffering backup files before merging them",
-		int64(defaultSmallFileBuffer),
-		settings.NonNegativeInt,
-	)
-
 	splitKeysOnTimestamps = settings.RegisterBoolSetting(
 		settings.TenantWritable,
 		"bulkio.backup.split_keys_on_timestamps",
@@ -108,7 +84,14 @@ var (
 	)
 )
 
-const backupProcessorName = "backupDataProcessor"
+const (
+	backupProcessorName = "backupDataProcessor"
+
+	// minimumWorkerCount is the minimum number of workers we will try to start.
+	// If we can't reserve memory for at least this many workers, the backup
+	// processors will fail.
+	minimumWorkerCount = 2
+)
 
 // TODO(pbardea): It would be nice if we could add some DistSQL processor tests
 // we would probably want to have a mock cloudStorage object that we could
@@ -124,7 +107,6 @@ type backupDataProcessor struct {
 
 	flowCtx *execinfra.FlowCtx
 	spec    execinfrapb.BackupDataSpec
-	output  execinfra.RowReceiver
 
 	// cancelAndWaitForWorker cancels the producer goroutine and waits for it to
 	// finish. It can be called multiple times.
@@ -134,6 +116,10 @@ type backupDataProcessor struct {
 
 	// BoundAccount that reserves the memory usage of the backup processor.
 	memAcc *mon.BoundAccount
+
+	// Aggregator that aggregates StructuredEvents emitted in the
+	// backupDataProcessors' trace recording.
+	agg *bulk.TracingAggregator
 }
 
 var (
@@ -142,11 +128,11 @@ var (
 )
 
 func newBackupDataProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.BackupDataSpec,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	memMonitor := flowCtx.Cfg.BackupMonitor
 	if knobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
@@ -158,11 +144,10 @@ func newBackupDataProcessor(
 	bp := &backupDataProcessor{
 		flowCtx: flowCtx,
 		spec:    spec,
-		output:  output,
 		progCh:  make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress),
 		memAcc:  &ba,
 	}
-	if err := bp.Init(bp, post, backupOutputTypes, flowCtx, processorID, output, nil, /* memMonitor */
+	if err := bp.Init(ctx, bp, post, backupOutputTypes, flowCtx, processorID, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			// This processor doesn't have any inputs to drain.
 			InputsToDrain: nil,
@@ -181,6 +166,12 @@ func (bp *backupDataProcessor) Start(ctx context.Context) {
 	ctx = logtags.AddTag(ctx, "job", bp.spec.JobID)
 	ctx = bp.StartInternal(ctx, backupProcessorName)
 	ctx, cancel := context.WithCancel(ctx)
+
+	// Construct an Aggregator to aggregate and render AggregatorEvents emitted in
+	// bps' trace recording.
+	ctx, bp.agg = bulk.MakeTracingAggregatorWithSpan(ctx,
+		fmt.Sprintf("%s-aggregator", backupProcessorName), bp.EvalCtx.Tracer)
+
 	bp.cancelAndWaitForWorker = func() {
 		cancel()
 		for range bp.progCh {
@@ -188,7 +179,7 @@ func (bp *backupDataProcessor) Start(ctx context.Context) {
 	}
 	log.Infof(ctx, "starting backup data")
 	if err := bp.flowCtx.Stopper().RunAsyncTaskEx(ctx, stop.TaskOpts{
-		TaskName: "backup-worker",
+		TaskName: "backupDataProcessor.runBackupProcessor",
 		SpanOpt:  stop.ChildSpan,
 	}, func(ctx context.Context) {
 		bp.backupErr = runBackupProcessor(ctx, bp.flowCtx, &bp.spec, bp.progCh, bp.memAcc)
@@ -227,7 +218,8 @@ func (bp *backupDataProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.Producer
 func (bp *backupDataProcessor) close() {
 	bp.cancelAndWaitForWorker()
 	if bp.InternalClose() {
-		bp.memAcc.Close(bp.Ctx)
+		bp.agg.Close()
+		bp.memAcc.Close(bp.Ctx())
 	}
 }
 
@@ -247,9 +239,9 @@ type spanAndTime struct {
 	lastTried  time.Time
 }
 
-type returnedSST struct {
-	f              BackupManifest_File
-	sst            []byte
+type exportedSpan struct {
+	metadata       backuppb.BackupManifest_File
+	dataSST        []byte
 	revStart       hlc.Timestamp
 	completedSpans int32
 	atKeyBoundary  bool
@@ -318,36 +310,51 @@ func runBackupProcessor(
 		return err
 	}
 
-	returnedSSTs := make(chan returnedSST, 1)
+	sinkConf := sstSinkConf{
+		id:       flowCtx.NodeID.SQLInstanceID(),
+		enc:      spec.Encryption,
+		progCh:   progCh,
+		settings: &flowCtx.Cfg.Settings.SV,
+	}
+	storage, err := flowCtx.Cfg.ExternalStorage(ctx, dest)
+	if err != nil {
+		return err
+	}
+	defer logClose(ctx, storage, "external storage")
 
-	grp := ctxgroup.WithContext(ctx)
-	// Start a goroutine that will then start a group of goroutines which each
-	// pull spans off of `todo` and send export requests. Any resume spans are put
-	// back on `todo`. Any returned SSTs are put on a  `returnedSSTs` to be routed
-	// to a buffered sink that merges them until they are large enough to flush.
-	grp.GoCtx(func(ctx context.Context) error {
-		defer close(returnedSSTs)
-		// TODO(pbardea): Check to see if this benefits from any tuning (e.g. +1, or
-		//  *2). See #49798.
-		numSenders := int(kvserver.ExportRequestsLimit.Get(&clusterSettings.SV)) * 2
+	// Start start a group of goroutines which each pull spans off of `todo` and
+	// send export requests. Any spans that encounter write intent errors during
+	// Export are put back on the todo queue for later processing.
+	numSenders, release, err := reserveWorkerMemory(ctx, clusterSettings, memAcc)
+	if err != nil {
+		return err
+	}
+	log.Infof(ctx, "starting %d backup export workers", numSenders)
+	defer release()
 
-		return ctxgroup.GroupWorkers(ctx, numSenders, func(ctx context.Context, _ int) error {
-			readTime := spec.BackupEndTime.GoTime()
+	return ctxgroup.GroupWorkers(ctx, numSenders, func(ctx context.Context, _ int) error {
+		readTime := spec.BackupEndTime.GoTime()
+		sink := makeFileSSTSink(sinkConf, storage)
+		defer func() {
+			if err := sink.flush(ctx); err != nil {
+				log.Warningf(ctx, "failed to flush SST sink: %s", err)
+			}
+			logClose(ctx, sink, "SST sink")
+		}()
 
-			// priority becomes true when we're sending re-attempts of reads far enough
-			// in the past that we want to run them with priority.
-			var priority bool
-			timer := timeutil.NewTimer()
-			defer timer.Stop()
+		// priority becomes true when we're sending re-attempts of reads far enough
+		// in the past that we want to run them with priority.
+		var priority bool
+		timer := timeutil.NewTimer()
+		defer timer.Stop()
 
-			ctxDone := ctx.Done()
-			for {
-				select {
-				case <-ctxDone:
-					return ctx.Err()
-				case span := <-todo:
-					header := roachpb.Header{Timestamp: span.end}
-
+		ctxDone := ctx.Done()
+		for {
+			select {
+			case <-ctxDone:
+				return ctx.Err()
+			case span := <-todo:
+				for len(span.span.Key) != 0 {
 					splitMidKey := splitKeysOnTimestamps.Get(&clusterSettings.SV)
 					// If we started splitting already, we must continue until we reach the end
 					// of split span.
@@ -355,15 +362,13 @@ func runBackupProcessor(
 						splitMidKey = true
 					}
 
-					req := &roachpb.ExportRequest{
-						RequestHeader:                       roachpb.RequestHeaderFromSpan(span.span),
-						ResumeKeyTS:                         span.firstKeyTS,
-						StartTime:                           span.start,
-						EnableTimeBoundIteratorOptimization: useTBI.Get(&clusterSettings.SV),
-						MVCCFilter:                          spec.MVCCFilter,
-						TargetFileSize:                      batcheval.ExportRequestTargetFileSize.Get(&clusterSettings.SV),
-						ReturnSST:                           true,
-						SplitMidKey:                         splitMidKey,
+					req := &kvpb.ExportRequest{
+						RequestHeader:  kvpb.RequestHeaderFromSpan(span.span),
+						ResumeKeyTS:    span.firstKeyTS,
+						StartTime:      span.start,
+						MVCCFilter:     spec.MVCCFilter,
+						TargetFileSize: batcheval.ExportRequestTargetFileSize.Get(&clusterSettings.SV),
+						SplitMidKey:    splitMidKey,
 					}
 
 					// If we're doing re-attempts but are not yet in the priority regime,
@@ -387,6 +392,14 @@ func runBackupProcessor(
 						priority = timeutil.Since(readTime) > priorityAfter.Get(&clusterSettings.SV)
 					}
 
+					header := kvpb.Header{
+						// We set the DistSender response target bytes field to a sentinel
+						// value. The sentinel value of 1 forces the ExportRequest to paginate
+						// after creating a single SST.
+						TargetBytes:                 1,
+						Timestamp:                   span.end,
+						ReturnElasticCPUResumeSpans: true,
+					}
 					if priority {
 						// This re-attempt is reading far enough in the past that we just want
 						// to abort any transactions it hits.
@@ -402,54 +415,39 @@ func runBackupProcessor(
 						header.WaitPolicy = lock.WaitPolicy_Error
 					}
 
-					// We set the DistSender response target bytes field to a sentinel
-					// value. The sentinel value of 1 forces the ExportRequest to paginate
-					// after creating a single SST.
-					header.TargetBytes = 1
-					admissionHeader := roachpb.AdmissionHeader{
-						// Export requests are currently assigned NormalPri.
+					admissionHeader := kvpb.AdmissionHeader{
+						// Export requests are currently assigned BulkNormalPri.
 						//
 						// TODO(dt): Consider linking this to/from the UserPriority field.
 						Priority:                 int32(admissionpb.BulkNormalPri),
 						CreateTime:               timeutil.Now().UnixNano(),
-						Source:                   roachpb.AdmissionHeader_FROM_SQL,
+						Source:                   kvpb.AdmissionHeader_FROM_SQL,
 						NoMemoryReservedAtSource: true,
 					}
-					log.Infof(ctx, "sending ExportRequest for span %s (attempt %d, priority %s)",
+					log.VEventf(ctx, 1, "sending ExportRequest for span %s (attempt %d, priority %s)",
 						span.span, span.attempts+1, header.UserPriority.String())
-					var rawRes roachpb.Response
-					var pErr *roachpb.Error
-					var reqSentTime time.Time
-					var respReceivedTime time.Time
+					var rawResp kvpb.Response
+					var pErr *kvpb.Error
+					requestSentAt := timeutil.Now()
 					exportRequestErr := contextutil.RunWithTimeout(ctx,
 						fmt.Sprintf("ExportRequest for span %s", span.span),
 						timeoutPerAttempt.Get(&clusterSettings.SV), func(ctx context.Context) error {
-							reqSentTime = timeutil.Now()
-							backupProcessorSpan.RecordStructured(&BackupExportTraceRequestEvent{
-								Span:        span.span.String(),
-								Attempt:     int32(span.attempts + 1),
-								Priority:    header.UserPriority.String(),
-								ReqSentTime: reqSentTime.String(),
-							})
-
-							rawRes, pErr = kv.SendWrappedWithAdmission(
-								ctx, flowCtx.Cfg.DB.NonTransactionalSender(), header, admissionHeader, req)
-							respReceivedTime = timeutil.Now()
+							rawResp, pErr = kv.SendWrappedWithAdmission(
+								ctx, flowCtx.Cfg.DB.KV().NonTransactionalSender(), header, admissionHeader, req)
 							if pErr != nil {
 								return pErr.GoError()
 							}
 							return nil
 						})
 					if exportRequestErr != nil {
-						if intentErr, ok := pErr.GetDetail().(*roachpb.WriteIntentError); ok {
+						if intentErr, ok := pErr.GetDetail().(*kvpb.WriteIntentError); ok {
 							span.lastTried = timeutil.Now()
 							span.attempts++
 							todo <- span
 							// TODO(dt): send a progress update to update job progress to note
 							// the intents being hit.
-							backupProcessorSpan.RecordStructured(&BackupExportTraceResponseEvent{
-								RetryableError: tracing.RedactAndTruncateError(intentErr),
-							})
+							log.VEventf(ctx, 1, "retrying ExportRequest for span %s; encountered WriteIntentError: %s", span.span, intentErr.Error())
+							span = spanAndTime{}
 							continue
 						}
 						// TimeoutError improves the opaque `context deadline exceeded` error
@@ -459,436 +457,157 @@ func runBackupProcessor(
 						}
 						// BatchTimestampBeforeGCError is returned if the ExportRequest
 						// attempts to read below the range's GC threshold.
-						if batchTimestampBeforeGCError, ok := pErr.GetDetail().(*roachpb.BatchTimestampBeforeGCError); ok {
+						if batchTimestampBeforeGCError, ok := pErr.GetDetail().(*kvpb.BatchTimestampBeforeGCError); ok {
 							// If the range we are exporting is marked to be excluded from
 							// backup, it is safe to ignore the error. It is likely that the
 							// table has been configured with a low GC TTL, and so the data
 							// the backup is targeting has already been gc'ed.
 							if batchTimestampBeforeGCError.DataExcludedFromBackup {
+								span = spanAndTime{}
 								continue
 							}
 						}
 						return errors.Wrapf(exportRequestErr, "exporting %s", span.span)
 					}
 
-					res := rawRes.(*roachpb.ExportResponse)
+					resp := rawResp.(*kvpb.ExportResponse)
 
-					// If the reply has a resume span, put the remaining span on
-					// todo to be picked up again in the next round.
-					if res.ResumeSpan != nil {
-						if !res.ResumeSpan.Valid() {
-							return errors.Errorf("invalid resume span: %s", res.ResumeSpan)
+					// If the reply has a resume span, we process it immediately.
+					var resumeSpan spanAndTime
+					if resp.ResumeSpan != nil {
+						if !resp.ResumeSpan.Valid() {
+							return errors.Errorf("invalid resume span: %s", resp.ResumeSpan)
 						}
 
 						resumeTS := hlc.Timestamp{}
 						// Taking resume timestamp from the last file of response since files must
 						// always be consecutive even if we currently expect only one.
-						if fileCount := len(res.Files); fileCount > 0 {
-							resumeTS = res.Files[fileCount-1].EndKeyTS
+						if fileCount := len(resp.Files); fileCount > 0 {
+							resumeTS = resp.Files[fileCount-1].EndKeyTS
 						}
-						resumeSpan := spanAndTime{
-							span:       *res.ResumeSpan,
+						resumeSpan = spanAndTime{
+							span:       *resp.ResumeSpan,
 							firstKeyTS: resumeTS,
 							start:      span.start,
 							end:        span.end,
 							attempts:   span.attempts,
 							lastTried:  span.lastTried,
 						}
-						todo <- resumeSpan
 					}
 
 					if backupKnobs, ok := flowCtx.TestingKnobs().BackupRestoreTestingKnobs.(*sql.BackupRestoreTestingKnobs); ok {
 						if backupKnobs.RunAfterExportingSpanEntry != nil {
-							backupKnobs.RunAfterExportingSpanEntry(ctx, res)
+							backupKnobs.RunAfterExportingSpanEntry(ctx, resp)
 						}
 					}
 
 					var completedSpans int32
-					if res.ResumeSpan == nil {
+					if resp.ResumeSpan == nil {
 						completedSpans = 1
 					}
 
-					duration := respReceivedTime.Sub(reqSentTime)
-					exportResponseTraceEvent := &BackupExportTraceResponseEvent{
-						Duration:      duration.String(),
-						FileSummaries: make([]roachpb.RowCount, 0),
-					}
-
-					if len(res.Files) > 1 {
+					if len(resp.Files) > 1 {
 						log.Warning(ctx, "unexpected multi-file response using header.TargetBytes = 1")
 					}
 
-					for i, file := range res.Files {
-						f := BackupManifest_File{
-							Span:        file.Span,
-							Path:        file.Path,
-							EntryCounts: countRows(file.Exported, spec.PKIDs),
-						}
-						exportResponseTraceEvent.FileSummaries = append(exportResponseTraceEvent.FileSummaries, f.EntryCounts)
+					for i, file := range resp.Files {
+						entryCounts := countRows(file.Exported, spec.PKIDs)
+
+						ret := exportedSpan{
+							// BackupManifest_File just happens to contain the exact fields
+							// to store the metadata we need, but there's no actual File
+							// on-disk anywhere yet.
+							metadata: backuppb.BackupManifest_File{
+								Span:        file.Span,
+								Path:        file.Path,
+								EntryCounts: entryCounts,
+								LocalityKV:  destLocalityKV,
+							},
+							dataSST:       file.SST,
+							revStart:      resp.StartTime,
+							atKeyBoundary: file.EndKeyTS.IsEmpty()}
 						if span.start != spec.BackupStartTime {
-							f.StartTime = span.start
-							f.EndTime = span.end
+							ret.metadata.StartTime = span.start
+							ret.metadata.EndTime = span.end
 						}
-						ret := returnedSST{f: f, sst: file.SST, revStart: res.StartTime, atKeyBoundary: file.EndKeyTS.IsEmpty()}
 						// If multiple files were returned for this span, only one -- the
 						// last -- should count as completing the requested span.
-						if i == len(res.Files)-1 {
+						if i == len(resp.Files)-1 {
 							ret.completedSpans = completedSpans
 						}
-						select {
-						case returnedSSTs <- ret:
-						case <-ctxDone:
-							return ctx.Err()
+
+						if err := sink.write(ctx, ret); err != nil {
+							return err
 						}
 					}
-					exportResponseTraceEvent.NumFiles = int32(len(res.Files))
-					backupProcessorSpan.RecordStructured(exportResponseTraceEvent)
-
-				default:
-					// No work left to do, so we can exit. Note that another worker could
-					// still be running and may still push new work (a retry) on to todo but
-					// that is OK, since that also means it is still running and thus can
-					// pick up that work on its next iteration.
-					return nil
+					// Emit the stats for the processed ExportRequest.
+					recordExportStats(backupProcessorSpan, resp, requestSentAt)
+					span = resumeSpan
 				}
+			default:
+				// No work left to do, so we can exit. Note that another worker could
+				// still be running and may still push new work (a retry) on to todo but
+				// that is OK, since that also means it is still running and thus can
+				// pick up that work on its next iteration.
+				return sink.flush(ctx)
 			}
-		})
+		}
 	})
-
-	// Start another goroutine which will read from returnedSSTs ch and push
-	// ssts from it into an sstSink responsible for actually writing their
-	// contents to cloud storage.
-	grp.GoCtx(func(ctx context.Context) error {
-		sinkConf := sstSinkConf{
-			id:       flowCtx.NodeID.SQLInstanceID(),
-			enc:      spec.Encryption,
-			progCh:   progCh,
-			settings: &flowCtx.Cfg.Settings.SV,
-		}
-
-		storage, err := flowCtx.Cfg.ExternalStorage(ctx, dest)
-		if err != nil {
-			return err
-		}
-
-		sink, err := makeSSTSink(ctx, sinkConf, storage, memAcc)
-		if err != nil {
-			return err
-		}
-
-		defer func() {
-			err := sink.Close()
-			err = errors.CombineErrors(storage.Close(), err)
-			if err != nil {
-				log.Warningf(ctx, "failed to close backup sink(s): % #v", pretty.Formatter(err))
-			}
-		}()
-
-		for res := range returnedSSTs {
-			res.f.LocalityKV = destLocalityKV
-			if err := sink.push(ctx, res); err != nil {
-				return err
-			}
-		}
-		return sink.flush(ctx)
-	})
-
-	return grp.Wait()
 }
 
-type sstSinkConf struct {
-	progCh   chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
-	enc      *roachpb.FileEncryptionOptions
-	id       base.SQLInstanceID
-	settings *settings.Values
+// recordExportStats emits a StructuredEvent containing the stats about the
+// evaluated ExportRequest.
+func recordExportStats(sp *tracing.Span, resp *kvpb.ExportResponse, requestSentAt time.Time) {
+	if sp == nil {
+		return
+	}
+	now := timeutil.Now()
+	exportStats := backuppb.ExportStats{
+		StartTime: hlc.Timestamp{WallTime: requestSentAt.UnixNano()},
+		EndTime:   hlc.Timestamp{WallTime: now.UnixNano()},
+		Duration:  now.Sub(requestSentAt),
+	}
+	for _, f := range resp.Files {
+		exportStats.NumFiles++
+		exportStats.DataSize += int64(len(f.SST))
+	}
+	sp.RecordStructured(&exportStats)
 }
 
-type sstSink struct {
-	dest cloud.ExternalStorage
-	conf sstSinkConf
-
-	queue []returnedSST
-	// queueCap is the maximum byte size that the queue can grow to.
-	queueCap int64
-	// queueSize is the current byte size of the queue.
-	queueSize int
-
-	sst     storage.SSTWriter
-	ctx     context.Context
-	cancel  func()
-	out     io.WriteCloser
-	outName string
-
-	flushedFiles    []BackupManifest_File
-	flushedSize     int64
-	flushedRevStart hlc.Timestamp
-	completedSpans  int32
-
-	stats struct {
-		files       int
-		flushes     int
-		oooFlushes  int
-		sizeFlushes int
-		spanGrows   int
+// reserveWorkerMemory returns the number of workers after reserving the appropriate
+// amount of memory for each worker.
+func reserveWorkerMemory(
+	ctx context.Context, settings *cluster.Settings, memAcc *mon.BoundAccount,
+) (int, func(), error) {
+	// TODO(pbardea): Check to see if this benefits from any tuning (e.g. +1, or
+	//  *2). See #49798.
+	maxWorkerCount := int(kvserver.ExportRequestsLimit.Get(&settings.SV)) * 2
+	// We assume that each worker needs at least enough memory to hold onto
+	// 1 buffer used by the external storage.
+	perWorkerMemory := cloud.WriteChunkSize.Get(&settings.SV)
+	// TODO(ssd): We could also add the size of the SST we might be holding here.
+	// Previously we would reserve a fixed-size buffer, but we left the possibly
+	// in-flight SSTs unaccounted for.
+	// perWorkerMemory = perWorkerMemory + batcheval.ExportRequestTargetFileSize.Get(&settings.SV)
+	if err := memAcc.Grow(ctx, minimumWorkerCount*perWorkerMemory); err != nil {
+		return 0, nil, errors.Wrapf(err, "could not reserve memory for minimum number of backup workers (%d * %d)", minimumWorkerCount, perWorkerMemory)
 	}
 
-	memAcc struct {
-		ba            *mon.BoundAccount
-		reservedBytes int64
-	}
-}
-
-func makeSSTSink(
-	ctx context.Context, conf sstSinkConf, dest cloud.ExternalStorage, backupMem *mon.BoundAccount,
-) (*sstSink, error) {
-	s := &sstSink{conf: conf, dest: dest}
-	s.memAcc.ba = backupMem
-
-	// Reserve memory for the file buffer. Incrementally reserve memory in chunks
-	// upto a maximum of the `smallFileBuffer` cluster setting value. If we fail
-	// to grow the bound account at any stage, use the buffer size we arrived at
-	// prior to the error.
-	incrementSize := int64(32 << 20)
-	maxSize := smallFileBuffer.Get(s.conf.settings)
-	for {
-		if s.queueCap >= maxSize {
+	workerCount := minimumWorkerCount
+	for i := 0; i < (maxWorkerCount - minimumWorkerCount); i++ {
+		if err := memAcc.Grow(ctx, perWorkerMemory); err != nil {
+			log.Warningf(ctx, "backup worker count restricted by memory limit")
 			break
 		}
-
-		if incrementSize > maxSize-s.queueCap {
-			incrementSize = maxSize - s.queueCap
-		}
-
-		if err := s.memAcc.ba.Grow(ctx, incrementSize); err != nil {
-			log.Infof(ctx, "failed to grow file queue by %d bytes, running backup with queue size %d bytes: %+v", incrementSize, s.queueCap, err)
-			break
-		}
-		s.queueCap += incrementSize
+		workerCount++
 	}
-	if s.queueCap == 0 {
-		return nil, errors.New("failed to reserve memory for sstSink queue")
-	}
-
-	s.memAcc.reservedBytes += s.queueCap
-	return s, nil
+	return workerCount, func() { memAcc.Shrink(ctx, int64(workerCount)*perWorkerMemory) }, nil
 }
 
-func (s *sstSink) Close() error {
-	if log.V(1) && s.ctx != nil {
-		log.Infof(s.ctx, "backup sst sink recv'd %d files, wrote %d (%d due to size, %d due to re-ordering), %d recv files extended prior span",
-			s.stats.files, s.stats.flushes, s.stats.sizeFlushes, s.stats.oooFlushes, s.stats.spanGrows)
+func logClose(ctx context.Context, c io.Closer, desc string) {
+	if err := c.Close(); err != nil {
+		log.Warningf(ctx, "failed to close %s: %s", redact.SafeString(desc), err.Error())
 	}
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	// Release the memory reserved for the file buffer.
-	s.memAcc.ba.Shrink(s.ctx, s.memAcc.reservedBytes)
-	s.memAcc.reservedBytes = 0
-	if s.out != nil {
-		return s.out.Close()
-	}
-	return nil
-}
-
-// push pushes one returned backup file into the sink. Returned files can arrive
-// out of order, but must be written to an underlying file in-order or else a
-// new underlying file has to be opened. The queue allows buffering up files and
-// sorting them before pushing them to the underlying file to try to avoid this.
-// When the queue length or sum of the data sizes in it exceeds thresholds the
-// queue is sorted and the first half is flushed.
-func (s *sstSink) push(ctx context.Context, resp returnedSST) error {
-	s.queue = append(s.queue, resp)
-	s.queueSize += len(resp.sst)
-
-	if s.queueSize >= int(s.queueCap) {
-		sort.Slice(s.queue, func(i, j int) bool { return s.queue[i].f.Span.Key.Compare(s.queue[j].f.Span.Key) < 0 })
-
-		// Drain the first half.
-		drain := len(s.queue) / 2
-		if drain < 1 {
-			drain = 1
-		}
-		for i := range s.queue[:drain] {
-			if err := s.write(ctx, s.queue[i]); err != nil {
-				return err
-			}
-			s.queueSize -= len(s.queue[i].sst)
-		}
-
-		// Shift down the remainder of the queue and slice off the tail.
-		copy(s.queue, s.queue[drain:])
-		s.queue = s.queue[:len(s.queue)-drain]
-	}
-	return nil
-}
-
-func (s *sstSink) flush(ctx context.Context) error {
-	for i := range s.queue {
-		if err := s.write(ctx, s.queue[i]); err != nil {
-			return err
-		}
-	}
-	s.queue = nil
-	return s.flushFile(ctx)
-}
-
-func (s *sstSink) flushFile(ctx context.Context) error {
-	if s.out == nil {
-		return nil
-	}
-	s.stats.flushes++
-
-	if err := s.sst.Finish(); err != nil {
-		return err
-	}
-	if err := s.out.Close(); err != nil {
-		log.Warningf(ctx, "failed to close write in sstSink: % #v", pretty.Formatter(err))
-		return errors.Wrap(err, "writing SST")
-	}
-	s.outName = ""
-	s.out = nil
-
-	progDetails := BackupManifest_Progress{
-		RevStartTime:   s.flushedRevStart,
-		Files:          s.flushedFiles,
-		CompletedSpans: s.completedSpans,
-	}
-	var prog execinfrapb.RemoteProducerMetadata_BulkProcessorProgress
-	details, err := gogotypes.MarshalAny(&progDetails)
-	if err != nil {
-		return err
-	}
-	prog.ProgressDetails = *details
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case s.conf.progCh <- prog:
-	}
-
-	s.flushedFiles = nil
-	s.flushedSize = 0
-	s.flushedRevStart.Reset()
-	s.completedSpans = 0
-
-	return nil
-}
-
-func (s *sstSink) open(ctx context.Context) error {
-	s.outName = generateUniqueSSTName(s.conf.id)
-	if s.ctx == nil {
-		s.ctx, s.cancel = context.WithCancel(ctx)
-	}
-	w, err := s.dest.Writer(s.ctx, s.outName)
-	if err != nil {
-		return err
-	}
-	if s.conf.enc != nil {
-		var err error
-		w, err = storageccl.EncryptingWriter(w, s.conf.enc.Key)
-		if err != nil {
-			return err
-		}
-	}
-	s.out = w
-	s.sst = storage.MakeBackupSSTWriter(ctx, s.dest.Settings(), s.out)
-
-	return nil
-}
-
-func (s *sstSink) write(ctx context.Context, resp returnedSST) error {
-	s.stats.files++
-
-	span := resp.f.Span
-
-	// If this span starts before the last buffered span ended, we need to flush
-	// since it overlaps but SSTWriter demands writes in-order.
-	if len(s.flushedFiles) > 0 {
-		last := s.flushedFiles[len(s.flushedFiles)-1].Span.EndKey
-		if span.Key.Compare(last) < 0 {
-			log.VEventf(ctx, 1, "flushing backup file %s of size %d because span %s cannot append before %s",
-				s.outName, s.flushedSize, span, last,
-			)
-			s.stats.oooFlushes++
-			if err := s.flushFile(ctx); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Initialize the writer if needed.
-	if s.out == nil {
-		if err := s.open(ctx); err != nil {
-			return err
-		}
-	}
-
-	log.VEventf(ctx, 2, "writing %s to backup file %s", span, s.outName)
-
-	// Copy SST content.
-	sst, err := storage.NewMemSSTIterator(resp.sst, false)
-	if err != nil {
-		return err
-	}
-	defer sst.Close()
-
-	sst.SeekGE(storage.MVCCKey{Key: keys.MinKey})
-	for {
-		if valid, err := sst.Valid(); !valid || err != nil {
-			if err != nil {
-				return err
-			}
-			break
-		}
-		k := sst.UnsafeKey()
-		if k.Timestamp.IsEmpty() {
-			if err := s.sst.PutUnversioned(k.Key, sst.UnsafeValue()); err != nil {
-				return err
-			}
-		} else {
-			if err := s.sst.PutMVCC(sst.UnsafeKey(), sst.UnsafeValue()); err != nil {
-				return err
-			}
-		}
-		sst.Next()
-	}
-
-	// If this span extended the last span added -- that is, picked up where it
-	// ended and has the same time-bounds -- then we can simply extend that span
-	// and add to its entry counts. Otherwise we need to record it separately.
-	if l := len(s.flushedFiles) - 1; l > 0 && s.flushedFiles[l].Span.EndKey.Equal(span.Key) &&
-		s.flushedFiles[l].EndTime.EqOrdering(resp.f.EndTime) &&
-		s.flushedFiles[l].StartTime.EqOrdering(resp.f.StartTime) {
-		s.flushedFiles[l].Span.EndKey = span.EndKey
-		s.flushedFiles[l].EntryCounts.Add(resp.f.EntryCounts)
-		s.stats.spanGrows++
-	} else {
-		f := resp.f
-		f.Path = s.outName
-		s.flushedFiles = append(s.flushedFiles, f)
-	}
-	s.flushedRevStart.Forward(resp.revStart)
-	s.completedSpans += resp.completedSpans
-	s.flushedSize += int64(len(resp.sst))
-
-	// If our accumulated SST is now big enough, and we are positioned at the end
-	// of a range flush it.
-	if s.flushedSize > targetFileSize.Get(s.conf.settings) && resp.atKeyBoundary {
-		s.stats.sizeFlushes++
-		log.VEventf(ctx, 2, "flushing backup file %s with size %d", s.outName, s.flushedSize)
-		if err := s.flushFile(ctx); err != nil {
-			return err
-		}
-	} else {
-		log.VEventf(ctx, 3, "continuing to write to backup file %s of size %d", s.outName, s.flushedSize)
-	}
-	return nil
-}
-
-func generateUniqueSSTName(nodeID base.SQLInstanceID) string {
-	// The data/ prefix, including a /, is intended to group SSTs in most of the
-	// common file/bucket browse UIs.
-	return fmt.Sprintf("data/%d.sst", builtins.GenerateUniqueInt(nodeID))
 }
 
 func init() {

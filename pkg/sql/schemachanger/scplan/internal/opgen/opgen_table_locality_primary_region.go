@@ -20,7 +20,7 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.TableLocalityPrimaryRegion) scop.Op {
+				emit(func(this *scpb.TableLocalityPrimaryRegion) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
 			),
@@ -28,7 +28,6 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
 				// TODO(postamar): remove revertibility constraint when possible
 				revertible(false),
 				// TODO(postamar): implement table locality update.

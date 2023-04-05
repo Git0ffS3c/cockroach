@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigsplitter"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils/spanconfigtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -34,17 +34,16 @@ import (
 // TestDataDriven is a data-driven test for spanconfig.Splitter. It offers
 // the following commands:
 //
-// - "exec-sql"
-//   Executes the input SQL query.
+//   - "exec-sql"
+//     Executes the input SQL query.
 //
-// - "query-sql"
-//   Executes the input SQL query and prints the results.
+//   - "query-sql"
+//     Executes the input SQL query and prints the results.
 //
-// - "splits" [database=<str> table=<str>] [id=<int>]
-//   Prints the number splits generated the referenced object (named database +
-//   table, or descriptor id). Also logs the set of internal steps the Splitter
-//   takes to arrive at the number.
-//
+//   - "splits" [database=<str> table=<str>] [id=<int>]
+//     Prints the number splits generated the referenced object (named database +
+//     table, or descriptor id). Also logs the set of internal steps the Splitter
+//     takes to arrive at the number.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -65,9 +64,11 @@ func TestDataDriven(t *testing.T) {
 			steps.WriteString(fmt.Sprintf("%s\n", step))
 		},
 	}
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
+				// Fails with nil pointer dereference. Tracked with #76378.
+				DefaultTestTenant: base.TestTenantDisabled,
 				Knobs: base.TestingKnobs{
 					SpanConfig: scKnobs,
 				},
@@ -80,7 +81,7 @@ func TestDataDriven(t *testing.T) {
 
 		var tenant *spanconfigtestcluster.Tenant
 		if strings.Contains(path, "tenant") {
-			tenantID := roachpb.MakeTenantID(10)
+			tenantID := roachpb.MustMakeTenantID(10)
 			tenant = spanConfigTestCluster.InitializeTenant(ctx, tenantID)
 			spanConfigTestCluster.AllowSecondaryTenantToSetZoneConfigurations(t, tenantID)
 			spanConfigTestCluster.EnsureTenantCanSetZoneConfigurationsOrFatal(t, tenant)

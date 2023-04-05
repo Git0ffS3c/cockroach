@@ -98,6 +98,7 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -116,8 +117,7 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 	}
 
 	proc, err := rowexec.NewProcessor(
-		ctx, flowCtx, 0, &args.pspec.Core, &args.pspec.Post,
-		inputsProc, []execinfra.RowReceiver{nil}, nil,
+		ctx, flowCtx, 0, &args.pspec.Core, &args.pspec.Post, inputsProc, nil,
 	)
 	if err != nil {
 		return err
@@ -127,12 +127,12 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 		return errors.New("processor is unexpectedly not a RowSource")
 	}
 
-	acc := evalCtx.Mon.MakeBoundAccount()
+	acc := evalCtx.TestingMon.MakeBoundAccount()
 	defer acc.Close(ctx)
 	testAllocator := colmem.NewAllocator(ctx, &acc, coldataext.NewExtendedColumnFactory(&evalCtx))
 	columnarizers := make([]colexecop.Operator, len(args.inputs))
 	for i, input := range inputsColOp {
-		columnarizers[i] = colexec.NewBufferingColumnarizer(testAllocator, flowCtx, int32(i)+1, input)
+		columnarizers[i] = colexec.NewBufferingColumnarizerForTests(testAllocator, flowCtx, int32(i)+1, input)
 	}
 
 	constructorArgs := &colexecargs.NewColOperatorArgs{
@@ -160,8 +160,10 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 	if err != nil {
 		return err
 	}
+	defer result.TestCleanupNoError(t)
 
 	outColOp := colexec.NewMaterializer(
+		nil, /* allocator */
 		flowCtx,
 		int32(len(args.inputs))+2,
 		result.OpWithMetaInfo,

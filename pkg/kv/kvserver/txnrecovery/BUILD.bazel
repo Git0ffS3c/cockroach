@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -10,6 +11,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/util/hlc",
         "//pkg/util/log",
@@ -24,9 +26,11 @@ go_test(
     name = "txnrecovery_test",
     size = "small",
     srcs = ["manager_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":txnrecovery"],
     deps = [
         "//pkg/kv",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
         "//pkg/testutils",
         "//pkg/util/hlc",
@@ -36,3 +40,5 @@ go_test(
         "@com_github_stretchr_testify//assert",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -23,9 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
 
@@ -33,6 +31,16 @@ import (
 type tableRef struct {
 	TableName *tree.TableName
 	Columns   []*tree.ColumnTableDef
+}
+
+func (t *tableRef) insertDefaultsAllowed() bool {
+	for _, column := range t.Columns {
+		if column.Nullable.Nullability == tree.NotNull &&
+			!column.HasDefaultExpr() {
+			return false
+		}
+	}
+	return true
 }
 
 type aliasedTableRef struct {
@@ -45,6 +53,7 @@ type tableRefs []*tableRef
 // ReloadSchemas loads tables from the database.
 func (s *Smither) ReloadSchemas() error {
 	if s.db == nil {
+		s.schemas = []*schemaRef{{SchemaName: "public"}}
 		return nil
 	}
 	s.lock.Lock()
@@ -82,7 +91,7 @@ func (s *Smither) getRandTable() (*aliasedTableRef, bool) {
 	table := s.tables[s.rnd.Intn(len(s.tables))]
 	indexes := s.indexes[*table.TableName]
 	var indexFlags tree.IndexFlags
-	if s.coin() {
+	if !s.disableIndexHints && s.coin() {
 		indexNames := make([]tree.Name, 0, len(indexes))
 		for _, index := range indexes {
 			if !index.Inverted {
@@ -212,29 +221,25 @@ FROM
 				members = append(members, string(tree.MustBeDString(d)))
 			}
 		}
-		// Try to construct type information from the resulting row.
-		switch {
-		case len(members) > 0:
-			typ := types.MakeEnum(catid.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeID */)
-			typ.TypeMeta = types.UserDefinedTypeMetadata{
-				Name: &types.UserDefinedTypeName{
-					Schema: scName,
-					Name:   name,
-				},
-				EnumData: &types.EnumMetadata{
-					LogicalRepresentations: members,
-					// The physical representations don't matter in this case, but the
-					// enum related code in tree expects that the length of
-					// PhysicalRepresentations is equal to the length of LogicalRepresentations.
-					PhysicalRepresentations: make([][]byte, len(members)),
-					IsMemberReadOnly:        make([]bool, len(members)),
-				},
-			}
-			key := tree.MakeSchemaQualifiedTypeName(scName, name)
-			udtMapping[key] = typ
-		default:
-			return nil, errors.New("unsupported SQLSmith type kind")
+		// Construct type information from the resulting row. Note that the UDT
+		// may have no members (e.g., `CREATE TYPE t AS ENUM ()`).
+		typ := types.MakeEnum(catid.TypeIDToOID(descpb.ID(id)), 0 /* arrayTypeID */)
+		typ.TypeMeta = types.UserDefinedTypeMetadata{
+			Name: &types.UserDefinedTypeName{
+				Schema: scName,
+				Name:   name,
+			},
+			EnumData: &types.EnumMetadata{
+				LogicalRepresentations: members,
+				// The physical representations don't matter in this case, but the
+				// enum related code in tree expects that the length of
+				// PhysicalRepresentations is equal to the length of LogicalRepresentations.
+				PhysicalRepresentations: make([][]byte, len(members)),
+				IsMemberReadOnly:        make([]bool, len(members)),
+			},
 		}
+		key := tree.MakeSchemaQualifiedTypeName(scName, name)
+		udtMapping[key] = typ
 	}
 	var udts []*types.T
 	for _, t := range udtMapping {
@@ -462,13 +467,13 @@ type operator struct {
 var operators = func() map[oid.Oid][]operator {
 	m := map[oid.Oid][]operator{}
 	for BinaryOperator, overload := range tree.BinOps {
-		for _, ov := range overload {
-			bo := ov.(*tree.BinOp)
+		_ = overload.ForEachBinOp(func(bo *tree.BinOp) error {
 			m[bo.ReturnType.Oid()] = append(m[bo.ReturnType.Oid()], operator{
 				BinOp:    bo,
 				Operator: treebin.MakeBinaryOperator(BinaryOperator),
 			})
-		}
+			return nil
+		})
 	}
 	return m
 }()
@@ -478,7 +483,7 @@ type function struct {
 	overload *tree.Overload
 }
 
-func functions(s *Smither) map[tree.FunctionClass]map[oid.Oid][]function {
+var functions = func() map[tree.FunctionClass]map[oid.Oid][]function {
 	m := map[tree.FunctionClass]map[oid.Oid][]function{}
 	for _, def := range tree.FunDefs {
 		switch def.Name {
@@ -490,6 +495,14 @@ func functions(s *Smither) map[tree.FunctionClass]map[oid.Oid][]function {
 			// See #69213.
 			continue
 		}
+
+		if n := tree.Name(def.Name); n.String() != def.Name {
+			// sqlsmith doesn't know how to quote function names, e.g. for
+			// the numeric cast, we need to use `"numeric"(val)`, but sqlsmith
+			// makes it `numeric(val)` which is incorrect.
+			continue
+		}
+
 		skip := false
 		for _, substr := range []string{
 			// crdb_internal.complete_stream_ingestion_job is a stateful
@@ -505,27 +518,17 @@ func functions(s *Smither) map[tree.FunctionClass]map[oid.Oid][]function {
 			"crdb_internal.start_replication_stream",
 			"crdb_internal.replication_stream_progress",
 			"crdb_internal.complete_replication_stream",
+			"crdb_internal.revalidate_unique_constraint",
+			"crdb_internal.request_statement_bundle",
+			"crdb_internal.set_compaction_concurrency",
+			// TODO(#97097): Temporarily disable crdb_internal.fingerprint
+			// which produces internal errors for some valid inputs.
+			"crdb_internal.fingerprint",
 		} {
 			skip = skip || strings.Contains(def.Name, substr)
 		}
 		if skip {
 			continue
-		}
-		if s.disableImpureFuncs {
-			var impure bool
-			for _, def := range def.Definition {
-				overload := def.(*tree.Overload)
-				switch overload.Volatility {
-				case volatility.Stable, volatility.Volatile:
-					impure = true
-				}
-			}
-			if impure {
-				continue
-			}
-		}
-		if _, ok := m[def.Class]; !ok {
-			m[def.Class] = map[oid.Oid][]function{}
 		}
 		// Ignore pg compat functions since many are unimplemented.
 		if def.Category == "Compatibility" {
@@ -535,7 +538,9 @@ func functions(s *Smither) map[tree.FunctionClass]map[oid.Oid][]function {
 			continue
 		}
 		for _, ov := range def.Definition {
-			ov := ov.(*tree.Overload)
+			if m[ov.Class] == nil {
+				m[ov.Class] = map[oid.Oid][]function{}
+			}
 			// Ignore documented unusable functions.
 			if strings.Contains(ov.Info, "Not usable") {
 				continue
@@ -550,11 +555,11 @@ func functions(s *Smither) map[tree.FunctionClass]map[oid.Oid][]function {
 			if !found {
 				continue
 			}
-			m[def.Class][typ.Oid()] = append(m[def.Class][typ.Oid()], function{
+			m[ov.Class][typ.Oid()] = append(m[ov.Class][typ.Oid()], function{
 				def:      def,
 				overload: ov,
 			})
 		}
 	}
 	return m
-}
+}()

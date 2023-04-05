@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -26,8 +27,8 @@ import (
 // isolation from conflicting transactions to the lockSpans set.
 type DeclareKeysFunc func(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	request roachpb.Request,
+	header *kvpb.Header,
+	request kvpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
 	maxOffset time.Duration,
 )
@@ -65,18 +66,22 @@ type Command struct {
 	// should treat the provided request as immutable.
 	//
 	// Only one of these is ever set at a time.
-	EvalRW func(context.Context, storage.ReadWriter, CommandArgs, roachpb.Response) (result.Result, error)
-	EvalRO func(context.Context, storage.Reader, CommandArgs, roachpb.Response) (result.Result, error)
+	EvalRW func(context.Context, storage.ReadWriter, CommandArgs, kvpb.Response) (result.Result, error)
+	EvalRO func(context.Context, storage.Reader, CommandArgs, kvpb.Response) (result.Result, error)
 }
 
-var cmds = make(map[roachpb.Method]Command)
+func (c Command) isEmpty() bool {
+	return c.EvalRW == nil && c.EvalRO == nil
+}
+
+var cmds [kvpb.NumMethods]Command
 
 // RegisterReadWriteCommand makes a read-write command available for execution.
 // It must only be called before any evaluation takes place.
 func RegisterReadWriteCommand(
-	method roachpb.Method,
+	method kvpb.Method,
 	declare DeclareKeysFunc,
-	impl func(context.Context, storage.ReadWriter, CommandArgs, roachpb.Response) (result.Result, error),
+	impl func(context.Context, storage.ReadWriter, CommandArgs, kvpb.Response) (result.Result, error),
 ) {
 	register(method, Command{
 		DeclareKeys: declare,
@@ -87,9 +92,9 @@ func RegisterReadWriteCommand(
 // RegisterReadOnlyCommand makes a read-only command available for execution. It
 // must only be called before any evaluation takes place.
 func RegisterReadOnlyCommand(
-	method roachpb.Method,
+	method kvpb.Method,
 	declare DeclareKeysFunc,
-	impl func(context.Context, storage.Reader, CommandArgs, roachpb.Response) (result.Result, error),
+	impl func(context.Context, storage.Reader, CommandArgs, kvpb.Response) (result.Result, error),
 ) {
 	register(method, Command{
 		DeclareKeys: declare,
@@ -97,8 +102,8 @@ func RegisterReadOnlyCommand(
 	})
 }
 
-func register(method roachpb.Method, command Command) {
-	if _, ok := cmds[method]; ok {
+func register(method kvpb.Method, command Command) {
+	if !cmds[method].isEmpty() {
 		log.Fatalf(context.TODO(), "cannot overwrite previously registered method %v", method)
 	}
 	cmds[method] = command
@@ -106,13 +111,16 @@ func register(method roachpb.Method, command Command) {
 
 // UnregisterCommand is provided for testing and allows removing a command.
 // It is a no-op if the command is not registered.
-func UnregisterCommand(method roachpb.Method) {
-	delete(cmds, method)
+func UnregisterCommand(method kvpb.Method) {
+	cmds[method] = Command{}
 }
 
 // LookupCommand returns the command for the given method, with the boolean
 // indicating success or failure.
-func LookupCommand(method roachpb.Method) (Command, bool) {
-	cmd, ok := cmds[method]
-	return cmd, ok
+func LookupCommand(method kvpb.Method) (Command, bool) {
+	if int(method) >= len(cmds) {
+		return Command{}, false
+	}
+	cmd := cmds[method]
+	return cmd, !cmd.isEmpty()
 }

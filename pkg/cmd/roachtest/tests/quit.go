@@ -55,7 +55,7 @@ func runQuitTransfersLeases(
 }
 
 func (q *quitTest) init(ctx context.Context) {
-	q.args = []string{"--vmodule=store=1,replica=1,replica_proposal=1"}
+	q.args = []string{"--vmodule=replica_proposal=1,allocator=3,allocator_scorer=3"}
 	q.env = []string{"COCKROACH_SCAN_MAX_IDLE_TIME=5ms"}
 	q.c.Put(ctx, q.t.Cockroach(), "./cockroach")
 	settings := install.MakeClusterSettings(install.EnvOption(q.env))
@@ -181,7 +181,7 @@ func (q *quitTest) createRanges(ctx context.Context) {
 	db := q.c.Conn(ctx, q.t.L(), 1)
 	defer db.Close()
 	if _, err := db.ExecContext(ctx, fmt.Sprintf(`
-CREATE TABLE t(x, y, PRIMARY KEY(x)) AS SELECT @1, 1 FROM generate_series(1,%[1]d)`,
+CREATE TABLE t(x, y, PRIMARY KEY(x)) AS SELECT i, 1 FROM generate_series(1,%[1]d) g(i)`,
 		numRanges)); err != nil {
 		q.Fatal(err)
 	}
@@ -202,10 +202,6 @@ ALTER TABLE t SPLIT AT TABLE generate_series(%[1]d,%[1]d-99,-1)`, i)); err != ni
 // checkNoLeases verifies that no range has a lease on the node
 // that's just been shut down.
 func (q *quitTest) checkNoLeases(ctx context.Context, nodeID int) {
-	// We need to use SQL against a node that's not the one we're
-	// shutting down.
-	otherNodeID := 1 + nodeID%q.c.Spec().NodeCount
-
 	// Now we're going to check two things:
 	//
 	// 1) *immediately*, that every range in the cluster has a lease
@@ -218,12 +214,21 @@ func (q *quitTest) checkNoLeases(ctx context.Context, nodeID int) {
 	//    drain does not wait for followers to catch up.
 	//    https://github.com/cockroachdb/cockroach/issues/47100
 	//
+	//    Additionally, the way the test is architected right now has a tiny race:
+	//    when n3 has transferred the lease, the result is visible to n3, but we
+	//    are only checking the other nodes. Even if some of them must have acked
+	//    the raft log entry, there is an additional delay until they apply it. So
+	//    we may still, in this test, find that a node has drained and there is a
+	//    lease transfer that is not yet visible (= has applied) on any other
+	//    node. To work around this, we sleep for one second prior to checking.
+	//
 	// 2) *eventually* that every other node than nodeID has no range
 	//    replica whose lease refers to nodeID, i.e. the followers
 	//    have all caught up.
 	//    Note: when issue #47100 is fixed, this 2nd condition
 	//    must be true immediately -- drain is then able to wait
 	//    for all followers to learn who the new leaseholder is.
+	time.Sleep(time.Second)
 
 	if err := testutils.SucceedsSoonError(func() error {
 		// To achieve that, we ask first each range in turn for its range
@@ -248,18 +253,18 @@ func (q *quitTest) checkNoLeases(ctx context.Context, nodeID int) {
 			// Get the report via HTTP.
 			// Flag -s is to remove progress on stderr, so that the buffer
 			// contains the JSON of the response and nothing else.
-			adminAddrs, err := q.c.InternalAdminUIAddr(ctx, q.t.L(), q.c.Node(otherNodeID))
+			adminAddrs, err := q.c.InternalAdminUIAddr(ctx, q.t.L(), q.c.Node(i))
 			if err != nil {
 				q.Fatal(err)
 			}
-			result, err := q.c.RunWithDetailsSingleNode(ctx, q.t.L(), q.c.Node(otherNodeID),
-				"curl", "-s", fmt.Sprintf("http://%s/_status/ranges/%d",
-					adminAddrs[0], i))
+			result, err := q.c.RunWithDetailsSingleNode(ctx, q.t.L(), q.c.Node(i),
+				"curl", "-s", fmt.Sprintf("http://%s/_status/ranges/local",
+					adminAddrs[0]))
 			if err != nil {
 				q.Fatal(err)
 			}
 			// Persist the response to artifacts to aid debugging. See #75438.
-			_ = os.WriteFile(filepath.Join(q.t.ArtifactsDir(), "status_ranges.json"),
+			_ = os.WriteFile(filepath.Join(q.t.ArtifactsDir(), fmt.Sprintf("status_ranges_n%d.json", i)),
 				[]byte(result.Stdout), 0644,
 			)
 			// We need just a subset of the response. Make an ad-hoc
@@ -312,7 +317,8 @@ func (q *quitTest) checkNoLeases(ctx context.Context, nodeID int) {
 				invLeaseMap[i] = invalidLeases
 			}
 		}
-		// (1): is there a range with no replica outside of nodeID?
+		// (1): is there a range where every replica thinks the lease is held by
+		// nodeID? If so, the value in knownRanges will be set to 0.
 		var leftOver []string
 		for r, n := range knownRanges {
 			if n == 0 {
@@ -322,7 +328,8 @@ func (q *quitTest) checkNoLeases(ctx context.Context, nodeID int) {
 		if len(leftOver) > 0 {
 			q.Fatalf("(1) ranges with no lease outside of node %d: %# v", nodeID, pretty.Formatter(leftOver))
 		}
-		// (2): is there a range with left over replicas on nodeID?
+		// (2): is there a range where any replica thinks the lease is held by
+		// nodeID?
 		//
 		// TODO(knz): Eventually we want this condition to be always
 		// true, i.e. fail the test immediately if found to be false
@@ -340,10 +347,11 @@ func (q *quitTest) checkNoLeases(ctx context.Context, nodeID int) {
 		q.Fatal(err)
 	}
 
+	// For good measure, also write to the table. This ensures it remains
+	// available. We pick a node that's not the drained node.
+	otherNodeID := 1 + nodeID%q.c.Spec().NodeCount
 	db := q.c.Conn(ctx, q.t.L(), otherNodeID)
 	defer db.Close()
-	// For good measure, also write to the table. This ensures it
-	// remains available.
 	if _, err := db.ExecContext(ctx, `UPDATE t SET y = y + 1`); err != nil {
 		q.Fatal(err)
 	}
@@ -368,13 +376,6 @@ func registerQuitTransfersLeases(r registry.Registry) {
 		stopOpts.RoachprodOpts.Sig = 15
 		stopOpts.RoachprodOpts.Wait = true
 		c.Stop(ctx, t.L(), stopOpts, c.Node(nodeID)) // graceful shutdown
-
-	})
-
-	// Uses 'cockroach quit' which should drain and then request a
-	// shutdown. It then waits for the process to self-exit.
-	registerTest("quit", "v19.2.0", func(ctx context.Context, t test.Test, c cluster.Cluster, nodeID int) {
-		_ = runQuit(ctx, t, c, nodeID)
 	})
 
 	// Uses 'cockroach drain', followed by a non-graceful process
@@ -444,82 +445,4 @@ func registerQuitTransfersLeases(r registry.Registry) {
 		stopOpts.RoachprodOpts.Wait = true
 		c.Stop(ctx, t.L(), stopOpts, c.Node(nodeID))
 	})
-}
-
-func runQuit(
-	ctx context.Context, t test.Test, c cluster.Cluster, nodeID int, extraArgs ...string,
-) []byte {
-	args := append([]string{
-		"./cockroach", "quit", "--insecure", "--logtostderr=INFO",
-		fmt.Sprintf("--port={pgport:%d}", nodeID)},
-		extraArgs...)
-	result, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(nodeID), args...)
-	output := result.Stdout + result.Stderr
-	t.L().Printf("cockroach quit:\n%s\n", output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stopOpts := option.DefaultStopOpts()
-	stopOpts.RoachprodOpts.Sig = 0
-	stopOpts.RoachprodOpts.Wait = true
-	c.Stop(ctx, t.L(), stopOpts, c.Node(nodeID)) // no shutdown, just wait for exit
-
-	return []byte(output)
-}
-
-func registerQuitAllNodes(r registry.Registry) {
-	// This test verifies that 'cockroach quit' can terminate all nodes
-	// in the cluster: normally as long as there's quorum, then with a
-	// short --drain-wait for the remaining nodes under quorum.
-	r.Add(registry.TestSpec{
-		Name:    "quit-all-nodes",
-		Owner:   registry.OwnerServer,
-		Cluster: r.MakeClusterSpec(5),
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			q := quitTest{t: t, c: c}
-
-			// Start the cluster.
-			q.init(ctx)
-			// Wait for up-replication so that the cluster expects 1 ranges
-			// everywhere for system ranges.
-			q.waitForUpReplication(ctx)
-
-			// Shut one nodes down gracefully with a very long wait (longer
-			// than the test timeout). This is guaranteed to work - we still
-			// have quorum at that point.
-			q.runWithTimeout(ctx, func(ctx context.Context) { _ = runQuit(ctx, q.t, q.c, 5, "--drain-wait=1h") })
-
-			// Now shut down the remaining 4 nodes less gracefully, with a
-			// short wait.
-
-			// For the next two nodes, we may or may not observe that
-			// the graceful shutdown succeed. It may succeed if every
-			// range has enough quorum on the last 2 nodes (shut down later below).
-			// It may fail if some ranges have a quorum composed of n3, n4, n5.
-			// See: https://github.com/cockroachdb/cockroach/issues/48339
-			q.runWithTimeout(ctx, func(ctx context.Context) { _ = runQuit(ctx, q.t, q.c, 4, "--drain-wait=4s") })
-			q.runWithTimeout(ctx, func(ctx context.Context) { _ = runQuit(ctx, q.t, q.c, 3, "--drain-wait=4s") })
-
-			// For the lat two nodes, we are always under quorum. In this
-			// case we can expect `quit` to always report a hard shutdown
-			// was required.
-			q.runWithTimeout(ctx, func(ctx context.Context) { expectHardShutdown(ctx, q.t, runQuit(ctx, q.t, q.c, 2, "--drain-wait=4s")) })
-			q.runWithTimeout(ctx, func(ctx context.Context) { expectHardShutdown(ctx, q.t, runQuit(ctx, q.t, q.c, 1, "--drain-wait=4s")) })
-
-			// At the end, restart all nodes. We do this to check that
-			// the cluster can indeed restart, and also to please
-			// the dead node detection check at the end of each test.
-			settings := install.MakeClusterSettings(install.EnvOption(q.env))
-			startOpts := option.DefaultStartOpts()
-			startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, q.args...)
-			q.c.Start(ctx, t.L(), startOpts, settings)
-		},
-	})
-}
-
-// expectHardShutdown expects a "drain did not complete successfully" message.
-func expectHardShutdown(ctx context.Context, t test.Test, cmdOut []byte) {
-	if !strings.Contains(string(cmdOut), "drain did not complete successfully") {
-		t.Fatalf("expected 'drain did not complete successfully' in quit output, got:\n%s", cmdOut)
-	}
 }

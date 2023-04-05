@@ -11,9 +11,13 @@
 package clusterunique
 
 import (
+	"encoding/json"
+
+	"github.com/biogo/store/llrb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uint128"
+	"github.com/cockroachdb/errors"
 )
 
 // ID represents an identifier that is guaranteed to be unique across
@@ -52,4 +56,57 @@ func IDFromBytes(b []byte) ID {
 // GetNodeID extracts the node ID from a ID.
 func (id ID) GetNodeID() int32 {
 	return int32(0xFFFFFFFF & id.Lo)
+}
+
+// Size returns the marshalled size of id in bytes.
+func (id ID) Size() int {
+	return len(id.GetBytes())
+}
+
+// MarshalTo marshals id to data.
+func (id ID) MarshalTo(data []byte) (int, error) {
+	return copy(data, id.GetBytes()), nil
+}
+
+// Unmarshal unmarshals data to id.
+func (id *ID) Unmarshal(data []byte) error {
+	if len(data) != 16 {
+		return errors.Errorf("input data %s for uint128 must be 16 bytes", data)
+	}
+	id.Uint128 = uint128.FromBytes(data)
+	return nil
+}
+
+// MarshalJSON returns the JSON encoding of u.
+func (id ID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(id.String())
+}
+
+// UnmarshalJSON unmarshal the JSON encoded data into u.
+func (id *ID) UnmarshalJSON(data []byte) error {
+	var uint128String string
+	if err := json.Unmarshal(data, &uint128String); err != nil {
+		return err
+	}
+
+	uint128, err := uint128.FromString(uint128String)
+	if err != nil {
+		return err
+	}
+
+	id.Uint128 = uint128
+	return nil
+}
+
+// ID implements llrb.Comparable.
+// While these IDs don't really have a global ordering, it is convenient to
+// be able to use them as keys in our `cache.OrderedCache`: their ordering
+// is at least monotonically increasing within the same SQL instance, and
+// that can be useful.
+var _ llrb.Comparable = ID{}
+
+// Compare returns a value indicating the sort order relationship between the
+// receiver and the parameter.
+func (id ID) Compare(o llrb.Comparable) int {
+	return id.Uint128.Compare(o.(ID).Uint128)
 }

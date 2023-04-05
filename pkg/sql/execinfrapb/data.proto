@@ -17,12 +17,12 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
-import "roachpb/api.proto";
+import "kv/kvpb/api.proto";
 import "roachpb/data.proto";
 import "errorspb/errors.proto";
-import "sql/catalog/descpb/encoded_datum.proto";
+import "sql/catalog/catenumpb/encoded_datum.proto";
 import "sql/types/types.proto";
 import "util/tracing/tracingpb/recorded_span.proto";
 import "gogoproto/gogo.proto";
@@ -135,6 +135,18 @@ message InputSyncSpec {
 
   // Schema for the streams entering this synchronizer.
   repeated sql.sem.types.T column_types = 4;
+
+  // EnforceHomeRegionStreamExclusiveUpperBound is one greater than the maximum
+  // stream input index this synchronizer will read into. It is only used if
+  // non-zero. Attempts to read a stream input index greater than or equal to
+  // this value will cause the query to error out before the read attempt is
+  // made.
+  optional uint32 enforce_home_region_stream_exclusive_upper_bound = 5 [(gogoproto.nullable) = false];
+
+  // EnforceHomeRegionError is the error to return when
+  // EnforceHomeRegionStreamExclusiveUpperBound is exceeded. This error must be
+  // set when EnforceHomeRegionStreamExclusiveUpperBound is non-zero.
+  optional Error enforce_home_region_error = 6;
 }
 
 // OutputRouterSpec is the specification for the output router of a processor;
@@ -231,16 +243,17 @@ message ProducerData {
 message ProducerMessage {
   optional ProducerHeader header = 1;
 
-  // Typing information. There will be one DatumInfo for each element in a row.
-  // This field has to be populated on, or before, a ProducerMessage with data
-  // in it, and can only be populated once. It can be nil if only zero length
-  // rows will be sent.
-  // TODO(andrei): It'd be nice if the typing information for streams would be
-  // configured statically at plan creation time, instead of being discovered
-  // dynamically through the first rows that flow.
-  repeated DatumInfo typing = 2 [(gogoproto.nullable) = false];
-
   optional ProducerData data = 3 [(gogoproto.nullable) = false];
+
+  // Encoding information. There will be one DatumEncoding for each element in a
+  // row. This field has to be populated on, or before, a ProducerMessage with
+  // data in it, and can only be populated once. It can be nil if only zero
+  // length rows will be sent.
+  // TODO(yuzefovich): it should be possible to determine this information
+  // statically instead of passing in the first message.
+  repeated sqlbase.DatumEncoding encoding = 4;
+
+  reserved 2;
 }
 
 // RemoteProducerMetadata represents records that a producer wants to pass to

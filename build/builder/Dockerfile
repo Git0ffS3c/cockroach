@@ -36,6 +36,7 @@ RUN apt-get update \
     git \
     gnupg2 \
     libncurses-dev \
+    llvm \
     make \
     patch \
     patchelf \
@@ -114,8 +115,8 @@ RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.20.3/cmake-
 # releases of Go will no longer be run in CI once it is changed. Consider
 # bumping the minimum allowed version of Go in /build/go-version-check.sh.
 RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends golang \
- && curl -fsSL https://storage.googleapis.com/golang/go1.17.6.src.tar.gz -o golang.tar.gz \
- && echo '4dc1bbf3ff61f0c1ff2b19355e6d88151a70126268a47c761477686ef94748c8 golang.tar.gz' | sha256sum -c - \
+ && curl -fsSL https://storage.googleapis.com/golang/go1.19.4.src.tar.gz -o golang.tar.gz \
+ && echo 'eda74db4ac494800a3e66ee784e495bfbb9b8e535df924a8b01b1a8028b7f368  golang.tar.gz' | sha256sum -c - \
  && tar -C /usr/local -xzf golang.tar.gz \
  && rm golang.tar.gz \
  && cd /usr/local/go/src \
@@ -143,7 +144,7 @@ RUN echo "add-auto-load-safe-path $(go env GOROOT)/src/runtime/runtime-gdb.py" >
 # chrome - ui
 # unzip - for installing awscli
 RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource.gpg.key | apt-key add - \
- && echo 'deb https://deb.nodesource.com/node_12.x focal main' | tee /etc/apt/sources.list.d/nodesource.list \
+ && echo 'deb https://deb.nodesource.com/node_16.x focal main' | tee /etc/apt/sources.list.d/nodesource.list \
  && curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg | apt-key add - \
  && echo 'deb https://dl.yarnpkg.com/debian/ stable main' | tee /etc/apt/sources.list.d/yarn.list \
  && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - \
@@ -197,6 +198,10 @@ RUN apt-get purge -y \
     rsync \
     texinfo \
  && apt-get autoremove -y
+
+# Replace the nm command with LLVM's version, llvm-nm, which knows how to read
+# binaries build for platforms others than Linux.
+RUN ln -sf /usr/bin/llvm-nm /usr/bin/nm
 
 RUN rm -rf /tmp/* /var/lib/apt/lists/*
 

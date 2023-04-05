@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -66,13 +67,13 @@ func TestCache(t *testing.T) {
 	readRowsAt := func(t *testing.T, ts hlc.Timestamp) []roachpb.KeyValue {
 		txn := kvDB.NewTxn(ctx, "test")
 		require.NoError(t, txn.SetFixedTimestamp(ctx, ts))
-		var ba roachpb.BatchRequest
-		ba.Add(&roachpb.ScanRequest{
-			RequestHeader: roachpb.RequestHeader{
+		ba := &kvpb.BatchRequest{}
+		ba.Add(&kvpb.ScanRequest{
+			RequestHeader: kvpb.RequestHeader{
 				Key:    scratch,
 				EndKey: scratchSpan.EndKey,
 			},
-			ScanFormat: roachpb.KEY_VALUES,
+			ScanFormat: kvpb.KEY_VALUES,
 		})
 		br, pErr := txn.Send(ctx, ba)
 		require.NoError(t, pErr.GoError())
@@ -108,7 +109,8 @@ func TestCache(t *testing.T) {
 		require.NoError(t, txn.Put(ctx, mkKey("d"), 1))
 	})
 	writeAndCheck(t, func(t *testing.T, txn *kv.Txn) {
-		require.NoError(t, txn.Del(ctx, mkKey("a")))
+		_, err := txn.Del(ctx, mkKey("a"))
+		require.NoError(t, err)
 	})
 	writeAndCheck(t, func(t *testing.T, txn *kv.Txn) {
 		_, err := txn.DelRange(ctx, mkKey("a"), mkKey("c"), false)

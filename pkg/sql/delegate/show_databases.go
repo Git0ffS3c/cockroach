@@ -13,13 +13,13 @@ package delegate
 import (
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
 func (d *delegator) delegateShowDatabases(stmt *tree.ShowDatabases) (tree.Statement, error) {
 	query := `SELECT
-	name AS database_name, owner, primary_region, regions, survival_goal`
+	name AS database_name, owner, primary_region, secondary_region, regions, survival_goal`
 
 	if stmt.WithComment {
 		query += `, comment`
@@ -41,12 +41,12 @@ LEFT JOIN
 			type = %d
 	) c
 ON
-	c.object_id = d.id`, keys.DatabaseCommentType)
+	c.object_id = d.id`, catalogkeys.DatabaseCommentType)
 	}
 
 	query += `
 ORDER BY
 	database_name`
 
-	return parse(query)
+	return d.parse(query)
 }

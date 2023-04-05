@@ -14,11 +14,9 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -48,7 +46,7 @@ func writeLargeFile(t testing.TB, file string, size int64) {
 		t.Fatal(err)
 	}
 	content := make([]byte, size)
-	err = ioutil.WriteFile(file, content, 0600)
+	err = os.WriteFile(file, content, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +59,7 @@ func BenchmarkStreamingReadFile(b *testing.B) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
@@ -120,7 +118,7 @@ func BenchmarkStreamingWriteFile(b *testing.B) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 

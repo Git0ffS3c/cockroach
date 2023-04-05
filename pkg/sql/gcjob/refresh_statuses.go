@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -92,17 +92,23 @@ func updateStatusForGCElements(
 ) (expired, missing bool, timeToNextTrigger time.Time) {
 	defTTL := execCfg.DefaultZoneConfig.GC.TTLSeconds
 	cfg := execCfg.SystemConfig.GetSystemConfig()
+	// If the system config is nil, it means we have not seen an initial system
+	// config. Because we register for notifications when the system config
+	// changes before we get here, we'll get notified to update statuses as soon
+	// a new configuration is available. If we were to proceed, we'd hit a nil
+	// pointer panic.
+	if cfg == nil {
+		return false, false, maxDeadline
+	}
 	protectedtsCache := execCfg.ProtectedTimestampProvider
-
 	earliestDeadline := timeutil.Unix(0, int64(math.MaxInt64))
 
-	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-		table, err := col.Direct().MustGetTableDescByID(ctx, txn, tableID)
+	if err := sql.DescsTxn(ctx, execCfg, func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+		table, err := col.ByID(txn.KV()).Get().Table(ctx, tableID)
 		if err != nil {
 			return err
 		}
-		v := execCfg.Settings.Version.ActiveVersionOrEmpty(ctx)
-		zoneCfg, err := cfg.GetZoneConfigForObject(execCfg.Codec, v, config.ObjectID(tableID))
+		zoneCfg, err := cfg.GetZoneConfigForObject(execCfg.Codec, config.ObjectID(tableID))
 		if err != nil {
 			log.Errorf(ctx, "zone config for desc: %d, err = %+v", tableID, err)
 			return nil
@@ -132,9 +138,12 @@ func updateStatusForGCElements(
 
 		return nil
 	}); err != nil {
-		if errors.Is(err, catalog.ErrDescriptorNotFound) {
+		if isMissingDescriptorError(err) {
 			log.Warningf(ctx, "table %d not found, marking as GC'd", tableID)
-			markTableGCed(ctx, tableID, progress)
+			markTableGCed(ctx, tableID, progress, jobspb.SchemaChangeGCProgress_CLEARED)
+			for indexID := range indexDropTimes {
+				markIndexGCed(ctx, indexID, progress, jobspb.SchemaChangeGCProgress_CLEARED)
+			}
 			return false, true, maxDeadline
 		}
 		log.Warningf(ctx, "error while calculating GC time for table %d, err: %+v", tableID, err)
@@ -160,7 +169,7 @@ func updateTableStatus(
 
 	for i, t := range progress.Tables {
 		droppedTable := &progress.Tables[i]
-		if droppedTable.ID != table.GetID() || droppedTable.Status == jobspb.SchemaChangeGCProgress_DELETED {
+		if droppedTable.ID != table.GetID() || droppedTable.Status == jobspb.SchemaChangeGCProgress_CLEARED {
 			continue
 		}
 
@@ -193,7 +202,7 @@ func updateTableStatus(
 			if log.V(2) {
 				log.Infof(ctx, "detected expired table %d", t.ID)
 			}
-			droppedTable.Status = jobspb.SchemaChangeGCProgress_DELETING
+			droppedTable.Status = jobspb.SchemaChangeGCProgress_CLEARING
 		} else {
 			if log.V(2) {
 				log.Infof(ctx, "table %d still has %+v until GC", t.ID, lifetime)
@@ -224,7 +233,7 @@ func updateIndexesStatus(
 	soonestDeadline = timeutil.Unix(0, int64(math.MaxInt64))
 	for i := 0; i < len(progress.Indexes); i++ {
 		idxProgress := &progress.Indexes[i]
-		if idxProgress.Status == jobspb.SchemaChangeGCProgress_DELETED {
+		if idxProgress.Status == jobspb.SchemaChangeGCProgress_CLEARED {
 			continue
 		}
 
@@ -262,7 +271,7 @@ func updateIndexesStatus(
 			if log.V(2) {
 				log.Infof(ctx, "detected expired index %d from table %d", idxProgress.IndexID, table.GetID())
 			}
-			idxProgress.Status = jobspb.SchemaChangeGCProgress_DELETING
+			idxProgress.Status = jobspb.SchemaChangeGCProgress_CLEARING
 		} else if deadline.Before(soonestDeadline) {
 			soonestDeadline = deadline
 		}
@@ -404,8 +413,8 @@ func isTenantProtected(
 
 	isProtected := false
 	ptsProvider := execCfg.ProtectedTimestampProvider
-	if err := execCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-		ptsState, err := ptsProvider.GetState(ctx, txn)
+	if err := execCfg.InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		ptsState, err := ptsProvider.WithTxn(txn).GetState(ctx)
 		if err != nil {
 			return errors.Wrap(err, "failed to get protectedts State")
 		}
@@ -447,16 +456,15 @@ func refreshTenant(
 	details *jobspb.SchemaChangeGCDetails,
 	progress *jobspb.SchemaChangeGCProgress,
 ) (expired bool, _ time.Time, _ error) {
-	if progress.Tenant.Status != jobspb.SchemaChangeGCProgress_WAITING_FOR_GC {
+	if progress.Tenant.Status != jobspb.SchemaChangeGCProgress_WAITING_FOR_CLEAR {
 		return true, time.Time{}, nil
 	}
 
-	// Read the tenant's GC TTL to check if the tenant's data has expired.
 	tenID := details.Tenant.ID
+	// Read the tenant's GC TTL to check if the tenant's data has expired.
 	cfg := execCfg.SystemConfig.GetSystemConfig()
 	tenantTTLSeconds := execCfg.DefaultZoneConfig.GC.TTLSeconds
-	v := execCfg.Settings.Version.ActiveVersionOrEmpty(ctx)
-	zoneCfg, err := cfg.GetZoneConfigForObject(keys.SystemSQLCodec, v, keys.TenantsRangesID)
+	zoneCfg, err := cfg.GetZoneConfigForObject(keys.SystemSQLCodec, keys.TenantsRangesID)
 	if err == nil {
 		tenantTTLSeconds = zoneCfg.GC.TTLSeconds
 	} else {
@@ -469,7 +477,7 @@ func refreshTenant(
 		// If the tenant's GC TTL has elapsed, check if there are any protected timestamp records
 		// that apply to the tenant keyspace.
 		atTime := hlc.Timestamp{WallTime: dropTime}
-		isProtected, err := isTenantProtected(ctx, atTime, roachpb.MakeTenantID(tenID), execCfg)
+		isProtected, err := isTenantProtected(ctx, atTime, roachpb.MustMakeTenantID(tenID), execCfg)
 		if err != nil {
 			return false, time.Time{}, err
 		}
@@ -481,7 +489,7 @@ func refreshTenant(
 		}
 
 		// At this point, the tenant's keyspace is ready for GC.
-		progress.Tenant.Status = jobspb.SchemaChangeGCProgress_DELETING
+		progress.Tenant.Status = jobspb.SchemaChangeGCProgress_CLEARING
 		return true, deadlineUnix, nil
 	}
 	return false, deadlineUnix, nil

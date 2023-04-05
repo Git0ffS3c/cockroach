@@ -21,11 +21,10 @@ import RequireLogin from "src/views/login/requireLogin";
 import {
   clusterIdSelector,
   clusterNameSelector,
-  singleVersionSelector,
+  clusterVersionLabelSelector,
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import LoginIndicator from "src/views/app/components/loginIndicator";
-import FeedbackSurveyLink from "src/views/app/components/feedbackSurveyLink/feedbackSurveyLink";
 import {
   GlobalNavigation,
   CockroachLabsLockupIcon,
@@ -34,11 +33,13 @@ import {
   PageHeader,
   Text,
   TextTypes,
-  Badge,
 } from "src/components";
+import { Badge } from "@cockroachlabs/cluster-ui";
 
 import "./layout.styl";
 import "./layoutPanel.styl";
+import { getDataFromServer } from "src/util/dataFromServer";
+import TenantDropdown from "../../components/tenantDropdown/tenantDropdown";
 
 export interface LayoutProps {
   clusterName: string;
@@ -61,7 +62,9 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
     // AdminUI layout keeps left and top panels have fixed position on a screen and has internal scrolling for content div
     // element which has to be scrolled back on top with navigation change.
     if (this.props.location.pathname !== prevProps.location.pathname) {
-      this.contentRef.current.scrollTo(0, 0);
+      if (typeof this.contentRef.current.scrollTo === "function") {
+        this.contentRef.current.scrollTo(0, 0);
+      }
     }
   }
 
@@ -82,7 +85,6 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
                 <CockroachLabsLockupIcon height={26} />
               </Left>
               <Right>
-                <FeedbackSurveyLink />
                 <LoginIndicator />
               </Right>
             </GlobalNavigation>
@@ -90,9 +92,13 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
           <div className="layout-panel__navigation-bar">
             <PageHeader>
               <Text textType={TextTypes.Heading2} noWrap>
+                {getDataFromServer().FeatureFlags.is_observability_service
+                  ? "(Obs Service) "
+                  : ""}
                 {clusterName || `Cluster id: ${clusterId || ""}`}
               </Text>
               <Badge text={clusterVersion} />
+              <TenantDropdown />
             </PageHeader>
           </div>
           <div className="layout-panel__body">
@@ -112,7 +118,7 @@ class Layout extends React.Component<LayoutProps & RouteComponentProps> {
 const mapStateToProps = (state: AdminUIState) => {
   return {
     clusterName: clusterNameSelector(state),
-    clusterVersion: singleVersionSelector(state),
+    clusterVersion: clusterVersionLabelSelector(state),
     clusterId: clusterIdSelector(state),
   };
 };

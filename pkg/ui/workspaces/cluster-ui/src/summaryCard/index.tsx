@@ -14,10 +14,12 @@ import styles from "./summaryCard.module.scss";
 import booleanSettingStyles from "../settings/booleanSetting.module.scss";
 import { CircleFilled } from "src/icon";
 import { Tooltip } from "antd";
+import "antd/lib/tooltip/style";
 
 interface ISummaryCardProps {
   children: React.ReactNode;
   className?: string;
+  id?: string;
 }
 
 const cx = classnames.bind(styles);
@@ -27,7 +29,12 @@ const booleanSettingCx = classnames.bind(booleanSettingStyles);
 export const SummaryCard: React.FC<ISummaryCardProps> = ({
   children,
   className = "",
-}) => <div className={`${cx("summary--card")} ${className}`}>{children}</div>;
+  id,
+}) => (
+  <div className={`${cx("summary--card")} ${className}`} id={id}>
+    {children}
+  </div>
+);
 
 interface ISummaryCardItemProps {
   label: React.ReactNode;
@@ -46,16 +53,13 @@ export const SummaryCardItem: React.FC<ISummaryCardItemProps> = ({
 }) => (
   <div className={cx("summary--card__item", className)}>
     <h4 className={cx("summary--card__item--label")}>{label}</h4>
-    <p className={cx("summary--card__item--value")}>{value}</p>
+    <span className={cx("summary--card__item--value")}>{value}</span>
   </div>
 );
 
-export const SummaryCardItemBoolSetting: React.FC<ISummaryCardItemBoolSettingProps> = ({
-  label,
-  value,
-  toolTipText,
-  className,
-}) => {
+export const SummaryCardItemBoolSetting: React.FC<
+  ISummaryCardItemBoolSettingProps
+> = ({ label, value, toolTipText, className }) => {
   const boolValue = value ? "Enabled" : "Disabled";
   const boolClass = value
     ? "bool-setting-icon__enabled"

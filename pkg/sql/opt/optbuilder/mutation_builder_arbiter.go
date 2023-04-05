@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,16 +43,16 @@ import (
 //
 // An arbiter index:
 //
-//   1. Must have lax key columns that match the columns in the ON CONFLICT
-//      clause.
-//   2. If it is a partial index, its predicate must be implied by the
-//      arbiter predicate supplied by the user.
+//  1. Must have lax key columns that match the columns in the ON CONFLICT
+//     clause.
+//  2. If it is a partial index, its predicate must be implied by the
+//     arbiter predicate supplied by the user.
 //
 // An arbiter constraint:
 //
-//   1. Must have columns that match the columns in the ON CONFLICT clause.
-//   2. If it is a partial constraint, its predicate must be implied by the
-//      arbiter predicate supplied by the user.
+//  1. Must have columns that match the columns in the ON CONFLICT clause.
+//  2. If it is a partial constraint, its predicate must be implied by the
+//     arbiter predicate supplied by the user.
 func (mb *mutationBuilder) findArbiters(onConflict *tree.OnConflict) arbiterSet {
 	if onConflict == nil {
 		// No on conflict constraint means that we're in the UPSERT case, which should
@@ -92,7 +92,7 @@ func (mb *mutationBuilder) findArbiters(onConflict *tree.OnConflict) arbiterSet 
 		))
 	}
 	// We have to infer an arbiter set.
-	var ords util.FastIntSet
+	var ords intsets.Fast
 	for _, name := range onConflict.Columns {
 		found := false
 		for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
@@ -146,13 +146,12 @@ func partialIndexArbiterError(onConflict *tree.OnConflict, tableName tree.Name) 
 // constraints are returned so that uniqueness is guaranteed on the respective
 // subsets of rows. In summary, if conflictOrds is non-empty, this function:
 //
-//   1. Returns a single non-partial or pseudo-partial arbiter index, if found.
-//   2. Return a single non-partial or pseudo-partial arbiter constraint, if
-//      found.
-//   3. Otherwise, returns all partial arbiter indexes and constraints.
-//
+//  1. Returns a single non-partial or pseudo-partial arbiter index, if found.
+//  2. Return a single non-partial or pseudo-partial arbiter constraint, if
+//     found.
+//  3. Otherwise, returns all partial arbiter indexes and constraints.
 func (mb *mutationBuilder) inferArbitersFromConflictOrds(
-	conflictOrds util.FastIntSet, arbiterPredicate tree.Expr,
+	conflictOrds intsets.Fast, arbiterPredicate tree.Expr,
 ) arbiterSet {
 	// If conflictOrds is empty, then all unique indexes and unique without
 	// index constraints are arbiters.
@@ -273,13 +272,12 @@ func (mb *mutationBuilder) inferArbitersFromConflictOrds(
 // anti-join wraps the current mb.outScope.expr (which produces the insert rows)
 // and removes rows that would conflict with existing rows.
 //
-// 	 - conflictOrds is the set of table column ordinals that the arbiter
+//   - conflictOrds is the set of table column ordinals that the arbiter
 //     guarantees uniqueness of.
-// 	 - pred is the partial index or constraint predicate. If the arbiter is
+//   - pred is the partial index or constraint predicate. If the arbiter is
 //     not a partial index or constraint, pred is nil.
-//
 func (mb *mutationBuilder) buildAntiJoinForDoNothingArbiter(
-	inScope *scope, conflictOrds util.FastIntSet, pred tree.Expr,
+	inScope *scope, conflictOrds intsets.Fast, pred tree.Expr,
 ) {
 	// Build the right side of the anti-join. Use a new metadata instance
 	// of the mutation table so that a different set of column IDs are used for
@@ -294,6 +292,7 @@ func (mb *mutationBuilder) buildAntiJoinForDoNothingArbiter(
 		nil, /* indexFlags */
 		noRowLocking,
 		inScope,
+		true, /* disableNotVisibleIndex */
 	)
 
 	// If the index is a unique partial index, then rows that are not in the
@@ -359,9 +358,8 @@ func (mb *mutationBuilder) buildAntiJoinForDoNothingArbiter(
 //   - partialIndexDistinctCol is a column that allows the UpsertDistinctOn to
 //     only de-duplicate insert rows that satisfy the partial index predicate.
 //     If the arbiter is not a partial index, partialIndexDistinctCol is nil.
-//
 func (mb *mutationBuilder) buildLeftJoinForUpsertArbiter(
-	inScope *scope, conflictOrds util.FastIntSet, pred tree.Expr,
+	inScope *scope, conflictOrds intsets.Fast, pred tree.Expr,
 ) {
 	// Build the right side of the left outer join. Use a different instance of
 	// table metadata so that col IDs do not overlap.
@@ -379,6 +377,7 @@ func (mb *mutationBuilder) buildLeftJoinForUpsertArbiter(
 		nil, /* indexFlags */
 		noRowLocking,
 		inScope,
+		true, /* disableNotVisibleIndex */
 	)
 	// Set fetchColIDs to reference the columns created for the fetch values.
 	mb.setFetchColIDs(mb.fetchScope.cols)
@@ -449,10 +448,9 @@ func (mb *mutationBuilder) buildLeftJoinForUpsertArbiter(
 //     constraint, partialArbiterDistinctCol is nil.
 //   - errorOnDup indicates whether multiple rows in the same distinct group
 //     should trigger an error. If empty, no error is triggered.
-//
 func (mb *mutationBuilder) buildDistinctOnForArbiter(
 	insertColScope *scope,
-	conflictOrds util.FastIntSet,
+	conflictOrds intsets.Fast,
 	partialArbiterDistinctCol *scopeColumn,
 	errorOnDup string,
 ) {
@@ -488,8 +486,8 @@ func (mb *mutationBuilder) buildDistinctOnForArbiter(
 // partial index or unique constraint predicate should be de-duplicated. For
 // example:
 //
-//   CREATE TABLE t (a INT, b INT, UNIQUE INDEX (a) WHERE b > 0)
-//   INSERT INTO t VALUES (1, 1), (1, 2), (1, -1), (1, -10) ON CONFLICT DO NOTHING
+//	CREATE TABLE t (a INT, b INT, UNIQUE INDEX (a) WHERE b > 0)
+//	INSERT INTO t VALUES (1, 1), (1, 2), (1, -1), (1, -10) ON CONFLICT DO NOTHING
 //
 // The rows (1, 1), (1, -1), and (1, -10) should be inserted. (1, -1)
 // and (1, -10) should not be removed from the input set. Even though
@@ -502,10 +500,10 @@ func (mb *mutationBuilder) buildDistinctOnForArbiter(
 // and NULL otherwise. For the example above, the projected column would
 // be (b > 0) OR NULL. The values of the projected rows would be:
 //
-//   (1, 1)   -> (1, 1, true)
-//   (1, 2)   -> (1, 2, true)
-//   (1, -1)  -> (1, -1, NULL)
-//   (1, -10) -> (1, -10, NULL)
+//	(1, 1)   -> (1, 1, true)
+//	(1, 2)   -> (1, 2, true)
+//	(1, -1)  -> (1, -1, NULL)
+//	(1, -10) -> (1, -10, NULL)
 //
 // The set of conflict columns to be used for de-duplication includes a and the
 // newly projected column. The UpsertDistinctOn considers NULL values as unique,
@@ -586,6 +584,7 @@ func (h *arbiterPredicateHelper) tableScope() *scope {
 			nil, /* indexFlags */
 			noRowLocking,
 			h.mb.b.allocScope(),
+			false, /* disableNotVisibleIndex */
 		)
 	}
 	return h.tableScopeLazy

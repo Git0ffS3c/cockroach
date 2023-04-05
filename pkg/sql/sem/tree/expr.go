@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -66,7 +67,7 @@ type TypedExpr interface {
 	// should be replaced prior to expression evaluation by an
 	// appropriate WalkExpr. For example, Placeholder should be replaced
 	// by the argument passed from the client.
-	Eval(ExprEvaluator) (Datum, error)
+	Eval(context.Context, ExprEvaluator) (Datum, error)
 }
 
 // VariableExpr is an Expr that may change per row. It is used to
@@ -346,8 +347,10 @@ func (node *ParenExpr) TypedInnerExpr() TypedExpr {
 
 // StripParens strips any parentheses surrounding an expression and
 // returns the inner expression. For instance:
-//   1   -> 1
-//  (1)  -> 1
+//
+//	 1   -> 1
+//	(1)  -> 1
+//
 // ((1)) -> 1
 func StripParens(expr Expr) Expr {
 	if p, ok := expr.(*ParenExpr); ok {
@@ -722,6 +725,28 @@ func (node *CoalesceExpr) Format(ctx *FmtCtx) {
 	ctx.WriteByte(')')
 }
 
+// GetWhenCondition builds the WHEN condition to use for the ith expression
+// inside the Coalesce.
+func (node *CoalesceExpr) GetWhenCondition(i int) (whenCond Expr) {
+	leftExpr := node.Exprs[i].(TypedExpr)
+	rightExpr := DNull
+	// IsDistinctFrom is listed as IsNotDistinctFrom in CmpOps.
+	_, ok :=
+		CmpOps[treecmp.IsNotDistinctFrom].LookupImpl(leftExpr.ResolvedType(), rightExpr.ResolvedType())
+	// If the comparison is legal, use IS NOT DISTINCT FROM NULL.
+	// Otherwise, use IS NOT NULL.
+	if ok {
+		whenCond = NewTypedComparisonExpr(
+			treecmp.MakeComparisonOperator(treecmp.IsDistinctFrom),
+			leftExpr,
+			rightExpr,
+		)
+		return whenCond
+	}
+	whenCond = NewTypedIsNotNullExpr(leftExpr)
+	return whenCond
+}
+
 // DefaultVal represents the DEFAULT expression.
 type DefaultVal struct{}
 
@@ -905,6 +930,18 @@ func (node *Exprs) Format(ctx *FmtCtx) {
 // because it's not parenthesized.
 type TypedExprs []TypedExpr
 
+var _ NodeFormatter = &TypedExprs{}
+
+// Format implements the NodeFormatter interface.
+func (node *TypedExprs) Format(ctx *FmtCtx) {
+	for i, n := range *node {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(n)
+	}
+}
+
 func (node *TypedExprs) String() string {
 	var prefix string
 	var buf bytes.Buffer
@@ -926,6 +963,14 @@ type Subquery struct {
 	Idx int
 
 	typeAnnotation
+}
+
+// ResolvedType implements the TypedExpr interface.
+func (node *Subquery) ResolvedType() *types.T {
+	if node.typ == nil {
+		return types.Any
+	}
+	return node.typ
 }
 
 // SetType forces the type annotation on the Subquery node.
@@ -1113,6 +1158,12 @@ func (o UnaryOperator) String() string {
 // Operator implements tree.Operator.
 func (UnaryOperator) Operator() {}
 
+// IsUnaryComplement returns whether op is a unary complement operator.
+func IsUnaryComplement(op Operator) bool {
+	u, ok := op.(UnaryOperator)
+	return ok && u.Symbol == UnaryComplement
+}
+
 // UnaryOperatorSymbol represents a unary operator.
 type UnaryOperatorSymbol uint8
 
@@ -1129,7 +1180,8 @@ const (
 
 var _ = NumUnaryOperatorSymbols
 
-var unaryOpName = [...]string{
+// UnaryOpName is the mapping of unary operators to names.
+var UnaryOpName = [...]string{
 	UnaryMinus:      "-",
 	UnaryPlus:       "+",
 	UnaryComplement: "~",
@@ -1138,10 +1190,10 @@ var unaryOpName = [...]string{
 }
 
 func (i UnaryOperatorSymbol) String() string {
-	if i > UnaryOperatorSymbol(len(unaryOpName)-1) {
+	if i > UnaryOperatorSymbol(len(UnaryOpName)-1) {
 		return fmt.Sprintf("UnaryOp(%d)", i)
 	}
-	return unaryOpName[i]
+	return UnaryOpName[i]
 }
 
 // UnaryExpr represents a unary value expression.
@@ -1186,14 +1238,18 @@ func NewTypedUnaryExpr(op UnaryOperator, expr TypedExpr, typ *types.T) *UnaryExp
 	node := &UnaryExpr{Operator: op, Expr: expr}
 	node.typ = typ
 	innerType := expr.ResolvedType()
-	for _, o := range UnaryOps[op.Symbol] {
-		o := o.(*UnaryOp)
+
+	_ = UnaryOps[op.Symbol].ForEachUnaryOp(func(o *UnaryOp) error {
 		if innerType.Equivalent(o.Typ) && node.typ.Equivalent(o.ReturnType) {
 			node.op = o
-			return node
+			return iterutil.StopIteration()
 		}
+		return nil
+	})
+	if node.op == nil {
+		panic(errors.AssertionFailedf("invalid TypedExpr with unary op %d: %s", op.Symbol, expr))
 	}
-	panic(errors.AssertionFailedf("invalid TypedExpr with unary op %d: %s", op.Symbol, expr))
+	return node
 }
 
 // FuncExpr represents a function call.
@@ -1251,15 +1307,8 @@ func (node *FuncExpr) ResolvedOverload() *Overload {
 
 // IsGeneratorClass returns true if the resolved overload metadata is of
 // the GeneratorClass.
-//
-// TODO(ajwerner): Figure out how this differs from IsGeneratorApplication.
 func (node *FuncExpr) IsGeneratorClass() bool {
-	return node.fnProps != nil && node.fnProps.Class == GeneratorClass
-}
-
-// IsGeneratorApplication returns true iff the function applied is a generator (SRF).
-func (node *FuncExpr) IsGeneratorApplication() bool {
-	return node.fn != nil && (node.fn.Generator != nil || node.fn.GeneratorWithExprs != nil)
+	return node.ResolvedOverload() != nil && node.ResolvedOverload().Class == GeneratorClass
 }
 
 // IsWindowFunctionApplication returns true iff the function is being applied as a window function.
@@ -1272,10 +1321,10 @@ func (node *FuncExpr) IsDistSQLBlocklist() bool {
 	return (node.fn != nil && node.fn.DistsqlBlocklist) || (node.fnProps != nil && node.fnProps.DistsqlBlocklist)
 }
 
-// CanHandleNulls returns whether or not the function can handle null
-// arguments.
-func (node *FuncExpr) CanHandleNulls() bool {
-	return node.fnProps != nil && node.fnProps.NullableArgs
+// IsVectorizeStreaming returns whether the function is of "streaming" nature
+// from the perspective of the vectorized execution engine.
+func (node *FuncExpr) IsVectorizeStreaming() bool {
+	return node.fnProps != nil && node.fnProps.VectorizeStreaming
 }
 
 type funcType int
@@ -1546,6 +1595,13 @@ func (node *AnnotateTypeExpr) Format(ctx *FmtCtx) {
 	switch node.SyntaxMode {
 	case AnnotateShort:
 		exprFmtWithParen(ctx, node.Expr)
+		// The Array format function handles adding type annotations for this case.
+		// We short circuit here to prevent double type annotation.
+		if arrayExpr, ok := node.Expr.(*Array); ok {
+			if ctx.HasFlags(FmtParsable) && arrayExpr.typ != nil {
+				return
+			}
+		}
 		ctx.WriteString(":::")
 		ctx.FormatTypeReference(node.Type)
 
@@ -1702,6 +1758,7 @@ func (node *ParenExpr) String() string        { return AsString(node) }
 func (node *RangeCond) String() string        { return AsString(node) }
 func (node *StrVal) String() string           { return AsString(node) }
 func (node *Subquery) String() string         { return AsString(node) }
+func (node *RoutineExpr) String() string      { return AsString(node) }
 func (node *Tuple) String() string            { return AsString(node) }
 func (node *TupleStar) String() string        { return AsString(node) }
 func (node *AnnotateTypeExpr) String() string { return AsString(node) }

@@ -15,25 +15,27 @@ import (
 	gosql "database/sql"
 	"encoding/hex"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -97,7 +99,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 					return nil
 				},
 			},
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, idx int) error {
 					// Assert that when job 3 is running, there are no mutations other
 					// than the ones associated with this schema change.
@@ -135,7 +137,9 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		// Start job 1: An index schema change, which does not use the new schema
 		// changer.
 		g.GoCtx(func(ctx context.Context) error {
-			_, err := sqlDB.ExecContext(ctx, `CREATE INDEX idx ON db.t(a)`)
+			_, err := sqlDB.ExecContext(ctx, `SET use_declarative_schema_changer='off'`)
+			assert.NoError(t, err)
+			_, err = sqlDB.ExecContext(ctx, `CREATE INDEX idx ON db.t(a)`)
 			assert.NoError(t, err)
 			return nil
 		})
@@ -161,7 +165,9 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		// Start job 2: Another index schema change which does not use the new
 		// schema changer.
 		g.GoCtx(func(ctx context.Context) error {
-			_, err := sqlDB.ExecContext(ctx, `CREATE INDEX idx2 ON db.t(a)`)
+			_, err := sqlDB.ExecContext(ctx, `SET use_declarative_schema_changer='off'`)
+			assert.NoError(t, err)
+			_, err = sqlDB.ExecContext(ctx, `CREATE INDEX idx2 ON db.t(a)`)
 			assert.NoError(t, err)
 			return nil
 		})
@@ -207,7 +213,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		var kvDB *kv.DB
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, idx int) error {
 					// Verify that we never queue mutations for job 2 before finishing job
 					// 1.
@@ -326,7 +332,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		stmt2 := `DROP SCHEMA db.s2`
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, stageIdx int) error {
 					if p.Params.ExecutionPhase != scop.PostCommitPhase {
 						return nil
@@ -419,7 +425,7 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 		stmt2 := `DROP TABLE db.t2`
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeStage: func(p scplan.Plan, stageIdx int) error {
 					if p.Params.ExecutionPhase != scop.PostCommitPhase {
 						return nil
@@ -507,12 +513,21 @@ func TestSchemaChangeWaitsForOtherSchemaChanges(t *testing.T) {
 func TestConcurrentSchemaChangesWait(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	const defaultInitialStmt = `ALTER TABLE db.t ADD COLUMN b INT DEFAULT 1`
+	type concurrentWaitTest struct {
+		// initial statement run under the declarative schema changer, paused on
+		// the first post commit phase.
+		initial string
+		// concurrent statement run under the legacy schema changer
+		concurrent string
+	}
 	ctx := context.Background()
-	runConcurrentSchemaChangeCase := func(t *testing.T, stmt string, implicit bool) {
+	runConcurrentSchemaChangeCase := func(t *testing.T, stmts concurrentWaitTest, implicit bool) {
 		defer log.Scope(t).Close(t)
 		var doOnce sync.Once
-		// Closed when we enter the RunBeforeBackfill knob.
-		beforeBackfillNotification := make(chan struct{})
+		// Closed when we enter the BeforeStage knob with a post commit or later
+		// phase.
+		beforePostCommitNotification := make(chan struct{})
 		// Closed when we're ready to continue with the schema change.
 		continueNotification := make(chan struct{})
 		// Sent on when we're waiting for the initial schema change.
@@ -521,7 +536,7 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 		var kvDB *kv.DB
 		params, _ := tests.CreateTestServerParams()
 		params.Knobs = base.TestingKnobs{
-			SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 				BeforeWaitingForConcurrentSchemaChanges: func(_ []string) {
 					waitingForConcurrent <- struct{}{}
 				},
@@ -537,17 +552,13 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 						assert.LessOrEqual(t, int(m.MutationID()), 2)
 					}
 					s := p.Stages[idx]
-					if s.Type() != scop.BackfillType {
+					if s.Phase < scop.PostCommitPhase {
 						return nil
 					}
-					for _, op := range s.EdgeOps {
-						if _, ok := op.(*scop.BackfillIndex); ok {
-							doOnce.Do(func() {
-								close(beforeBackfillNotification)
-								<-continueNotification
-							})
-						}
-					}
+					doOnce.Do(func() {
+						close(beforePostCommitNotification)
+						<-continueNotification
+					})
 					return nil
 				},
 			},
@@ -566,8 +577,10 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 			}
 			_, err = conn.ExecContext(ctx, `SET use_declarative_schema_changer = 'unsafe'`)
 			assert.NoError(t, err)
-			_, err = conn.ExecContext(ctx, `ALTER TABLE db.t ADD COLUMN b INT DEFAULT 1`)
-			assert.NoError(t, err)
+			for _, s := range strings.Split(stmts.initial, ";") {
+				_, err = conn.ExecContext(ctx, s)
+				assert.NoError(t, err)
+			}
 			return nil
 		}
 		concurrentSchemaChangeImplicit := func() error {
@@ -576,10 +589,9 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 				return err
 			}
 			defer func() { _ = conn.Close() }()
-			for _, s := range []string{
+			for _, s := range append([]string{
 				`SET use_declarative_schema_changer = 'off'`,
-				stmt,
-			} {
+			}, strings.Split(stmts.concurrent, ";")...) {
 				if _, err = conn.ExecContext(ctx, s); err != nil {
 					return err
 				}
@@ -612,8 +624,10 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 				if _, err := tx.Exec("SELECT * FROM db.other_t"); err != nil {
 					return err
 				}
-				if _, err := tx.Exec(stmt); err != nil {
-					return err
+				for _, s := range strings.Split(stmts.concurrent, ";") {
+					if _, err := tx.ExecContext(ctx, s); err != nil {
+						return err
+					}
 				}
 				return tx.Commit()
 			})
@@ -623,10 +637,15 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 		tdb.Exec(t, `CREATE DATABASE db`)
 		tdb.Exec(t, `CREATE TABLE db.other_t (a INT PRIMARY KEY)`)
 		tdb.Exec(t, `CREATE TABLE db.t (a INT PRIMARY KEY)`)
+		tdb.Exec(t, `CREATE USER testuser`)
+		tdb.Exec(t, `CREATE SCHEMA db.sc`)
+		tdb.Exec(t, `ALTER SCHEMA db.sc OWNER to testuser`)
+		tdb.Exec(t, `CREATE TABLE db.sc.t (a INT PRIMARY KEY)`)
+		tdb.Exec(t, `ALTER TABLE db.sc.t OWNER to testuser`)
 		var initialSchemaChangeGroup errgroup.Group
 		var concurrentSchemaChangeGroup errgroup.Group
 		initialSchemaChangeGroup.Go(initialSchemaChange)
-		<-beforeBackfillNotification
+		<-beforePostCommitNotification
 		if implicit {
 			concurrentSchemaChangeGroup.Go(concurrentSchemaChangeImplicit)
 		} else {
@@ -638,20 +657,20 @@ func TestConcurrentSchemaChangesWait(t *testing.T) {
 		require.NoError(t, concurrentSchemaChangeGroup.Wait())
 	}
 
-	stmts := []string{
-		`ALTER TABLE db.t ADD COLUMN c INT DEFAULT 2`,
-		`CREATE INDEX ON db.t(a)`,
-		`ALTER TABLE db.t RENAME COLUMN a TO c`,
-		`CREATE TABLE db.t2 (i INT PRIMARY KEY, a INT REFERENCES db.t)`,
-		`CREATE VIEW db.v AS SELECT a FROM db.t`,
-		`ALTER TABLE db.t RENAME TO db.new`,
-		`GRANT ALL ON db.t TO root`,
-		`TRUNCATE TABLE db.t`,
-		`DROP TABLE db.t`,
+	stmts := []concurrentWaitTest{
+		{defaultInitialStmt, `ALTER TABLE db.t ADD COLUMN c INT DEFAULT 2`},
+		{defaultInitialStmt, `CREATE INDEX ON db.t(a)`},
+		{defaultInitialStmt, `ALTER TABLE db.t RENAME COLUMN a TO c`},
+		{defaultInitialStmt, `CREATE TABLE db.t2 (i INT PRIMARY KEY, a INT REFERENCES db.t)`},
+		{defaultInitialStmt, `CREATE VIEW db.v AS SELECT a FROM db.t`},
+		{defaultInitialStmt, `ALTER TABLE db.t RENAME TO db.new`},
+		{defaultInitialStmt, `TRUNCATE TABLE db.t`},
+		{defaultInitialStmt, `DROP TABLE db.t`},
+		{"USE db; DROP OWNED BY testuser;", `DROP DATABASE db`},
 	}
 	for i := range stmts {
 		stmt := stmts[i] // copy for closure
-		t.Run(stmt, func(t *testing.T) {
+		t.Run(stmt.concurrent, func(t *testing.T) {
 			testutils.RunTrueAndFalse(t, "implicit", func(t *testing.T, implicit bool) {
 				runConcurrentSchemaChangeCase(t, stmt, implicit)
 			})
@@ -667,7 +686,7 @@ func TestSchemaChangerJobRunningStatus(t *testing.T) {
 	var jr *jobs.Registry
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 			AfterStage: func(p scplan.Plan, stageIdx int) error {
 				if p.Params.ExecutionPhase < scop.PostCommitPhase || stageIdx > 1 {
 					return nil
@@ -710,7 +729,7 @@ func TestSchemaChangerJobErrorDetails(t *testing.T) {
 	var jobIDValue int64
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 			AfterStage: func(p scplan.Plan, stageIdx int) error {
 				if p.Params.ExecutionPhase == scop.PostCommitPhase && stageIdx == 1 {
 					atomic.StoreInt64(&jobIDValue, int64(p.JobID))
@@ -722,6 +741,7 @@ func TestSchemaChangerJobErrorDetails(t *testing.T) {
 				return nil
 			},
 		},
+		EventLog:         &sql.EventLogTestingKnobs{SyncWrites: true},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 	}
 
@@ -753,7 +773,7 @@ func TestSchemaChangerJobErrorDetails(t *testing.T) {
 		require.Regexp(t, "^stages graphviz: https.*", ed[1])
 		require.Regexp(t, "^dependencies graphviz: https.*", ed[2])
 	}
-	results = tdb.QueryStr(t, `SELECT encode(payload, 'hex') FROM system.jobs WHERE id = $1`, jobID)
+	results = tdb.QueryStr(t, `SELECT encode(payload, 'hex') FROM crdb_internal.system_jobs WHERE id = $1`, jobID)
 	require.Len(t, results, 1)
 	b, err := hex.DecodeString(results[0][0])
 	require.NoError(t, err)
@@ -763,6 +783,18 @@ func TestSchemaChangerJobErrorDetails(t *testing.T) {
 	checkErrWithDetails(p.FinalResumeError)
 	require.LessOrEqual(t, 1, len(p.RetriableExecutionFailureLog))
 	checkErrWithDetails(p.RetriableExecutionFailureLog[0].Error)
+
+	// Check that the error is featured in the event log.
+	const eventLogCountQuery = `SELECT count(*) FROM system.eventlog WHERE "eventType" = $1`
+	results = tdb.QueryStr(t, eventLogCountQuery, "finish_schema_change")
+	require.EqualValues(t, [][]string{{"0"}}, results)
+	results = tdb.QueryStr(t, eventLogCountQuery, "finish_schema_change_rollback")
+	require.EqualValues(t, [][]string{{"1"}}, results)
+	results = tdb.QueryStr(t, eventLogCountQuery, "reverse_schema_change")
+	require.EqualValues(t, [][]string{{"1"}}, results)
+	const eventLogErrorQuery = `SELECT (info::JSONB)->>'Error' FROM system.eventlog WHERE "eventType" = 'reverse_schema_change'`
+	results = tdb.QueryStr(t, eventLogErrorQuery)
+	require.EqualValues(t, [][]string{{"boom"}}, results)
 }
 
 func TestInsertDuringAddColumnNotWritingToCurrentPrimaryIndex(t *testing.T) {
@@ -785,7 +817,7 @@ func TestInsertDuringAddColumnNotWritingToCurrentPrimaryIndex(t *testing.T) {
 				return nil
 			},
 		},
-		SQLDeclarativeSchemaChanger: &scrun.TestingKnobs{
+		SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 			BeforeStage: func(p scplan.Plan, stageIdx int) error {
 				// Verify that we never get a mutation ID not associated with the schema
 				// change that is running.
@@ -860,10 +892,27 @@ func TestInsertDuringAddColumnNotWritingToCurrentPrimaryIndex(t *testing.T) {
 	results := tdb.QueryStr(t, `
 		SELECT message
 		FROM [SHOW KV TRACE FOR SESSION]
-		WHERE message LIKE 'CPut %' OR message LIKE 'InitPut %'`)
+		WHERE message LIKE 'CPut %' OR message LIKE 'Put %'`)
 	require.GreaterOrEqual(t, len(results), 2)
 	require.Equal(t, fmt.Sprintf("CPut /Table/%d/1/10/0 -> /TUPLE/", desc.GetID()), results[0][0])
-	require.Equal(t, fmt.Sprintf("InitPut /Table/%d/2/10/0 -> /TUPLE/2:2:Int/100", desc.GetID()), results[1][0])
+
+	// The write to the temporary index is wrapped for the delete-preserving
+	// encoding. We need to unwrap it to verify its data. To do this, we pull
+	// the hex-encoded wrapped data, decode it, then pretty-print it to ensure
+	// it looks right.
+	wrappedPutRE := regexp.MustCompile(fmt.Sprintf(
+		"Put /Table/%d/3/10/0 -> /BYTES/0x([0-9a-f]+)$", desc.GetID(),
+	))
+	match := wrappedPutRE.FindStringSubmatch(results[1][0])
+	require.NotEmpty(t, match)
+	var val roachpb.Value
+	wrapped, err := hex.DecodeString(match[1])
+	require.NoError(t, err)
+	val.SetBytes(wrapped)
+	wrapper, err := rowenc.DecodeWrapper(&val)
+	require.NoError(t, err)
+	val.SetTagAndData(wrapper.Value)
+	require.Equal(t, "/TUPLE/2:2:Int/100", val.PrettyPrint())
 }
 
 // TestDropJobCancelable ensure that certain operations like
@@ -936,17 +985,17 @@ CREATE SEQUENCE db.sq1;
 `)
 			require.NoError(t, err)
 
-			go func() {
+			go func(query string, isCancellable bool) {
 				atomic.StoreUint64(&jobControlHookEnabled, 1)
-				_, err := sqlDB.Exec(tc.query)
-				if tc.cancelable && !testutils.IsError(err, "job canceled by user") {
+				_, err := sqlDB.Exec(query)
+				if isCancellable && !testutils.IsError(err, "job canceled by user") {
 					t.Errorf("expected user to have canceled job, got %v", err)
 				}
-				if !tc.cancelable && err != nil {
+				if !isCancellable && err != nil {
 					t.Error(err)
 				}
 				finishedSchemaChange.Done()
-			}()
+			}(tc.query, tc.cancelable)
 
 			schemaChangeStarted.Wait()
 			rows, err := sqlDB.Query(`
@@ -974,53 +1023,4 @@ WHERE
 			finishedSchemaChange.Wait()
 		})
 	}
-}
-
-// TODO (Chengxiong): Remove this version gating test in 22.2
-func TestNewSchemaChangerVersionGating(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	t.Run("new_schema_changer_version_enabled", func(t *testing.T) {
-		params, _ := tests.CreateTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.EnableDeclarativeSchemaChanger),
-		}
-
-		s, sqlDB, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.Background())
-
-		tdb := sqlutils.MakeSQLRunner(sqlDB)
-		tdb.Exec(t, `CREATE DATABASE db`)
-		tdb.Exec(t, `CREATE TABLE db.t (a INT PRIMARY KEY);`)
-
-		results := tdb.QueryStr(t, "EXPLAIN (DDL) DROP TABLE db.t;")
-		require.Equal(t, len(results), 1)
-		require.Equal(t, len(results[0]), 1)
-	})
-
-	t.Run("new_schema_changer_version_disabled", func(t *testing.T) {
-		params, _ := tests.CreateTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(clusterversion.EnableDeclarativeSchemaChanger - 1),
-		}
-
-		s, sqlDB, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.Background())
-
-		tdb := sqlutils.MakeSQLRunner(sqlDB)
-		tdb.Exec(t, `CREATE DATABASE db`)
-		tdb.Exec(t, `CREATE TABLE db.t (a INT PRIMARY KEY);`)
-
-		_, err := sqlDB.Query(`EXPLAIN (DDL) DROP TABLE db.t;`)
-		require.Error(t, err)
-		require.Equal(
-			t,
-			"pq: cannot explain a statement which is not supported by the declarative schema changer",
-			err.Error(),
-		)
-	})
 }

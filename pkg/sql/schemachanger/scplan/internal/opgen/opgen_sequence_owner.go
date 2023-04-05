@@ -20,7 +20,7 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.SequenceOwner) scop.Op {
+				emit(func(this *scpb.SequenceOwner) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
 			),
@@ -28,17 +28,16 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
 				// TODO(postamar): remove revertibility constraint when possible
 				revertible(false),
-				emit(func(this *scpb.SequenceOwner) scop.Op {
+				emit(func(this *scpb.SequenceOwner) *scop.RemoveSequenceOwner {
 					return &scop.RemoveSequenceOwner{
 						OwnedSequenceID: this.SequenceID,
 						TableID:         this.TableID,
 						ColumnID:        this.ColumnID,
 					}
 				}),
-				emit(func(this *scpb.SequenceOwner) scop.Op {
+				emit(func(this *scpb.SequenceOwner) *scop.RemoveOwnerBackReferenceInSequence {
 					return &scop.RemoveOwnerBackReferenceInSequence{
 						SequenceID: this.SequenceID,
 					}

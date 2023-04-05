@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -61,9 +60,6 @@ func getTypedExprs(exprs []tree.Expr) []tree.TypedExpr {
 func (b *Builder) expandStar(
 	expr tree.Expr, inScope *scope,
 ) (aliases []string, exprs []tree.TypedExpr) {
-	if b.insideViewDef {
-		panic(unimplemented.NewWithIssue(10028, "views do not currently support * expressions"))
-	}
 	switch t := expr.(type) {
 	case *tree.TupleStar:
 		texpr := inScope.resolveType(t.Expr, types.Any)
@@ -191,9 +187,13 @@ func (b *Builder) expandStarAndResolveType(
 // a synthesized column "x_incr".
 //
 // scope  The scope is passed in so it can can be updated with the newly bound
-//        variable.
+//
+//	variable.
+//
 // name   This is the name for the new column (e.g., if specified with
-//        the AS keyword).
+//
+//	the AS keyword).
+//
 // typ    The type of the column.
 // expr   The expression this column refers to (if any).
 // scalar The scalar expression associated with this column (if any).
@@ -225,15 +225,15 @@ func (b *Builder) populateSynthesizedColumn(col *scopeColumn, scalar opt.ScalarE
 // projectColumn projects src by copying its column ID to dst. projectColumn
 // also copies src.name to dst if an alias is not already set in dst. No other
 // fields are copied, for the following reasons:
-// - We don't copy group, as dst becomes a pass-through column in the new
-//   scope. dst already has group=0, so keep it as-is.
-// - We don't copy hidden, because projecting a column makes it visible.
-//   dst already has hidden=false, so keep it as-is.
-// - We don't copy table, since the table becomes anonymous in the new scope.
-// - We don't copy descending, since we don't want to overwrite dst.descending
-//   if dst is an ORDER BY column.
-// - expr, exprStr and typ in dst already correspond to the expression and type
-//   of the src column.
+//   - We don't copy group, as dst becomes a pass-through column in the new
+//     scope. dst already has group=0, so keep it as-is.
+//   - We don't copy hidden, because projecting a column makes it visible.
+//     dst already has hidden=false, so keep it as-is.
+//   - We don't copy table, since the table becomes anonymous in the new scope.
+//   - We don't copy descending, since we don't want to overwrite dst.descending
+//     if dst is an ORDER BY column.
+//   - expr, exprStr and typ in dst already correspond to the expression and type
+//     of the src column.
 func (b *Builder) projectColumn(dst *scopeColumn, src *scopeColumn) {
 	if dst.name.IsAnonymous() {
 		dst.name = src.name
@@ -241,18 +241,29 @@ func (b *Builder) projectColumn(dst *scopeColumn, src *scopeColumn) {
 	dst.id = src.id
 }
 
-// shouldCreateDefaultColumn decides if we need to create a default
-// column and default label for a function expression.
-// Returns true if the function's return type is not an empty tuple and
-// doesn't declare any tuple labels.
+// shouldCreateDefaultColumn decides if we need to create a default column and
+// default label for a function expression. Returns true if the function's
+// return type is not an empty tuple and doesn't declare any tuple labels.
 func (b *Builder) shouldCreateDefaultColumn(texpr tree.TypedExpr) bool {
 	if texpr.ResolvedType() == types.EmptyTuple {
 		// This is only to support crdb_internal.unary_table().
 		return false
 	}
 
-	// We need to create a default column with a default name when
-	// the function return type doesn't declare any return labels.
+	if funcExpr, ok := texpr.(*tree.FuncExpr); ok {
+		if funcExpr.Func.FunctionReference.(*tree.ResolvedFunctionDefinition).Name == "unnest" {
+			// Special case for unnest functions: we should create a default column in
+			// the case when there is one input argument, since this implies there
+			// will be one output column. This is necessary because the type of the
+			// single column output by unnest in this case may be a tuple with labels,
+			// which breaks the assumption made below.
+			return len(funcExpr.Exprs) == 1
+		}
+	}
+
+	// We need to create a default column with a default name when the function
+	// return type doesn't declare any return labels. This logic assumes that any
+	// SRF that has a labeled tuple as a return type returns multiple columns.
 	return len(texpr.ResolvedType().TupleLabels()) == 0
 }
 
@@ -268,7 +279,9 @@ func (b *Builder) synthesizeResultColumns(scope *scope, cols colinfo.ResultColum
 // colIndex takes an expression that refers to a column using an integer,
 // verifies it refers to a valid target in the SELECT list, and returns the
 // corresponding column index. For example:
-//    SELECT a from T ORDER by 1
+//
+//	SELECT a from T ORDER by 1
+//
 // Here "1" refers to the first item in the SELECT list, "a". The returned
 // index is 0.
 func colIndex(numOriginalCols int, expr tree.Expr, context string) int {
@@ -455,12 +468,28 @@ func resolveTemporaryStatus(name *tree.TableName, persistence tree.Persistence) 
 	return name.SchemaName == catconstants.PgTempSchemaName || persistence.IsTemporary()
 }
 
+// resolveSchemaForCreateTable is the same as resolveSchemaForCreate but
+// specific for tables.
+func (b *Builder) resolveSchemaForCreateTable(name *tree.TableName) (cat.Schema, cat.SchemaName) {
+	return b.resolveSchemaForCreate(&name.ObjectNamePrefix, name)
+}
+
+// resolveSchemaForCreateFunction is the same as resolveSchemaForCreate but
+// specific for functions.
+func (b *Builder) resolveSchemaForCreateFunction(
+	name *tree.FunctionName,
+) (cat.Schema, cat.SchemaName) {
+	return b.resolveSchemaForCreate(&name.ObjectNamePrefix, name)
+}
+
 // resolveSchemaForCreate returns the schema that will contain a newly created
 // catalog object with the given name. If the current user does not have the
 // CREATE privilege, then resolveSchemaForCreate raises an error.
-func (b *Builder) resolveSchemaForCreate(name *tree.TableName) (cat.Schema, cat.SchemaName) {
+func (b *Builder) resolveSchemaForCreate(
+	prefix *tree.ObjectNamePrefix, name tree.NodeFormatter,
+) (cat.Schema, cat.SchemaName) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
-	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, &name.ObjectNamePrefix)
+	sch, resName, err := b.catalog.ResolveSchema(b.ctx, flags, prefix)
 	if err != nil {
 		// Remap invalid schema name error text so that it references the catalog
 		// object that could not be created.
@@ -602,8 +631,9 @@ func (b *Builder) resolveDataSource(
 	tn *tree.TableName, priv privilege.Kind,
 ) (cat.DataSource, opt.MDDepName, cat.DataSourceName) {
 	var flags cat.Flags
-	if b.insideViewDef {
-		// Avoid taking table leases when we're creating a view.
+	if b.insideViewDef || b.insideFuncDef {
+		// Avoid taking descriptor leases when we're creating a view or a
+		// function.
 		flags.AvoidDescriptorCaches = true
 	}
 	ds, resName, err := b.catalog.ResolveDataSource(b.ctx, flags, tn)
@@ -629,8 +659,8 @@ func (b *Builder) resolveDataSourceRef(
 	ref *tree.TableRef, priv privilege.Kind,
 ) (cat.DataSource, opt.MDDepName) {
 	var flags cat.Flags
-	if b.insideViewDef {
-		// Avoid taking table leases when we're creating a view.
+	if b.insideViewDef || b.insideFuncDef {
+		// Avoid taking table leases when we're creating a view or a function.
 		flags.AvoidDescriptorCaches = true
 	}
 	ds, _, err := b.catalog.ResolveDataSourceByID(b.ctx, flags, cat.StableID(ref.TableID))

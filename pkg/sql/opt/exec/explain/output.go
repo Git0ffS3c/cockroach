@@ -16,20 +16,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // OutputBuilder is used to build the output of an explain tree.
 //
 // See ExampleOutputBuilder for sample usage.
 type OutputBuilder struct {
-	flags   Flags
-	entries []entry
+	flags    Flags
+	entries  []entry
+	warnings []string
 
 	// Current depth level (# of EnterNode() calls - # of LeaveNode() calls).
 	level int
@@ -106,10 +108,10 @@ func (ob *OutputBuilder) AddField(key, value string) {
 	ob.entries = append(ob.entries, entry{field: key, fieldVal: value})
 }
 
-// AddRedactableField adds an information field under the current node, hiding
-// the value depending depending on the given redact flag.
-func (ob *OutputBuilder) AddRedactableField(flag RedactFlags, key, value string) {
-	if ob.flags.Redact.Has(flag) {
+// AddFlakyField adds an information field under the current node, hiding the
+// value depending on the given deflake flags.
+func (ob *OutputBuilder) AddFlakyField(flags DeflakeFlags, key, value string) {
+	if ob.flags.Deflake.Has(flags) {
 		value = "<hidden>"
 	}
 	ob.AddField(key, value)
@@ -147,6 +149,9 @@ func (ob *OutputBuilder) Expr(key string, expr tree.TypedExpr, varColumns colinf
 	if ob.flags.HideValues {
 		flags |= tree.FmtHideConstants
 	}
+	if ob.flags.RedactValues {
+		flags |= tree.FmtMarkRedactionNode | tree.FmtOmitNameRedaction
+	}
 	f := tree.NewFmtCtx(
 		flags,
 		tree.FmtIndexedVarFormat(func(ctx *tree.FmtCtx, idx int) {
@@ -164,66 +169,6 @@ func (ob *OutputBuilder) VExpr(key string, expr tree.TypedExpr, varColumns colin
 	if ob.flags.Verbose {
 		ob.Expr(key, expr, varColumns)
 	}
-}
-
-// buildTreeRows creates the treeprinter structure; returns one string for each
-// entry in ob.entries.
-func (ob *OutputBuilder) buildTreeRows() []string {
-	// We reconstruct the hierarchy using the levels.
-	// stack keeps track of the current node on each level.
-	tp := treeprinter.New()
-	stack := []treeprinter.Node{tp}
-
-	for _, entry := range ob.entries {
-		if entry.isNode() {
-			stack = append(stack[:entry.level], stack[entry.level-1].Child(entry.node))
-		} else {
-			tp.AddEmptyLine()
-		}
-	}
-
-	treeRows := tp.FormattedRows()
-	for len(treeRows) < len(ob.entries) {
-		// This shouldn't happen - the formatter should emit one row per entry.
-		// But just in case, add empty strings if necessary to avoid a panic later.
-		treeRows = append(treeRows, "")
-	}
-
-	return treeRows
-}
-
-// BuildExplainRows builds the output rows for an EXPLAIN (PLAN) statement.
-//
-// The columns are:
-//   verbose=false:  Tree Field Description
-//   verbose=true:   Tree Level Type Field Description
-func (ob *OutputBuilder) BuildExplainRows() []tree.Datums {
-	treeRows := ob.buildTreeRows()
-	rows := make([]tree.Datums, len(ob.entries))
-	level := 1
-	for i, e := range ob.entries {
-		if e.isNode() {
-			level = e.level
-		}
-		if !ob.flags.Verbose {
-			rows[i] = tree.Datums{
-				tree.NewDString(treeRows[i]), // Tree
-				tree.NewDString(e.field),     // Field
-				tree.NewDString(e.fieldVal),  // Description
-			}
-		} else {
-			rows[i] = tree.Datums{
-				tree.NewDString(treeRows[i]),       // Tree
-				tree.NewDInt(tree.DInt(level - 1)), // Level
-				tree.NewDString(e.node),            // Type
-				tree.NewDString(e.field),           // Field
-				tree.NewDString(e.fieldVal),        // Description
-				tree.NewDString(e.columns),         // Columns
-				tree.NewDString(e.ordering),        // Ordering
-			}
-		}
-	}
-	return rows
 }
 
 // BuildStringRows creates a string representation of the plan information and
@@ -269,10 +214,18 @@ func (ob *OutputBuilder) BuildStringRows() []string {
 		}
 		// Add any fields for the node.
 		for entry = popField(); entry != nil; entry = popField() {
-			child.AddLine(entry.fieldStr())
+			field := entry.fieldStr()
+			if ob.flags.RedactValues {
+				field = string(redact.RedactableString(field).Redact())
+			}
+			child.AddLine(field)
 		}
 	}
 	result = append(result, tp.FormattedRows()...)
+	if len(ob.GetWarnings()) > 0 {
+		result = append(result, "")
+		result = append(result, ob.GetWarnings()...)
+	}
 	return result
 }
 
@@ -289,23 +242,23 @@ func (ob *OutputBuilder) BuildString() string {
 }
 
 // BuildProtoTree creates a representation of the plan as a tree of
-// roachpb.ExplainTreePlanNodes.
-func (ob *OutputBuilder) BuildProtoTree() *roachpb.ExplainTreePlanNode {
+// appstatspb.ExplainTreePlanNodes.
+func (ob *OutputBuilder) BuildProtoTree() *appstatspb.ExplainTreePlanNode {
 	// We reconstruct the hierarchy using the levels.
 	// stack keeps track of the current node on each level. We use a sentinel node
 	// for level 0.
-	sentinel := &roachpb.ExplainTreePlanNode{}
-	stack := []*roachpb.ExplainTreePlanNode{sentinel}
+	sentinel := &appstatspb.ExplainTreePlanNode{}
+	stack := []*appstatspb.ExplainTreePlanNode{sentinel}
 
 	for _, entry := range ob.entries {
 		if entry.isNode() {
 			parent := stack[entry.level-1]
-			child := &roachpb.ExplainTreePlanNode{Name: entry.node}
+			child := &appstatspb.ExplainTreePlanNode{Name: entry.node}
 			parent.Children = append(parent.Children, child)
 			stack = append(stack[:entry.level], child)
 		} else {
 			node := stack[len(stack)-1]
-			node.Attrs = append(node.Attrs, &roachpb.ExplainTreePlanNode_Attr{
+			node.Attrs = append(node.Attrs, &appstatspb.ExplainTreePlanNode_Attr{
 				Key:   entry.field,
 				Value: entry.fieldVal,
 			})
@@ -324,10 +277,10 @@ func (ob *OutputBuilder) AddTopLevelField(key, value string) {
 	ob.AddField(key, value)
 }
 
-// AddRedactableTopLevelField adds a top-level field, hiding the value depending
-// depending on the given redact flag.
-func (ob *OutputBuilder) AddRedactableTopLevelField(redactFlag RedactFlags, key, value string) {
-	if ob.flags.Redact.Has(redactFlag) {
+// AddFlakyTopLevelField adds a top-level field, hiding the value depending on
+// the given deflake flags.
+func (ob *OutputBuilder) AddFlakyTopLevelField(flags DeflakeFlags, key, value string) {
+	if ob.flags.Deflake.Has(flags) {
 		value = "<hidden>"
 	}
 	ob.AddTopLevelField(key, value)
@@ -336,19 +289,19 @@ func (ob *OutputBuilder) AddRedactableTopLevelField(redactFlag RedactFlags, key,
 // AddDistribution adds a top-level distribution field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddDistribution(value string) {
-	ob.AddRedactableTopLevelField(RedactDistribution, "distribution", value)
+	ob.AddFlakyTopLevelField(DeflakeDistribution, "distribution", value)
 }
 
 // AddVectorized adds a top-level vectorized field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddVectorized(value bool) {
-	ob.AddRedactableTopLevelField(RedactVectorized, "vectorized", fmt.Sprintf("%t", value))
+	ob.AddFlakyTopLevelField(DeflakeVectorized, "vectorized", fmt.Sprintf("%t", value))
 }
 
 // AddPlanningTime adds a top-level planning time field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddPlanningTime(delta time.Duration) {
-	if ob.flags.Redact.Has(RedactVolatile) {
+	if ob.flags.Deflake.Has(DeflakeVolatile) {
 		delta = 10 * time.Microsecond
 	}
 	ob.AddTopLevelField("planning time", string(humanizeutil.Duration(delta)))
@@ -357,29 +310,31 @@ func (ob *OutputBuilder) AddPlanningTime(delta time.Duration) {
 // AddExecutionTime adds a top-level execution time field. Cannot be called
 // while inside a node.
 func (ob *OutputBuilder) AddExecutionTime(delta time.Duration) {
-	if ob.flags.Redact.Has(RedactVolatile) {
+	if ob.flags.Deflake.Has(DeflakeVolatile) {
 		delta = 100 * time.Microsecond
 	}
 	ob.AddTopLevelField("execution time", string(humanizeutil.Duration(delta)))
 }
 
-// AddKVReadStats adds a top-level field for the bytes/rows read from KV.
-func (ob *OutputBuilder) AddKVReadStats(rows, bytes int64) {
+// AddKVReadStats adds a top-level field for the bytes/rows read from KV as well
+// as for the number of BatchRequests issued.
+func (ob *OutputBuilder) AddKVReadStats(rows, bytes, batchRequests int64) {
 	ob.AddTopLevelField("rows read from KV", fmt.Sprintf(
-		"%s (%s)", humanizeutil.Count(uint64(rows)), humanizeutil.IBytes(bytes),
+		"%s (%s, %s gRPC calls)", humanizeutil.Count(uint64(rows)),
+		humanizeutil.IBytes(bytes), humanizeutil.Count(uint64(batchRequests)),
 	))
 }
 
 // AddKVTime adds a top-level field for the cumulative time spent in KV.
 func (ob *OutputBuilder) AddKVTime(kvTime time.Duration) {
-	ob.AddRedactableTopLevelField(
-		RedactVolatile, "cumulative time spent in KV", string(humanizeutil.Duration(kvTime)))
+	ob.AddFlakyTopLevelField(
+		DeflakeVolatile, "cumulative time spent in KV", string(humanizeutil.Duration(kvTime)))
 }
 
 // AddContentionTime adds a top-level field for the cumulative contention time.
 func (ob *OutputBuilder) AddContentionTime(contentionTime time.Duration) {
-	ob.AddRedactableTopLevelField(
-		RedactVolatile,
+	ob.AddFlakyTopLevelField(
+		DeflakeVolatile,
 		"cumulative time spent due to contention",
 		string(humanizeutil.Duration(contentionTime)),
 	)
@@ -387,15 +342,15 @@ func (ob *OutputBuilder) AddContentionTime(contentionTime time.Duration) {
 
 // AddMaxMemUsage adds a top-level field for the memory used by the query.
 func (ob *OutputBuilder) AddMaxMemUsage(bytes int64) {
-	ob.AddRedactableTopLevelField(
-		RedactVolatile, "maximum memory usage", string(humanizeutil.IBytes(bytes)),
+	ob.AddFlakyTopLevelField(
+		DeflakeVolatile, "maximum memory usage", string(humanizeutil.IBytes(bytes)),
 	)
 }
 
 // AddNetworkStats adds a top-level field for network statistics.
 func (ob *OutputBuilder) AddNetworkStats(messages, bytes int64) {
-	ob.AddRedactableTopLevelField(
-		RedactVolatile,
+	ob.AddFlakyTopLevelField(
+		DeflakeVolatile,
 		"network usage",
 		fmt.Sprintf("%s (%s messages)", humanizeutil.IBytes(bytes), humanizeutil.Count(uint64(messages))),
 	)
@@ -408,17 +363,54 @@ func (ob *OutputBuilder) AddNetworkStats(messages, bytes int64) {
 // information entirely if we're redacting. Since disk spilling is rare we only
 // include this field is bytes is greater than zero.
 func (ob *OutputBuilder) AddMaxDiskUsage(bytes int64) {
-	if !ob.flags.Redact.Has(RedactVolatile) && bytes > 0 {
+	if !ob.flags.Deflake.Has(DeflakeVolatile) && bytes > 0 {
 		ob.AddTopLevelField("max sql temp disk usage",
 			string(humanizeutil.IBytes(bytes)))
 	}
 }
 
+// AddCPUTime adds a top-level field for the cumulative cpu time spent by SQL
+// execution. If we're redacting, we leave this out to keep test outputs
+// independent of platform because the grunning library isn't currently
+// supported on all platforms.
+func (ob *OutputBuilder) AddCPUTime(cpuTime time.Duration) {
+	if !ob.flags.Deflake.Has(DeflakeVolatile) {
+		ob.AddTopLevelField("sql cpu time", string(humanizeutil.Duration(cpuTime)))
+	}
+}
+
+// AddRUEstimate adds a top-level field for the estimated number of RUs consumed
+// by the query.
+func (ob *OutputBuilder) AddRUEstimate(ru int64) {
+	ob.AddFlakyTopLevelField(
+		DeflakeVolatile,
+		"estimated RUs consumed",
+		string(humanizeutil.Count(uint64(ru))),
+	)
+}
+
 // AddRegionsStats adds a top-level field for regions executed on statistics.
 func (ob *OutputBuilder) AddRegionsStats(regions []string) {
-	ob.AddRedactableTopLevelField(
-		RedactNodes,
+	ob.AddFlakyTopLevelField(
+		DeflakeNodes,
 		"regions",
 		strings.Join(regions, ", "),
 	)
+}
+
+// AddWarning adds the provided string to the list of warnings. Warnings will be
+// appended to the end of the output produced by BuildStringRows / BuildString.
+func (ob *OutputBuilder) AddWarning(warning string) {
+	// Do not add duplicate warnings.
+	for _, oldWarning := range ob.warnings {
+		if oldWarning == warning {
+			return
+		}
+	}
+	ob.warnings = append(ob.warnings, warning)
+}
+
+// GetWarnings returns the list of unique warnings accumulated so far.
+func (ob *OutputBuilder) GetWarnings() []string {
+	return ob.warnings
 }

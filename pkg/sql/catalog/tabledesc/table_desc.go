@@ -12,14 +12,16 @@
 package tabledesc
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -27,10 +29,6 @@ var _ catalog.TableDescriptor = (*immutable)(nil)
 var _ catalog.TableDescriptor = (*Mutable)(nil)
 var _ catalog.MutableDescriptor = (*Mutable)(nil)
 var _ catalog.TableDescriptor = (*wrapper)(nil)
-
-// ConstraintIDsAddedToTableDescsVersion constraint IDs have been added to table
-// descriptors at this cluster version.
-const ConstraintIDsAddedToTableDescsVersion = clusterversion.RemoveIncompatibleDatabasePrivileges
 
 // wrapper is the base implementation of the catalog.Descriptor
 // interface, which is overloaded by immutable and Mutable.
@@ -41,11 +39,20 @@ type wrapper struct {
 	// to a struct containing precomputed catalog.Mutation, catalog.Index or
 	// catalog.Column slices.
 	// Those can therefore only be set when creating an immutable.
-	mutationCache *mutationCache
-	indexCache    *indexCache
-	columnCache   *columnCache
+	mutationCache   *mutationCache
+	indexCache      *indexCache
+	columnCache     *columnCache
+	constraintCache *constraintCache
 
 	changes catalog.PostDeserializationChanges
+
+	// This is the raw bytes (tag + data) of the table descriptor in storage.
+	rawBytesInStorage []byte
+}
+
+// GetRawBytesInStorage implements the catalog.Descriptor interface.
+func (desc *wrapper) GetRawBytesInStorage() []byte {
+	return desc.rawBytesInStorage
 }
 
 // IsUncommittedVersion implements the catalog.Descriptor interface.
@@ -63,16 +70,14 @@ func (desc *wrapper) GetPostDeserializationChanges() catalog.PostDeserialization
 func (desc *wrapper) HasConcurrentSchemaChanges() bool {
 	return (desc.DeclarativeSchemaChangerState != nil &&
 		desc.DeclarativeSchemaChangerState.JobID != catpb.InvalidJobID) ||
-		len(desc.Mutations) > 0
+		len(desc.MutationJobs) > 0
 }
 
-// ActiveChecks implements the TableDescriptor interface.
-func (desc *wrapper) ActiveChecks() []descpb.TableDescriptor_CheckConstraint {
-	checks := make([]descpb.TableDescriptor_CheckConstraint, len(desc.Checks))
-	for i, c := range desc.Checks {
-		checks[i] = *c
-	}
-	return checks
+// SkipNamespace implements the descriptor interface.
+func (desc *wrapper) SkipNamespace() bool {
+	// Virtual tables are hard-coded and don't have entries in the
+	// system.namespace table.
+	return desc.IsVirtualTable()
 }
 
 // immutable is a custom type for TableDescriptors
@@ -81,20 +86,21 @@ func (desc *wrapper) ActiveChecks() []descpb.TableDescriptor_CheckConstraint {
 type immutable struct {
 	wrapper
 
-	allChecks []descpb.TableDescriptor_CheckConstraint
-
 	// isUncommittedVersion is set to true if this descriptor was created from
 	// a copy of a Mutable with an uncommitted version.
 	isUncommittedVersion bool
-
-	// TODO (lucy): populate these and use them
-	// inboundFKs  []*ForeignKeyConstraint
-	// outboundFKs []*ForeignKeyConstraint
 }
 
 // IsUncommittedVersion implements the Descriptor interface.
 func (desc *immutable) IsUncommittedVersion() bool {
 	return desc.isUncommittedVersion
+}
+
+// NewBuilder implements the Descriptor interface.
+func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
+	b := newBuilder(desc.TableDesc(), hlc.Timestamp{}, desc.isUncommittedVersion, desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // DescriptorProto implements the Descriptor interface.
@@ -104,6 +110,12 @@ func (desc *wrapper) DescriptorProto() *descpb.Descriptor {
 	}
 }
 
+// GetDeclarativeSchemaChangerState is part of the catalog.MutableDescriptor
+// interface.
+func (desc *immutable) GetDeclarativeSchemaChangerState() *scpb.DescriptorState {
+	return desc.DeclarativeSchemaChangerState.Clone()
+}
+
 // ByteSize implements the Descriptor interface.
 func (desc *wrapper) ByteSize() int64 {
 	return int64(desc.Size())
@@ -111,7 +123,9 @@ func (desc *wrapper) ByteSize() int64 {
 
 // NewBuilder implements the catalog.Descriptor interface.
 func (desc *wrapper) NewBuilder() catalog.DescriptorBuilder {
-	return newBuilder(desc.TableDesc(), desc.IsUncommittedVersion(), desc.changes)
+	b := newBuilder(desc.TableDesc(), hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // GetPrimaryIndexID implements the TableDescriptor interface.
@@ -134,20 +148,15 @@ func (desc *Mutable) ImmutableCopy() catalog.Descriptor {
 // It overrides the wrapper's implementation to deal with the fact that
 // mutable has overridden the definition of IsUncommittedVersion.
 func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
-	return newBuilder(desc.TableDesc(), desc.IsUncommittedVersion(), desc.changes)
+	b := newBuilder(desc.TableDesc(), hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // IsUncommittedVersion implements the Descriptor interface.
 func (desc *Mutable) IsUncommittedVersion() bool {
 	clusterVersion := desc.ClusterVersion()
 	return desc.IsNew() || desc.GetVersion() != clusterVersion.GetVersion()
-}
-
-// SetDrainingNames implements the MutableDescriptor interface.
-//
-// Deprecated: Do not use.
-func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
-	desc.DrainingNames = names
 }
 
 // RemovePublicNonPrimaryIndex removes a secondary index by ordinal.
@@ -180,6 +189,20 @@ func (desc *Mutable) SetPublicNonPrimaryIndex(indexOrdinal int, index descpb.Ind
 	desc.Indexes[indexOrdinal-1] = index
 }
 
+// InitializeImport binds the import start time to the table descriptor
+func (desc *Mutable) InitializeImport(startWallTime int64) error {
+	if desc.ImportStartWallTime != 0 {
+		return errors.AssertionFailedf("Import in progress with start time %v", desc.ImportStartWallTime)
+	}
+	desc.ImportStartWallTime = startWallTime
+	return nil
+}
+
+// FinalizeImport removes the ImportStartTime
+func (desc *Mutable) FinalizeImport() {
+	desc.ImportStartWallTime = 0
+}
+
 // UpdateIndexPartitioning applies the new partition and adjusts the column info
 // for the specified index descriptor. Returns false iff this was a no-op.
 func UpdateIndexPartitioning(
@@ -194,11 +217,11 @@ func UpdateIndexPartitioning(
 	newCap := numCols + len(newImplicitCols) - oldNumImplicitCols
 	newColumnIDs := make([]descpb.ColumnID, len(newImplicitCols), newCap)
 	newColumnNames := make([]string, len(newImplicitCols), newCap)
-	newColumnDirections := make([]descpb.IndexDescriptor_Direction, len(newImplicitCols), newCap)
+	newColumnDirections := make([]catenumpb.IndexColumn_Direction, len(newImplicitCols), newCap)
 	for i, col := range newImplicitCols {
 		newColumnIDs[i] = col.GetID()
 		newColumnNames[i] = col.GetName()
-		newColumnDirections[i] = descpb.IndexDescriptor_ASC
+		newColumnDirections[i] = catenumpb.IndexColumn_ASC
 		if isNoOp &&
 			(idx.KeyColumnIDs[i] != newColumnIDs[i] ||
 				idx.KeyColumnNames[i] != newColumnNames[i] ||
@@ -244,7 +267,7 @@ func UpdateIndexPartitioning(
 }
 
 // GetPrimaryIndex implements the TableDescriptor interface.
-func (desc *wrapper) GetPrimaryIndex() catalog.Index {
+func (desc *wrapper) GetPrimaryIndex() catalog.UniqueWithIndexConstraint {
 	return desc.getExistingOrNewIndexCache().primary
 }
 
@@ -280,10 +303,10 @@ func (desc *wrapper) ActiveIndexes() []catalog.Index {
 
 // NonDropIndexes returns a slice of all non-drop indexes in the underlying
 // proto, in their canonical order. This means:
-// - the primary index, if the table is a physical table,
-// - the public non-primary indexes in the Indexes array, in order,
-// - the non-public indexes present in the Mutations array, in order,
-//   if the mutation is not a drop.
+//   - the primary index, if the table is a physical table,
+//   - the public non-primary indexes in the Indexes array, in order,
+//   - the non-public indexes present in the Mutations array, in order,
+//     if the mutation is not a drop.
 //
 // See also catalog.Index.Ordinal().
 func (desc *wrapper) NonDropIndexes() []catalog.Index {
@@ -336,55 +359,6 @@ func (desc *wrapper) DeletableNonPrimaryIndexes() []catalog.Index {
 // state.
 func (desc *wrapper) DeleteOnlyNonPrimaryIndexes() []catalog.Index {
 	return desc.getExistingOrNewIndexCache().deleteOnlyNonPrimary
-}
-
-// FindIndexWithID returns the first catalog.Index that matches the id
-// in the set of all indexes, or an error if none was found. The order of
-// traversal is the canonical order, see catalog.Index.Ordinal().
-func (desc *wrapper) FindIndexWithID(id descpb.IndexID) (catalog.Index, error) {
-	if idx := catalog.FindIndex(desc, catalog.IndexOpts{
-		NonPhysicalPrimaryIndex: true,
-		DropMutations:           true,
-		AddMutations:            true,
-	}, func(idx catalog.Index) bool {
-		return idx.GetID() == id
-	}); idx != nil {
-		return idx, nil
-	}
-	return nil, errors.Errorf("index-id \"%d\" does not exist", id)
-}
-
-// FindIndexWithName returns the first catalog.Index that matches the name in
-// the set of all indexes, excluding the primary index of non-physical
-// tables, or an error if none was found. The order of traversal is the
-// canonical order, see catalog.Index.Ordinal().
-func (desc *wrapper) FindIndexWithName(name string) (catalog.Index, error) {
-	if idx := catalog.FindIndex(desc, catalog.IndexOpts{
-		NonPhysicalPrimaryIndex: false,
-		DropMutations:           true,
-		AddMutations:            true,
-	}, func(idx catalog.Index) bool {
-		return idx.GetName() == name
-	}); idx != nil {
-		return idx, nil
-	}
-	return nil, errors.Errorf("index %q does not exist", name)
-}
-
-// FindNonDropIndexWithName returns the first catalog.Index that matches the name in
-// the set of all non-drop indexes, excluding the primary index of non-physical
-// tables, or an error if none was found. The order of traversal is the
-// canonical order, see catalog.Index.Ordinal().
-func (desc *wrapper) FindNonDropIndexWithName(name string) (catalog.Index, error) {
-	if idx := catalog.FindIndex(
-		desc,
-		catalog.IndexOpts{AddMutations: true},
-		func(idx catalog.Index) bool {
-			return idx.GetName() == name
-		}); idx != nil {
-		return idx, nil
-	}
-	return nil, errors.Errorf("index %q does not exist", name)
 }
 
 // getExistingOrNewColumnCache should be the only place where the columnCache
@@ -447,7 +421,7 @@ func (desc *wrapper) SystemColumns() []catalog.Column {
 }
 
 // FamilyDefaultColumns implements the TableDescriptor interface.
-func (desc *wrapper) FamilyDefaultColumns() []descpb.IndexFetchSpec_FamilyDefaultColumn {
+func (desc *wrapper) FamilyDefaultColumns() []fetchpb.IndexFetchSpec_FamilyDefaultColumn {
 	return desc.getExistingOrNewColumnCache().familyDefaultColumns
 }
 
@@ -478,9 +452,7 @@ func (desc *wrapper) IndexKeyColumns(idx catalog.Index) []catalog.Column {
 }
 
 // IndexKeyColumnDirections implements the TableDescriptor interface.
-func (desc *wrapper) IndexKeyColumnDirections(
-	idx catalog.Index,
-) []descpb.IndexDescriptor_Direction {
+func (desc *wrapper) IndexKeyColumnDirections(idx catalog.Index) []catenumpb.IndexColumn_Direction {
 	if ic := desc.getExistingOrNewIndexColumnCache(idx); ic != nil {
 		return ic.keyDirs
 	}
@@ -506,7 +478,7 @@ func (desc *wrapper) IndexFullColumns(idx catalog.Index) []catalog.Column {
 // IndexFullColumnDirections implements the TableDescriptor interface.
 func (desc *wrapper) IndexFullColumnDirections(
 	idx catalog.Index,
-) []descpb.IndexDescriptor_Direction {
+) []catenumpb.IndexColumn_Direction {
 	if ic := desc.getExistingOrNewIndexColumnCache(idx); ic != nil {
 		return ic.fullDirs
 	}
@@ -521,10 +493,64 @@ func (desc *wrapper) IndexStoredColumns(idx catalog.Index) []catalog.Column {
 	return nil
 }
 
+// CheckConstraintColumns implements the TableDescriptor interface.
+func (desc *wrapper) CheckConstraintColumns(ck catalog.CheckConstraint) []catalog.Column {
+	n := ck.NumReferencedColumns()
+	if n == 0 {
+		return nil
+	}
+	ret := make([]catalog.Column, n)
+	for i := 0; i < n; i++ {
+		ret[i] = catalog.FindColumnByID(desc, ck.GetReferencedColumnID(i))
+	}
+	return ret
+}
+
+// ForeignKeyReferencedColumns implements the TableDescriptor interface.
+func (desc *wrapper) ForeignKeyReferencedColumns(fk catalog.ForeignKeyConstraint) []catalog.Column {
+	n := fk.NumReferencedColumns()
+	if fk.GetReferencedTableID() != desc.GetID() || n == 0 {
+		return nil
+	}
+	ret := make([]catalog.Column, n)
+	for i := 0; i < n; i++ {
+		ret[i] = catalog.FindColumnByID(desc, fk.GetReferencedColumnID(i))
+	}
+	return ret
+}
+
+// ForeignKeyOriginColumns implements the TableDescriptor interface.
+func (desc *wrapper) ForeignKeyOriginColumns(fk catalog.ForeignKeyConstraint) []catalog.Column {
+	n := fk.NumOriginColumns()
+	if fk.GetOriginTableID() != desc.GetID() || n == 0 {
+		return nil
+	}
+	ret := make([]catalog.Column, n)
+	for i := 0; i < n; i++ {
+		ret[i] = catalog.FindColumnByID(desc, fk.GetOriginColumnID(i))
+	}
+	return ret
+}
+
+// UniqueWithoutIndexColumns implements the TableDescriptor interface.
+func (desc *wrapper) UniqueWithoutIndexColumns(
+	uwoi catalog.UniqueWithoutIndexConstraint,
+) []catalog.Column {
+	n := uwoi.NumKeyColumns()
+	if uwoi.ParentTableID() != desc.GetID() || n == 0 {
+		return nil
+	}
+	ret := make([]catalog.Column, n)
+	for i := 0; i < n; i++ {
+		ret[i] = catalog.FindColumnByID(desc, uwoi.GetKeyColumnID(i))
+	}
+	return ret
+}
+
 // IndexFetchSpecKeyAndSuffixColumns implements the TableDescriptor interface.
 func (desc *wrapper) IndexFetchSpecKeyAndSuffixColumns(
 	idx catalog.Index,
-) []descpb.IndexFetchSpec_KeyColumn {
+) []fetchpb.IndexFetchSpec_KeyColumn {
 	if ic := desc.getExistingOrNewIndexColumnCache(idx); ic != nil {
 		return ic.keyAndSuffix
 	}
@@ -544,40 +570,6 @@ func (desc *wrapper) getExistingOrNewIndexColumnCache(idx catalog.Index) *indexC
 	return &c.index[idx.Ordinal()]
 }
 
-// FindColumnWithID implements the TableDescriptor interface.
-func (desc *wrapper) FindColumnWithID(id descpb.ColumnID) (catalog.Column, error) {
-	for _, col := range desc.AllColumns() {
-		if col.GetID() == id {
-			return col, nil
-		}
-	}
-
-	return nil, pgerror.Newf(pgcode.UndefinedColumn, "column-id \"%d\" does not exist", id)
-}
-
-// FindColumnWithPGAttributeNum implements the TableDescriptor interface.
-func (desc *wrapper) FindColumnWithPGAttributeNum(
-	id descpb.PGAttributeNum,
-) (catalog.Column, error) {
-	for _, col := range desc.AllColumns() {
-		if col.GetPGAttributeNum() == id {
-			return col, nil
-		}
-	}
-
-	return nil, pgerror.Newf(pgcode.UndefinedColumn, "column with logical order %q does not exist", id)
-}
-
-// FindColumnWithName implements the TableDescriptor interface.
-func (desc *wrapper) FindColumnWithName(name tree.Name) (catalog.Column, error) {
-	for _, col := range desc.AllColumns() {
-		if col.ColName() == name {
-			return col, nil
-		}
-	}
-	return nil, colinfo.NewUndefinedColumnError(string(name))
-}
-
 // getExistingOrNewMutationCache should be the only place where the
 // mutationCache field in wrapper is ever read.
 func (desc *wrapper) getExistingOrNewMutationCache() *mutationCache {
@@ -590,4 +582,34 @@ func (desc *wrapper) getExistingOrNewMutationCache() *mutationCache {
 // AllMutations implements the TableDescriptor interface.
 func (desc *wrapper) AllMutations() []catalog.Mutation {
 	return desc.getExistingOrNewMutationCache().all
+}
+
+// IsRefreshViewRequired implements the TableDescriptor interface.
+func (desc *wrapper) IsRefreshViewRequired() bool {
+	return desc.IsMaterializedView && desc.RefreshViewRequired
+}
+
+// GetObjectType implements the Object interface.
+func (desc *wrapper) GetObjectType() privilege.ObjectType {
+	if desc.IsVirtualTable() {
+		return privilege.VirtualTable
+	} else if desc.IsSequence() {
+		return privilege.Sequence
+	}
+	return privilege.Table
+}
+
+// GetInProgressImportStartTime returns the start wall time of the import if there's one in progress
+func (desc *wrapper) GetInProgressImportStartTime() int64 {
+	return desc.ImportStartWallTime
+}
+
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (desc *wrapper) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	for _, c := range desc.UserDefinedTypeColumns() {
+		if err := fn(c.GetType()); err != nil {
+			return iterutil.Map(err)
+		}
+	}
+	return nil
 }

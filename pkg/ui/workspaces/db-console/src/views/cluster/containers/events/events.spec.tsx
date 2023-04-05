@@ -9,14 +9,9 @@
 // licenses/APL.txt.
 
 import React from "react";
-import { assert } from "chai";
 import { mount, shallow } from "enzyme";
 import _ from "lodash";
-import Long from "long";
-import * as sinon from "sinon";
 
-import "src/enzymeInit";
-import * as protos from "src/js/protos";
 import {
   EventBoxUnconnected as EventBox,
   EventRow,
@@ -25,11 +20,10 @@ import {
 import { refreshEvents } from "src/redux/apiReducers";
 import { allEvents } from "src/util/eventTypes";
 import { ToolTipWrapper } from "src/views/shared/components/toolTip";
-
-type Event = protos.cockroach.server.serverpb.EventsResponse.Event;
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 
 function makeEventBox(
-  events: protos.cockroach.server.serverpb.EventsResponse.IEvent[],
+  events: clusterUiApi.EventsResponse,
   refreshEventsFn: typeof refreshEvents,
 ) {
   return shallow(
@@ -41,105 +35,70 @@ function makeEventBox(
   );
 }
 
-function makeEvent(event: Event) {
+function makeEvent(event: clusterUiApi.EventColumns) {
   return mount(<EventRow event={event}></EventRow>);
 }
 
-describe("<EventBox>", function() {
-  let spy: sinon.SinonSpy;
+const createEventWithEventType = (
+  eventType: string,
+): clusterUiApi.EventColumns => {
+  return {
+    eventType: eventType,
+    timestamp: "2016-01-25T10:10:10.555555",
+    reportingID: "1",
+    info: `{"Timestamp":1668442242840943000,"EventType":"${eventType}","NodeID":1,"StartedAt":1668442242644228000,"LastUp":1668442242644228000}`,
+    uniqueID: "\\\x4ce0d9e74bd5480ab1d9e6f98cc2f483",
+  };
+};
 
-  beforeEach(function() {
-    spy = sinon.spy();
-  });
+describe("<EventBox>", function () {
+  const spy = jest.fn();
 
-  describe("refresh", function() {
-    it("refreshes events when mounted.", function() {
+  describe("refresh", function () {
+    it("refreshes events when mounted.", function () {
       makeEventBox([], spy);
-      assert.isTrue(spy.called);
-    });
-  });
-
-  describe("attach", function() {
-    it("attaches event data to contained component", function() {
-      const eventsResponse = new protos.cockroach.server.serverpb.EventsResponse(
-        {
-          events: [
-            {
-              target_id: Long.fromNumber(1),
-              event_type: "test1",
-            },
-            {
-              target_id: Long.fromNumber(2),
-              event_type: "test2",
-            },
-          ],
-        },
-      );
-
-      const provider = makeEventBox(eventsResponse.events, spy);
-      const eventRows = provider
-        .children()
-        .first()
-        .children()
-        .first()
-        .children();
-      const event1Props: any = eventRows.first().props();
-      const event2Props: any = eventRows.at(1).props();
-      assert.lengthOf(eventRows, 3); // 3rd row is "more events" link
-      assert.isDefined(event1Props.event);
-      assert.deepEqual(event1Props.event, eventsResponse.events[0]);
-      assert.isDefined(event2Props.event);
-      assert.deepEqual(event2Props.event, eventsResponse.events[1]);
+      expect(spy).toHaveBeenCalled();
     });
   });
 });
 
-describe("<EventRow>", function() {
-  describe("attach", function() {
-    it("correctly renders a known event", function() {
-      const e = new protos.cockroach.server.serverpb.EventsResponse.Event({
-        target_id: Long.fromNumber(1),
-        event_type: "create_database",
-      });
-
+describe("<EventRow>", function () {
+  describe("attach", function () {
+    it("correctly renders a known event", function () {
+      const e: clusterUiApi.EventColumns =
+        createEventWithEventType("create_database");
       const provider = makeEvent(e);
-      assert.isTrue(
+
+      expect(
         provider
           .find("div.events__message > span")
           .text()
           .includes("created database"),
-      );
-      assert.isTrue(provider.find(ToolTipWrapper).exists());
+      ).toBe(true);
+      expect(provider.find(ToolTipWrapper).exists()).toBe(true);
     });
 
-    it("correctly renders an unknown event", function() {
-      const e = new protos.cockroach.server.serverpb.EventsResponse.Event({
-        target_id: Long.fromNumber(1),
-        event_type: "unknown",
-      });
+    it("correctly renders an unknown event", function () {
+      const e: clusterUiApi.EventColumns = createEventWithEventType("unknown");
       const provider = makeEvent(e);
 
-      assert.isTrue(
-        provider
-          .find("div.events__message > span")
-          .text()
-          .includes("unknown"),
-      );
-      assert.isTrue(provider.find(ToolTipWrapper).exists());
+      expect(
+        provider.find("div.events__message > span").text().includes("unknown"),
+      ).toBe(true);
+      expect(provider.find(ToolTipWrapper).exists()).toBe(true);
     });
   });
 });
 
-describe("getEventInfo", function() {
-  it("covers every currently known event", function() {
+describe("getEventInfo", function () {
+  it("covers every currently known event", function () {
     _.each(allEvents, eventType => {
-      const event = new protos.cockroach.server.serverpb.EventsResponse.Event({
-        event_type: eventType,
-      });
+      const event: clusterUiApi.EventColumns =
+        createEventWithEventType(eventType);
       const eventContent = shallow(
         getEventInfo(event).content as React.ReactElement<any>,
       );
-      assert.notMatch(eventContent.text(), /Unknown event type/);
+      expect(eventContent.text()).not.toMatch(/Unknown event type/);
     });
   });
 });

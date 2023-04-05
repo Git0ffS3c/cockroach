@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -7,20 +8,20 @@ go_library(
         "decode.go",
         "doc.go",
         "encode.go",
+        "json.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/geo",
         "//pkg/geo/geopb",
-        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/bitarray",
         "//pkg/util/duration",
         "//pkg/util/encoding",
-        "//pkg/util/errorutil/unimplemented",
         "//pkg/util/ipaddr",
+        "//pkg/util/json",
         "//pkg/util/timetz",
         "//pkg/util/timeutil/pgdate",
         "//pkg/util/uuid",
@@ -33,6 +34,7 @@ go_library(
 go_test(
     name = "keyside_test",
     srcs = ["keyside_test.go"],
+    args = ["-test.timeout=295s"],
     deps = [
         ":keyside",
         "//pkg/settings/cluster",
@@ -47,3 +49,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

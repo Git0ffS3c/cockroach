@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedbuffer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -88,16 +89,20 @@ func NewWithAdditionalProvider(
 	c.mu.registry = notificationRegistry{}
 	c.additionalKVsSource = additional
 
-	// TODO(ajwerner): Consider stripping this down to just watching
-	// descriptor and zones.
-	span := roachpb.Span{
-		Key:    append(codec.TenantPrefix(), keys.SystemConfigSplitKey...),
-		EndKey: append(codec.TenantPrefix(), keys.SystemConfigTableDataMax...),
+	spans := []roachpb.Span{
+		{
+			Key:    append(codec.TenantPrefix(), keys.SystemDescriptorTableSpan.Key...),
+			EndKey: append(codec.TenantPrefix(), keys.SystemDescriptorTableSpan.EndKey...),
+		},
+		{
+			Key:    append(codec.TenantPrefix(), keys.SystemZonesTableSpan.Key...),
+			EndKey: append(codec.TenantPrefix(), keys.SystemZonesTableSpan.EndKey...),
+		},
 	}
 	c.w = rangefeedcache.NewWatcher(
 		"system-config-cache", clock, f,
 		bufferSize,
-		[]roachpb.Span{span},
+		spans,
 		withPrevValue,
 		passThroughTranslation,
 		c.handleUpdate,
@@ -263,9 +268,7 @@ func (c *Cache) setUpdatedConfigLocked(updated *config.SystemConfig, ts hlc.Time
 	}
 }
 
-func passThroughTranslation(
-	ctx context.Context, value *roachpb.RangeFeedValue,
-) rangefeedbuffer.Event {
+func passThroughTranslation(ctx context.Context, value *kvpb.RangeFeedValue) rangefeedbuffer.Event {
 	return value
 }
 

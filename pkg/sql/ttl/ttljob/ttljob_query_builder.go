@@ -11,19 +11,18 @@
 package ttljob
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/errors"
 )
 
@@ -33,9 +32,10 @@ type selectQueryBuilder struct {
 	tableID         descpb.ID
 	pkColumns       []string
 	selectOpName    string
-	startPK, endPK  tree.Datums
-	selectBatchSize int
-	aost            tree.DTimestampTZ
+	spanToProcess   spanToProcess
+	selectBatchSize int64
+	aostDuration    time.Duration
+	ttlExpr         catpb.Expression
 
 	// isFirst is true if we have not invoked a query using the builder yet.
 	isFirst bool
@@ -51,22 +51,29 @@ type selectQueryBuilder struct {
 	endPKColumnNamesSQL string
 }
 
+type spanToProcess struct {
+	startPK, endPK tree.Datums
+}
+
 func makeSelectQueryBuilder(
 	tableID descpb.ID,
 	cutoff time.Time,
 	pkColumns []string,
 	relationName string,
-	startPK, endPK tree.Datums,
-	aost tree.DTimestampTZ,
-	selectBatchSize int,
+	spanToProcess spanToProcess,
+	aostDuration time.Duration,
+	selectBatchSize int64,
+	ttlExpr catpb.Expression,
 ) selectQueryBuilder {
 	// We will have a maximum of 1 + len(pkColumns)*2 columns, where one
 	// is reserved for AOST, and len(pkColumns) for both start and end key.
 	cachedArgs := make([]interface{}, 0, 1+len(pkColumns)*2)
 	cachedArgs = append(cachedArgs, cutoff)
+	endPK := spanToProcess.endPK
 	for _, d := range endPK {
 		cachedArgs = append(cachedArgs, d)
 	}
+	startPK := spanToProcess.startPK
 	for _, d := range startPK {
 		cachedArgs = append(cachedArgs, d)
 	}
@@ -75,26 +82,27 @@ func makeSelectQueryBuilder(
 		tableID:         tableID,
 		pkColumns:       pkColumns,
 		selectOpName:    fmt.Sprintf("ttl select %s", relationName),
-		startPK:         startPK,
-		endPK:           endPK,
-		aost:            aost,
+		spanToProcess:   spanToProcess,
+		aostDuration:    aostDuration,
 		selectBatchSize: selectBatchSize,
+		ttlExpr:         ttlExpr,
 
 		cachedArgs:          cachedArgs,
 		isFirst:             true,
-		pkColumnNamesSQL:    makeColumnNamesSQL(pkColumns),
-		endPKColumnNamesSQL: makeColumnNamesSQL(pkColumns[:len(endPK)]),
+		pkColumnNamesSQL:    ttlbase.MakeColumnNamesSQL(pkColumns),
+		endPKColumnNamesSQL: ttlbase.MakeColumnNamesSQL(pkColumns[:len(endPK)]),
 	}
 }
 
 func (b *selectQueryBuilder) buildQuery() string {
 	// Generate the end key clause for SELECT, which always stays the same.
 	// Start from $2 as $1 is for the now clause.
-	// The end key of a range is exclusive, so use <.
+	// The end key of a span is exclusive, so use <.
 	var endFilterClause string
-	if len(b.endPK) > 0 {
+	endPK := b.spanToProcess.endPK
+	if len(endPK) > 0 {
 		endFilterClause = fmt.Sprintf(" AND (%s) < (", b.endPKColumnNamesSQL)
-		for i := range b.endPK {
+		for i := range endPK {
 			if i > 0 {
 				endFilterClause += ", "
 			}
@@ -103,42 +111,40 @@ func (b *selectQueryBuilder) buildQuery() string {
 		endFilterClause += ")"
 	}
 
+	startPK := b.spanToProcess.startPK
 	var filterClause string
 	if !b.isFirst {
 		// After the first query, we always want (col1, ...) > (cursor_col_1, ...)
-		filterClause = fmt.Sprintf(" AND (%s) > (", b.pkColumnNamesSQL)
+		filterClause = fmt.Sprintf("AND (%s) > (", b.pkColumnNamesSQL)
 		for i := range b.pkColumns {
 			if i > 0 {
 				filterClause += ", "
 			}
 			// We start from 2 if we don't have an endPK clause, but add len(b.endPK)
 			// if there is.
-			filterClause += fmt.Sprintf("$%d", 2+len(b.endPK)+i)
+			filterClause += fmt.Sprintf("$%d", 2+len(endPK)+i)
 		}
 		filterClause += ")"
-	} else if len(b.startPK) > 0 {
+	} else if len(startPK) > 0 {
 		// For the the first query, we want (col1, ...) >= (cursor_col_1, ...)
-		filterClause = fmt.Sprintf(" AND (%s) >= (", makeColumnNamesSQL(b.pkColumns[:len(b.startPK)]))
-		for i := range b.startPK {
+		filterClause = fmt.Sprintf("AND (%s) >= (", ttlbase.MakeColumnNamesSQL(b.pkColumns[:len(startPK)]))
+		for i := range startPK {
 			if i > 0 {
 				filterClause += ", "
 			}
 			// We start from 2 if we don't have an endPK clause, but add len(b.endPK)
 			// if there is.
-			filterClause += fmt.Sprintf("$%d", 2+len(b.endPK)+i)
+			filterClause += fmt.Sprintf("$%d", 2+len(endPK)+i)
 		}
 		filterClause += ")"
 	}
 
 	return fmt.Sprintf(
-		`SELECT %[1]s FROM [%[2]d AS tbl_name]
-AS OF SYSTEM TIME %[3]s
-WHERE crdb_internal_expiration <= $1%[4]s%[5]s
-ORDER BY %[1]s
-LIMIT %[6]d`,
+		ttlbase.SelectTemplate,
 		b.pkColumnNamesSQL,
 		b.tableID,
-		b.aost.String(),
+		int64(b.aostDuration.Seconds()),
+		b.ttlExpr,
 		filterClause,
 		endFilterClause,
 		b.selectBatchSize,
@@ -159,9 +165,7 @@ func (b *selectQueryBuilder) nextQuery() (string, []interface{}) {
 	return b.cachedQuery, b.cachedArgs
 }
 
-func (b *selectQueryBuilder) run(
-	ctx context.Context, ie *sql.InternalExecutor,
-) ([]tree.Datums, error) {
+func (b *selectQueryBuilder) run(ctx context.Context, ie isql.Executor) ([]tree.Datums, error) {
 	q, args := b.nextQuery()
 
 	// Use a nil txn so that the AOST clause is handled correctly. Currently,
@@ -192,7 +196,7 @@ func (b *selectQueryBuilder) moveCursor(rows []tree.Datums) error {
 	// Move the cursor forward.
 	if len(rows) > 0 {
 		lastRow := rows[len(rows)-1]
-		b.cachedArgs = b.cachedArgs[:1+len(b.endPK)]
+		b.cachedArgs = b.cachedArgs[:1+len(b.spanToProcess.endPK)]
 		if len(lastRow) != len(b.pkColumns) {
 			return errors.AssertionFailedf("expected %d columns for last row, got %d", len(b.pkColumns), len(lastRow))
 		}
@@ -208,8 +212,9 @@ func (b *selectQueryBuilder) moveCursor(rows []tree.Datums) error {
 type deleteQueryBuilder struct {
 	tableID         descpb.ID
 	pkColumns       []string
-	deleteBatchSize int
+	deleteBatchSize int64
 	deleteOpName    string
+	ttlExpr         catpb.Expression
 
 	// cachedQuery is the cached query, which stays the same as long as we are
 	// deleting up to deleteBatchSize elements.
@@ -220,9 +225,14 @@ type deleteQueryBuilder struct {
 }
 
 func makeDeleteQueryBuilder(
-	tableID descpb.ID, cutoff time.Time, pkColumns []string, relationName string, deleteBatchSize int,
+	tableID descpb.ID,
+	cutoff time.Time,
+	pkColumns []string,
+	relationName string,
+	deleteBatchSize int64,
+	ttlExpr catpb.Expression,
 ) deleteQueryBuilder {
-	cachedArgs := make([]interface{}, 0, 1+len(pkColumns)*deleteBatchSize)
+	cachedArgs := make([]interface{}, 0, 1+int64(len(pkColumns))*deleteBatchSize)
 	cachedArgs = append(cachedArgs, cutoff)
 
 	return deleteQueryBuilder{
@@ -230,13 +240,13 @@ func makeDeleteQueryBuilder(
 		pkColumns:       pkColumns,
 		deleteBatchSize: deleteBatchSize,
 		deleteOpName:    fmt.Sprintf("ttl delete %s", relationName),
-
-		cachedArgs: cachedArgs,
+		ttlExpr:         ttlExpr,
+		cachedArgs:      cachedArgs,
 	}
 }
 
 func (b *deleteQueryBuilder) buildQuery(numRows int) string {
-	columnNamesSQL := makeColumnNamesSQL(b.pkColumns)
+	columnNamesSQL := ttlbase.MakeColumnNamesSQL(b.pkColumns)
 	var placeholderStr string
 	for i := 0; i < numRows; i++ {
 		if i > 0 {
@@ -253,8 +263,9 @@ func (b *deleteQueryBuilder) buildQuery(numRows int) string {
 	}
 
 	return fmt.Sprintf(
-		`DELETE FROM [%d AS tbl_name] WHERE crdb_internal_expiration <= $1 AND (%s) IN (%s)`,
+		ttlbase.DeleteTemplate,
 		b.tableID,
+		b.ttlExpr,
 		columnNamesSQL,
 		placeholderStr,
 	)
@@ -262,7 +273,7 @@ func (b *deleteQueryBuilder) buildQuery(numRows int) string {
 
 func (b *deleteQueryBuilder) buildQueryAndArgs(rows []tree.Datums) (string, []interface{}) {
 	var q string
-	if len(rows) == b.deleteBatchSize {
+	if int64(len(rows)) == b.deleteBatchSize {
 		if b.cachedQuery == "" {
 			b.cachedQuery = b.buildQuery(len(rows))
 		}
@@ -280,14 +291,14 @@ func (b *deleteQueryBuilder) buildQueryAndArgs(rows []tree.Datums) (string, []in
 }
 
 func (b *deleteQueryBuilder) run(
-	ctx context.Context, ie *sql.InternalExecutor, txn *kv.Txn, rows []tree.Datums,
-) error {
+	ctx context.Context, txn isql.Txn, rows []tree.Datums,
+) (int64, error) {
 	q, deleteArgs := b.buildQueryAndArgs(rows)
 	qosLevel := sessiondatapb.TTLLow
-	_, err := ie.ExecEx(
+	rowCount, err := txn.ExecEx(
 		ctx,
 		b.deleteOpName,
-		txn,
+		txn.KV(),
 		sessiondata.InternalExecutorOverride{
 			User:             username.RootUserName(),
 			QualityOfService: &qosLevel,
@@ -295,20 +306,5 @@ func (b *deleteQueryBuilder) run(
 		q,
 		deleteArgs...,
 	)
-	return err
-}
-
-// makeColumnNamesSQL converts columns into an escape string
-// for an order by clause, e.g.:
-//   {"a", "b"} => a, b
-//   {"escape-me", "b"} => "escape-me", b
-func makeColumnNamesSQL(columns []string) string {
-	var b bytes.Buffer
-	for i, pkColumn := range columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		lexbase.EncodeRestrictedSQLIdent(&b, pkColumn, lexbase.EncNoFlags)
-	}
-	return b.String()
+	return int64(rowCount), err
 }

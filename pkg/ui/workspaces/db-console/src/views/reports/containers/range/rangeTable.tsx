@@ -17,7 +17,6 @@ import * as protos from "src/js/protos";
 import { cockroach } from "src/js/protos";
 import { util } from "@cockroachlabs/cluster-ui";
 import { FixLong } from "src/util/fixLong";
-import { Bytes } from "src/util/format";
 import Lease from "src/views/reports/containers/range/lease";
 import Print from "src/views/reports/containers/range/print";
 import RangeInfo from "src/views/reports/containers/range/rangeInfo";
@@ -171,6 +170,16 @@ const rangeTableDisplayList: RangeTableRow[] = [
     compareToLeader: true,
   },
   {
+    variable: "mvccRangeKeyBytesCount",
+    display: "MVCC Range Key Bytes/Count",
+    compareToLeader: true,
+  },
+  {
+    variable: "mvccRangeValueBytesCount",
+    display: "MVCC Range Value Bytes/Count",
+    compareToLeader: true,
+  },
+  {
     variable: "mvccIntentBytesCount",
     display: "MVCC Intent Bytes/Count",
     compareToLeader: true,
@@ -255,6 +264,11 @@ const rangeTableDisplayList: RangeTableRow[] = [
     display: "Locality Info",
     compareToLeader: false,
   },
+  {
+    variable: "pausedFollowers",
+    display: "Paused Followers",
+    compareToLeader: false,
+  },
 ];
 
 const rangeTableEmptyContent: RangeTableCellContent = {
@@ -328,7 +342,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
   }
 
   contentMVCC(bytes: Long, count: Long): RangeTableCellContent {
-    const humanizedBytes = Bytes(bytes.toNumber());
+    const humanizedBytes = util.Bytes(bytes.toNumber());
     return {
       value: [`${humanizedBytes} / ${count.toString()} count`],
       title: [
@@ -343,7 +357,7 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
     className: string = null,
     toolTip: string = null,
   ): RangeTableCellContent {
-    const humanized = Bytes(bytes.toNumber());
+    const humanized = util.Bytes(bytes.toNumber());
     if (_.isNull(className)) {
       return {
         value: [humanized],
@@ -796,6 +810,14 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
           FixLong(mvcc.val_bytes),
           FixLong(mvcc.val_count),
         ),
+        mvccRangeKeyBytesCount: this.contentMVCC(
+          FixLong(mvcc.range_key_bytes || 0),
+          FixLong(mvcc.range_key_count || 0),
+        ),
+        mvccRangeValueBytesCount: this.contentMVCC(
+          FixLong(mvcc.range_val_bytes || 0),
+          FixLong(mvcc.range_val_count || 0),
+        ),
         mvccIntentBytesCount: this.contentMVCC(
           FixLong(mvcc.intent_bytes),
           FixLong(mvcc.intent_count),
@@ -881,6 +903,9 @@ export default class RangeTable extends React.Component<RangeTableProps, {}> {
             tier => `${tier.key}: ${tier.value}`,
           ),
         })),
+        pausedFollowers: this.createContent(
+          info.state.paused_replicas?.join(", "),
+        ),
       });
     });
 

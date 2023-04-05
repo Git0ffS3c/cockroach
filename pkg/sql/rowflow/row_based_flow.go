@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -82,12 +83,13 @@ func (f *rowBasedFlow) setupProcessors(
 	ctx context.Context, spec *execinfrapb.FlowSpec, inputSyncs [][]execinfra.RowSource,
 ) error {
 	processors := make([]execinfra.Processor, 0, len(spec.Processors))
+	outputs := make([]execinfra.RowReceiver, 0, len(spec.Processors))
 
 	// Populate processors: see which processors need their own goroutine and
 	// which are fused with their consumer.
 	for i := range spec.Processors {
 		pspec := &spec.Processors[i]
-		p, err := f.makeProcessor(ctx, pspec, inputSyncs[i])
+		p, output, err := f.makeProcessorAndOutput(ctx, pspec, inputSyncs[i])
 		if err != nil {
 			return err
 		}
@@ -164,10 +166,10 @@ func (f *rowBasedFlow) setupProcessors(
 		}
 		if !fuse() {
 			processors = append(processors, p)
+			outputs = append(outputs, output)
 		}
 	}
-	f.SetProcessors(processors)
-	return nil
+	return f.SetProcessorsAndOutputs(processors, outputs)
 }
 
 // findProcByOutputStreamID looks in spec for a processor that has a
@@ -199,11 +201,11 @@ func findProcByOutputStreamID(
 	return nil
 }
 
-func (f *rowBasedFlow) makeProcessor(
+func (f *rowBasedFlow) makeProcessorAndOutput(
 	ctx context.Context, ps *execinfrapb.ProcessorSpec, inputs []execinfra.RowSource,
-) (execinfra.Processor, error) {
+) (execinfra.Processor, execinfra.RowReceiver, error) {
 	if len(ps.Output) != 1 {
-		return nil, errors.Errorf("only single-output processors supported")
+		return nil, nil, errors.Errorf("only single-output processors supported")
 	}
 	var output execinfra.RowReceiver
 	spec := &ps.Output[0]
@@ -211,17 +213,17 @@ func (f *rowBasedFlow) makeProcessor(
 		// There is no entity that corresponds to a pass-through router - we just
 		// use its output stream directly.
 		if len(spec.Streams) != 1 {
-			return nil, errors.Errorf("expected one stream for passthrough router")
+			return nil, nil, errors.Errorf("expected one stream for passthrough router")
 		}
 		var err error
-		output, err = f.setupOutboundStream(spec.Streams[0])
+		output, err = f.setupOutboundStream(spec.Streams[0], ps.ProcessorID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
-		r, err := f.setupRouter(spec)
+		r, err := f.setupRouter(spec, ps.ProcessorID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		output = r
 		f.AddStartable(r)
@@ -236,7 +238,6 @@ func (f *rowBasedFlow) makeProcessor(
 
 	output = &copyingRowReceiver{RowReceiver: output}
 
-	outputs := []execinfra.RowReceiver{output}
 	proc, err := rowexec.NewProcessor(
 		ctx,
 		&f.FlowCtx,
@@ -244,11 +245,10 @@ func (f *rowBasedFlow) makeProcessor(
 		&ps.Core,
 		&ps.Post,
 		inputs,
-		outputs,
 		f.GetLocalProcessors(),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Initialize any routers (the setupRouter case above) and outboxes.
@@ -256,11 +256,11 @@ func (f *rowBasedFlow) makeProcessor(
 	rowRecv := output.(*copyingRowReceiver).RowReceiver
 	switch o := rowRecv.(type) {
 	case router:
-		o.init(ctx, &f.FlowCtx, types)
+		o.init(ctx, &f.FlowCtx, ps.ProcessorID, types)
 	case *flowinfra.Outbox:
 		o.Init(types)
 	}
-	return proc, nil
+	return proc, output, nil
 }
 
 // setupInputSyncs populates a slice of input syncs, one for each Processor in
@@ -298,7 +298,7 @@ func (f *rowBasedFlow) setupInputSyncs(
 					mrc := &execinfra.RowChannel{}
 					mrc.InitWithNumSenders(is.ColumnTypes, len(is.Streams))
 					for _, s := range is.Streams {
-						if err := f.setupInboundStream(ctx, s, mrc); err != nil {
+						if err := f.setupInboundStream(ctx, s, mrc, is.ColumnTypes); err != nil {
 							return nil, err
 						}
 					}
@@ -317,7 +317,7 @@ func (f *rowBasedFlow) setupInputSyncs(
 				for i, s := range is.Streams {
 					rowChan := &execinfra.RowChannel{}
 					rowChan.InitWithNumSenders(is.ColumnTypes, 1 /* numSenders */)
-					if err := f.setupInboundStream(ctx, s, rowChan); err != nil {
+					if err := f.setupInboundStream(ctx, s, rowChan, is.ColumnTypes); err != nil {
 						return nil, err
 					}
 					streams[i] = rowChan
@@ -327,7 +327,20 @@ func (f *rowBasedFlow) setupInputSyncs(
 				if is.Type == execinfrapb.InputSyncSpec_ORDERED {
 					ordering = execinfrapb.ConvertToColumnOrdering(is.Ordering)
 				}
-				sync, err = makeSerialSync(ordering, f.EvalCtx, streams)
+				var returnErrorFunc func() error
+				if is.EnforceHomeRegionError != nil {
+					returnErrorFunc = func() error {
+						enforceHomeRegionError := is.EnforceHomeRegionError.ErrorDetail(ctx)
+						if f.FlowCtx.EvalCtx.SessionData().EnforceHomeRegionFollowerReadsEnabled {
+							enforceHomeRegionError = execinfra.NewDynamicQueryHasNoHomeRegionError(enforceHomeRegionError)
+						}
+						return enforceHomeRegionError
+					}
+				}
+				sync, err = makeSerialSync(ordering, f.EvalCtx, streams,
+					is.EnforceHomeRegionStreamExclusiveUpperBound,
+					returnErrorFunc,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -341,7 +354,10 @@ func (f *rowBasedFlow) setupInputSyncs(
 // setupInboundStream adds a stream to the stream map (inboundStreams or
 // localStreams).
 func (f *rowBasedFlow) setupInboundStream(
-	ctx context.Context, spec execinfrapb.StreamEndpointSpec, receiver execinfra.RowReceiver,
+	ctx context.Context,
+	spec execinfrapb.StreamEndpointSpec,
+	receiver execinfra.RowReceiver,
+	types []*types.T,
 ) error {
 	sid := spec.StreamID
 	switch spec.Type {
@@ -356,7 +372,10 @@ func (f *rowBasedFlow) setupInboundStream(
 			log.Infof(ctx, "set up inbound stream %d", sid)
 		}
 		f.AddRemoteStream(sid, flowinfra.NewInboundStreamInfo(
-			flowinfra.RowInboundStreamHandler{RowReceiver: receiver},
+			flowinfra.RowInboundStreamHandler{
+				RowReceiver: receiver,
+				Types:       types,
+			},
 			f.GetWaitGroup(),
 		))
 
@@ -380,7 +399,7 @@ func (f *rowBasedFlow) setupInboundStream(
 // RowChannel is looked up in the localStreams map; otherwise an outgoing
 // mailbox is created.
 func (f *rowBasedFlow) setupOutboundStream(
-	spec execinfrapb.StreamEndpointSpec,
+	spec execinfrapb.StreamEndpointSpec, processorID int32,
 ) (execinfra.RowReceiver, error) {
 	sid := spec.StreamID
 	switch spec.Type {
@@ -389,7 +408,7 @@ func (f *rowBasedFlow) setupOutboundStream(
 
 	case execinfrapb.StreamEndpointSpec_REMOTE:
 		atomic.AddInt32(&f.numOutboxes, 1)
-		outbox := flowinfra.NewOutbox(&f.FlowCtx, spec.TargetNodeID, sid, &f.numOutboxes, f.FlowCtx.Gateway)
+		outbox := flowinfra.NewOutbox(&f.FlowCtx, processorID, spec.TargetNodeID, sid, &f.numOutboxes, f.FlowCtx.Gateway)
 		f.AddStartable(outbox)
 		return outbox, nil
 
@@ -412,21 +431,18 @@ func (f *rowBasedFlow) setupOutboundStream(
 // setupRouter initializes a router and the outbound streams.
 //
 // Pass-through routers are not supported; they should be handled separately.
-func (f *rowBasedFlow) setupRouter(spec *execinfrapb.OutputRouterSpec) (router, error) {
+func (f *rowBasedFlow) setupRouter(
+	spec *execinfrapb.OutputRouterSpec, processorID int32,
+) (router, error) {
 	streams := make([]execinfra.RowReceiver, len(spec.Streams))
 	for i := range spec.Streams {
 		var err error
-		streams[i], err = f.setupOutboundStream(spec.Streams[i])
+		streams[i], err = f.setupOutboundStream(spec.Streams[i], processorID)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return makeRouter(spec, streams)
-}
-
-// IsVectorized is part of the flowinfra.Flow interface.
-func (f *rowBasedFlow) IsVectorized() bool {
-	return false
 }
 
 // Release releases this rowBasedFlow back to the pool.
@@ -437,6 +453,9 @@ func (f *rowBasedFlow) Release() {
 
 // Cleanup is part of the flowinfra.Flow interface.
 func (f *rowBasedFlow) Cleanup(ctx context.Context) {
+	startCleanup, endCleanup := f.FlowBase.GetOnCleanupFns()
+	startCleanup()
+	defer endCleanup()
 	f.FlowBase.Cleanup(ctx)
 	f.Release()
 }

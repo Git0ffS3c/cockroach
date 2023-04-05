@@ -122,16 +122,16 @@ func (c *CustomFuncs) ConstructValuesFromZips(zip memo.ZipExpr) memo.RelExpr {
 				panic(errors.AssertionFailedf("unexpected GeneratorWithExprs"))
 			}
 			generator, err := function.Overload.
-				Generator.(eval.GeneratorOverload)(c.f.evalCtx, tree.Datums{t.Value})
+				Generator.(eval.GeneratorOverload)(c.f.ctx, c.f.evalCtx, tree.Datums{t.Value})
 			if err != nil {
 				panic(errors.NewAssertionErrorWithWrappedErrf(err, "generator retrieval failed"))
 			}
-			if err = generator.Start(c.f.evalCtx.Context, c.f.evalCtx.Txn); err != nil {
+			if err = generator.Start(c.f.ctx, c.f.evalCtx.Txn); err != nil {
 				panic(errors.NewAssertionErrorWithWrappedErrf(err, "generator.Start failed"))
 			}
 
 			for j := 0; ; j++ {
-				hasNext, err := generator.Next(c.f.evalCtx.Context)
+				hasNext, err := generator.Next(c.f.ctx)
 				if err != nil {
 					panic(errors.NewAssertionErrorWithWrappedErrf(err, "generator.Next failed"))
 				}
@@ -150,7 +150,7 @@ func (c *CustomFuncs) ConstructValuesFromZips(zip memo.ZipExpr) memo.RelExpr {
 				val := c.f.ConstructConstVal(vals[0], vals[0].ResolvedType())
 				addValToOutRows(val, j, i)
 			}
-			generator.Close(c.f.evalCtx.Context)
+			generator.Close(c.f.ctx)
 
 		default:
 			panic(errors.AssertionFailedf("invalid parameter type"))
@@ -173,13 +173,13 @@ func (c *CustomFuncs) ConstructValuesFromZips(zip memo.ZipExpr) memo.RelExpr {
 // wraps a DArray or an ArrayExpr. The complete set of expressions within a
 // static array can be determined during planning:
 //
-//   ARRAY[1,2]
-//   ARRAY[x,y]
+//	ARRAY[1,2]
+//	ARRAY[x,y]
 //
 // By contrast, expressions within a dynamic array can only be determined at
 // run-time:
 //
-//   SELECT (SELECT array_agg(x) FROM xy)
+//	SELECT (SELECT array_agg(x) FROM xy)
 //
 // Here, the length of the array is only known at run-time.
 func (c *CustomFuncs) IsStaticArray(scalar opt.ScalarExpr) bool {

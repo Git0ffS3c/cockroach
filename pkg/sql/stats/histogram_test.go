@@ -26,13 +26,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
+type expBucket struct {
+	upper        int
+	numEq        int64
+	numLess      int64
+	distinctLess float64
+}
+
 func TestEquiDepthHistogram(t *testing.T) {
-	type expBucket struct {
-		upper        int
-		numEq        int64
-		numLess      int64
-		distinctLess float64
-	}
 	testCases := []struct {
 		samples       []int64
 		numRows       int64
@@ -245,30 +246,7 @@ func TestEquiDepthHistogram(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(h.Buckets) != len(tc.buckets) {
-				t.Fatalf("Invalid number of buckets %d, expected %d", len(h.Buckets), len(tc.buckets))
-			}
-			for i, b := range h.Buckets {
-				_, val, err := encoding.DecodeVarintAscending(b.UpperBound)
-				if err != nil {
-					t.Fatal(err)
-				}
-				exp := tc.buckets[i]
-				if val != int64(exp.upper) {
-					t.Errorf("bucket %d: incorrect boundary %d, expected %d", i, val, exp.upper)
-				}
-				if b.NumEq != exp.numEq {
-					t.Errorf("bucket %d: incorrect EqRows %d, expected %d", i, b.NumEq, exp.numEq)
-				}
-				if b.NumRange != exp.numLess {
-					t.Errorf("bucket %d: incorrect RangeRows %d, expected %d", i, b.NumRange, exp.numLess)
-				}
-				// Round to two decimal places.
-				distinctRange := math.Round(b.DistinctRange*100.0) / 100.0
-				if distinctRange != exp.distinctLess {
-					t.Errorf("bucket %d: incorrect DistinctRows %f, expected %f", i, distinctRange, exp.distinctLess)
-				}
-			}
+			validateHistogramBuckets(t, tc.buckets, h)
 		})
 	}
 
@@ -293,6 +271,104 @@ func TestEquiDepthHistogram(t *testing.T) {
 	})
 }
 
+func TestConstructExtremesHistogram(t *testing.T) {
+	testCases := []struct {
+		values                 []int64
+		numRows, distinctCount int64
+		maxBuckets             int
+		lowerBound             int64
+		expected               []expBucket
+	}{
+		// This case is intended to simulate when the distribution of the
+		// values is such that a generated equi-depth histogram from the total set
+		// of samples could overlap over the range that the partial collection
+		// skips. Here, we verify that the resulting histogram for this type of
+		// sample does not overlap these bounds. Consider a case with spans:
+		// [\0-\2), (\2-\10] and sample lower: [0,1], upper: [3, 4, 5, 6, 7, 8, 9,
+		// 10], where maxBuckets = 4. The equi-depth histogram for the total sum
+		// would be [upperbound]: [0], [4], [7], [10], but this incorrect as 2
+		// should be undefined. This test helps validate that the constructed
+		// histogram does not include the undefined range.
+		{
+			values:        []int64{0, 1, 3, 4, 5, 6, 7, 8, 9, 10},
+			numRows:       10,
+			distinctCount: 10,
+			maxBuckets:    4,
+			lowerBound:    2,
+			expected: []expBucket{
+				{0, 1, 0, 0},
+				{1, 1, 0, 0},
+				{3, 1, 1, 0.67},
+				{10, 1, 6, 5.33},
+			},
+		},
+		{
+			// Test with a small distribution of values but a large
+			// number of rows.
+			values:        []int64{1, 2, 4, 5},
+			numRows:       3000,
+			distinctCount: 600,
+			maxBuckets:    5,
+			lowerBound:    3,
+			expected: []expBucket{
+				{math.MinInt64, 0, 0, 0},
+				{1, 601, 298, 297.5},
+				{2, 601, 0, 0},
+				{4, 601, 1, 1},
+				{5, 601, 0, 0},
+				{math.MaxInt64, 0, 298, 297.5},
+			},
+		},
+		{
+			// Test with a lowerbound towards the end of the range.
+			values:        []int64{3, 6, 9, 12, 18},
+			numRows:       500,
+			distinctCount: 5,
+			maxBuckets:    10,
+			lowerBound:    15,
+			expected: []expBucket{
+				{3, 100, 0, 0},
+				{6, 100, 0, 0},
+				{9, 100, 0, 0},
+				{12, 100, 0, 0},
+				{18, 100, 0, 0}},
+		},
+		{
+			// Test with values that are very sparsely distributed.
+			values:        []int64{0, 100, 500, 800},
+			numRows:       50,
+			distinctCount: 20,
+			maxBuckets:    8,
+			lowerBound:    250,
+			expected: []expBucket{
+				{0, 9, 0, 0},
+				{100, 9, 2, 1.99},
+				{500, 9, 8, 8.01},
+				{800, 9, 6, 6},
+			},
+		},
+	}
+
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			samples := make(tree.Datums, len(tc.values))
+			perm := rand.Perm(len(tc.values))
+			for i := range samples {
+				// Randomly permute the samples.
+				val := tc.values[perm[i]]
+
+				samples[i] = tree.NewDInt(tree.DInt(val))
+			}
+			h, _, err := ConstructExtremesHistogram(evalCtx, types.Int, samples, tc.numRows, tc.distinctCount, tc.maxBuckets, tree.NewDInt(tree.DInt(tc.lowerBound)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			validateHistogramBuckets(t, tc.expected, h)
+		})
+	}
+}
+
 func TestAdjustCounts(t *testing.T) {
 	d := func(val tree.DInt) tree.Datum {
 		return tree.NewDInt(val)
@@ -309,6 +385,28 @@ func TestAdjustCounts(t *testing.T) {
 		distinctCount float64
 		expected      []cat.HistogramBucket
 	}{
+		{ // Empty histogram already matching empty table.
+			expected: make([]cat.HistogramBucket, 0),
+		},
+		{ // Empty histogram not matching rowCount.
+			rowCount:      1,
+			distinctCount: 1,
+			expected:      make([]cat.HistogramBucket, 0),
+		},
+		{ // One empty bucket already matching counts.
+			h: []cat.HistogramBucket{
+				{UpperBound: d(0)},
+			},
+			expected: make([]cat.HistogramBucket, 0),
+		},
+		{ // One empty bucket not matching rowCount.
+			h: []cat.HistogramBucket{
+				{UpperBound: d(0)},
+			},
+			rowCount:      1,
+			distinctCount: 1,
+			expected:      make([]cat.HistogramBucket, 0),
+		},
 		{ // One bucket already matching counts.
 			h: []cat.HistogramBucket{
 				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: d(1)},
@@ -449,6 +547,54 @@ func TestAdjustCounts(t *testing.T) {
 				{NumRange: 4.29, NumEq: 0, DistinctRange: 4.5, UpperBound: d(math.MaxInt64)},
 			},
 		},
+		{ // Two buckets already matching counts, 0 NumEq.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 7, NumEq: 0, DistinctRange: 5, UpperBound: d(10)},
+			},
+			rowCount:      7,
+			distinctCount: 5,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 7, NumEq: 0, DistinctRange: 5, UpperBound: d(10)},
+			},
+		},
+		{ // Two buckets matching distinctCount but not rowCount, 0 NumEq.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 7, NumEq: 0, DistinctRange: 5, UpperBound: d(10)},
+			},
+			rowCount:      14,
+			distinctCount: 5,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 14, NumEq: 0, DistinctRange: 5, UpperBound: d(10)},
+			},
+		},
+		{ // Two buckets matching rowCount but not distinctCount, 0 NumEq.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 7, NumEq: 0, DistinctRange: 5, UpperBound: d(10)},
+			},
+			rowCount:      7,
+			distinctCount: 6,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 7, NumEq: 0, DistinctRange: 6, UpperBound: d(10)},
+			},
+		},
+		{ // Two buckets matching neither count, 0 NumEq.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 4000, NumEq: 0, DistinctRange: 3, UpperBound: d(10)},
+			},
+			rowCount:      6000,
+			distinctCount: 2,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(1)},
+				{NumRange: 6000, NumEq: 0, DistinctRange: 2, UpperBound: d(10)},
+			},
+		},
 		{ // Two buckets with floats.
 			h: []cat.HistogramBucket{
 				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: f(1)},
@@ -518,6 +664,156 @@ func TestAdjustCounts(t *testing.T) {
 				{NumRange: 1551.19, NumEq: 3447.09, DistinctRange: 450, UpperBound: f(1000)},
 			},
 		},
+		{ // Zero rowCount and distinctCount.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: f(1)},
+			},
+			rowCount:      0,
+			distinctCount: 0,
+			expected:      []cat.HistogramBucket{},
+		},
+		{ // Negative rowCount and distinctCount.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: f(1)},
+			},
+			rowCount:      -100,
+			distinctCount: -90,
+			expected:      []cat.HistogramBucket{},
+		},
+		{ // Empty initial histogram.
+			h:             []cat.HistogramBucket{},
+			rowCount:      1000,
+			distinctCount: 1000,
+			expected:      []cat.HistogramBucket{},
+		},
+		{ // Empty bucket in initial histogram.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: f(1)},
+			},
+			rowCount:      99,
+			distinctCount: 99,
+			expected:      []cat.HistogramBucket{},
+		},
+		{ // All zero NumEq.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: f(1)},
+				{NumRange: 10, NumEq: 0, DistinctRange: 5, UpperBound: f(100)},
+				{NumRange: 10, NumEq: 0, DistinctRange: 10, UpperBound: f(200)},
+			},
+			rowCount:      100,
+			distinctCount: 60,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: f(1)},
+				{NumRange: 50, NumEq: 0, DistinctRange: 27.5, UpperBound: f(100)},
+				{NumRange: 50, NumEq: 0, DistinctRange: 32.5, UpperBound: f(200)},
+			},
+		},
+		{ // Adjust a leading bucket to zero.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: f(52)},
+				{NumRange: 1, NumEq: 10, DistinctRange: 1, UpperBound: f(62)},
+			},
+			rowCount:      1,
+			distinctCount: 1,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: f(62)},
+			},
+		},
+		{ // Adjust a trailing bucket to zero.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 10, DistinctRange: 0, UpperBound: f(42)},
+				{NumRange: 1, NumEq: 0, DistinctRange: 1, UpperBound: f(52)},
+			},
+			rowCount:      1,
+			distinctCount: 1,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: f(42)},
+			},
+		},
+		{ // Adjust a middle bucket to zero.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 10, DistinctRange: 0, UpperBound: f(42)},
+				{NumRange: 1, NumEq: 0, DistinctRange: 1, UpperBound: f(52)},
+				{NumRange: 0, NumEq: 10, DistinctRange: 0, UpperBound: f(62)},
+			},
+			rowCount:      1,
+			distinctCount: 1,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: .5, DistinctRange: 0, UpperBound: f(42)},
+				{NumRange: 0, NumEq: .5, DistinctRange: 0, UpperBound: f(62)},
+			},
+		},
+		{ // Adjust all buckets to zero.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 10, DistinctRange: 0, UpperBound: f(42)},
+				{NumRange: 0, NumEq: 10, DistinctRange: 0, UpperBound: f(52)},
+				{NumRange: 0, NumEq: 10, DistinctRange: 0, UpperBound: f(62)},
+			},
+			rowCount:      0,
+			distinctCount: 0,
+			expected:      []cat.HistogramBucket{},
+		},
+		{ // Add outer buckets.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: d(-2)},
+				{NumRange: 1, NumEq: 1, DistinctRange: 1, UpperBound: d(0)},
+				{NumRange: 1, NumEq: 1, DistinctRange: 1, UpperBound: d(2)},
+			},
+			rowCount:      18,
+			distinctCount: 9,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 0, DistinctRange: 0, UpperBound: d(-9223372036854775808)},
+				{NumRange: 4, NumEq: 2, DistinctRange: 2, UpperBound: d(-2)},
+				{NumRange: 2, NumEq: 2, DistinctRange: 1, UpperBound: d(0)},
+				{NumRange: 2, NumEq: 2, DistinctRange: 1, UpperBound: d(2)},
+				{NumRange: 4, NumEq: 0, DistinctRange: 2, UpperBound: d(9223372036854775807)},
+			},
+		},
+		{ // Add outer buckets but do not fill in range of first outer bucket (which
+			// is then removed for being redundant.)
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: d(-9223372036854775807)},
+				{NumRange: 1, NumEq: 1, DistinctRange: 1, UpperBound: d(-9223372036854775805)},
+				{NumRange: 1, NumEq: 1, DistinctRange: 1, UpperBound: d(-9223372036854775803)},
+			},
+			rowCount:      11,
+			distinctCount: 6,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 2, DistinctRange: 0, UpperBound: d(-9223372036854775807)},
+				{NumRange: 2, NumEq: 2, DistinctRange: 1.2, UpperBound: d(-9223372036854775805)},
+				{NumRange: 2, NumEq: 2, DistinctRange: 1.2, UpperBound: d(-9223372036854775803)},
+				{NumRange: 1, NumEq: 0, DistinctRange: 0.6, UpperBound: d(9223372036854775807)},
+			},
+		},
+		{ // Avoid adding negative NumRange for zero-range buckets with NumRange = 0
+			// and DistinctRange > 0 (see #93892).
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1, DistinctRange: 0, UpperBound: d(10)},
+				{NumRange: 0, NumEq: 1, DistinctRange: 1, UpperBound: d(11)},
+				{NumRange: 1, NumEq: 1, DistinctRange: 1, UpperBound: d(15)},
+			},
+			rowCount:      10,
+			distinctCount: 6,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 1.67, DistinctRange: 0, UpperBound: d(10)},
+				{NumRange: 0, NumEq: 1.67, DistinctRange: 0.75, UpperBound: d(11)},
+				{NumRange: 5, NumEq: 1.67, DistinctRange: 2.25, UpperBound: d(15)},
+			},
+		},
+		{ // Clamp negative counts to zero.
+			h: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 100, DistinctRange: 0, UpperBound: d(-80)},
+				{NumRange: 100, NumEq: -1, DistinctRange: 8, UpperBound: d(-70)},
+				{NumRange: -1, NumEq: 100, DistinctRange: -1, UpperBound: d(-60)},
+			},
+			rowCount:      298,
+			distinctCount: 9,
+			expected: []cat.HistogramBucket{
+				{NumRange: 0, NumEq: 100, DistinctRange: 0, UpperBound: d(-80)},
+				{NumRange: 100, NumEq: 0, DistinctRange: 8, UpperBound: d(-70)},
+				{NumRange: 0, NumEq: 100, DistinctRange: 0, UpperBound: d(-60)},
+			},
+		},
 	}
 
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
@@ -526,7 +822,11 @@ func TestAdjustCounts(t *testing.T) {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			actual := histogram{buckets: make([]cat.HistogramBucket, len(tc.h))}
 			copy(actual.buckets, tc.h)
-			actual.adjustCounts(&evalCtx, tc.rowCount, tc.distinctCount)
+			colType := types.Int
+			if len(tc.h) > 0 {
+				colType = tc.h[0].UpperBound.ResolvedType()
+			}
+			actual.adjustCounts(&evalCtx, colType, tc.rowCount, tc.distinctCount)
 			roundHistogram(&actual)
 			if !reflect.DeepEqual(actual.buckets, tc.expected) {
 				t.Fatalf("expected %v but found %v", tc.expected, actual.buckets)
@@ -536,7 +836,7 @@ func TestAdjustCounts(t *testing.T) {
 
 	t.Run("random", func(t *testing.T) {
 		// randHist returns a random histogram with anywhere from 1-200 buckets.
-		randHist := func() histogram {
+		randHist := func() (histogram, *types.T) {
 			numBuckets := rand.Intn(200) + 1
 			buckets := make([]cat.HistogramBucket, numBuckets)
 			ub := rand.Intn(100000000)
@@ -544,6 +844,7 @@ func TestAdjustCounts(t *testing.T) {
 			if rand.Intn(2) == 0 {
 				ub = -ub
 			}
+			colType := types.Int
 			buckets[0].UpperBound = tree.NewDInt(tree.DInt(ub))
 			buckets[0].NumEq = float64(rand.Intn(1000)) + 1
 			for i := 1; i < len(buckets); i++ {
@@ -556,17 +857,18 @@ func TestAdjustCounts(t *testing.T) {
 			}
 			// Half the time, use floats instead of ints.
 			if rand.Intn(2) == 0 {
+				colType = types.Float
 				for i := range buckets {
 					buckets[i].UpperBound = tree.NewDFloat(tree.DFloat(*buckets[i].UpperBound.(*tree.DInt)))
 				}
 			}
-			return histogram{buckets: buckets}
+			return histogram{buckets: buckets}, colType
 		}
 
 		// Create 100 random histograms, and check that we can correctly adjust the
 		// counts to match a random row count and distinct count.
 		for trial := 0; trial < 100; trial++ {
-			h := randHist()
+			h, colType := randHist()
 			rowCount := rand.Intn(1000000)
 			distinctCount := rand.Intn(rowCount + 1)
 
@@ -576,7 +878,7 @@ func TestAdjustCounts(t *testing.T) {
 			distinctCount = max(distinctCount, len(h.buckets))
 
 			// Adjust the counts in the histogram to match the provided counts.
-			h.adjustCounts(&evalCtx, float64(rowCount), float64(distinctCount))
+			h.adjustCounts(&evalCtx, colType, float64(rowCount), float64(distinctCount))
 
 			// Check that the resulting histogram is valid.
 			if h.buckets[0].NumRange > 0 || h.buckets[0].DistinctRange > 0 {
@@ -639,12 +941,12 @@ func makeEnums(t *testing.T) tree.Datums {
 		},
 	}
 	res := make(tree.Datums, len(enumMembers))
-	var err error
 	for i := range enumMembers {
-		res[i], err = tree.MakeDEnumFromLogicalRepresentation(enumType, enumMembers[i])
+		e, err := tree.MakeDEnumFromLogicalRepresentation(enumType, enumMembers[i])
 		if err != nil {
 			t.Fatal(err)
 		}
+		res[i] = tree.NewDEnum(e)
 	}
 	return res
 }
@@ -691,4 +993,37 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func validateHistogramBuckets(t *testing.T, expected []expBucket, h HistogramData) {
+	if h.Version != histVersion {
+		t.Errorf("Invalid histogram version %d expected %d", h.Version, histVersion)
+	}
+	if (h.Buckets == nil) != (expected == nil) {
+		t.Fatalf("Invalid bucket == nil: %v, expected %v", h.Buckets == nil, expected == nil)
+	}
+	if len(h.Buckets) != len(expected) {
+		t.Fatalf("Invalid number of buckets %d, expected %d", len(h.Buckets), len(expected))
+	}
+	for i, b := range h.Buckets {
+		_, val, err := encoding.DecodeVarintAscending(b.UpperBound)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exp := expected[i]
+		if val != int64(exp.upper) {
+			t.Errorf("bucket %d: incorrect boundary %d, expected %d", i, val, exp.upper)
+		}
+		if b.NumEq != exp.numEq {
+			t.Errorf("bucket %d: incorrect EqRows %d, expected %d", i, b.NumEq, exp.numEq)
+		}
+		if b.NumRange != exp.numLess {
+			t.Errorf("bucket %d: incorrect RangeRows %d, expected %d", i, b.NumRange, exp.numLess)
+		}
+		// Round to two decimal places.
+		distinctRange := math.Round(b.DistinctRange*100.0) / 100.0
+		if distinctRange != exp.distinctLess {
+			t.Errorf("bucket %d: incorrect DistinctRows %f, expected %f", i, distinctRange, exp.distinctLess)
+		}
+	}
 }

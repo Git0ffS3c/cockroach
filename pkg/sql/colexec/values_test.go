@@ -13,6 +13,7 @@ package colexec
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 
@@ -88,7 +89,7 @@ func TestValues(t *testing.T) {
 					if err != nil {
 						return nil, err
 					}
-					return NewValuesOp(testAllocator, &spec), nil
+					return NewValuesOp(testAllocator, &spec, math.MaxInt64), nil
 				})
 		}
 	}
@@ -135,6 +136,7 @@ func BenchmarkValues(b *testing.B) {
 	flowCtx := execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	post := execinfrapb.PostProcessSpec{}
 
@@ -143,7 +145,7 @@ func BenchmarkValues(b *testing.B) {
 			// Measure the vectorized values operator.
 			subBenchmarkValues(ctx, b, numRows, numCols, "valuesOpNative",
 				func(spec *execinfrapb.ValuesCoreSpec) (colexecop.Operator, error) {
-					return NewValuesOp(testAllocator, spec), nil
+					return NewValuesOp(testAllocator, spec, math.MaxInt64), nil
 				})
 
 			// For comparison, also measure the row-based values processor wrapped in
@@ -153,13 +155,12 @@ func BenchmarkValues(b *testing.B) {
 					var core execinfrapb.ProcessorCoreUnion
 					core.Values = spec
 					proc, err := rowexec.NewProcessor(
-						ctx, &flowCtx, 0 /* processorID */, &core, &post, nil, /* inputs */
-						[]execinfra.RowReceiver{nil} /* outputs */, nil, /* localProcessors */
+						ctx, &flowCtx, 0 /* processorID */, &core, &post, nil /* inputs */, nil, /* localProcessors */
 					)
 					if err != nil {
 						b.Fatal(err)
 					}
-					return NewBufferingColumnarizer(
+					return NewBufferingColumnarizerForTests(
 						testAllocator, &flowCtx, 0, proc.(execinfra.RowSource),
 					), nil
 				})

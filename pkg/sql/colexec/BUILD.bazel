@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//pkg/sql/colexecop:EXECGEN.bzl", "eg_go_filegroup", "gen_eg_go_rules")
 load(":COLEXEC.bzl", "gen_sort_partitioner_rule")
@@ -14,6 +15,8 @@ go_library(
         "constants.go",
         "count.go",
         "hash_aggregator.go",
+        "hash_group_joiner.go",
+        "insert.go",
         "invariants_checker.go",
         "limit.go",
         "materializer.go",
@@ -22,6 +25,7 @@ go_library(
         "ordered_aggregator.go",
         "parallel_unordered_synchronizer.go",
         "partially_ordered_distinct.go",
+        "range_stats.go",
         "serial_unordered_synchronizer.go",
         "sort.go",
         "sort_chunks.go",
@@ -40,11 +44,16 @@ go_library(
         "//pkg/col/coldata",
         "//pkg/col/coldataext",  # keep
         "//pkg/col/typeconv",  # keep
+        "//pkg/kv/kvserver/kvserverbase",
+        "//pkg/roachpb",
         "//pkg/server/telemetry",  # keep
         "//pkg/settings",
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/colinfo",  # keep
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/colconv",
+        "//pkg/sql/colenc",
         "//pkg/sql/colexec/colexecagg",  # keep
         "//pkg/sql/colexec/colexecargs",
         "//pkg/sql/colexec/colexecbase",
@@ -60,7 +69,9 @@ go_library(
         "//pkg/sql/execinfra/execreleasable",
         "//pkg/sql/execinfrapb",
         "//pkg/sql/memsize",
+        "//pkg/sql/row",
         "//pkg/sql/rowenc",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sqltelemetry",  # keep
@@ -69,7 +80,9 @@ go_library(
         "//pkg/util/buildutil",
         "//pkg/util/duration",  # keep
         "//pkg/util/encoding",  # keep
+        "//pkg/util/intsets",
         "//pkg/util/json",  # keep
+        "//pkg/util/log",
         "//pkg/util/stringarena",
         "//pkg/util/tracing",
         "@com_github_cockroachdb_apd_v3//:apd",  # keep
@@ -97,6 +110,7 @@ go_test(
         "external_hash_joiner_test.go",
         "external_sort_test.go",
         "hash_aggregator_test.go",
+        "hash_group_joiner_test.go",
         "hashjoiner_test.go",
         "if_expr_test.go",
         "inject_setup_test.go",
@@ -111,7 +125,7 @@ go_test(
         "ordered_synchronizer_test.go",
         "parallel_unordered_synchronizer_test.go",
         "proj_utils_test.go",
-        "rowstovec_test.go",
+        "rowtovec_test.go",
         "select_in_test.go",
         "serial_unordered_synchronizer_test.go",
         "sort_chunks_test.go",
@@ -119,9 +133,9 @@ go_test(
         "sort_utils_test.go",
         "sorttopk_test.go",
         "types_integration_test.go",
-        "utils_test.go",
         "values_test.go",
     ],
+    args = ["-test.timeout=895s"],
     embed = [":colexec"],
     shard_count = 16,
     deps = [
@@ -184,8 +198,8 @@ targets = [
     ("hash_aggregator.eg.go", "hash_aggregator_tmpl.go"),
     ("is_null_ops.eg.go", "is_null_ops_tmpl.go"),
     ("ordered_synchronizer.eg.go", "ordered_synchronizer_tmpl.go"),
-    ("quicksort.eg.go", "quicksort_tmpl.go"),
-    ("rowstovec.eg.go", "rowstovec_tmpl.go"),
+    ("pdqsort.eg.go", "pdqsort_tmpl.go"),
+    ("rowtovec.eg.go", "rowtovec_tmpl.go"),
     ("select_in.eg.go", "select_in_tmpl.go"),
     ("sort.eg.go", "sort_tmpl.go"),
     ("sorttopk.eg.go", "sorttopk_tmpl.go"),
@@ -218,3 +232,5 @@ disallowed_imports_test(
         "//pkg/sql/rowflow",
     ],
 )
+
+get_x_data(name = "get_x_data")

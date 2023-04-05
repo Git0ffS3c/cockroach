@@ -60,32 +60,32 @@ import (
 
 // NewOneInputDiskSpiller returns a new oneInputDiskSpiller. It takes the
 // following arguments:
-// - inMemoryOp - the in-memory operator that will be consuming input and doing
-//   computations until it either successfully processes the whole input or
-//   reaches its memory limit.
-// - inMemoryMemMonitorName - the name of the memory monitor of the in-memory
-//   operator. diskSpiller will catch an OOM error only if this name is
-//   contained within the error message.
-// - diskBackedOpConstructor - the function to construct the disk-backed
-//   operator when given an input operator. We take in a constructor rather
-//   than an already created operator in order to hide the complexity of buffer
-//   exporting operator that serves as the input to the disk-backed operator.
-// - spillingCallbackFn will be called when the spilling from in-memory to disk
-//   backed operator occurs. It should only be set in tests.
+//   - inMemoryOp - the in-memory operator that will be consuming input and doing
+//     computations until it either successfully processes the whole input or
+//     reaches its memory limit.
+//   - inMemoryMemMonitorName - the name of the memory monitor of the in-memory
+//     operator. diskSpiller will catch an OOM error only if this name is
+//     contained within the error message.
+//   - diskBackedOpConstructor - the function to construct the disk-backed
+//     operator when given an input operator. We take in a constructor rather
+//     than an already created operator in order to hide the complexity of buffer
+//     exporting operator that serves as the input to the disk-backed operator.
+//   - spillingCallbackFn will be called when the spilling from in-memory to disk
+//     backed operator occurs. It should only be set in tests.
 func NewOneInputDiskSpiller(
 	input colexecop.Operator,
 	inMemoryOp colexecop.BufferingInMemoryOperator,
 	inMemoryMemMonitorName redact.RedactableString,
 	diskBackedOpConstructor func(input colexecop.Operator) colexecop.Operator,
 	spillingCallbackFn func(),
-) colexecop.Operator {
+) colexecop.ClosableOperator {
 	diskBackedOpInput := newBufferExportingOperator(inMemoryOp, input)
 	return &diskSpillerBase{
-		inputs:                 []colexecop.Operator{input},
-		inMemoryOp:             inMemoryOp,
-		inMemoryMemMonitorName: string(inMemoryMemMonitorName),
-		diskBackedOp:           diskBackedOpConstructor(diskBackedOpInput),
-		spillingCallbackFn:     spillingCallbackFn,
+		inputs:                  []colexecop.Operator{input},
+		inMemoryOp:              inMemoryOp,
+		inMemoryMemMonitorNames: []string{string(inMemoryMemMonitorName)},
+		diskBackedOp:            diskBackedOpConstructor(diskBackedOpInput),
+		spillingCallbackFn:      spillingCallbackFn,
 	}
 }
 
@@ -127,33 +127,37 @@ func NewOneInputDiskSpiller(
 
 // NewTwoInputDiskSpiller returns a new twoInputDiskSpiller. It takes the
 // following arguments:
-// - inMemoryOp - the in-memory operator that will be consuming inputs and
-//   doing computations until it either successfully processes the whole inputs
-//   or reaches its memory limit.
-// - inMemoryMemMonitorName - the name of the memory monitor of the in-memory
-//   operator. diskSpiller will catch an OOM error only if this name is
-//   contained within the error message.
-// - diskBackedOpConstructor - the function to construct the disk-backed
-//   operator when given two input operators. We take in a constructor rather
-//   than an already created operator in order to hide the complexity of buffer
-//   exporting operators that serves as inputs to the disk-backed operator.
-// - spillingCallbackFn will be called when the spilling from in-memory to disk
-//   backed operator occurs. It should only be set in tests.
+//   - inMemoryOp - the in-memory operator that will be consuming inputs and
+//     doing computations until it either successfully processes the whole inputs
+//     or reaches its memory limit.
+//   - inMemoryMemMonitorNames - the name of the memory monitors of the
+//     in-memory operator. diskSpiller will catch an OOM error only if one of
+//     these names is contained within the error message.
+//   - diskBackedOpConstructor - the function to construct the disk-backed
+//     operator when given two input operators. We take in a constructor rather
+//     than an already created operator in order to hide the complexity of buffer
+//     exporting operators that serves as inputs to the disk-backed operator.
+//   - spillingCallbackFn will be called when the spilling from in-memory to disk
+//     backed operator occurs. It should only be set in tests.
 func NewTwoInputDiskSpiller(
 	inputOne, inputTwo colexecop.Operator,
 	inMemoryOp colexecop.BufferingInMemoryOperator,
-	inMemoryMemMonitorName redact.RedactableString,
+	inMemoryMemMonitorNames []redact.RedactableString,
 	diskBackedOpConstructor func(inputOne, inputTwo colexecop.Operator) colexecop.Operator,
 	spillingCallbackFn func(),
-) colexecop.Operator {
+) colexecop.ClosableOperator {
 	diskBackedOpInputOne := newBufferExportingOperator(inMemoryOp, inputOne)
 	diskBackedOpInputTwo := newBufferExportingOperator(inMemoryOp, inputTwo)
+	names := make([]string, len(inMemoryMemMonitorNames))
+	for i := range names {
+		names[i] = string(inMemoryMemMonitorNames[i])
+	}
 	return &diskSpillerBase{
-		inputs:                 []colexecop.Operator{inputOne, inputTwo},
-		inMemoryOp:             inMemoryOp,
-		inMemoryMemMonitorName: string(inMemoryMemMonitorName),
-		diskBackedOp:           diskBackedOpConstructor(diskBackedOpInputOne, diskBackedOpInputTwo),
-		spillingCallbackFn:     spillingCallbackFn,
+		inputs:                  []colexecop.Operator{inputOne, inputTwo},
+		inMemoryOp:              inMemoryOp,
+		inMemoryMemMonitorNames: names,
+		diskBackedOp:            diskBackedOpConstructor(diskBackedOpInputOne, diskBackedOpInputTwo),
+		spillingCallbackFn:      spillingCallbackFn,
 	}
 }
 
@@ -168,7 +172,7 @@ type diskSpillerBase struct {
 	spilled bool
 
 	inMemoryOp              colexecop.BufferingInMemoryOperator
-	inMemoryMemMonitorName  string
+	inMemoryMemMonitorNames []string
 	diskBackedOp            colexecop.Operator
 	diskBackedOpInitialized bool
 	spillingCallbackFn      func()
@@ -198,17 +202,26 @@ func (d *diskSpillerBase) Next() coldata.Batch {
 			batch = d.inMemoryOp.Next()
 		},
 	); err != nil {
-		if sqlerrors.IsOutOfMemoryError(err) &&
-			strings.Contains(err.Error(), d.inMemoryMemMonitorName) {
-			d.spilled = true
-			if d.spillingCallbackFn != nil {
-				d.spillingCallbackFn()
+		if sqlerrors.IsOutOfMemoryError(err) {
+			// Check if this error is from one of our memory monitors.
+			var found bool
+			for i := range d.inMemoryMemMonitorNames {
+				if strings.Contains(err.Error(), d.inMemoryMemMonitorNames[i]) {
+					found = true
+					break
+				}
 			}
-			// It is ok if we call Init() multiple times (once after every
-			// Reset) since all calls except for the first one are noops.
-			d.diskBackedOp.Init(d.Ctx)
-			d.diskBackedOpInitialized = true
-			return d.diskBackedOp.Next()
+			if found {
+				d.spilled = true
+				if d.spillingCallbackFn != nil {
+					d.spillingCallbackFn()
+				}
+				// It is ok if we call Init() multiple times (once after every
+				// Reset) since all calls except for the first one are noops.
+				d.diskBackedOp.Init(d.Ctx)
+				d.diskBackedOpInitialized = true
+				return d.diskBackedOp.Next()
+			}
 		}
 		// Either not an out of memory error or an OOM error coming from a
 		// different operator, so we propagate it further.
@@ -240,8 +253,17 @@ func (d *diskSpillerBase) Close(ctx context.Context) error {
 		return nil
 	}
 	var retErr error
+	for _, input := range d.inputs {
+		if c, ok := input.(colexecop.Closer); ok {
+			if err := c.Close(ctx); err != nil {
+				retErr = err
+			}
+		}
+	}
 	if c, ok := d.inMemoryOp.(colexecop.Closer); ok {
-		retErr = c.Close(ctx)
+		if err := c.Close(ctx); err != nil {
+			retErr = err
+		}
 	}
 	if c, ok := d.diskBackedOp.(colexecop.Closer); ok {
 		if err := c.Close(ctx); err != nil {

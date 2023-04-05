@@ -17,7 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
@@ -32,12 +34,23 @@ import (
 func NewColSpanAssembler(
 	codec keys.SQLCodec,
 	allocator *colmem.Allocator,
-	fetchSpec *descpb.IndexFetchSpec,
+	fetchSpec *fetchpb.IndexFetchSpec,
 	splitFamilyIDs []descpb.FamilyID,
 	inputTypes []*types.T,
 ) ColSpanAssembler {
 	sa := spanAssemblerPool.Get().(*spanAssembler)
-	sa.colFamStartKeys, sa.colFamEndKeys = getColFamilyEncodings(splitFamilyIDs)
+	if len(splitFamilyIDs) > 0 {
+		sa.colFamStartKeys, sa.colFamEndKeys = getColFamilyEncodings(splitFamilyIDs)
+		for i := range sa.colFamStartKeys {
+			sa.colFamStartKeysTotalLength += len(sa.colFamStartKeys[i])
+		}
+		for i := range sa.colFamEndKeys {
+			if len(sa.colFamEndKeys[i]) > 0 {
+				sa.colFamEndKeysTotalLength += len(sa.colFamEndKeys[i])
+				sa.numNonNilColFamEndKeys++
+			}
+		}
+	}
 	keyPrefix := rowenc.MakeIndexKeyPrefix(codec, fetchSpec.TableID, fetchSpec.IndexID)
 	sa.scratchKey = append(sa.scratchKey[:0], keyPrefix...)
 	sa.prefixLength = len(keyPrefix)
@@ -47,7 +60,7 @@ func NewColSpanAssembler(
 	// ColSpanAssembler will later append these together to form valid spans.
 	keyColumns := fetchSpec.KeyColumns()
 	for i := range keyColumns {
-		asc := keyColumns[i].Direction == descpb.IndexDescriptor_ASC
+		asc := keyColumns[i].Direction == catenumpb.IndexColumn_ASC
 		sa.spanEncoders = append(sa.spanEncoders, newSpanEncoder(allocator, inputTypes[i], asc, i))
 	}
 	if cap(sa.spanCols) < len(sa.spanEncoders) {
@@ -58,7 +71,7 @@ func NewColSpanAssembler(
 
 	// Account for the memory currently in use.
 	sa.spansBytes = int64(cap(sa.spans)) * spanSize
-	sa.allocator.AdjustMemoryUsage(sa.spansBytes)
+	sa.allocator.AdjustMemoryUsageAfterAllocation(sa.spansBytes)
 
 	return sa
 }
@@ -142,6 +155,13 @@ type spanAssembler struct {
 	// possible to break a span into family scans (in which case these slices are
 	// empty).
 	colFamStartKeys, colFamEndKeys []roachpb.Key
+	// colFamStartKeysTotalLength and colFamEndKeysTotalLength contains the
+	// combined length of all keys in colFamStartKeys and colFamEndKeys,
+	// respectively.
+	colFamStartKeysTotalLength, colFamEndKeysTotalLength int
+	// numNonNilColFamEndKeys contains the number of non-nil keys in
+	// colFamEndKeys.
+	numNonNilColFamEndKeys int
 }
 
 var _ ColSpanAssembler = (*spanAssembler)(nil)
@@ -170,12 +190,14 @@ func (sa *spanAssembler) ConsumeBatch(batch coldata.Batch, startIdx, endIdx int)
 				sa.scratchKey = append(sa.scratchKey, sa.spanCols[j].Get(i)...)
 			}
 			var span roachpb.Span
-			span.Key = make(roachpb.Key, 0, len(sa.scratchKey))
-			span.Key = append(span.Key, sa.scratchKey...)
+			span.Key = make(roachpb.Key, len(sa.scratchKey))
+			copy(span.Key, sa.scratchKey)
 			sa.keyBytes += len(span.Key)
-			span.EndKey = make(roachpb.Key, 0, len(sa.scratchKey)+1)
-			span.EndKey = append(span.EndKey, sa.scratchKey...)
-			span.EndKey = span.EndKey.PrefixEnd()
+			// span.Key cannot be empty (because it will at least contain the
+			// table ID and the index ID), so PrefixEnd() will definitely
+			// allocate a new slice; therefore, we don't have to preallocate any
+			// memory for span.EndKey.
+			span.EndKey = span.Key.PrefixEnd()
 			sa.keyBytes += len(span.EndKey)
 			sa.spans = append(sa.spans, span)
 		}
@@ -191,18 +213,24 @@ func (sa *spanAssembler) ConsumeBatch(batch coldata.Batch, startIdx, endIdx int)
 				// calculated and stored in an input column.
 				sa.scratchKey = append(sa.scratchKey, sa.spanCols[j].Get(i)...)
 			}
+			// Calculate how much space all start and end keys will take for
+			// this row.
+			keyAllocCap := len(sa.scratchKey)*(len(sa.colFamStartKeys)+sa.numNonNilColFamEndKeys) +
+				sa.colFamStartKeysTotalLength + sa.colFamEndKeysTotalLength
+			keyAlloc := make([]byte, keyAllocCap)
+			sa.keyBytes += keyAllocCap
 			for j := range sa.colFamStartKeys {
 				var span roachpb.Span
-				span.Key = make(roachpb.Key, 0, len(sa.scratchKey)+len(sa.colFamStartKeys[j]))
+				span.Key = keyAlloc[: 0 : len(sa.scratchKey)+len(sa.colFamStartKeys[j])]
+				keyAlloc = keyAlloc[len(sa.scratchKey)+len(sa.colFamStartKeys[j]):]
 				span.Key = append(span.Key, sa.scratchKey...)
 				span.Key = append(span.Key, sa.colFamStartKeys[j]...)
-				sa.keyBytes += len(span.Key)
 				// The end key may be nil, in which case the span is a point lookup.
 				if len(sa.colFamEndKeys[j]) > 0 {
-					span.EndKey = make(roachpb.Key, 0, len(sa.scratchKey)+len(sa.colFamEndKeys[j]))
+					span.EndKey = keyAlloc[: 0 : len(sa.scratchKey)+len(sa.colFamEndKeys[j])]
+					keyAlloc = keyAlloc[len(sa.scratchKey)+len(sa.colFamEndKeys[j]):]
 					span.EndKey = append(span.EndKey, sa.scratchKey...)
 					span.EndKey = append(span.EndKey, sa.colFamEndKeys[j]...)
-					sa.keyBytes += len(span.EndKey)
 				}
 				sa.spans = append(sa.spans, span)
 			}
@@ -212,7 +240,7 @@ func (sa *spanAssembler) ConsumeBatch(batch coldata.Batch, startIdx, endIdx int)
 	// Account for the memory allocated for the span slice and keys.
 	keyBytesMem := int64(sa.keyBytes - oldKeyBytes)
 	sa.spansBytes = int64(cap(sa.spans)) * spanSize
-	sa.allocator.AdjustMemoryUsage((sa.spansBytes - oldSpansBytes) + keyBytesMem)
+	sa.allocator.AdjustMemoryUsageAfterAllocation((sa.spansBytes - oldSpansBytes) + keyBytesMem)
 }
 
 const spanSize = int64(unsafe.Sizeof(roachpb.Span{}))
@@ -237,7 +265,7 @@ func (sa *spanAssembler) AccountForSpans() {
 		))
 	}
 	sa.spansBytes = int64(cap(sa.spans)) * spanSize
-	sa.allocator.AdjustMemoryUsage(sa.spansBytes)
+	sa.allocator.AdjustMemoryUsageAfterAllocation(sa.spansBytes)
 }
 
 // Close implements the ColSpanAssembler interface.
@@ -277,12 +305,7 @@ func (sa *spanAssembler) Release() {
 // getColFamilyEncodings returns two lists of keys of the same length. Each pair
 // of keys at the same index corresponds to the suffixes of the start and end
 // keys of a span over a specific column family (or adjacent column families).
-// If the returned lists are empty, the spans cannot be split into separate
-// family spans.
 func getColFamilyEncodings(splitFamilyIDs []descpb.FamilyID) (startKeys, endKeys []roachpb.Key) {
-	if len(splitFamilyIDs) == 0 {
-		return nil, nil
-	}
 	for i, familyID := range splitFamilyIDs {
 		var key roachpb.Key
 		key = keys.MakeFamilyKey(key, uint32(familyID))

@@ -8,46 +8,14 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React from "react";
 import { assert } from "chai";
-import { ReactWrapper, mount } from "enzyme";
-import { MemoryRouter } from "react-router-dom";
 
-import {
-  filterBySearchQuery,
-  StatementsPage,
-  StatementsPageProps,
-  StatementsPageState,
-} from "src/statementsPage";
-import statementsPagePropsFixture from "./statementsPage.fixture";
+import { filterBySearchQuery } from "src/statementsPage";
 import { AggregateStatistics } from "../statementsTable";
 import { FlatPlanNode } from "../statementDetails";
 
 describe("StatementsPage", () => {
-  describe("Statements table", () => {
-    it("sorts data by Execution Count DESC as default option", () => {
-      const rootWrapper = mount(
-        <MemoryRouter>
-          <StatementsPage {...statementsPagePropsFixture} />
-        </MemoryRouter>,
-      );
-
-      const statementsPageWrapper: ReactWrapper<
-        StatementsPageProps,
-        StatementsPageState,
-        React.Component<any, any>
-      > = rootWrapper.find(StatementsPage).first();
-      const statementsPageInstance = statementsPageWrapper.instance();
-
-      assert.equal(
-        statementsPageInstance.props.sortSetting.columnTitle,
-        "executionCount",
-      );
-      assert.equal(statementsPageInstance.props.sortSetting.ascending, false);
-    });
-  });
-
-  describe("filterBySearchQuery", () => {
+  test("filterBySearchQuery", () => {
     const testPlanNode: FlatPlanNode = {
       name: "render",
       attrs: [],
@@ -86,9 +54,10 @@ describe("StatementsPage", () => {
 
     const statement: AggregateStatistics = {
       aggregatedFingerprintID: "",
+      aggregatedFingerprintHexID: "",
       aggregatedTs: 0,
-      aggregationInterval: 0,
       database: "",
+      applicationName: "",
       fullScan: false,
       implicitTxn: false,
       summary: "",
@@ -102,8 +71,13 @@ describe("StatementsPage", () => {
     };
 
     assert.equal(filterBySearchQuery(statement, "select"), true);
-    assert.equal(filterBySearchQuery(statement, "virtual table"), true);
-    assert.equal(filterBySearchQuery(statement, "group (scalar)"), true);
+    assert.equal(filterBySearchQuery(statement, "count"), true);
+    assert.equal(filterBySearchQuery(statement, "select count"), true);
+    assert.equal(filterBySearchQuery(statement, "cluster settings"), true);
+
+    // Searching by plan should be false.
+    assert.equal(filterBySearchQuery(statement, "virtual table"), false);
+    assert.equal(filterBySearchQuery(statement, "group (scalar)"), false);
     assert.equal(filterBySearchQuery(statement, "node_build_info"), false);
     assert.equal(filterBySearchQuery(statement, "crdb_internal"), false);
   });

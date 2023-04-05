@@ -19,7 +19,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -39,8 +38,6 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 )
-
-const fsnotifyBinName = "docker-fsnotify-bin"
 
 // sqlQuery consists of a sql query and the expected result.
 type sqlQuery struct {
@@ -79,7 +76,7 @@ func TestSingleNodeDocker(t *testing.T) {
 		t.Fatal(errors.NewAssertionErrorWithWrappedErrf(err, "cannot get pwd"))
 	}
 
-	fsnotifyPath := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(pwd)))))), "docker-fsnotify")
+	fsnotifyBinPath := filepath.Join(pwd, "docker-fsnotify/docker-fsnotify-bin")
 
 	var dockerTests = []singleNodeDockerTest{
 		{
@@ -93,21 +90,19 @@ func TestSingleNodeDocker(t *testing.T) {
 				},
 				volSetting: []string{
 					fmt.Sprintf("%s/testdata/single-node-test/docker-entrypoint-initdb.d/:/docker-entrypoint-initdb.d", pwd),
-					fmt.Sprintf("%s/docker-fsnotify-bin:/cockroach/docker-fsnotify", fsnotifyPath),
+					fmt.Sprintf("%s:/cockroach/docker-fsnotify", fsnotifyBinPath),
 				},
 				cmd: []string{"start-single-node", "--certs-dir=certs"},
 			},
 			sqlOpts: []string{
 				"--format=csv",
-				"--certs-dir=certs",
-				"--user=myuser",
 				"--url=postgresql://myuser:23333@127.0.0.1:26257/mydb?sslcert=certs%2Fclient.myuser.crt&sslkey=certs%2Fclient.myuser.key&sslmode=verify-full&sslrootcert=certs%2Fca.crt",
 			},
 			sqlQueries: []sqlQuery{
 				{"SELECT current_user", "current_user\nmyuser"},
 				{"SELECT current_database()", "current_database\nmydb"},
 				{"CREATE TABLE hello (X INT)", "CREATE TABLE"},
-				{"INSERT INTO hello VALUES (1), (2), (3)", "INSERT 3"},
+				{"INSERT INTO hello VALUES (1), (2), (3)", "INSERT 0 3"},
 				{"SELECT * FROM hello", "x\n1\n2\n3"},
 				{"SELECT * FROM bello", "id,name\n1,a\n2,b\n3,c"},
 			},
@@ -121,7 +116,7 @@ func TestSingleNodeDocker(t *testing.T) {
 				},
 				volSetting: []string{
 					fmt.Sprintf("%s/testdata/single-node-test/docker-entrypoint-initdb.d/:/docker-entrypoint-initdb.d", pwd),
-					fmt.Sprintf("%s/docker-fsnotify-bin:/cockroach/docker-fsnotify", fsnotifyPath),
+					fmt.Sprintf("%s:/cockroach/docker-fsnotify", fsnotifyBinPath),
 				},
 				cmd: []string{"start-single-node", "--insecure"},
 			},
@@ -134,7 +129,7 @@ func TestSingleNodeDocker(t *testing.T) {
 				{"SELECT current_user", "current_user\nroot"},
 				{"SELECT current_database()", "current_database\nmydb"},
 				{"CREATE TABLE hello (X INT)", "CREATE TABLE"},
-				{"INSERT INTO hello VALUES (1), (2), (3)", "INSERT 3"},
+				{"INSERT INTO hello VALUES (1), (2), (3)", "INSERT 0 3"},
 				{"SELECT * FROM hello", "x\n1\n2\n3"},
 				{"SELECT * FROM bello", "id,name\n1,a\n2,b\n3,c"},
 			},
@@ -148,7 +143,7 @@ func TestSingleNodeDocker(t *testing.T) {
 				},
 				volSetting: []string{
 					fmt.Sprintf("%s/testdata/single-node-test/docker-entrypoint-initdb.d/:/docker-entrypoint-initdb.d", pwd),
-					fmt.Sprintf("%s/docker-fsnotify-bin:/cockroach/docker-fsnotify", fsnotifyPath),
+					fmt.Sprintf("%s:/cockroach/docker-fsnotify", fsnotifyBinPath),
 				},
 				cmd: []string{"start-single-node", "--insecure", "--store=type=mem,size=0.25"},
 			},
@@ -161,7 +156,7 @@ func TestSingleNodeDocker(t *testing.T) {
 				{"SELECT current_user", "current_user\nroot"},
 				{"SELECT current_database()", "current_database\nmydb"},
 				{"CREATE TABLE hello (X INT)", "CREATE TABLE"},
-				{"INSERT INTO hello VALUES (1), (2), (3)", "INSERT 3"},
+				{"INSERT INTO hello VALUES (1), (2), (3)", "INSERT 0 3"},
 				{"SELECT * FROM hello", "x\n1\n2\n3"},
 				{"SELECT * FROM bello", "id,name\n1,a\n2,b\n3,c"},
 			},
@@ -447,11 +442,11 @@ func (dn *dockerNode) InspectExecResp(ctx context.Context, execID string) (execR
 		return execRes, ctx.Err()
 	}
 
-	stdout, err := ioutil.ReadAll(&outBuf)
+	stdout, err := io.ReadAll(&outBuf)
 	if err != nil {
 		return execRes, err
 	}
-	stderr, err := ioutil.ReadAll(&errBuf)
+	stderr, err := io.ReadAll(&errBuf)
 	if err != nil {
 		return execRes, err
 	}
@@ -553,7 +548,7 @@ func (dn *dockerNode) execSQLQuery(
 	return res, nil
 }
 
-//rmContainer performs a forced deletion of the current container.
+// rmContainer performs a forced deletion of the current container.
 func (dn *dockerNode) rmContainer(ctx context.Context) error {
 	if err := dn.cl.ContainerRemove(ctx, dn.contID, types.ContainerRemoveOptions{
 		Force: true,
@@ -573,7 +568,7 @@ func cleanQueryResult(queryRes string) (string, error) {
 	r := regexp.MustCompile(`([\s\S]+)\n{3}Time:.+`)
 	res := r.FindStringSubmatch(formatted)
 	if len(res) < 2 {
-		return "", errors.Wrapf(errors.Newf("%s", queryRes), "cannot parse the query result: %#v")
+		return "", errors.Errorf("cannot parse the query result: %s", queryRes)
 	}
 	return res[1], nil
 

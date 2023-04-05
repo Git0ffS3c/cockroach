@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 const maxDelaySplitTriggerDur = 20 * time.Second
@@ -28,7 +28,7 @@ type replicaMsgAppDropper Replica
 func (rd *replicaMsgAppDropper) Args() (initialized bool, age time.Duration) {
 	r := (*Replica)(rd)
 	r.mu.RLock()
-	initialized = r.isInitializedRLocked()
+	initialized = r.IsInitialized()
 	creationTime := r.creationTime
 	r.mu.RUnlock()
 	age = timeutil.Since(creationTime)

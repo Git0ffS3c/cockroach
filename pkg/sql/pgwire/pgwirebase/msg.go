@@ -12,11 +12,13 @@ package pgwirebase
 
 import "math"
 
-//ClientMessageType represents a client pgwire message.
+// ClientMessageType represents a client pgwire message.
+//
 //go:generate stringer -type=ClientMessageType
 type ClientMessageType byte
 
-//ServerMessageType represents a server pgwire message.
+// ServerMessageType represents a server pgwire message.
+//
 //go:generate stringer -type=ServerMessageType
 type ServerMessageType byte
 
@@ -42,6 +44,9 @@ const (
 	ServerMsgCommandComplete      ServerMessageType = 'C'
 	ServerMsgCloseComplete        ServerMessageType = '3'
 	ServerMsgCopyInResponse       ServerMessageType = 'G'
+	ServerMsgCopyOutResponse      ServerMessageType = 'H'
+	ServerMsgCopyDataCommand      ServerMessageType = 'd'
+	ServerMsgCopyDoneCommand      ServerMessageType = 'c'
 	ServerMsgDataRow              ServerMessageType = 'D'
 	ServerMsgEmptyQuery           ServerMessageType = 'I'
 	ServerMsgErrorResponse        ServerMessageType = 'E'
@@ -56,23 +61,26 @@ const (
 )
 
 // ServerErrFieldType represents the error fields.
+//
 //go:generate stringer -type=ServerErrFieldType
 type ServerErrFieldType byte
 
 // http://www.postgresql.org/docs/current/static/protocol-error-fields.html
 const (
-	ServerErrFieldSeverity       ServerErrFieldType = 'S'
-	ServerErrFieldSQLState       ServerErrFieldType = 'C'
-	ServerErrFieldMsgPrimary     ServerErrFieldType = 'M'
-	ServerErrFieldDetail         ServerErrFieldType = 'D'
-	ServerErrFieldHint           ServerErrFieldType = 'H'
-	ServerErrFieldSrcFile        ServerErrFieldType = 'F'
-	ServerErrFieldSrcLine        ServerErrFieldType = 'L'
-	ServerErrFieldSrcFunction    ServerErrFieldType = 'R'
-	ServerErrFieldConstraintName ServerErrFieldType = 'n'
+	ServerErrFieldSeverity             ServerErrFieldType = 'S'
+	ServerErrFieldSeverityNonLocalized ServerErrFieldType = 'V'
+	ServerErrFieldSQLState             ServerErrFieldType = 'C'
+	ServerErrFieldMsgPrimary           ServerErrFieldType = 'M'
+	ServerErrFieldDetail               ServerErrFieldType = 'D'
+	ServerErrFieldHint                 ServerErrFieldType = 'H'
+	ServerErrFieldSrcFile              ServerErrFieldType = 'F'
+	ServerErrFieldSrcLine              ServerErrFieldType = 'L'
+	ServerErrFieldSrcFunction          ServerErrFieldType = 'R'
+	ServerErrFieldConstraintName       ServerErrFieldType = 'n'
 )
 
 // PrepareType represents a subtype for prepare messages.
+//
 //go:generate stringer -type=PrepareType
 type PrepareType byte
 

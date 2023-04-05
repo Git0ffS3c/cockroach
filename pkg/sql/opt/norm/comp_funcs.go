@@ -13,39 +13,51 @@ package norm
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 )
 
 // CommuteInequality swaps the operands of an inequality comparison expression,
 // changing the operator to compensate:
-//   5 < x
+//
+//	5 < x
+//
 // to:
-//   x > 5
+//
+//	x > 5
 func (c *CustomFuncs) CommuteInequality(
 	op opt.Operator, left, right opt.ScalarExpr,
 ) opt.ScalarExpr {
-	switch op {
-	case opt.GeOp:
-		return c.f.ConstructLe(right, left)
-	case opt.GtOp:
-		return c.f.ConstructLt(right, left)
-	case opt.LeOp:
-		return c.f.ConstructGe(right, left)
-	case opt.LtOp:
-		return c.f.ConstructGt(right, left)
+	op = opt.CommuteEqualityOrInequalityOp(op)
+	return c.f.DynamicConstruct(op, right, left).(opt.ScalarExpr)
+}
+
+// ArithmeticErrorsOnOverflow returns true if addition or subtraction with the
+// given types will cause an error when the value overflows or underflows.
+func (c *CustomFuncs) ArithmeticErrorsOnOverflow(left, right *types.T) bool {
+	switch left.Family() {
+	case types.IntFamily, types.FloatFamily, types.DecimalFamily:
+	default:
+		return false
 	}
-	panic(errors.AssertionFailedf("called commuteInequality with operator %s", redact.Safe(op)))
+	switch right.Family() {
+	case types.IntFamily, types.FloatFamily, types.DecimalFamily:
+	default:
+		return false
+	}
+	return true
 }
 
 // NormalizeTupleEquality remaps the elements of two tuples compared for
 // equality, like this:
-//   (a, b, c) = (x, y, z)
+//
+//	(a, b, c) = (x, y, z)
+//
 // into this:
-//   (a = x) AND (b = y) AND (c = z)
+//
+//	(a = x) AND (b = y) AND (c = z)
 func (c *CustomFuncs) NormalizeTupleEquality(left, right memo.ScalarListExpr) opt.ScalarExpr {
 	if len(left) != len(right) {
 		panic(errors.AssertionFailedf("tuple length mismatch"))
@@ -104,7 +116,7 @@ func (c *CustomFuncs) MakeTimeZoneFunction(zone opt.ScalarExpr, ts opt.ScalarExp
 // timezone() function with a second argument that matches the given input type.
 // If no overload is found, findTimeZoneFunction panics.
 func findTimeZoneFunction(typ *types.T) (*tree.FunctionProperties, *tree.Overload) {
-	props, overloads := builtins.GetBuiltinProperties("timezone")
+	props, overloads := builtinsregistry.GetBuiltinProperties("timezone")
 	for o := range overloads {
 		overload := &overloads[o]
 		if overload.Types.MatchAt(typ, 1) {

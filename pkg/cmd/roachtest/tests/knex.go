@@ -12,6 +12,7 @@ package tests
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
@@ -21,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const supportedKnexTag = "0.95.14"
+const supportedKnexTag = "2.0.0"
 
 // This test runs one of knex's test suite against a single cockroach
 // node.
@@ -38,9 +39,6 @@ func registerKnex(r registry.Registry) {
 		node := c.Node(1)
 		t.Status("setting up cockroach")
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		if err := c.PutLibraries(ctx, "./lib"); err != nil {
-			t.Fatal(err)
-		}
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
@@ -65,7 +63,7 @@ func registerKnex(r registry.Registry) {
 			c,
 			node,
 			"add nodesource repository",
-			`sudo apt install ca-certificates && curl -sL https://deb.nodesource.com/setup_12.x | sudo -E bash -`,
+			`sudo apt install ca-certificates && curl -fsSL https://deb.nodesource.com/setup_16.x | sudo -E bash -`,
 		)
 		require.NoError(t, err)
 
@@ -101,7 +99,7 @@ func registerKnex(r registry.Registry) {
 		require.NoError(t, err)
 
 		err = repeatRunE(
-			ctx, t, c, node, "install knex npm dependencies", `cd /mnt/data1/knex/ && sudo npm i`,
+			ctx, t, c, node, "install knex npm dependencies", `cd /mnt/data1/knex/ && npm i`,
 		)
 		require.NoError(t, err)
 
@@ -115,15 +113,25 @@ func registerKnex(r registry.Registry) {
 		rawResultsStr := result.Stdout + result.Stderr
 		t.L().Printf("Test Results: %s", rawResultsStr)
 		if err != nil {
-			t.Fatal(err)
+			// Ignore failures from test expecting `DELETE FROM ... USING` syntax to
+			// fail (https://github.com/cockroachdb/cockroach/issues/40963). We don't
+			// have a good way of parsing test results from javascript, so we do
+			// substring matching instead. This can be removed once the upstream knex
+			// repo updates to test with v23.1.
+			if !strings.Contains(rawResultsStr, "1) should handle basic delete with join") ||
+				!strings.Contains(rawResultsStr, "2) should handle returning") ||
+				strings.Contains(rawResultsStr, " 3) ") {
+				t.Fatal(err)
+			}
 		}
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "knex",
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `orm`},
+		Name:       "knex",
+		Owner:      registry.OwnerSQLSessions,
+		Cluster:    r.MakeClusterSpec(1),
+		NativeLibs: registry.LibGEOS,
+		Tags:       []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runKnex(ctx, t, c)
 		},

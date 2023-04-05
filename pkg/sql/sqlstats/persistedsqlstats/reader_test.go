@@ -19,11 +19,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -87,7 +88,7 @@ func TestPersistedSQLStatsRead(t *testing.T) {
 
 		foundQueries := make(map[string]struct{})
 		foundTxns := make(map[string]struct{})
-		stmtFingerprintIDToQueries := make(map[roachpb.StmtFingerprintID]string)
+		stmtFingerprintIDToQueries := make(map[appstatspb.StmtFingerprintID]string)
 
 		require.NoError(t,
 			sqlStats.IterateStatementStats(
@@ -96,7 +97,7 @@ func TestPersistedSQLStatsRead(t *testing.T) {
 					SortedKey:      true,
 					SortedAppNames: true,
 				},
-				func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+				func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 					if expectedExecCount, ok := expectedStmtFingerprints[statistics.Key.Query]; ok {
 						_, ok = foundQueries[statistics.Key.Query]
 						require.False(
@@ -117,7 +118,7 @@ func TestPersistedSQLStatsRead(t *testing.T) {
 				&sqlstats.IteratorOptions{},
 				func(
 					ctx context.Context,
-					statistics *roachpb.CollectedTransactionStatistics,
+					statistics *appstatspb.CollectedTransactionStatistics,
 				) error {
 					if len(statistics.StatementFingerprintIDs) == 1 {
 						if query, ok := stmtFingerprintIDToQueries[statistics.StatementFingerprintIDs[0]]; ok {
@@ -143,6 +144,66 @@ func TestPersistedSQLStatsRead(t *testing.T) {
 	})
 }
 
+// Testing same fingerprint having more than one index recommendation and
+// checking the aggregation on the crdb_internal.statement_statistics table.
+// Testing for issue #85958.
+func TestSQLStatsWithMultipleIdxRec(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderStressRace(t, "expensive tests")
+
+	fakeTime := stubTime{
+		aggInterval: time.Hour,
+	}
+	fakeTime.setTime(timeutil.Now())
+
+	testCluster := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Knobs: base.TestingKnobs{
+				SQLStatsKnobs: &sqlstats.TestingKnobs{
+					StubTimeNow: fakeTime.Now,
+					AOSTClause:  "AS OF SYSTEM TIME '-1us'",
+				},
+			},
+		},
+	})
+	ctx := context.Background()
+	defer testCluster.Stopper().Stop(ctx)
+
+	sqlConn := sqlutils.MakeSQLRunner(testCluster.ServerConn(0 /* idx */))
+
+	sqlConn.Exec(t, "CREATE TABLE t1 (k INT, i INT, f FLOAT, s STRING)")
+	sqlConn.Exec(t, "CREATE TABLE t2 (k INT, i INT, s STRING)")
+
+	query := "SELECT t1.k FROM t1 JOIN t2 ON t1.k = t2.k WHERE t1.i > 3 AND t2.i > 3"
+	memorySelect := "SELECT statistics -> 'statistics' ->> 'cnt' as count, " +
+		"array_length(index_recommendations, 1) FROM " +
+		"crdb_internal.cluster_statement_statistics WHERE metadata ->> 'query' = " +
+		"'SELECT t1.k FROM t1 JOIN t2 ON t1.k = t2.k WHERE (t1.i > _) AND (t2.i > _)'"
+	combinedSelect := "SELECT statistics -> 'statistics' ->> 'cnt' as count, " +
+		"array_length(index_recommendations, 1) FROM " +
+		"crdb_internal.statement_statistics WHERE metadata ->> 'query' = " +
+		"'SELECT t1.k FROM t1 JOIN t2 ON t1.k = t2.k WHERE (t1.i > _) AND (t2.i > _)'"
+
+	// Execute enough times to have index recommendations generated.
+	// This will generate two recommendations.
+	for i := 0; i < 6; i++ {
+		sqlConn.Exec(t, query)
+	}
+	var cnt int64
+	var recs int64
+	// It must have the same count 6 on both in-memory and combined tables.
+	// This test when there are more than one recommendation, so adding this
+	// example that has 2 recommendations;
+	sqlConn.QueryRow(t, memorySelect).Scan(&cnt, &recs)
+	require.Equal(t, int64(6), cnt)
+	require.Equal(t, int64(2), recs)
+	sqlConn.QueryRow(t, combinedSelect).Scan(&cnt, &recs)
+	require.Equal(t, int64(6), cnt)
+	require.Equal(t, int64(2), recs)
+}
+
 func verifyStoredStmtFingerprints(
 	t *testing.T,
 	expectedStmtFingerprints map[string]int64,
@@ -150,12 +211,12 @@ func verifyStoredStmtFingerprints(
 ) {
 	foundQueries := make(map[string]struct{})
 	foundTxns := make(map[string]struct{})
-	stmtFingerprintIDToQueries := make(map[roachpb.StmtFingerprintID]string)
+	stmtFingerprintIDToQueries := make(map[appstatspb.StmtFingerprintID]string)
 	require.NoError(t,
 		sqlStats.IterateStatementStats(
 			context.Background(),
 			&sqlstats.IteratorOptions{},
-			func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+			func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 				if expectedExecCount, ok := expectedStmtFingerprints[statistics.Key.Query]; ok {
 					foundQueries[statistics.Key.Query] = struct{}{}
 					stmtFingerprintIDToQueries[statistics.ID] = statistics.Key.Query
@@ -170,7 +231,7 @@ func verifyStoredStmtFingerprints(
 			&sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
-				statistics *roachpb.CollectedTransactionStatistics,
+				statistics *appstatspb.CollectedTransactionStatistics,
 			) error {
 				if len(statistics.StatementFingerprintIDs) == 1 {
 					if query, ok := stmtFingerprintIDToQueries[statistics.StatementFingerprintIDs[0]]; ok {

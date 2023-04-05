@@ -13,7 +13,6 @@ import { util } from "@cockroachlabs/cluster-ui";
 export const indexNameAttr = "index_name";
 
 export const {
-  aggregationIntervalAttr,
   aggregatedTsAttr,
   appAttr,
   appNamesAttr,
@@ -32,6 +31,8 @@ export const {
   tabAttr,
   tableNameAttr,
   txnFingerprintIdAttr,
+  unset,
   viewAttr,
   REMOTE_DEBUGGING_ERROR_TEXT,
+  idAttr,
 } = util;

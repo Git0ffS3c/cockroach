@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
@@ -70,10 +71,10 @@ var (
 // This method is part of the serverpb.AdminClient interface.
 func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_DrainServer) error {
 	ctx := stream.Context()
-	ctx = s.server.AnnotateCtx(ctx)
+	ctx = s.AnnotateCtx(ctx)
 
 	// Which node is this request for?
-	nodeID, local, err := s.server.status.parseNodeID(req.NodeId)
+	nodeID, local, err := s.serverIterator.parseServerID(req.NodeId)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, err.Error())
 	}
@@ -85,18 +86,20 @@ func (s *adminServer) Drain(req *serverpb.DrainRequest, stream serverpb.Admin_Dr
 		// response. We must forward all of them.
 
 		// Connect to the target node.
-		client, err := s.dialNode(ctx, nodeID)
+		client, err := s.dialNode(ctx, roachpb.NodeID(nodeID))
 		if err != nil {
 			return serverError(ctx, err)
 		}
 		return delegateDrain(ctx, req, client, stream)
 	}
 
-	return s.server.drain.handleDrain(ctx, req, stream)
+	return s.drainServer.handleDrain(ctx, req, stream)
 }
 
 type drainServer struct {
-	stopper      *stop.Stopper
+	stopper *stop.Stopper
+	// stopTrigger is used to request that the server is shut down.
+	stopTrigger  *stopTrigger
 	grpc         *grpcServer
 	sqlServer    *SQLServer
 	drainSleepFn func(time.Duration)
@@ -109,7 +112,11 @@ type drainServer struct {
 
 // newDrainServer constructs a drainServer suitable for any kind of server.
 func newDrainServer(
-	cfg BaseConfig, stopper *stop.Stopper, grpc *grpcServer, sqlServer *SQLServer,
+	cfg BaseConfig,
+	stopper *stop.Stopper,
+	stopTrigger *stopTrigger,
+	grpc *grpcServer,
+	sqlServer *SQLServer,
 ) *drainServer {
 	var drainSleepFn = time.Sleep
 	if cfg.TestingKnobs.Server != nil {
@@ -119,6 +126,7 @@ func newDrainServer(
 	}
 	return &drainServer{
 		stopper:      stopper,
+		stopTrigger:  stopTrigger,
 		grpc:         grpc,
 		sqlServer:    sqlServer,
 		drainSleepFn: drainSleepFn,
@@ -175,7 +183,7 @@ func (s *drainServer) maybeShutdownAfterDrain(
 		// away (and who knows whether gRPC-goroutines are tied up in some
 		// stopper task somewhere).
 		s.grpc.Stop()
-		s.stopper.Stop(ctx)
+		s.stopTrigger.signalStop(ctx, MakeShutdownRequest(ShutdownReasonDrainRPC, nil /* err */))
 	}()
 
 	select {
@@ -347,6 +355,18 @@ func (s *drainServer) drainClients(
 		return err
 	}
 
+	// Inform the job system that the node is draining.
+	//
+	// We cannot do this before SQL clients disconnect, because
+	// otherwise there is a risk that one of the remaining SQL sessions
+	// issues a BACKUP or some other job-based statement before it
+	// disconnects, and encounters a job error as a result -- that the
+	// registry is now unavailable due to the drain.
+	s.sqlServer.jobRegistry.SetDraining()
+
+	// Inform the auto-stats tasks that the node is draining.
+	s.sqlServer.statsRefresher.SetDraining()
+
 	// Drain any remaining SQL connections.
 	// The queryWait duration is a timeout for waiting for SQL queries to finish.
 	// If the timeout is reached, any remaining connections
@@ -361,11 +381,39 @@ func (s *drainServer) drainClients(
 	s.sqlServer.distSQLServer.Drain(ctx, queryMaxWait, reporter)
 
 	// Flush in-memory SQL stats into the statement stats system table.
-	s.sqlServer.pgServer.SQLServer.GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+	statsProvider := s.sqlServer.pgServer.SQLServer.GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
+	statsProvider.Flush(ctx)
+	statsProvider.Stop(ctx)
+
+	// Inform the async tasks for table stats that the node is draining
+	// and wait for task shutdown.
+	s.sqlServer.statsRefresher.WaitForAutoStatsShutdown(ctx)
+
+	// Inform the job system that the node is draining and wait for task
+	// shutdown.
+	s.sqlServer.jobRegistry.WaitForRegistryShutdown(ctx)
 
 	// Drain all SQL table leases. This must be done after the pgServer has
 	// given sessions a chance to finish ongoing work.
 	s.sqlServer.leaseMgr.SetDraining(ctx, true /* drain */, reporter)
+
+	// Mark this phase in the logs to clarify the context of any subsequent
+	// errors/warnings, if any.
+	log.Infof(ctx, "SQL server drained successfully; SQL queries cannot execute any more")
+
+	session, err := s.sqlServer.sqlLivenessProvider.Release(ctx)
+	if err != nil {
+		return err
+	}
+
+	instanceID := s.sqlServer.sqlIDContainer.SQLInstanceID()
+	err = s.sqlServer.sqlInstanceStorage.ReleaseInstance(ctx, session, instanceID)
+	if err != nil {
+		return err
+	}
+
+	// Mark the node as fully drained.
+	s.sqlServer.gracefulDrainComplete.Set(true)
 
 	// Done. This executes the defers set above to drain SQL leases.
 	return nil

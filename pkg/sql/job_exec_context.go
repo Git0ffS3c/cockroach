@@ -11,19 +11,14 @@
 package sql
 
 import (
-	"context"
-
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/migration"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
 )
 
 // plannerJobExecContext is a wrapper to implement JobExecContext with a planner
@@ -64,23 +59,15 @@ func (e *plannerJobExecContext) ExecCfg() *ExecutorConfig        { return e.p.Ex
 func (e *plannerJobExecContext) DistSQLPlanner() *DistSQLPlanner { return e.p.DistSQLPlanner() }
 func (e *plannerJobExecContext) LeaseMgr() *lease.Manager        { return e.p.LeaseMgr() }
 func (e *plannerJobExecContext) User() username.SQLUsername      { return e.p.User() }
-func (e *plannerJobExecContext) MigrationJobDeps() migration.JobDeps {
+func (e *plannerJobExecContext) MigrationJobDeps() upgrade.JobDeps {
 	return e.p.MigrationJobDeps()
 }
 func (e *plannerJobExecContext) SpanConfigReconciler() spanconfig.Reconciler {
 	return e.p.SpanConfigReconciler()
 }
-func (e *plannerJobExecContext) Txn() *kv.Txn { return e.p.Txn() }
 
-// ConstrainPrimaryIndexSpanByExpr implements SpanConstrainer
-func (e *plannerJobExecContext) ConstrainPrimaryIndexSpanByExpr(
-	ctx context.Context,
-	desc catalog.TableDescriptor,
-	evalCtx *eval.Context,
-	semaCtx *tree.SemaContext,
-	filter tree.Expr,
-) ([]roachpb.Span, error) {
-	return e.p.ConstrainPrimaryIndexSpanByExpr(ctx, desc, evalCtx, semaCtx, filter)
+func (e *plannerJobExecContext) SpanStatsConsumer() keyvisualizer.SpanStatsConsumer {
+	return e.p.SpanStatsConsumer()
 }
 
 // JobExecContext provides the execution environment for a job. It is what is
@@ -93,7 +80,6 @@ func (e *plannerJobExecContext) ConstrainPrimaryIndexSpanByExpr(
 // (though note that ExtendedEvalContext may transitively include methods that
 // close over/expect a txn so use it with caution).
 type JobExecContext interface {
-	SpanConstrainer
 	SemaCtx() *tree.SemaContext
 	ExtendedEvalContext() *extendedEvalContext
 	SessionData() *sessiondata.SessionData
@@ -102,7 +88,7 @@ type JobExecContext interface {
 	DistSQLPlanner() *DistSQLPlanner
 	LeaseMgr() *lease.Manager
 	User() username.SQLUsername
-	MigrationJobDeps() migration.JobDeps
+	MigrationJobDeps() upgrade.JobDeps
 	SpanConfigReconciler() spanconfig.Reconciler
-	Txn() *kv.Txn
+	SpanStatsConsumer() keyvisualizer.SpanStatsConsumer
 }

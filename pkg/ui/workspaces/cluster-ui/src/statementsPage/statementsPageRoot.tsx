@@ -17,15 +17,15 @@ import {
   StatementsPageProps,
 } from "src/statementsPage/statementsPage";
 import {
-  ActiveStatementsView,
-  ActiveStatementsViewProps,
-} from "./activeStatementsView";
+  RecentStatementsView,
+  RecentStatementsViewProps,
+} from "./recentStatementsView";
 import { statementsSql } from "src/util/docs";
 import { Anchor } from "src/anchor";
 
 export type StatementsPageRootProps = {
   fingerprintsPageProps: StatementsPageProps;
-  activePageProps: ActiveStatementsViewProps;
+  activePageProps: RecentStatementsViewProps;
 };
 
 export const StatementsPageRoot = ({
@@ -41,7 +41,7 @@ export const StatementsPageRoot = ({
           {`A statement fingerprint represents one or more completed SQL
           statements by replacing literal values (e.g., numbers and strings)
           with underscores (_).\nThis can help you quickly identify
-          frequently executed SQL statements and their latencies.`}
+          frequently executed SQL statements and their latencies. `}
           <Anchor href={statementsSql}>Learn more</Anchor>
         </span>
       ),
@@ -59,7 +59,7 @@ export const StatementsPageRoot = ({
           {/* TODO (xinhaoz) #78379 add 'Learn More' link to documentation page*/}
         </span>
       ),
-      component: <ActiveStatementsView {...activePageProps} />,
+      component: <RecentStatementsView {...activePageProps} />,
     },
   ];
 

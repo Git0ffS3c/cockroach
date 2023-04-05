@@ -17,11 +17,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -36,51 +34,68 @@ func (r *Registry) NotifyToAdoptJobs() {
 	}
 }
 
-// NotifyToResume is used to notify the registry that it should attempt
-// to resume the specified jobs. The assumption is that these jobs were
-// created by this registry and thus are pre-claimed by it. This bypasses
-// the loop to discover jobs already claimed by this registry. If the jobs
-// turn out to not be claimed by this registry, it's not a problem.
+// NotifyToResume is used to notify the registry that it should attempt to
+// resume the specified jobs. The assumption is that these jobs were created by
+// this registry and thus are pre-claimed by it. This bypasses the loop to
+// discover jobs already claimed by this registry. Jobs that are not claimed by
+// this registry are silently ignored.
 func (r *Registry) NotifyToResume(ctx context.Context, jobs ...jobspb.JobID) {
 	m := newJobIDSet(jobs...)
 	_ = r.stopper.RunAsyncTask(ctx, "resume-jobs", func(ctx context.Context) {
+		ctx, cancel := r.stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+
 		r.withSession(ctx, func(ctx context.Context, s sqlliveness.Session) {
 			r.filterAlreadyRunningAndCancelFromPreviousSessions(ctx, s, m)
-			r.resumeClaimedJobs(ctx, s, m)
+			if !r.adoptionDisabled(ctx) {
+				r.resumeClaimedJobs(ctx, s, m)
+			}
 		})
 	})
 }
 
 // WaitForJobs waits for a given list of jobs to reach some sort
 // of terminal state.
-func (r *Registry) WaitForJobs(
-	ctx context.Context, ex sqlutil.InternalExecutor, jobs []jobspb.JobID,
-) error {
+func (r *Registry) WaitForJobs(ctx context.Context, jobs []jobspb.JobID) error {
 	log.Infof(ctx, "waiting for %d %v queued jobs to complete", len(jobs), jobs)
 	jobFinishedLocally, cleanup := r.installWaitingSet(jobs...)
 	defer cleanup()
-	return r.waitForJobs(ctx, ex, jobs, jobFinishedLocally)
+	return r.waitForJobs(ctx, jobs, jobFinishedLocally)
 }
 
-func (r *Registry) waitForJobs(
-	ctx context.Context,
-	ex sqlutil.InternalExecutor,
-	jobs []jobspb.JobID,
-	jobFinishedLocally <-chan struct{},
-) error {
+// WaitForJobsIgnoringJobErrors is like WaitForJobs but it only
+// returns an error in the case that polling the jobs table fails.
+func (r *Registry) WaitForJobsIgnoringJobErrors(ctx context.Context, jobs []jobspb.JobID) error {
+	log.Infof(ctx, "waiting for %d %v queued jobs to complete", len(jobs), jobs)
+	jobFinishedLocally, cleanup := r.installWaitingSet(jobs...)
+	defer cleanup()
+	return r.waitForJobsToBeTerminalOrPaused(ctx, jobs, jobFinishedLocally)
+}
 
+func (r *Registry) waitForJobsToBeTerminalOrPaused(
+	ctx context.Context, jobs []jobspb.JobID, jobFinishedLocally <-chan struct{},
+) error {
 	if len(jobs) == 0 {
 		return nil
 	}
-
 	query := makeWaitForJobsQuery(jobs)
-	start := timeutil.Now()
 	// Manually retry instead of using SHOW JOBS WHEN COMPLETE so we have greater
 	// control over retries. Also, avoiding SHOW JOBS prevents us from having to
 	// populate the crdb_internal.jobs vtable.
+	initialBackoff := 500 * time.Millisecond
+	maxBackoff := 3 * time.Second
+
+	if r.knobs.IntervalOverrides.WaitForJobsInitialDelay != nil {
+		initialBackoff = *r.knobs.IntervalOverrides.WaitForJobsInitialDelay
+	}
+
+	if r.knobs.IntervalOverrides.WaitForJobsMaxDelay != nil {
+		maxBackoff = *r.knobs.IntervalOverrides.WaitForJobsMaxDelay
+	}
+
 	ret := retry.StartWithCtx(ctx, retry.Options{
-		InitialBackoff: 500 * time.Millisecond,
-		MaxBackoff:     3 * time.Second,
+		InitialBackoff: initialBackoff,
+		MaxBackoff:     maxBackoff,
 		Multiplier:     1.5,
 
 		// Setting the closer here will terminate the loop if the job finishes
@@ -92,11 +107,14 @@ func (r *Registry) waitForJobs(
 		// We poll the number of queued jobs that aren't finished. As with SHOW JOBS
 		// WHEN COMPLETE, if one of the jobs is missing from the jobs table for
 		// whatever reason, we'll fail later when we try to load the job.
-		row, err := ex.QueryRowEx(
+		if fn := r.knobs.BeforeWaitForJobsQuery; fn != nil {
+			fn(jobs)
+		}
+		row, err := r.db.Executor().QueryRowEx(
 			ctx,
 			"poll-show-jobs",
 			nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			query,
 		)
 		if err != nil {
@@ -110,13 +128,28 @@ func (r *Registry) waitForJobs(
 			log.Infof(ctx, "waiting for %d queued jobs to complete", count)
 		}
 		if count == 0 {
-			break
+			return nil
 		}
 	}
+	return nil
+}
+
+func (r *Registry) waitForJobs(
+	ctx context.Context, jobs []jobspb.JobID, jobFinishedLocally <-chan struct{},
+) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	start := timeutil.Now()
 	defer func() {
 		log.Infof(ctx, "waited for %d %v queued jobs to complete %v",
 			len(jobs), jobs, timeutil.Since(start))
 	}()
+
+	if err := r.waitForJobsToBeTerminalOrPaused(ctx, jobs, jobFinishedLocally); err != nil {
+		return err
+	}
+
 	for i, id := range jobs {
 		j, err := r.LoadJob(ctx, id)
 		if err != nil {
@@ -162,16 +195,14 @@ func makeWaitForJobsQuery(jobs []jobspb.JobID) string {
 
 // Run starts previously unstarted jobs from a list of scheduled
 // jobs. Canceling ctx interrupts the waiting but doesn't cancel the jobs.
-func (r *Registry) Run(
-	ctx context.Context, ex sqlutil.InternalExecutor, jobs []jobspb.JobID,
-) error {
+func (r *Registry) Run(ctx context.Context, jobs []jobspb.JobID) error {
 	if len(jobs) == 0 {
 		return nil
 	}
 	done, cleanup := r.installWaitingSet(jobs...)
 	defer cleanup()
 	r.NotifyToResume(ctx, jobs...)
-	return r.waitForJobs(ctx, ex, jobs, done)
+	return r.waitForJobs(ctx, jobs, done)
 }
 
 // jobWaitingSets stores the set of waitingSets currently waiting on a job ID.

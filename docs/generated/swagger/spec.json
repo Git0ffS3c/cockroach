@@ -218,12 +218,6 @@
           },
           {
             "type": "integer",
-            "description": "Filter for events with this targetID. Only one targetID can be specified at a time.",
-            "name": "targetID",
-            "in": "query"
-          },
-          {
-            "type": "integer",
             "description": "Maximum number of results to return in this call.",
             "name": "limit",
             "in": "query"
@@ -580,6 +574,193 @@
         }
       }
     },
+    "/sql/": {
+      "post": {
+        "description": "Executes one or more SQL statements.\n\nIf the execute parameter is not specified, only check the SQL\nsyntax.\n\nIf only one SQL statement is specified, it is executed using an\nimplicit transaction.\n\nIf multiple SQL statements are specified and the multi_statement\noption is set, the SQL statements are executed using a common\ntransaction. This means that the client cannot use\nBEGIN/COMMIT/ROLLBACK. If any statement encounters a non-retriable\nerror, the transaction is aborted and execution stops.\n\nOnly a single SQL statement is allowed if the multi_statement\noption is  not set, as a form of protection against SQL injection\nattacks.\n\nThere is no session state shared across the statements. For example,\nSET statements are ineffective.",
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/json"
+        ],
+        "summary": "Execute one or more SQL statements",
+        "operationId": "execSQL",
+        "parameters": [
+          {
+            "name": "request",
+            "in": "body",
+            "schema": {
+              "type": "object",
+              "required": [
+                "statements"
+              ],
+              "properties": {
+                "application_name": {
+                  "description": "The SQL application_name parameter.",
+                  "type": "string"
+                },
+                "database": {
+                  "description": "The current database for the execution. Defaults to defaultdb.",
+                  "type": "string"
+                },
+                "max_result_size": {
+                  "description": "Max size in bytes for the execution field in the response. Execution stops with an error if the results do not fit.",
+                  "type": "integer"
+                },
+                "statements": {
+                  "description": "The SQL statement(s) to run.",
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "sql"
+                    ],
+                    "properties": {
+                      "arguments": {
+                        "description": "Placeholder parameter values.",
+                        "type": "array"
+                      },
+                      "sql": {
+                        "description": "SQL syntax for one statement.",
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "timeout": {
+                  "description": "Max time budget for the execution, using Go duration syntax. Default to 5 seconds.",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Query results and optional execution error.",
+            "schema": {
+              "type": "object",
+              "required": [
+                "num_statements",
+                "execution"
+              ],
+              "properties": {
+                "execution": {
+                  "type": "object",
+                  "required": [
+                    "retries",
+                    "txn_results"
+                  ],
+                  "properties": {
+                    "retries": {
+                      "description": "The number of times the transaction was retried.",
+                      "type": "integer"
+                    },
+                    "txn_results": {
+                      "description": "The result sets, one per SQL statement.",
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "statement",
+                          "tag",
+                          "start",
+                          "end"
+                        ],
+                        "properties": {
+                          "columns": {
+                            "description": "The list of columns in the result rows.",
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "required": [
+                                "name",
+                                "type",
+                                "oid"
+                              ],
+                              "properties": {
+                                "name": {
+                                  "description": "The column name.",
+                                  "type": "string"
+                                },
+                                "oid": {
+                                  "description": "The PostgreSQL OID for the column type.",
+                                  "type": "integer"
+                                },
+                                "type": {
+                                  "description": "The SQL type of the column.",
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          },
+                          "end": {
+                            "description": "End timestamp, encoded as RFC3339.",
+                            "type": "string"
+                          },
+                          "rows": {
+                            "description": "The result rows.",
+                            "type": "array",
+                            "items": {}
+                          },
+                          "rows_affected": {
+                            "description": "The number of rows affected.",
+                            "type": "integer"
+                          },
+                          "start": {
+                            "description": "Start timestamp, encoded as RFC3339.",
+                            "type": "string"
+                          },
+                          "statement": {
+                            "description": "The statement index in the SQL input.",
+                            "type": "integer"
+                          },
+                          "tag": {
+                            "description": "The short statement tag.",
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "num_statements": {
+                  "description": "The number of statements in the input SQL.",
+                  "type": "integer"
+                },
+                "txn_error": {
+                  "description": "The details of the error, if an error was encountered.",
+                  "type": "object",
+                  "required": [
+                    "message",
+                    "code"
+                  ],
+                  "properties": {
+                    "code": {
+                      "description": "The SQLSTATE 5-character code of the error.",
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Bad input encoding, missing SQL or invalid parameter."
+          },
+          "405": {
+            "description": "Bad method. Only the POST method is supported."
+          },
+          "500": {
+            "description": "Internal error encountered."
+          }
+        }
+      }
+    },
     "/users/": {
       "get": {
         "description": "List SQL users on this cluster.",
@@ -627,6 +808,11 @@
           "description": "True if this query is distributed.",
           "type": "boolean",
           "x-go-name": "IsDistributed"
+        },
+        "is_full_scan": {
+          "description": "True if the query contains a full table or index scan. Note that this\nfield is only valid if the query is in the EXECUTING phase.",
+          "type": "boolean",
+          "x-go-name": "IsFullScan"
         },
         "phase": {
           "$ref": "#/definitions/ActiveQuery_Phase"
@@ -686,7 +872,7 @@
     },
     "ClockTimestamp": {
       "description": "ClockTimestamp is the statically typed version of a Timestamp with its\nSynthetic flag set to false.",
-      "title": "ClockTimestamp is a Timestamp with the added capability of being able to\nupdate a peer's HLC clock. It possesses this capability because the clock\ntimestamp itself is guaranteed to have come from an HLC clock somewhere in\nthe system. As such, a clock timestamp is an promise that some node in the\nsystem has a clock with a reading equal to or above its value.",
+      "title": "ClockTimestamp is a Timestamp with the added capability of being able to\nupdate a peer's HLC clock. It possesses this capability because the clock\ntimestamp itself is guaranteed to have come from an HLC clock somewhere in\nthe system. As such, a clock timestamp is a promise that some node in the\nsystem has a clock with a reading equal to or above its value.",
       "$ref": "#/definitions/Timestamp"
     },
     "Constraint": {
@@ -768,6 +954,12 @@
       },
       "x-go-package": "github.com/cockroachdb/cockroach/pkg/server/serverpb"
     },
+    "Duration": {
+      "description": "A Duration represents the elapsed time between two instants\nas an int64 nanosecond count. The representation limits the\nlargest representable duration to approximately 290 years.",
+      "type": "integer",
+      "format": "int64",
+      "x-go-package": "time"
+    },
     "EventsResponse": {
       "description": "EventsResponse contains a set of event log entries. This is always limited\nto the latest N entries (N is enforced in the associated endpoint).",
       "type": "object",
@@ -800,12 +992,6 @@
           "type": "integer",
           "format": "int64",
           "x-go-name": "ReportingID"
-        },
-        "target_id": {
-          "description": "target_id is the target for this event.",
-          "type": "integer",
-          "format": "int64",
-          "x-go-name": "TargetID"
         },
         "timestamp": {
           "description": "timestamp is the time at which the event occurred.",
@@ -1059,6 +1245,10 @@
           "type": "boolean",
           "x-go-name": "Overreplicated"
         },
+        "paused_followers": {
+          "type": "boolean",
+          "x-go-name": "PausedFollowers"
+        },
         "quiescent_equals_ticking": {
           "description": "Quiescent ranges do not tick by definition, but we track this in\ntwo different ways and suspect that they're getting out of sync.\nIf the replica's quiescent flag doesn't agree with the store's\nlist of replicas that are ticking, warn about it.",
           "type": "boolean",
@@ -1124,7 +1314,7 @@
       "x-go-package": "github.com/cockroachdb/cockroach/pkg/server/serverpb"
     },
     "ReplicaDescriptor": {
-      "description": "ReplicaDescriptor describes a replica location by node ID\n(corresponds to a host:port via lookup on gossip network) and store\nID (identifies the device).\nTODO(jeffreyxiao): All nullable fields in ReplicaDescriptor can be made\nnon-nullable if #38302 is guaranteed to be on all nodes (I.E. 20.1).",
+      "description": "ReplicaDescriptor describes a replica location by node ID\n(corresponds to a host:port via lookup on gossip network) and store\nID (identifies the device).",
       "type": "object",
       "properties": {
         "node_id": {
@@ -1220,6 +1410,12 @@
         "node_id": {
           "$ref": "#/definitions/NodeID"
         },
+        "num_txns_executed": {
+          "description": "Count of the number of transactions that have been opened on this session.\nThis count includes transactions that are in progress.",
+          "type": "integer",
+          "format": "int32",
+          "x-go-name": "NumTxnsExecuted"
+        },
         "start": {
           "description": "Timestamp of session's start.",
           "type": "string",
@@ -1228,6 +1424,17 @@
         },
         "status": {
           "$ref": "#/definitions/Session_Status"
+        },
+        "total_active_time": {
+          "$ref": "#/definitions/Duration"
+        },
+        "txn_fingerprint_ids": {
+          "description": "List of transaction fingerprint IDs in this session.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TransactionFingerprintID"
+          },
+          "x-go-name": "TxnFingerprintIDs"
         },
         "username": {
           "description": "Username of the user for this session.",
@@ -1308,8 +1515,26 @@
           "type": "string",
           "x-go-name": "CreateTableStatement"
         },
+        "data_live_bytes": {
+          "description": "data_live_bytes is the size in bytes of live (non MVCC) data on the table.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "DataLiveBytes"
+        },
+        "data_live_percentage": {
+          "description": "data_live_percentage is the percentage of live (non MVCC) data on the table.",
+          "type": "number",
+          "format": "float",
+          "x-go-name": "DataLivePercentage"
+        },
+        "data_total_bytes": {
+          "description": "data_total_bytes is the size in bytes of live and non-live data on the table.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "DataTotalBytes"
+        },
         "descriptor_id": {
-          "description": "descriptor_id is an identifier used to uniquely identify this table.\nIt can be used to find events pertaining to this table by filtering on\nthe 'target_id' field of events.",
+          "description": "descriptor_id is an identifier used to uniquely identify this table.",
           "type": "integer",
           "format": "int64",
           "x-go-name": "DescriptorID"
@@ -1480,7 +1705,7 @@
           "x-go-name": "Logical"
         },
         "synthetic": {
-          "description": "Indicates that the Timestamp did not come from an HLC clock somewhere\nin the system and, therefore, does not have the ability to update a\npeer's HLC clock. If set to true, the \"synthetic timestamp\" may be\narbitrarily disconnected from real time.\n\nThe flag serves as the dynamically typed version of a ClockTimestamp\n(but inverted). Only Timestamps with this flag set to false can be\ndowncast to a ClockTimestamp successfully (see TryToClockTimestamp).\n\nSynthetic timestamps with this flag set to true are central to\nnon-blocking transactions, which write \"into the future\". Setting the\nflag to true is also used to disconnect some committed MVCC versions\nfrom observed timestamps by indicating that those versions were moved\nfrom the timestamp at which they were originally written. Committed\nMVCC versions with synthetic timestamps require observing the full\nuncertainty interval, whereas readings off the leaseholders's clock\ncan tighten the uncertainty interval that is applied to MVCC versions\nwith clock timestamp.\n\nThis flag does not affect the sort order of Timestamps. However, it\nis considered when performing structural equality checks (e.g. using\nthe == operator). Consider use of the EqOrdering method when testing\nfor equality.",
+          "description": "Indicates that the Timestamp did not come from an HLC clock somewhere\nin the system and, therefore, does not have the ability to update a\npeer's HLC clock. If set to true, the \"synthetic timestamp\" may be\narbitrarily disconnected from real time.\n\nThe flag serves as the dynamically typed version of a ClockTimestamp\n(but inverted). Only Timestamps with this flag set to false can be\ndowncast to a ClockTimestamp successfully (see\nDeprecatedTryToClockTimestamp).\n\nSynthetic timestamps with this flag set to true are central to\nnon-blocking transactions, which write \"into the future\". Setting the\nflag to true is also used to disconnect some committed MVCC versions\nfrom observed timestamps by indicating that those versions were moved\nfrom the timestamp at which they were originally written. Committed\nMVCC versions with synthetic timestamps require observing the full\nuncertainty interval, whereas readings off the leaseholders's clock\ncan tighten the uncertainty interval that is applied to MVCC versions\nwith clock timestamp.\n\nThis flag does not affect the sort order of Timestamps. However, it\nis considered when performing structural equality checks (e.g. using\nthe == operator). Consider use of the EqOrdering method when testing\nfor equality.",
           "type": "boolean",
           "x-go-name": "Synthetic"
         },
@@ -1492,6 +1717,12 @@
         }
       },
       "x-go-package": "github.com/cockroachdb/cockroach/pkg/util/hlc"
+    },
+    "TransactionFingerprintID": {
+      "description": "TransactionFingerprintID is the hashed string constructed using the\nindividual statement fingerprint IDs that comprise the transaction.",
+      "type": "integer",
+      "format": "uint64",
+      "x-go-package": "github.com/cockroachdb/cockroach/pkg/roachpb"
     },
     "TxnInfo": {
       "type": "object",
@@ -1520,6 +1751,11 @@
         "is_historical": {
           "type": "boolean",
           "x-go-name": "IsHistorical"
+        },
+        "last_auto_retry_reason": {
+          "description": "Error message describing the cause for the txn's last automatic retry.",
+          "type": "string",
+          "x-go-name": "LastAutoRetryReason"
         },
         "max_alloc_bytes": {
           "description": "High water mark of allocated bytes in the txn memory monitor.",
@@ -1754,7 +1990,7 @@
       "title": "Response for databaseDetails.",
       "properties": {
         "descriptor_id": {
-          "description": "DescriptorID is an identifier used to uniquely identify this database.\nIt can be used to find events pertaining to this database by filtering on\nthe 'target_id' field of events.",
+          "description": "DescriptorID is an identifier used to uniquely identify this database.",
           "type": "integer",
           "format": "int64",
           "x-go-name": "DescriptorID"
@@ -1867,6 +2103,31 @@
           "type": "number",
           "format": "double",
           "x-go-name": "QPS"
+        },
+        "writes_per_second": {
+          "type": "number",
+          "format": "double",
+          "x-go-name": "WritesPerSecond"
+        },
+        "reads_per_second": {
+          "type": "number",
+          "format": "double",
+          "x-go-name": "ReadsPerSecond"
+        },
+        "write_bytes_per_second": {
+          "type": "number",
+          "format": "double",
+          "x-go-name": "WriteBytesPerSecond"
+        },
+        "read_bytes_per_second": {
+          "type": "number",
+          "format": "double",
+          "x-go-name": "ReadBytesPerSecond"
+        },
+        "cpu_time_per_second": {
+          "type": "number",
+          "format": "double",
+          "x-go-name": "CPUTimePerSecond"
         },
         "range_id": {
           "$ref": "#/definitions/RangeID"

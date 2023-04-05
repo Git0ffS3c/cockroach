@@ -27,12 +27,11 @@ import ConnectionsTable from "src/views/reports/containers/problemRanges/connect
 import { Loading } from "@cockroachlabs/cluster-ui";
 import { getMatchParamByName } from "src/util/query";
 
-type NodeProblems$Properties = protos.cockroach.server.serverpb.ProblemRangesResponse.INodeProblems;
+type NodeProblems$Properties =
+  protos.cockroach.server.serverpb.ProblemRangesResponse.INodeProblems;
 
 interface ProblemRangesOwnProps {
-  problemRanges: CachedDataReducerState<
-    protos.cockroach.server.serverpb.ProblemRangesResponse
-  >;
+  problemRanges: CachedDataReducerState<protos.cockroach.server.serverpb.ProblemRangesResponse>;
   refreshProblemRanges: typeof refreshProblemRanges;
 }
 
@@ -212,6 +211,11 @@ export class ProblemRanges extends React.Component<ProblemRangesProps, {}> {
           name="Circuit breaker error"
           problems={problems}
           extract={problem => problem.circuit_breaker_error_range_ids}
+        />
+        <ProblemRangeList
+          name="Paused Replicas"
+          problems={problems}
+          extract={problem => problem.paused_replica_ids}
         />
       </div>
     );

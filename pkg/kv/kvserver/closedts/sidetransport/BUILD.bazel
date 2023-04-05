@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("//build:STRINGER.bzl", "stringer")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
@@ -19,8 +20,8 @@ go_library(
         "//pkg/rpc",
         "//pkg/rpc/nodedialer",
         "//pkg/settings/cluster",
-        "//pkg/util",
         "//pkg/util/hlc",
+        "//pkg/util/intsets",
         "//pkg/util/log",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
@@ -36,6 +37,7 @@ go_test(
         "receiver_test.go",
         "sender_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":sidetransport"],
     deps = [
         "//pkg/base",
@@ -61,3 +63,5 @@ stringer(
     src = "sender.go",
     typ = "CantCloseReason",
 )
+
+get_x_data(name = "get_x_data")

@@ -169,8 +169,8 @@ EXECUTE insert_f4(18754999.99)
 query F
 SELECT f4 FROM assn_cast WHERE f4 IS NOT NULL
 ----
-1.875499999e+07
-1.875499999e+07
+1.8755e+07
+1.8755e+07
 
 statement ok
 INSERT INTO assn_cast(t) VALUES ('1970-01-01'::timestamptz)
@@ -263,10 +263,14 @@ INSERT INTO assn_cast(s) VALUES (1)
 statement ok
 PREPARE insert_s AS INSERT INTO assn_cast(s) VALUES ($1)
 
-# TODO(mgartner): This should succeed to match the behavior of Postgres.
-statement error expected EXECUTE parameter expression to have type string, but \'1\' has type int
-EXECUTE insert_s(1)
+statement ok
+EXECUTE insert_s(2)
 
+query T rowsort
+SELECT s FROM assn_cast WHERE s IS NOT NULL
+----
+1
+2
 
 # Tests for assignment casts of DEFAULT expressions.
 subtest assignment_casts_default
@@ -1223,7 +1227,7 @@ statement ok
 CREATE TABLE t66067_a (
   a INT,
   c CHAR(26),
-  CONSTRAINT c UNIQUE (c)
+  INDEX (c, a)
 );
 
 statement ok
@@ -1271,8 +1275,8 @@ SELECT i, i::oid, i::oid::text,
   i::oid::regproc, i::oid::regprocedure, i::oid::regnamespace, i::oid::regclass, i::oid::regtype, i::oid::regrole
 FROM (VALUES (0), (1)) v(i)
 ----
-0  0  0  -  -  -  -  -  -
-1  1  1  1  1  1  1  1  1
+0  0  0  -          -          -  -  -  -
+1  1  1  array_agg  array_agg  1  1  1  1
 
 query TOOOOOOOOOOOO
 SELECT i, i::regproc::oid, i::regprocedure::oid, i::regnamespace::oid, i::regtype::oid, i::regclass::oid, i::regrole::oid,
@@ -1401,3 +1405,114 @@ select CASE WHEN false THEN 1::REGTYPE ELSE 2::REGNAMESPACE END;
 select CASE WHEN false THEN 1::REGTYPE ELSE 2::REGPROC END;
 select CASE WHEN false THEN 1::REGTYPE ELSE 2::REGPROCEDURE END;
 select CASE WHEN false THEN 1::REGTYPE ELSE 2::REGROLE END;
+
+# As per the comment on eval.performCast(), the type width for FLOAT4 is
+# not available at the time that the cast is done, so the FLOAT4 -> TEXT
+# cast results in more digits than it should.
+query TT
+SELECT (1/3.0)::float4::text, (-1/3.0)::float8::text
+----
+0.3333333333333333  -0.3333333333333333
+
+statement ok
+SET extra_float_digits = -15
+
+# Verify that extra_float_digits applies to casts.
+query TT
+SELECT (-1/3.0)::float4::text, (1/3.0)::float8::text
+----
+-0.3  0.3
+
+# Test that default/on update expression is allowed to differ from column type
+statement ok
+CREATE TABLE def_assn_cast (
+  id INT4,
+  a INT4 DEFAULT 1.0::FLOAT4,
+  b VARCHAR DEFAULT 'true'::BOOL,
+  c NAME DEFAULT 'foo'::BPCHAR
+)
+
+statement ok
+CREATE TABLE upd_assn_cast (
+  id INT4,
+  a TEXT ON UPDATE 'POINT(2.0 2.0)'::GEOMETRY,
+  b FLOAT8 ON UPDATE 6::INT4,
+  c VARCHAR ON UPDATE '{ "customer": "John Doe"}'::JSONB
+)
+
+# Ensure insertions are allowed
+statement ok
+INSERT INTO def_assn_cast(id) VALUES (1)
+
+statement ok
+INSERT INTO upd_assn_cast(id) VALUES (1)
+
+statement ok
+UPDATE upd_assn_cast SET id = 2
+
+query IITT
+SELECT * from def_assn_cast
+----
+1  1  true  f
+
+query ITFT
+SELECT * from upd_assn_cast
+----
+2  010100000000000000000000400000000000000040  6  {"customer": "John Doe"}
+
+
+statement error pq: could not parse .* as type .*: invalid .* value
+CREATE TABLE fail_assn_cast (
+  a BOOL DEFAULT 'foo'
+)
+
+statement error pq: expected DEFAULT \(in CREATE TABLE\) expression to have type .*, but .* has type .*
+CREATE TABLE fail_assn_cast (
+  a DATE DEFAULT 1.0::FLOAT4
+)
+
+statement error pq: expected DEFAULT \(in CREATE TABLE\) expression to have type .*, but .* has type .*
+CREATE TABLE fail_assn_cast (
+  b JSONB DEFAULT 'null'::CHAR
+)
+
+statement error pq: expected ON UPDATE expression to have type .*, but .* has type .*
+CREATE TABLE fail_assn_cast (
+  a INT4 ON UPDATE 1.0::BOOL
+)
+
+statement error pq: expected ON UPDATE expression to have type .*, but .* has type .*
+CREATE TABLE fail_assn_cast (
+  a FLOAT4 ON UPDATE '01/02/03'::DATE
+)
+
+statement error pq: expected ON UPDATE expression to have type .*, but .* has type .*
+CREATE TABLE fail_assn_cast (
+  a NUMERIC ON UPDATE '1-2'::INTERVAL
+)
+
+subtest regression_98373
+
+statement ok
+CREATE TABLE IF NOT EXISTS t98373 AS
+        SELECT
+                g::INT2 AS _int2,
+                g::INT4 AS _int4,
+                g::INT8 AS _int8,
+                g::FLOAT8 AS _float8,
+                '2001-01-01'::DATE + g AS _date,
+                '2001-01-01'::TIMESTAMP + g * '1 day'::INTERVAL AS _timestamp
+        FROM
+                generate_series(1, 5) AS g;
+
+query T
+SELECT
+        regproc(_int2::INT8)::REGPROC AS col865
+FROM
+        t98373@[0]
+----
+array_agg
+array_agg
+array_agg
+array_agg
+array_agg

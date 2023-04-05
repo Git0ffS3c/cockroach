@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/poison"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -44,6 +45,41 @@ func scanTimestampWithName(t *testing.T, d *datadriven.TestData, name string) hl
 	return ts
 }
 
+func scanTxnPriority(t *testing.T, d *datadriven.TestData) enginepb.TxnPriority {
+	priority := scanUserPriority(t, d)
+	// NB: don't use roachpb.MakePriority to avoid randomness.
+	switch priority {
+	case roachpb.MinUserPriority:
+		return enginepb.MinTxnPriority
+	case roachpb.NormalUserPriority:
+		return 1 // not min nor max
+	case roachpb.MaxUserPriority:
+		return enginepb.MaxTxnPriority
+	default:
+		d.Fatalf(t, "unknown priority: %s", priority)
+		return 0
+	}
+}
+
+func scanUserPriority(t *testing.T, d *datadriven.TestData) roachpb.UserPriority {
+	const key = "priority"
+	priS := "normal"
+	if d.HasArg(key) {
+		d.ScanArgs(t, key, &priS)
+	}
+	switch priS {
+	case "low":
+		return roachpb.MinUserPriority
+	case "normal":
+		return roachpb.NormalUserPriority
+	case "high":
+		return roachpb.MaxUserPriority
+	default:
+		d.Fatalf(t, "unknown priority: %s", priS)
+		return 0
+	}
+}
+
 func scanLockDurability(t *testing.T, d *datadriven.TestData) lock.Durability {
 	var durS string
 	d.ScanArgs(t, "dur", &durS)
@@ -70,6 +106,8 @@ func scanWaitPolicy(t *testing.T, d *datadriven.TestData, required bool) lock.Wa
 		return lock.WaitPolicy_Block
 	case "error":
 		return lock.WaitPolicy_Error
+	case "skip-locked":
+		return lock.WaitPolicy_SkipLocked
 	default:
 		d.Fatalf(t, "unknown wait policy: %s", policy)
 		return 0
@@ -96,7 +134,7 @@ func scanPoisonPolicy(t *testing.T, d *datadriven.TestData) poison.Policy {
 
 func scanSingleRequest(
 	t *testing.T, d *datadriven.TestData, line string, txns map[string]*roachpb.Transaction,
-) roachpb.Request {
+) kvpb.Request {
 	cmd, cmdArgs, err := datadriven.ParseLine(line)
 	if err != nil {
 		d.Fatalf(t, "error parsing single request: %v", err)
@@ -132,13 +170,13 @@ func scanSingleRequest(
 
 	switch cmd {
 	case "get":
-		var r roachpb.GetRequest
+		var r kvpb.GetRequest
 		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
 		return &r
 
 	case "scan":
-		var r roachpb.ScanRequest
+		var r kvpb.ScanRequest
 		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
 		if v, ok := fields["endkey"]; ok {
@@ -147,25 +185,25 @@ func scanSingleRequest(
 		return &r
 
 	case "put":
-		var r roachpb.PutRequest
+		var r kvpb.PutRequest
 		r.Sequence = maybeGetSeq()
 		r.Key = roachpb.Key(mustGetField("key"))
 		r.Value.SetString(mustGetField("value"))
 		return &r
 
 	case "resolve-intent":
-		var r roachpb.ResolveIntentRequest
+		var r kvpb.ResolveIntentRequest
 		r.IntentTxn = txns[mustGetField("txn")].TxnMeta
 		r.Key = roachpb.Key(mustGetField("key"))
 		r.Status = parseTxnStatus(t, d, mustGetField("status"))
 		return &r
 
 	case "request-lease":
-		var r roachpb.RequestLeaseRequest
+		var r kvpb.RequestLeaseRequest
 		return &r
 
 	case "barrier":
-		var r roachpb.BarrierRequest
+		var r kvpb.BarrierRequest
 		r.Key = roachpb.Key(mustGetField("key"))
 		if v, ok := fields["endkey"]; ok {
 			r.EndKey = roachpb.Key(v)

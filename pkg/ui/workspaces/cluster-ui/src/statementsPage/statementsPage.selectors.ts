@@ -12,6 +12,7 @@ import { createSelector } from "reselect";
 import {
   aggregateStatementStats,
   appAttr,
+  FixFingerprintHexValue,
   combineStatementStats,
   ExecutionStatistics,
   flattenStatementStats,
@@ -20,6 +21,7 @@ import {
   statementKey,
   StatementStatistics,
   TimestampToMoment,
+  unset,
 } from "src/util";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { RouteComponentProps } from "react-router-dom";
@@ -29,90 +31,78 @@ import { selectDiagnosticsReportsPerStatement } from "../store/statementDiagnost
 import { AggregateStatistics } from "../statementsTable";
 import { sqlStatsSelector } from "../store/sqlStats/sqlStats.selector";
 import { SQLStatsState } from "../store/sqlStats";
+import { localStorageSelector } from "../store/utils/selectors";
+import { databasesListSelector } from "src/store/databasesList/databasesList.selectors";
 
-type ICollectedStatementStatistics = cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+type ICollectedStatementStatistics =
+  cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 export interface StatementsSummaryData {
   statementFingerprintID: string;
+  statementFingerprintHexID: string;
   statement: string;
   statementSummary: string;
   aggregatedTs: number;
-  aggregationInterval: number;
   implicitTxn: boolean;
   fullScan: boolean;
   database: string;
+  applicationName: string;
   stats: StatementStatistics[];
 }
 
-export const adminUISelector = createSelector(
-  (state: AppState) => state.adminUI,
-  adminUiState => adminUiState,
-);
-
-export const localStorageSelector = createSelector(
-  adminUISelector,
-  adminUiState => adminUiState.localStorage,
+export const selectStatementsLastUpdated = createSelector(
+  sqlStatsSelector,
+  sqlStats => sqlStats.lastUpdated,
 );
 
 // selectApps returns the array of all apps with statement statistics present
 // in the data.
 export const selectApps = createSelector(sqlStatsSelector, sqlStatsState => {
-  if (!sqlStatsState.data || !sqlStatsState.valid) {
+  if (!sqlStatsState?.data || !sqlStatsState?.valid) {
     return [];
   }
 
   let sawBlank = false;
+  let sawInternal = false;
   const apps: { [app: string]: boolean } = {};
   sqlStatsState.data.statements.forEach(
     (statement: ICollectedStatementStatistics) => {
-      const isNotInternalApp =
-        sqlStatsState.data.internal_app_name_prefix &&
-        !statement.key.key_data.app.startsWith(
-          sqlStatsState.data.internal_app_name_prefix,
-        );
       if (
-        sqlStatsState.data.internal_app_name_prefix == undefined ||
-        isNotInternalApp
+        sqlStatsState.data.internal_app_name_prefix &&
+        statement.key.key_data.app.startsWith(
+          sqlStatsState.data.internal_app_name_prefix,
+        )
       ) {
-        if (statement.key.key_data.app) {
-          apps[statement.key.key_data.app] = true;
-        } else {
-          sawBlank = true;
-        }
+        sawInternal = true;
+      } else if (statement.key.key_data.app) {
+        apps[statement.key.key_data.app] = true;
+      } else {
+        sawBlank = true;
       }
     },
   );
   return []
-    .concat(sawBlank ? ["(unset)"] : [])
+    .concat(sawInternal ? [sqlStatsState.data.internal_app_name_prefix] : [])
+    .concat(sawBlank ? [unset] : [])
     .concat(Object.keys(apps).sort());
 });
 
-// selectDatabases returns the array of all databases with statement statistics present
-// in the data.
-export const selectDatabases = createSelector(
-  sqlStatsSelector,
-  sqlStatsState => {
-    if (!sqlStatsState.data) {
-      return [];
-    }
+// selectDatabases returns the array of all databases in the cluster.
+export const selectDatabases = createSelector(databasesListSelector, state => {
+  if (!state?.data) {
+    return [];
+  }
 
-    return Array.from(
-      new Set(
-        sqlStatsState.data.statements.map(s =>
-          s.key.key_data.database ? s.key.key_data.database : "(unset)",
-        ),
-      ),
-    )
-      .filter((dbName: string) => dbName !== null && dbName.length > 0)
-      .sort();
-  },
-);
+  return state.data.databases
+    .filter((dbName: string) => dbName !== null && dbName.length > 0)
+    .sort();
+});
 
 // selectTotalFingerprints returns the count of distinct statement fingerprints
 // present in the data.
 export const selectTotalFingerprints = createSelector(
   sqlStatsSelector,
   state => {
-    if (!state.data) {
+    if (!state?.data) {
       return 0;
     }
     const aggregated = aggregateStatementStats(state.data.statements);
@@ -123,12 +113,26 @@ export const selectTotalFingerprints = createSelector(
 // selectLastReset returns a string displaying the last time the statement
 // statistics were reset.
 export const selectLastReset = createSelector(sqlStatsSelector, state => {
-  if (!state.data) {
+  if (!state?.data) {
     return "";
   }
 
   return formatDate(TimestampToMoment(state.data.last_reset));
 });
+
+export const selectStatementsDataValid = createSelector(
+  sqlStatsSelector,
+  (state: SQLStatsState): boolean => {
+    return state.valid;
+  },
+);
+
+export const selectStatementsDataInFlight = createSelector(
+  sqlStatsSelector,
+  (state: SQLStatsState): boolean => {
+    return state.inFlight;
+  },
+);
 
 export const selectStatements = createSelector(
   sqlStatsSelector,
@@ -140,7 +144,7 @@ export const selectStatements = createSelector(
     diagnosticsReportsPerStatement,
   ): AggregateStatistics[] => {
     // State is valid if we successfully fetched data, and the data has not yet been invalidated.
-    if (!state.data || !state.valid) {
+    if (!state?.data || !state?.valid) {
       return null;
     }
     let statements = flattenStatementStats(state.data.statements);
@@ -154,7 +158,7 @@ export const selectStatements = createSelector(
       if (criteria.includes(state.data.internal_app_name_prefix)) {
         showInternal = true;
       }
-      if (criteria.includes("(unset)")) {
+      if (criteria.includes(unset)) {
         criteria.push("");
       }
 
@@ -178,13 +182,16 @@ export const selectStatements = createSelector(
       if (!(key in statsByStatementKey)) {
         statsByStatementKey[key] = {
           statementFingerprintID: stmt.statement_fingerprint_id?.toString(),
+          statementFingerprintHexID: FixFingerprintHexValue(
+            stmt.statement_fingerprint_id?.toString(16),
+          ),
           statement: stmt.statement,
           statementSummary: stmt.statement_summary,
           aggregatedTs: stmt.aggregated_ts,
-          aggregationInterval: stmt.aggregation_interval,
           implicitTxn: stmt.implicit_txn,
           fullScan: stmt.full_scan,
           database: stmt.database,
+          applicationName: stmt.app,
           stats: [],
         };
       }
@@ -195,13 +202,16 @@ export const selectStatements = createSelector(
       const stmt = statsByStatementKey[key];
       return {
         aggregatedFingerprintID: stmt.statementFingerprintID,
+        aggregatedFingerprintHexID: FixFingerprintHexValue(
+          stmt.statementFingerprintHexID,
+        ),
         label: stmt.statement,
         summary: stmt.statementSummary,
         aggregatedTs: stmt.aggregatedTs,
-        aggregationInterval: stmt.aggregationInterval,
         implicitTxn: stmt.implicitTxn,
         fullScan: stmt.fullScan,
         database: stmt.database,
+        applicationName: stmt.applicationName,
         stats: combineStatementStats(stmt.stats),
         diagnosticsReports: diagnosticsReportsPerStatement[stmt.statement],
       };
@@ -219,13 +229,8 @@ export const selectColumns = createSelector(
   // return array of columns if user have customized it or `null` otherwise
   localStorage =>
     localStorage["showColumns/StatementsPage"]
-      ? localStorage["showColumns/StatementsPage"].split(",")
+      ? localStorage["showColumns/StatementsPage"]?.split(",")
       : null,
-);
-
-export const selectTimeScale = createSelector(
-  localStorageSelector,
-  localStorage => localStorage["timeScale/SQLActivity"],
 );
 
 export const selectSortSetting = createSelector(

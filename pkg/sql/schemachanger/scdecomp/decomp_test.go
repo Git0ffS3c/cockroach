@@ -16,9 +16,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/sctest"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -29,10 +30,14 @@ func TestDecomposeToElements(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	newCluster := func(t *testing.T, knobs *scrun.TestingKnobs) (_ *gosql.DB, cleanup func()) {
-		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
-		return tc.ServerConn(0), func() { tc.Stopper().Stop(ctx) }
+	newCluster := func(t *testing.T, knobs *scexec.TestingKnobs) (_ serverutils.TestServerInterface, _ *gosql.DB, cleanup func()) {
+		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestTenantDisabled,
+			},
+		})
+		return nil, tc.ServerConn(0), func() { tc.Stopper().Stop(ctx) }
 	}
 
-	sctest.DecomposeToElements(t, testutils.TestDataPath(t), newCluster)
+	sctest.DecomposeToElements(t, datapathutils.TestDataPath(t), newCluster)
 }

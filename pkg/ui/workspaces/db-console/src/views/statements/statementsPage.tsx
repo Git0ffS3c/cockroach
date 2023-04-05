@@ -14,6 +14,8 @@ import { createSelector } from "reselect";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 import * as protos from "src/js/protos";
 import {
+  refreshNodes,
+  refreshDatabases,
   refreshStatementDiagnosticsRequests,
   refreshStatements,
   refreshUserSQLRoles,
@@ -21,15 +23,17 @@ import {
 import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { AdminUIState, AppDispatch } from "src/redux/state";
 import { StatementsResponseMessage } from "src/util/api";
-import { appAttr } from "src/util/constants";
+import { appAttr, unset } from "src/util/constants";
 import { PrintTime } from "src/views/reports/containers/range/print";
 import { selectDiagnosticsReportsPerStatement } from "src/redux/statements/statementsSelectors";
 import {
   createStatementDiagnosticsAlertLocalSetting,
   cancelStatementDiagnosticsAlertLocalSetting,
 } from "src/redux/alerts";
-import { statementsTimeScaleLocalSetting } from "src/redux/statementsTimeScale";
-import { selectHasViewActivityRedactedRole } from "src/redux/user";
+import {
+  selectHasViewActivityRedactedRole,
+  selectHasAdminRole,
+} from "src/redux/user";
 import { queryByName } from "src/util/query";
 
 import {
@@ -38,19 +42,21 @@ import {
   defaultFilters,
   util,
   StatementsPageRoot,
-  ActiveStatementsViewStateProps,
+  RecentStatementsViewStateProps,
   StatementsPageStateProps,
-  ActiveStatementsViewDispatchProps,
+  RecentStatementsViewDispatchProps,
   StatementsPageDispatchProps,
   StatementsPageRootProps,
+  api,
 } from "@cockroachlabs/cluster-ui";
 import {
   cancelStatementDiagnosticsReportAction,
   createOpenDiagnosticsModalAction,
   createStatementDiagnosticsReportAction,
-  setCombinedStatementsTimeScaleAction,
+  setGlobalTimeScaleAction,
 } from "src/redux/statements";
 import {
+  trackApplySearchCriteriaAction,
   trackCancelDiagnosticsBundleAction,
   trackDownloadDiagnosticsBundleAction,
   trackStatementsPaginationAction,
@@ -59,12 +65,19 @@ import { resetSQLStatsAction } from "src/redux/sqlStats";
 import { LocalSetting } from "src/redux/localsettings";
 import { nodeRegionsByIDSelector } from "src/redux/nodes";
 import {
-  activeStatementsViewActions,
-  mapStateToActiveStatementViewProps,
-} from "./activeStatementsSelectors";
+  recentStatementsViewActions,
+  mapStateToRecentStatementViewProps,
+} from "./recentStatementsSelectors";
+import { selectTimeScale } from "src/redux/timeScale";
+import {
+  selectStatementsLastUpdated,
+  selectStatementsDataValid,
+  selectStatementsDataInFlight,
+} from "src/selectors/executionFingerprintsSelectors";
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 
-type ICollectedStatementStatistics = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
-type IStatementDiagnosticsReport = protos.cockroach.server.serverpb.IStatementDiagnosticsReport;
+type ICollectedStatementStatistics =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 
 const {
   aggregateStatementStats,
@@ -78,13 +91,14 @@ type StatementStatistics = util.StatementStatistics;
 
 interface StatementsSummaryData {
   statementFingerprintID: string;
+  statementFingerprintHexID: string;
   statement: string;
   statementSummary: string;
   aggregatedTs: number;
-  aggregationInterval: number;
   implicitTxn: boolean;
   fullScan: boolean;
   database: string;
+  applicationName: string;
   stats: StatementStatistics[];
 }
 
@@ -99,7 +113,7 @@ export const selectStatements = createSelector(
     props: RouteComponentProps<any>,
     diagnosticsReportsPerStatement,
   ): AggregateStatistics[] => {
-    if (!state.data || state.inFlight) {
+    if (!state?.data || !state?.valid) {
       return null;
     }
     let statements = flattenStatementStats(state.data.statements);
@@ -113,7 +127,7 @@ export const selectStatements = createSelector(
       if (criteria.includes(state.data.internal_app_name_prefix)) {
         showInternal = true;
       }
-      if (criteria.includes("(unset)")) {
+      if (criteria.includes(unset)) {
         criteria.push("");
       }
 
@@ -137,13 +151,16 @@ export const selectStatements = createSelector(
       if (!(key in statsByStatementKey)) {
         statsByStatementKey[key] = {
           statementFingerprintID: stmt.statement_fingerprint_id?.toString(),
+          statementFingerprintHexID: util.FixFingerprintHexValue(
+            stmt.statement_fingerprint_id?.toString(16),
+          ),
           statement: stmt.statement,
           statementSummary: stmt.statement_summary,
           aggregatedTs: stmt.aggregated_ts,
-          aggregationInterval: stmt.aggregation_interval,
           implicitTxn: stmt.implicit_txn,
           fullScan: stmt.full_scan,
           database: stmt.database,
+          applicationName: stmt.app,
           stats: [],
         };
       }
@@ -154,13 +171,16 @@ export const selectStatements = createSelector(
       const stmt = statsByStatementKey[key];
       return {
         aggregatedFingerprintID: stmt.statementFingerprintID,
+        aggregatedFingerprintHexID: util.FixFingerprintHexValue(
+          stmt.statementFingerprintHexID,
+        ),
         label: stmt.statement,
         summary: stmt.statementSummary,
         aggregatedTs: stmt.aggregatedTs,
-        aggregationInterval: stmt.aggregationInterval,
         implicitTxn: stmt.implicitTxn,
         fullScan: stmt.fullScan,
         database: stmt.database,
+        applicationName: stmt.applicationName,
         stats: combineStatementStats(stmt.stats),
         diagnosticsReports: diagnosticsReportsPerStatement[stmt.statement],
       };
@@ -173,53 +193,46 @@ export const selectStatements = createSelector(
 export const selectApps = createSelector(
   (state: AdminUIState) => state.cachedData.statements,
   (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
+    if (!state?.data) {
       return [];
     }
 
     let sawBlank = false;
+    let sawInternal = false;
     const apps: { [app: string]: boolean } = {};
     state.data.statements.forEach(
       (statement: ICollectedStatementStatistics) => {
-        const isNotInternalApp =
-          state.data.internal_app_name_prefix &&
-          !statement.key.key_data.app.startsWith(
-            state.data.internal_app_name_prefix,
-          );
         if (
-          state.data.internal_app_name_prefix == undefined ||
-          isNotInternalApp
+          state.data.internal_app_name_prefix &&
+          statement.key.key_data.app.startsWith(
+            state.data.internal_app_name_prefix,
+          )
         ) {
-          if (statement.key.key_data.app) {
-            apps[statement.key.key_data.app] = true;
-          } else {
-            sawBlank = true;
-          }
+          sawInternal = true;
+        } else if (statement.key.key_data.app) {
+          apps[statement.key.key_data.app] = true;
+        } else {
+          sawBlank = true;
         }
       },
     );
     return []
-      .concat(sawBlank ? ["(unset)"] : [])
+      .concat(sawInternal ? [state.data.internal_app_name_prefix] : [])
+      .concat(sawBlank ? [unset] : [])
       .concat(Object.keys(apps))
       .sort();
   },
 );
 
-// selectDatabases returns the array of all databases with statement statistics present
-// in the data.
+// selectDatabases returns the array of all databases in the cluster.
 export const selectDatabases = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
+  (state: AdminUIState) => state.cachedData.databases,
+  (state: CachedDataReducerState<clusterUiApi.DatabasesListResponse>) => {
+    if (!state?.data) {
       return [];
     }
-    return Array.from(
-      new Set(
-        state.data.statements.map(s =>
-          s.key.key_data.database ? s.key.key_data.database : "(unset)",
-        ),
-      ),
-    )
+
+    return state.data.databases
       .filter((dbName: string) => dbName !== null && dbName.length > 0)
       .sort();
   },
@@ -230,7 +243,7 @@ export const selectDatabases = createSelector(
 export const selectTotalFingerprints = createSelector(
   (state: AdminUIState) => state.cachedData.statements,
   (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
+    if (!state?.data) {
       return 0;
     }
     const aggregated = aggregateStatementStats(state.data.statements);
@@ -243,7 +256,7 @@ export const selectTotalFingerprints = createSelector(
 export const selectLastReset = createSelector(
   (state: AdminUIState) => state.cachedData.statements,
   (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
+    if (!state?.data) {
       return "unknown";
     }
     return PrintTime(util.TimestampToMoment(state.data.last_reset));
@@ -257,7 +270,7 @@ export const statementColumnsLocalSetting = new LocalSetting(
 );
 
 export const sortSettingLocalSetting = new LocalSetting(
-  "sortSetting/StatementsPage",
+  "tableSortSetting/StatementsPage",
   (state: AdminUIState) => state.localSettings,
   { ascending: false, columnTitle: "executionCount" },
 );
@@ -274,10 +287,24 @@ export const searchLocalSetting = new LocalSetting(
   null,
 );
 
+export const reqSortSetting = new LocalSetting(
+  "reqSortSetting/StatementsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.sortStmt,
+);
+
+export const limitSetting = new LocalSetting(
+  "reqLimitSetting/StatementsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.limit,
+);
+
 const fingerprintsPageActions = {
-  refreshStatements,
-  onTimeScaleChange: setCombinedStatementsTimeScaleAction,
+  refreshStatements: refreshStatements,
+  refreshDatabases: refreshDatabases,
+  onTimeScaleChange: setGlobalTimeScaleAction,
   refreshStatementDiagnosticsRequests,
+  refreshNodes,
   refreshUserSQLRoles,
   resetSQLStats: resetSQLStatsAction,
   dismissAlertMessage: () => {
@@ -290,7 +317,14 @@ const fingerprintsPageActions = {
       );
     };
   },
-  onActivateStatementDiagnostics: createStatementDiagnosticsReportAction,
+  onActivateStatementDiagnostics: (
+    insertStmtDiagnosticRequest: clusterUiApi.InsertStmtDiagnosticRequest,
+  ) => {
+    return (dispatch: AppDispatch) =>
+      dispatch(
+        createStatementDiagnosticsReportAction(insertStmtDiagnosticRequest),
+      );
+  },
   onDiagnosticsModalOpen: createOpenDiagnosticsModalAction,
   onSearchComplete: (query: string) => searchLocalSetting.set(query),
   onPageChanged: trackStatementsPaginationAction,
@@ -305,13 +339,15 @@ const fingerprintsPageActions = {
     }),
   onFilterChange: (filters: Filters) => filtersLocalSetting.set(filters),
   onSelectDiagnosticsReportDropdownOption: (
-    report: IStatementDiagnosticsReport,
+    report: clusterUiApi.StatementDiagnosticsReport,
   ) => {
     if (report.completed) {
       return trackDownloadDiagnosticsBundleAction(report.statement_fingerprint);
     } else {
       return (dispatch: AppDispatch) => {
-        dispatch(cancelStatementDiagnosticsReportAction(report.id));
+        dispatch(
+          cancelStatementDiagnosticsReportAction({ requestId: report.id }),
+        );
         dispatch(
           trackCancelDiagnosticsBundleAction(report.statement_fingerprint),
         );
@@ -326,16 +362,19 @@ const fingerprintsPageActions = {
     statementColumnsLocalSetting.set(
       value.length === 0 ? " " : value.join(","),
     ),
+  onChangeLimit: (newLimit: number) => limitSetting.set(newLimit),
+  onChangeReqSort: (sort: api.SqlStatsSortType) => reqSortSetting.set(sort),
+  onApplySearchCriteria: trackApplySearchCriteriaAction,
 };
 
 type StateProps = {
   fingerprintsPageProps: StatementsPageStateProps;
-  activePageProps: ActiveStatementsViewStateProps;
+  activePageProps: RecentStatementsViewStateProps;
 };
 
 type DispatchProps = {
   fingerprintsPageProps: StatementsPageDispatchProps;
-  activePageProps: ActiveStatementsViewDispatchProps;
+  activePageProps: RecentStatementsViewDispatchProps;
 };
 
 export default withRouter(
@@ -351,26 +390,34 @@ export default withRouter(
         apps: selectApps(state),
         columns: statementColumnsLocalSetting.selectorToArray(state),
         databases: selectDatabases(state),
-        timeScale: statementsTimeScaleLocalSetting.selector(state),
+        timeScale: selectTimeScale(state),
         filters: filtersLocalSetting.selector(state),
         lastReset: selectLastReset(state),
         nodeRegions: nodeRegionsByIDSelector(state),
         search: searchLocalSetting.selector(state),
         sortSetting: sortSettingLocalSetting.selector(state),
         statements: selectStatements(state, props),
+        isDataValid: selectStatementsDataValid(state),
+        isReqInFlight: selectStatementsDataInFlight(state),
+        lastUpdated: selectStatementsLastUpdated(state),
         statementsError: state.cachedData.statements.lastError,
         totalFingerprints: selectTotalFingerprints(state),
         hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+        hasAdminRole: selectHasAdminRole(state),
+        limit: limitSetting.selector(state),
+        reqSortSetting: reqSortSetting.selector(state),
+        stmtsTotalRuntimeSecs:
+          state.cachedData?.statements?.data?.stmts_total_runtime_secs ?? 0,
       },
-      activePageProps: mapStateToActiveStatementViewProps(state),
+      activePageProps: mapStateToRecentStatementViewProps(state),
     }),
-    dispatch => ({
+    (dispatch: AppDispatch): DispatchProps => ({
       fingerprintsPageProps: bindActionCreators(
         fingerprintsPageActions,
         dispatch,
       ),
       activePageProps: bindActionCreators(
-        activeStatementsViewActions,
+        recentStatementsViewActions,
         dispatch,
       ),
     }),

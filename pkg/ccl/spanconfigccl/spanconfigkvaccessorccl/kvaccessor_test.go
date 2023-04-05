@@ -38,9 +38,11 @@ func TestCommitTSIntervals(t *testing.T) {
 
 	var i interceptor
 	ts, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// Manually starts a tenant below. No need to start one here.
+		DefaultTestTenant: base.TestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
-				ClockSource: manual.UnixNano,
+				WallClock: manual,
 			},
 			SpanConfig: &spanconfig.TestingKnobs{
 				KVAccessorPostCommitDeadlineSetInterceptor: func(txn *kv.Txn) {
@@ -52,7 +54,7 @@ func TestCommitTSIntervals(t *testing.T) {
 	defer ts.Stopper().Stop(ctx)
 
 	tt, _ := serverutils.StartTenant(t, ts, base.TestTenantArgs{
-		TenantID: roachpb.MakeTenantID(10),
+		TenantID: roachpb.MustMakeTenantID(10),
 	})
 
 	manual.Pause() // control the clock manually below

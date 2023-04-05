@@ -18,7 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/rel"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
@@ -64,7 +64,7 @@ type QueryTest struct {
 
 func (tc DatabaseTest) run(t *testing.T, s Suite) {
 	for i, databaseIndexes := range tc.databaseIndexes() {
-		t.Run(fmt.Sprintf("%v", databaseIndexes), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%v", i), func(t *testing.T) {
 			db, err := rel.NewDatabase(s.Schema, databaseIndexes...)
 			require.NoError(t, err)
 			for _, k := range tc.Data {
@@ -98,13 +98,13 @@ func (qc QueryTest) run(t *testing.T, indexes int, db *rel.Database) {
 		results = append(results, cur)
 		return nil
 	}); testutils.IsError(err, `failed to find index to satisfy query`) {
-		if util.MakeFastIntSet(qc.UnsatisfiableIndexes...).Contains(indexes) {
+		if intsets.MakeFast(qc.UnsatisfiableIndexes...).Contains(indexes) {
 			return
 		}
 		t.Fatalf("expected to succeed with indexes %d: %v", indexes, err)
 	} else if err != nil {
 		t.Fatal(err)
-	} else if util.MakeFastIntSet(qc.UnsatisfiableIndexes...).Contains(indexes) {
+	} else if intsets.MakeFast(qc.UnsatisfiableIndexes...).Contains(indexes) {
 		t.Fatalf("expected to fail with indexes %d", indexes)
 	}
 	expResults := append(qc.Results[:0:0], qc.Results...)

@@ -130,28 +130,6 @@ func (e *tenantEntry) AddPod(pod *Pod) bool {
 	return true
 }
 
-// UpdatePod updates the given pod in the tenant's list of pods. If an entry
-// with a match Addr is not present, UpdatePod returns false.
-func (e *tenantEntry) UpdatePod(pod *Pod) bool {
-	e.pods.Lock()
-	defer e.pods.Unlock()
-
-	for i, existing := range e.pods.pods {
-		if existing.Addr == pod.Addr {
-			// e.pods.pods is copy on write. Whenever modifications are made,
-			// we must make a copy to avoid accidentally mutating the slice
-			// retrieved by GetPods.
-			pods := e.pods.pods
-			e.pods.pods = make([]*Pod, len(pods))
-			copy(e.pods.pods, pods)
-			e.pods.pods[i] = pod
-			return true
-		}
-	}
-
-	return false
-}
-
 // RemovePodByAddr removes the pod with the given IP address from the tenant's
 // list of pod addresses. If it was not present, RemovePodByAddr returns false.
 func (e *tenantEntry) RemovePodByAddr(addr string) bool {
@@ -175,10 +153,10 @@ func (e *tenantEntry) GetPods() []*Pod {
 	return e.pods.pods
 }
 
-// EnsureTenantPod ensures that at least one SQL process exists for this tenant,
-// and is ready for connection attempts to its IP address. If errorIfNoPods is
-// true, then EnsureTenantPod returns an error if there are no pods available
-// rather than blocking.
+// EnsureTenantPod ensures that at least one RUNNING SQL process exists for this
+// tenant, and is ready for connection attempts to its IP address. If
+// errorIfNoPods is true, then EnsureTenantPod returns an error if there are no
+// pods available rather than blocking.
 func (e *tenantEntry) EnsureTenantPod(
 	ctx context.Context, client DirectoryClient, errorIfNoPods bool,
 ) (pods []*Pod, err error) {
@@ -187,11 +165,11 @@ func (e *tenantEntry) EnsureTenantPod(
 	e.calls.Lock()
 	defer e.calls.Unlock()
 
-	// If an IP address is already available, nothing more to do. Check this
-	// immediately after obtaining the lock so that only the first thread does
-	// the work to get information about the tenant.
+	// If an IP address for a RUNNING pod is already available, nothing more to
+	// do. Check this immediately after obtaining the lock so that only the
+	// first thread does the work to get information about the tenant.
 	pods = e.GetPods()
-	if len(pods) != 0 {
+	if hasRunningPod(pods) {
 		return pods, nil
 	}
 
@@ -215,7 +193,7 @@ func (e *tenantEntry) EnsureTenantPod(
 		if err != nil {
 			return nil, err
 		}
-		if len(pods) != 0 {
+		if hasRunningPod(pods) {
 			log.Infof(ctx, "resumed tenant %d", e.TenantID)
 			break
 		}
@@ -239,6 +217,7 @@ func (e *tenantEntry) fetchPodsLocked(
 	ctx context.Context, client DirectoryClient,
 ) (tenantPods []*Pod, err error) {
 	// List the pods for the given tenant.
+	//
 	// TODO(andyk): This races with the pod watcher, which may receive updates
 	// that are newer than what ListPods returns. This could be fixed by adding
 	// version values to the pods in order to detect races.
@@ -272,4 +251,15 @@ func (e *tenantEntry) canRefreshLocked() bool {
 	}
 	e.calls.lastRefresh = now
 	return true
+}
+
+// hasRunningPod returns true if there is at least one RUNNING pod, or false
+// otherwise.
+func hasRunningPod(pods []*Pod) bool {
+	for _, pod := range pods {
+		if pod.State == RUNNING {
+			return true
+		}
+	}
+	return false
 }

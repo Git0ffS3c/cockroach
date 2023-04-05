@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -30,7 +31,7 @@ import (
 func runDecommissionMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
+	predecessorVersion, err := version.PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,23 +43,22 @@ func runDecommissionMixedVersions(
 	pinnedUpgrade := h.getRandNode()
 	t.L().Printf("pinned n%d for upgrade", pinnedUpgrade)
 
-	// An empty string means that the cockroach binary specified by flag
-	// `cockroach` will be used.
-	const mainVersion = ""
 	allNodes := c.All()
 	u := newVersionUpgradeTest(c,
 		// We upload both binaries to each node, to be able to vary the binary
 		// used when issuing `cockroach node` subcommands.
 		uploadVersionStep(allNodes, predecessorVersion),
-		uploadVersionStep(allNodes, mainVersion),
+		uploadVersionStep(allNodes, clusterupgrade.MainVersion),
 
 		startVersion(allNodes, predecessorVersion),
 		waitForUpgradeStep(allNodes),
 		preventAutoUpgradeStep(h.nodeIDs[0]),
 
+		preloadDataStep(pinnedUpgrade),
+
 		// We upgrade a pinnedUpgrade and one other random node of the cluster to v20.2.
-		binaryUpgradeStep(c.Node(pinnedUpgrade), mainVersion),
-		binaryUpgradeStep(c.Node(h.getRandNodeOtherThan(pinnedUpgrade)), mainVersion),
+		binaryUpgradeStep(c.Node(pinnedUpgrade), clusterupgrade.MainVersion),
+		binaryUpgradeStep(c.Node(h.getRandNodeOtherThan(pinnedUpgrade)), clusterupgrade.MainVersion),
 		checkAllMembership(pinnedUpgrade, "active"),
 
 		// Partially decommission a random node from another random node. We
@@ -78,7 +78,7 @@ func runDecommissionMixedVersions(
 		binaryUpgradeStep(allNodes, predecessorVersion),
 
 		// Roll all nodes forward, and finalize upgrade.
-		binaryUpgradeStep(allNodes, mainVersion),
+		binaryUpgradeStep(allNodes, clusterupgrade.MainVersion),
 		allowAutoUpgradeStep(1),
 		waitForUpgradeStep(allNodes),
 
@@ -105,6 +105,22 @@ func cockroachBinaryPath(version string) string {
 		return "./cockroach"
 	}
 	return fmt.Sprintf("./v%s/cockroach", version)
+}
+
+// preloadDataStep load data into cluster to ensure we have a large enough
+// number of replicas to move on decommissioning.
+func preloadDataStep(target int) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		// Load data into cluster to ensure we have a large enough number of replicas
+		// to move on decommissioning.
+		c := u.c
+		c.Run(ctx, c.Node(target), `./cockroach workload fixtures import tpcc --warehouses=100`)
+		db := c.Conn(ctx, t.L(), target)
+		defer db.Close()
+		if err := WaitFor3XReplication(ctx, t, db); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // partialDecommissionStep runs `cockroach node decommission --wait=none` from a
@@ -135,7 +151,7 @@ func fullyDecommissionStep(target, from int, binaryVersion string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		c := u.c
 		c.Run(ctx, c.Node(from), cockroachBinaryPath(binaryVersion), "node", "decommission",
-			"--wait=all", "--insecure", strconv.Itoa(target))
+			"--wait=all", "--checks=skip", "--insecure", strconv.Itoa(target))
 	}
 }
 

@@ -73,10 +73,13 @@ func AlterColumnType(
 			}
 		}
 		if found {
-			return params.p.dependentViewError(
+			return params.p.dependentError(
 				ctx, "column", col.GetName(), tableDesc.ParentID, tableRef.ID, "alter type of",
 			)
 		}
+	}
+	if err := schemaexpr.ValidateTTLExpressionDoesNotDependOnColumn(tableDesc, tableDesc.GetRowLevelTTL(), col); err != nil {
+		return err
 	}
 
 	typ, err := tree.ResolveType(ctx, t.ToType, params.p.semaCtx.GetTypeResolver())
@@ -101,7 +104,7 @@ func AlterColumnType(
 		}
 	}
 
-	err = colinfo.ValidateColumnDefType(typ)
+	err = colinfo.ValidateColumnDefType(ctx, params.EvalContext().Settings.Version, typ)
 	if err != nil {
 		return err
 	}
@@ -190,7 +193,7 @@ func alterColumnTypeGeneral(
 					errors.IssueLink{IssueURL: build.MakeIssueURL(49329)}),
 				"you can enable alter column type general support by running "+
 					"`SET enable_experimental_alter_column_type_general = true`"),
-			pgcode.FeatureNotSupported)
+			pgcode.ExperimentalFeature)
 	}
 
 	// Disallow ALTER COLUMN TYPE general for columns that own sequences.
@@ -200,64 +203,39 @@ func alterColumnTypeGeneral(
 
 	// Disallow ALTER COLUMN TYPE general for columns that have a check
 	// constraint.
-	for i := range tableDesc.Checks {
-		uses, err := tableDesc.CheckConstraintUsesColumn(tableDesc.Checks[i], col.GetID())
-		if err != nil {
-			return err
-		}
-		if uses {
+	for _, ck := range tableDesc.EnforcedCheckConstraints() {
+		if ck.CollectReferencedColumnIDs().Contains(col.GetID()) {
 			return colWithConstraintNotSupportedErr
 		}
 	}
 
 	// Disallow ALTER COLUMN TYPE general for columns that have a
 	// UNIQUE WITHOUT INDEX constraint.
-	for _, uc := range tableDesc.AllActiveAndInactiveUniqueWithoutIndexConstraints() {
-		for _, id := range uc.ColumnIDs {
-			if col.GetID() == id {
-				return colWithConstraintNotSupportedErr
-			}
+	for _, uc := range tableDesc.UniqueConstraintsWithoutIndex() {
+		if uc.CollectKeyColumnIDs().Contains(col.GetID()) {
+			return colWithConstraintNotSupportedErr
 		}
 	}
 
 	// Disallow ALTER COLUMN TYPE general for columns that have a foreign key
 	// constraint.
-	for _, fk := range tableDesc.AllActiveAndInactiveForeignKeys() {
-		if fk.OriginTableID == tableDesc.GetID() {
-			for _, id := range fk.OriginColumnIDs {
-				if col.GetID() == id {
-					return colWithConstraintNotSupportedErr
-				}
-			}
+	for _, fk := range tableDesc.OutboundForeignKeys() {
+		if fk.CollectOriginColumnIDs().Contains(col.GetID()) {
+			return colWithConstraintNotSupportedErr
 		}
-		if fk.ReferencedTableID == tableDesc.GetID() {
-			for _, id := range fk.ReferencedColumnIDs {
-				if col.GetID() == id {
-					return colWithConstraintNotSupportedErr
-				}
-			}
+		if fk.GetReferencedTableID() == tableDesc.GetID() &&
+			fk.CollectReferencedColumnIDs().Contains(col.GetID()) {
+			return colWithConstraintNotSupportedErr
 		}
 	}
 
 	// Disallow ALTER COLUMN TYPE general for columns that are
 	// part of indexes.
 	for _, idx := range tableDesc.NonDropIndexes() {
-		for i := 0; i < idx.NumKeyColumns(); i++ {
-			if idx.GetKeyColumnID(i) == col.GetID() {
-				return colInIndexNotSupportedErr
-			}
-		}
-		for i := 0; i < idx.NumKeySuffixColumns(); i++ {
-			if idx.GetKeySuffixColumnID(i) == col.GetID() {
-				return colInIndexNotSupportedErr
-			}
-		}
-		if !idx.Primary() {
-			for i := 0; i < idx.NumSecondaryStoredColumns(); i++ {
-				if idx.GetStoredColumnID(i) == col.GetID() {
-					return colInIndexNotSupportedErr
-				}
-			}
+		if idx.CollectKeyColumnIDs().Contains(col.GetID()) ||
+			idx.CollectKeySuffixColumnIDs().Contains(col.GetID()) ||
+			idx.CollectSecondaryStoredColumnIDs().Contains(col.GetID()) {
+			return colInIndexNotSupportedErr
 		}
 	}
 
@@ -282,8 +260,7 @@ func alterColumnTypeGeneral(
 	}
 
 	nameExists := func(name string) bool {
-		_, err := tableDesc.FindColumnWithName(tree.Name(name))
-		return err == nil
+		return catalog.FindColumnByName(tableDesc, name) != nil
 	}
 
 	shadowColName := tabledesc.GenerateUniqueName(col.GetName(), nameExists)
@@ -305,10 +282,11 @@ func alterColumnTypeGeneral(
 			tableDesc,
 			using,
 			toType,
-			"ALTER COLUMN TYPE USING EXPRESSION",
+			tree.AlterColumnTypeUsingExpr,
 			&params.p.semaCtx,
 			volatility.Volatile,
 			tn,
+			params.ExecCfg().Settings.Version.ActiveVersion(ctx),
 		)
 
 		if err != nil {

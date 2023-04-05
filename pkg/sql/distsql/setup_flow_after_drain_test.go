@@ -39,15 +39,16 @@ func TestSetupFlowAfterDrain(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 	cfg := s.DistSQLServer().(*ServerImpl).ServerConfig
 
-	flowScheduler := flowinfra.NewFlowScheduler(cfg.AmbientContext, cfg.Stopper, cfg.Settings)
-	flowScheduler.Init(cfg.Metrics)
+	remoteFlowRunner := flowinfra.NewRemoteFlowRunner(cfg.AmbientContext, cfg.Stopper, nil /* acc */)
+	remoteFlowRunner.Init(cfg.Metrics)
 	distSQLSrv := NewServer(
 		ctx,
 		cfg,
-		flowScheduler,
+		remoteFlowRunner,
 	)
 	distSQLSrv.flowRegistry.Drain(
-		time.Duration(0) /* flowDrainWait */, time.Duration(0) /* minFlowDrainWait */, nil /* reporter */)
+		time.Duration(0) /* flowDrainWait */, time.Duration(0) /* minFlowDrainWait */, nil, /* reporter */
+	)
 
 	// We create some flow; it doesn't matter what.
 	req := execinfrapb.SetupFlowRequest{Version: execinfra.Version}

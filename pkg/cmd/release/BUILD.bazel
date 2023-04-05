@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
@@ -11,13 +12,17 @@ go_library(
         "metadata.go",
         "orchestration.go",
         "pick_sha.go",
+        "roachtest_predecessors.go",
         "sender.go",
         "sentry.go",
+        "set_cockroach_version.go",
         "templates.go",
+        "update_versions.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/cmd/release",
     visibility = ["//visibility:private"],
     deps = [
+        "//pkg/util/timeutil",
         "@com_github_andygrunwald_go_jira//:go-jira",
         "@com_github_google_go_github_v42//github",
         "@com_github_jordan_wright_email//:email",
@@ -38,12 +43,19 @@ go_test(
     name = "release_test",
     srcs = [
         "blockers_test.go",
+        "roachtest_predecessors_test.go",
         "sender_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob([
         "templates/**",
         "testdata/**",
     ]),
     embed = [":release_lib"],
-    deps = ["@com_github_stretchr_testify//require"],
+    deps = [
+        "@com_github_masterminds_semver_v3//:semver",
+        "@com_github_stretchr_testify//require",
+    ],
 )
+
+get_x_data(name = "get_x_data")

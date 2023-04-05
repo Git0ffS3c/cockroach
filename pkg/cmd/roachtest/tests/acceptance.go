@@ -21,56 +21,59 @@ import (
 
 func registerAcceptance(r registry.Registry) {
 	testCases := map[registry.Owner][]struct {
-		name            string
-		fn              func(ctx context.Context, t test.Test, c cluster.Cluster)
-		skip            string
-		minVersion      string
-		numNodes        int
-		timeout         time.Duration
-		encryptAtRandom bool
+		name              string
+		fn                func(ctx context.Context, t test.Test, c cluster.Cluster)
+		skip              string
+		numNodes          int
+		timeout           time.Duration
+		encryptionSupport registry.EncryptionSupport
 	}{
 		registry.OwnerKV: {
 			{name: "decommission-self", fn: runDecommissionSelf},
 			{name: "event-log", fn: runEventLog},
-			{name: "gossip/peerings", fn: runGossipPeerings},
+			{name: "gossip/peerings", fn: runGossipPeerings, skip: "flaky test. tracked in #96091"},
 			{name: "gossip/restart", fn: runGossipRestart},
 			{
-				name: "gossip/restart-node-one",
-				fn:   runGossipRestartNodeOne,
+				name:              "gossip/restart-node-one",
+				fn:                runGossipRestartNodeOne,
+				encryptionSupport: registry.EncryptionAlwaysDisabled,
 			},
 			{name: "gossip/locality-address", fn: runCheckLocalityIPAddress},
-			{
-				name:       "multitenant",
-				minVersion: "v20.2.0", // multitenancy is introduced in this cycle
-				fn:         runAcceptanceMultitenant,
-			},
 			{name: "reset-quorum", fn: runResetQuorum, numNodes: 8},
 			{
 				name: "many-splits", fn: runManySplits,
-				minVersion:      "v19.2.0", // SQL syntax unsupported on 19.1.x
-				encryptAtRandom: true,
+				encryptionSupport: registry.EncryptionMetamorphic,
 			},
-			{
-				name: "version-upgrade",
-				fn: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					runVersionUpgrade(ctx, t, c)
-				},
-				// This test doesn't like running on old versions because it upgrades to
-				// the latest released version and then it tries to "head", where head is
-				// the cockroach binary built from the branch on which the test is
-				// running. If that branch corresponds to an older release, then upgrading
-				// to head after 19.2 fails.
-				minVersion: "v19.2.0",
-				timeout:    30 * time.Minute,
-			},
-		},
-		registry.OwnerServer: {
-			{name: "build-info", fn: RunBuildInfo},
-			{name: "build-analyze", fn: RunBuildAnalyze},
 			{name: "cli/node-status", fn: runCLINodeStatus},
 			{name: "cluster-init", fn: runClusterInit},
 			{name: "rapid-restart", fn: runRapidRestart},
+		},
+		registry.OwnerMultiTenant: {
+			{
+				name: "multitenant",
+				fn:   runAcceptanceMultitenant,
+			},
+		},
+		registry.OwnerObsInf: {
 			{name: "status-server", fn: runStatusServer},
+		},
+		registry.OwnerDevInf: {
+			{name: "build-info", fn: RunBuildInfo},
+			{name: "build-analyze", fn: RunBuildAnalyze},
+		},
+		registry.OwnerTestEng: {
+			{
+				name:    "version-upgrade",
+				fn:      runVersionUpgrade,
+				timeout: 30 * time.Minute,
+			},
+		},
+		registry.OwnerDisasterRecovery: {
+			{
+				name:     "c2c",
+				fn:       runAcceptanceClusterReplication,
+				numNodes: 3,
+			},
 		},
 	}
 	tags := []string{"default", "quick"}
@@ -102,7 +105,7 @@ func registerAcceptance(r registry.Registry) {
 			if tc.timeout != 0 {
 				spec.Timeout = tc.timeout
 			}
-			spec.EncryptAtRandom = tc.encryptAtRandom
+			spec.EncryptionSupport = tc.encryptionSupport
 			spec.Run = func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				tc.fn(ctx, t, c)
 			}

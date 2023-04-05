@@ -16,6 +16,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -56,9 +57,9 @@ func (s *State) Update(since time.Duration) {
 // Request processes a request for more tokens and updates the State
 // accordingly.
 func (s *State) Request(
-	ctx context.Context, req *roachpb.TokenBucketRequest,
-) roachpb.TokenBucketResponse {
-	var res roachpb.TokenBucketResponse
+	ctx context.Context, req *kvpb.TokenBucketRequest,
+) kvpb.TokenBucketResponse {
+	var res kvpb.TokenBucketResponse
 
 	// Calculate the fallback rate.
 	res.FallbackRate = s.RURefillRate
@@ -131,28 +132,27 @@ func (s *State) Request(
 //
 // Arguments:
 //
-//  - availableRU is the amount of Request Units that the tenant can consume at
-//    will. Also known as "burst RUs".
+//   - availableRU is the amount of Request Units that the tenant can consume at
+//     will. Also known as "burst RUs".
 //
-//  - refillRate is the amount of Request Units per second that the tenant
-//    receives.
+//   - refillRate is the amount of Request Units per second that the tenant
+//     receives.
 //
-//  - maxBurstRU is the maximum amount of Request Units that can be accumulated
-//    from the refill rate, or 0 if there is no limit.
+//   - maxBurstRU is the maximum amount of Request Units that can be accumulated
+//     from the refill rate, or 0 if there is no limit.
 //
-//  - asOf is a timestamp; the reconfiguration request is assumed to be based on
-//    the consumption at that time. This timestamp is used to compensate for any
-//    refill that would have happened in the meantime.
+//   - asOf is a timestamp; the reconfiguration request is assumed to be based on
+//     the consumption at that time. This timestamp is used to compensate for any
+//     refill that would have happened in the meantime.
 //
-//  - asOfConsumedRequestUnits is the total number of consumed RUs based on
-//    which the reconfiguration values were calculated (i.e. at the asOf time).
-//    It is used to adjust availableRU with the consumption that happened in the
-//    meantime.
+//   - asOfConsumedRequestUnits is the total number of consumed RUs based on
+//     which the reconfiguration values were calculated (i.e. at the asOf time).
+//     It is used to adjust availableRU with the consumption that happened in the
+//     meantime.
 //
-//  - now is the current time.
+//   - now is the current time.
 //
-//  - currentConsumedRequestUnits is the current total number of consumed RUs.
-//
+//   - currentConsumedRequestUnits is the current total number of consumed RUs.
 func (s *State) Reconfigure(
 	ctx context.Context,
 	tenantID roachpb.TenantID,

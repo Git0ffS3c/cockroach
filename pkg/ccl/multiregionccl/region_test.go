@@ -10,15 +10,19 @@ package multiregionccl_test
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -27,16 +31,86 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// startTestCluster starts a 3 node cluster.
+//
+// Note, if a testfeed depends on particular testing knobs, those may
+// need to be applied to each of the servers in the test cluster
+// returned from this function.
+func TestMultiRegionDatabaseStats(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t, "times out under race")
+
+	ctx := context.Background()
+	knobs := base.TestingKnobs{}
+
+	tc, db, cleanup := multiregionccltestutils.TestingCreateMultiRegionClusterWithRegionList(
+		t,
+		[]string{"us-east", "us-west"},
+		3, /* serversPerRegion */
+		knobs,
+		multiregionccltestutils.WithUseDatabase("d"),
+	)
+
+	defer cleanup()
+
+	_, err := db.ExecContext(ctx,
+		`CREATE DATABASE test PRIMARY REGION "us-west";
+    USE test;
+    CREATE TABLE a(id uuid primary key);`)
+	require.NoError(t, err)
+
+	s := tc.Server(0)
+
+	testutils.SucceedsWithin(t, func() error {
+		// Get the list of nodes from ranges table
+		row := db.QueryRowContext(ctx,
+			`USE test;
+    WITH x AS (SHOW RANGES FROM TABLE a) SELECT replicas FROM x;`)
+		var nodesStr string
+		err = row.Scan(&nodesStr)
+		if err != nil {
+			return err
+		}
+
+		// string comes back "{1,2,3}".
+		nodesStr = strings.TrimLeft(nodesStr, "{")
+		nodesStr = strings.TrimRight(nodesStr, "}")
+		nodes := strings.Split(nodesStr, ",")
+
+		var resp serverpb.DatabaseDetailsResponse
+		require.NoError(t, serverutils.GetJSONProto(s, "/_admin/v1/databases/test?include_stats=true", &resp))
+
+		if resp.Stats.RangeCount != int64(1) {
+			return errors.Newf("expected range-count=1, got %d", resp.Stats.RangeCount)
+		}
+
+		if len(resp.Stats.NodeIDs) != len(nodes) {
+			return errors.Newf("expected node-ids=%s, got %s", nodes, resp.Stats.NodeIDs)
+		}
+
+		for i, n := range resp.Stats.NodeIDs {
+			if nodes[i] != fmt.Sprint(n) {
+				return errors.Newf("The nodes returned from endpoint do not match nodes listed in the show range from table. expected: %s; actual: %s", nodes, resp.Stats.NodeIDs)
+			}
+		}
+
+		return nil
+	}, 45*time.Second)
+}
+
 // TestConcurrentAddDropRegions tests all combinations of add/drop as if they
 // were executed by two concurrent sessions. The general sketch of the test is
 // as follows:
-// - First operation is executed and blocks before the enum members are promoted.
-// - The second operation starts once the first operation has reached the type
-//   schema changer. It continues to completion. It may succeed/fail depending
-//   on the specific test setup.
-// - The first operation is resumed and allowed to complete. We expect it to
-//   succeed.
-// - Verify database regions are as expected.
+//   - First operation is executed and blocks before the enum members are promoted.
+//   - The second operation starts once the first operation has reached the type
+//     schema changer. It continues to completion. It may succeed/fail depending
+//     on the specific test setup.
+//   - The first operation is resumed and allowed to complete. We expect it to
+//     succeed.
+//   - Verify database regions are as expected.
+//
 // Operations act on a multi-region database that contains a REGIONAL BY ROW
 // table, so as to exercise the repartitioning semantics.
 func TestConcurrentAddDropRegions(t *testing.T) {
@@ -149,12 +223,12 @@ CREATE DATABASE db WITH PRIMARY REGION "us-east1" REGIONS "us-east2", "us-east3"
 CREATE TABLE db.rbr () LOCALITY REGIONAL BY ROW`)
 			require.NoError(t, err)
 
-			go func() {
-				if _, err := sqlDB.Exec(tc.firstOp); err != nil {
+			go func(firstOp string) {
+				if _, err := sqlDB.Exec(firstOp); err != nil {
 					t.Error(err)
 				}
 				close(firstOpFinished)
-			}()
+			}(tc.firstOp)
 
 			// Wait for the first operation to reach the type schema changer.
 			<-firstOpStarted
@@ -288,12 +362,12 @@ CREATE TABLE db.rbr(k INT PRIMARY KEY, v INT NOT NULL) LOCALITY REGIONAL BY ROW;
 `)
 				require.NoError(t, err)
 
-				go func() {
+				go func(cmd string, shouldSucceed bool) {
 					defer func() {
 						close(typeChangeFinished)
 					}()
-					_, err := sqlDB.Exec(regionAlterCmd.cmd)
-					if regionAlterCmd.shouldSucceed {
+					_, err := sqlDB.Exec(cmd)
+					if shouldSucceed {
 						if err != nil {
 							t.Errorf("expected success, got %v", err)
 						}
@@ -302,7 +376,7 @@ CREATE TABLE db.rbr(k INT PRIMARY KEY, v INT NOT NULL) LOCALITY REGIONAL BY ROW;
 							t.Errorf("expected error boom, found %v", err)
 						}
 					}
-				}()
+				}(regionAlterCmd.cmd, regionAlterCmd.shouldSucceed)
 
 				<-typeChangeStarted
 
@@ -350,7 +424,7 @@ func TestSettingPlacementAmidstAddDrop(t *testing.T) {
 ALTER TABLE db.public.global CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 5,
 	num_voters = 3,
@@ -366,7 +440,7 @@ ALTER TABLE db.public.global CONFIGURE ZONE USING
 ALTER TABLE db.public.global CONFIGURE ZONE USING
 	range_min_bytes = 134217728,
 	range_max_bytes = 536870912,
-	gc.ttlseconds = 90000,
+	gc.ttlseconds = 14400,
 	global_reads = true,
 	num_replicas = 3,
 	num_voters = 3,
@@ -405,14 +479,14 @@ CREATE TABLE db.global () LOCALITY GLOBAL;`)
 			require.NoError(t, err)
 			_, err = sqlDB.Exec(`SET CLUSTER SETTING sql.defaults.multiregion_placement_policy.enabled = true;`)
 			require.NoError(t, err)
-			go func() {
+			go func(regionOp string) {
 				defer func() {
 					close(regionOpFinished)
 				}()
 
-				_, err := sqlDB.Exec(tc.regionOp)
+				_, err := sqlDB.Exec(regionOp)
 				require.NoError(t, err)
-			}()
+			}(tc.regionOp)
 
 			<-regionOpStarted
 			_, err = sqlDB.Exec(tc.placementOp)
@@ -830,8 +904,8 @@ func TestRegionAddDropWithConcurrentBackupOps(t *testing.T) {
 	}{
 		{
 			name:      "backup-database",
-			backupOp:  `BACKUP DATABASE db TO 'nodelocal://0/db_backup'`,
-			restoreOp: `RESTORE DATABASE db FROM 'nodelocal://0/db_backup'`,
+			backupOp:  `BACKUP DATABASE db TO 'nodelocal://1/db_backup'`,
+			restoreOp: `RESTORE DATABASE db FROM 'nodelocal://1/db_backup'`,
 		},
 	}
 
@@ -883,15 +957,15 @@ INSERT INTO db.rbr VALUES (1,1),(2,2),(3,3);
 `)
 				require.NoError(t, err)
 
-				go func() {
+				go func(cmd string) {
 					defer func() {
 						close(typeChangeFinished)
 					}()
-					_, err := sqlDBBackup.Exec(regionAlterCmd.cmd)
+					_, err := sqlDBBackup.Exec(cmd)
 					if err != nil {
-						t.Errorf("expected success, got %v when executing %s", err, regionAlterCmd.cmd)
+						t.Errorf("expected success, got %v when executing %s", err, cmd)
 					}
-				}()
+				}(regionAlterCmd.cmd)
 
 				<-typeChangeStarted
 

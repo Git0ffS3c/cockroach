@@ -54,10 +54,28 @@ in let og = labels("outs",  $targets)
 in $og - filter(".*:.*(-gen|gen-).*", $og)`,
 	},
 	{
+		target: "diagrams",
+		query:  `labels("outs", //docs/generated/sql/bnf:svg)`,
+	},
+	{
+		target: "bnf",
+		query:  `labels("outs", //docs/generated/sql/bnf:bnf)`,
+	},
+	{
 		target: "docs",
+		query:  `kind("generated file", //docs/...:*) - ({{ template "diagrams" $ }})`,
+	},
+	{
+		target: "parser",
+		query:  `labels("outs", kind("genrule rule", //pkg/sql/sem/... + //pkg/sql/parser/... + //pkg/sql/lexbase/...))`,
+	},
+	{
+		target: "schemachanger",
 		query: `
-kind("generated file", //docs/...:*)
-  - labels("outs", //docs/generated/sql/bnf:svg)`,
+kind("generated file", //pkg/sql/schemachanger/...:*)
+  + kind("generated file", //pkg/ccl/schemachangerccl:*)
+  - labels("out", kind("_gomock_prog_gen rule", //pkg/sql/schemachanger/...:*))
+`,
 	},
 	{
 		target: "excluded",
@@ -66,8 +84,8 @@ let all = kind("generated file", {{ .All }})
 in ($all ^ labels("out", kind("_gomock_prog_gen rule",  {{ .All }})))
   + filter(".*:.*(-gen|gen-).*", $all)
   + //pkg/testutils/lint/passes/errcheck:errcheck_excludes.txt
-  + //build/bazelutil:test_stamping.txt
-  + labels("outs", //docs/generated/sql/bnf:svg)
+  + //build/bazelutil:test_force_build_cdeps.txt
+  + //pkg/cmd/mirror/npm:*
 `,
 		doNotGenerate: true,
 	},
@@ -80,13 +98,17 @@ kind("bindata", {{ .All }})`,
 		target: "misc",
 		query: `
 kind("generated file", {{ .All }}) - (
-    {{ template "protobuf" $ }}
-  + {{ template "gomock" $ }}
-  + {{ template "stringer" $ }}
-  + {{ template "execgen" $ }}
-  + {{ template "optgen" $ }}
-  + {{ template "docs" $ }}
-  + {{ template "excluded" $ }}
+    ({{ template "protobuf" $ }})
+  + ({{ template "gomock" $ }})
+  + ({{ template "stringer" $ }})
+  + ({{ template "execgen" $ }})
+  + ({{ template "optgen" $ }})
+  + ({{ template "docs" $ }})
+  + ({{ template "excluded" $ }})
+  + ({{ template "parser" $ }})
+  + ({{ template "schemachanger" $ }})
+  + ({{ template "diagrams" $ }})
+  + ({{ template "bnf" $ }})
 )`,
 	},
 }

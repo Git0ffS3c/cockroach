@@ -27,7 +27,7 @@ import { call, takeEvery } from "redux-saga/effects";
 import { PayloadAction } from "src/interfaces/action";
 
 const STORAGE_PREFIX = "cockroachui";
-const SET_UI_VALUE = `${STORAGE_PREFIX}/ui/SET_UI_VALUE`;
+export const SET_UI_VALUE = `${STORAGE_PREFIX}/ui/SET_UI_VALUE`;
 
 export interface LocalSettingData {
   key: string;
@@ -61,7 +61,7 @@ function saveToSessionStorage(data: LocalSettingData) {
  * Retrieve local setting value by key from sessionStorage.
  * Value is stored as a stringified JSON so has to be parsed back.
  */
-function getValueFromSessionStorage(key: string) {
+export function getValueFromSessionStorage(key: string) {
   const value = sessionStorage.getItem(`${STORAGE_PREFIX}/${key}`);
   return JSON.parse(value);
 }
@@ -135,9 +135,7 @@ export class LocalSetting<S, T> {
    * @param state The current top-level redux state of the application.
    */
   selectorToArray = (state: S): string[] | null => {
-    const value = this._value(state)
-      ?.toString()
-      .split(",");
+    const value = this._value(state)?.toString().split(",");
 
     return value ?? null;
   };
@@ -159,6 +157,9 @@ export class LocalSetting<S, T> {
       innerSelector,
       () => getValueFromSessionStorage(this.key),
       (uiSettings, cachedValue) => {
+        if (cachedValue != null && uiSettings[this.key] == null) {
+          uiSettings[this.key] = cachedValue;
+        }
         return uiSettings[this.key] ?? cachedValue ?? defaultValue;
       },
     );

@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -39,7 +40,7 @@ func startMonitorWithBudget(budget int64) *mon.BytesMonitor {
 		nil, nil,
 		128 /* small allocation increment */, 100,
 		cluster.MakeTestingClusterSettings())
-	mm.Start(context.Background(), nil, mon.MakeStandaloneBudget(budget))
+	mm.Start(context.Background(), nil, mon.NewStandaloneBudget(budget))
 	return mm
 }
 
@@ -197,7 +198,7 @@ func TestDBClientScan(t *testing.T) {
 		retryScanErr := errors.New("retry scan")
 
 		feed, err := f.RangeFeed(ctx, "foo-feed", []roachpb.Span{fooSpan}, db.Clock().Now(),
-			func(ctx context.Context, value *roachpb.RangeFeedValue) {},
+			func(ctx context.Context, value *kvpb.RangeFeedValue) {},
 
 			rangefeed.WithScanRetryBehavior(rangefeed.ScanRetryRemaining),
 			rangefeed.WithInitialScanParallelismFn(func() int { return parallelism }),

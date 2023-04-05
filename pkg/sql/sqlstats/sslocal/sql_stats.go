@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/outliers"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/insights"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/ssmemstorage"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -67,7 +67,8 @@ type SQLStats struct {
 
 	knobs *sqlstats.TestingKnobs
 
-	outliers *outliers.Registry
+	insights           insights.WriterProvider
+	latencyInformation insights.LatencyInformation
 }
 
 func newSQLStats(
@@ -75,10 +76,12 @@ func newSQLStats(
 	uniqueStmtFingerprintLimit *settings.IntSetting,
 	uniqueTxnFingerprintLimit *settings.IntSetting,
 	curMemBytesCount *metric.Gauge,
-	maxMemBytesHist *metric.Histogram,
+	maxMemBytesHist metric.IHistogram,
+	insightsWriter insights.WriterProvider,
 	parentMon *mon.BytesMonitor,
 	flushTarget Sink,
 	knobs *sqlstats.TestingKnobs,
+	latencyInformation insights.LatencyInformation,
 ) *SQLStats {
 	monitor := mon.NewMonitor(
 		"SQLStats",
@@ -95,16 +98,17 @@ func newSQLStats(
 		uniqueTxnFingerprintLimit:  uniqueTxnFingerprintLimit,
 		flushTarget:                flushTarget,
 		knobs:                      knobs,
-		outliers:                   outliers.New(st),
+		insights:                   insightsWriter,
+		latencyInformation:         latencyInformation,
 	}
 	s.mu.apps = make(map[string]*ssmemstorage.Container)
 	s.mu.mon = monitor
-	s.mu.mon.Start(context.Background(), parentMon, mon.BoundAccount{})
+	s.mu.mon.StartNoReserved(context.Background(), parentMon)
 	return s
 }
 
 // GetTotalFingerprintCount returns total number of unique statement and
-// transaction fingerprints stored in the currnet SQLStats.
+// transaction fingerprints stored in the current SQLStats.
 func (s *SQLStats) GetTotalFingerprintCount() int64 {
 	return atomic.LoadInt64(&s.atomic.uniqueStmtFingerprintCount) + atomic.LoadInt64(&s.atomic.uniqueTxnFingerprintCount)
 }
@@ -133,7 +137,8 @@ func (s *SQLStats) getStatsForApplication(appName string) *ssmemstorage.Containe
 		s.mu.mon,
 		appName,
 		s.knobs,
-		s.outliers,
+		s.insights(false /* internal */),
+		s.latencyInformation,
 	)
 	s.mu.apps[appName] = a
 	return a
@@ -155,6 +160,7 @@ func (s *SQLStats) resetAndMaybeDumpStats(ctx context.Context, target Sink) (err
 	// different application_names seen so far.
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Clear the per-apps maps manually,
 	// because any SQL session currently open has cached the
@@ -185,15 +191,10 @@ func (s *SQLStats) resetAndMaybeDumpStats(ctx context.Context, target Sink) (err
 		statsContainer.Clear(ctx)
 	}
 	s.mu.lastReset = timeutil.Now()
-	s.mu.Unlock()
 
 	return err
 }
 
-// IterateOutliers calls visitor with each of the currently retained set of
-// execution outliers.
-func (s *SQLStats) IterateOutliers(
-	ctx context.Context, visitor func(context.Context, *outliers.Outlier),
-) {
-	s.outliers.IterateOutliers(ctx, visitor)
+func (s *SQLStats) GetClusterSettings() *cluster.Settings {
+	return s.st
 }

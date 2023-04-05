@@ -34,8 +34,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const tpchVecPerfSlownessThreshold = 1.5
-
 var tpchTables = []string{
 	"nation", "region", "part", "supplier",
 	"partsupp", "customer", "orders", "lineitem",
@@ -46,9 +44,6 @@ type tpchVecTestRunConfig struct {
 	// numRunsPerQuery determines how many time a single query runs, set to 1
 	// by default.
 	numRunsPerQuery int
-	// queriesToRun specifies which queries to run (in [1, tpch.NumQueries]
-	// range).
-	queriesToRun []int
 	// clusterSetups specifies all cluster setup queries that need to be
 	// executed before running any of the TPCH queries. First dimension
 	// determines the number of different clusterSetups a tpchvec test is run
@@ -73,10 +68,8 @@ func performClusterSetup(t test.Test, conn *gosql.DB, clusterSetup []string) {
 type tpchVecTestCase interface {
 	// getRunConfig returns the configuration of tpchvec test run.
 	getRunConfig() tpchVecTestRunConfig
-	// preTestRunHook is called before any tpch query is run. Can be used to
-	// perform any setup that cannot be expressed as a modification to
-	// cluster-wide settings (those should go into tpchVecTestRunConfig).
-	preTestRunHook(ctx context.Context, t test.Test, c cluster.Cluster, conn *gosql.DB, clusterSetup []string)
+	// preQueryRunHook is called before each tpch query is run.
+	preQueryRunHook(t test.Test, conn *gosql.DB, clusterSetup []string)
 	// postQueryRunHook is called after each tpch query is run with the output and
 	// the index of the setup it was run in.
 	postQueryRunHook(t test.Test, output []byte, setupIdx int)
@@ -90,7 +83,7 @@ type tpchVecTestCase interface {
 type tpchVecTestCaseBase struct{}
 
 func (b tpchVecTestCaseBase) getRunConfig() tpchVecTestRunConfig {
-	runConfig := tpchVecTestRunConfig{
+	return tpchVecTestRunConfig{
 		numRunsPerQuery: 1,
 		clusterSetups: [][]string{{
 			"RESET CLUSTER SETTING sql.distsql.temp_storage.workmem",
@@ -98,19 +91,10 @@ func (b tpchVecTestCaseBase) getRunConfig() tpchVecTestRunConfig {
 		}},
 		setupNames: []string{"default"},
 	}
-	for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
-		runConfig.queriesToRun = append(runConfig.queriesToRun, queryNum)
-	}
-	return runConfig
 }
 
-func (b tpchVecTestCaseBase) preTestRunHook(
-	t test.Test, conn *gosql.DB, clusterSetup []string, createStats bool,
-) {
+func (b tpchVecTestCaseBase) preQueryRunHook(t test.Test, conn *gosql.DB, clusterSetup []string) {
 	performClusterSetup(t, conn, clusterSetup)
-	if createStats {
-		createStatsFromTables(t, conn, tpchTables)
-	}
 }
 
 func (b tpchVecTestCaseBase) postQueryRunHook(test.Test, []byte, int) {}
@@ -121,15 +105,17 @@ func (b tpchVecTestCaseBase) postTestRunHook(
 }
 
 type tpchVecPerfHelper struct {
+	setupNames     []string
 	timeByQueryNum []map[int][]float64
 }
 
-func newTpchVecPerfHelper(numSetups int) *tpchVecPerfHelper {
-	timeByQueryNum := make([]map[int][]float64, numSetups)
+func newTpchVecPerfHelper(setupNames []string) *tpchVecPerfHelper {
+	timeByQueryNum := make([]map[int][]float64, len(setupNames))
 	for i := range timeByQueryNum {
 		timeByQueryNum[i] = make(map[int][]float64)
 	}
 	return &tpchVecPerfHelper{
+		setupNames:     setupNames,
 		timeByQueryNum: timeByQueryNum,
 	}
 }
@@ -154,55 +140,99 @@ func (h *tpchVecPerfHelper) parseQueryOutput(t test.Test, output []byte, setupId
 	}
 }
 
+// compareSetups compares the runtimes of TPCH queries in different setups and
+// logs that comparison. The expectation is that the second "ON" setup should be
+// faster, and if that is not the case, then a warning message is included in
+// the log.
+func (h *tpchVecPerfHelper) compareSetups(
+	t test.Test,
+	numRunsPerQuery int,
+	timesCallback func(queryNum int, onTime, offTime float64, onTimes, offTimes []float64),
+) {
+	t.Status("comparing the runtimes (only median values for each query are compared)")
+	for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
+		findMedian := func(times []float64) float64 {
+			sort.Float64s(times)
+			return times[len(times)/2]
+		}
+		onTimes := h.timeByQueryNum[tpchPerfTestOnConfigIdx][queryNum]
+		onName := h.setupNames[tpchPerfTestOnConfigIdx]
+		offTimes := h.timeByQueryNum[tpchPerfTestOffConfigIdx][queryNum]
+		offName := h.setupNames[tpchPerfTestOffConfigIdx]
+		if len(onTimes) != numRunsPerQuery {
+			t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
+				"recorded with %s config: %v", queryNum, onName, onTimes))
+		}
+		if len(offTimes) != numRunsPerQuery {
+			t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
+				"recorded with %s config: %v", queryNum, offName, offTimes))
+		}
+		onTime := findMedian(onTimes)
+		offTime := findMedian(offTimes)
+		if offTime < onTime {
+			t.L().Printf(
+				fmt.Sprintf("[q%d] %s was faster by %.2f%%: "+
+					"%.2fs %s vs %.2fs %s --- WARNING\n"+
+					"%s times: %v\t %s times: %v",
+					queryNum, offName, 100*(onTime-offTime)/offTime, onTime, onName,
+					offTime, offName, onName, onTimes, offName, offTimes))
+		} else {
+			t.L().Printf(
+				fmt.Sprintf("[q%d] %s was faster by %.2f%%: "+
+					"%.2fs %s vs %.2fs %s\n"+
+					"%s times: %v\t %s times: %v",
+					queryNum, onName, 100*(offTime-onTime)/onTime, onTime, onName,
+					offTime, offName, onName, onTimes, offName, offTimes))
+		}
+		if timesCallback != nil {
+			timesCallback(queryNum, onTime, offTime, onTimes, offTimes)
+		}
+	}
+}
+
 const (
-	tpchPerfTestVecOnConfigIdx  = 1
-	tpchPerfTestVecOffConfigIdx = 0
+	tpchPerfTestOnConfigIdx  = 1
+	tpchPerfTestOffConfigIdx = 0
 )
 
 type tpchVecPerfTest struct {
 	tpchVecTestCaseBase
 	*tpchVecPerfHelper
 
-	disableStatsCreation bool
+	settingName       string
+	slownessThreshold float64
 }
 
 var _ tpchVecTestCase = &tpchVecPerfTest{}
 
-func newTpchVecPerfTest(disableStatsCreation bool) *tpchVecPerfTest {
+func newTpchVecPerfTest(settingName string, slownessThreshold float64) *tpchVecPerfTest {
 	return &tpchVecPerfTest{
-		tpchVecPerfHelper:    newTpchVecPerfHelper(2 /* numSetups */),
-		disableStatsCreation: disableStatsCreation,
+		tpchVecPerfHelper: newTpchVecPerfHelper([]string{"OFF", "ON"}),
+		settingName:       settingName,
+		slownessThreshold: slownessThreshold,
 	}
 }
 
 func (p tpchVecPerfTest) getRunConfig() tpchVecTestRunConfig {
 	runConfig := p.tpchVecTestCaseBase.getRunConfig()
-	if p.disableStatsCreation {
-		// Query 9 takes too long without stats, so we'll skip it.
-		runConfig.queriesToRun = append(runConfig.queriesToRun[:8], runConfig.queriesToRun[9:]...)
-	}
 	runConfig.numRunsPerQuery = 3
-	// Make a copy of the default configuration setup and add different
-	// vectorize setting updates. Note that it's ok that the default setup
-	// sets vectorize cluster setting to 'on' - we will override it with
-	// queries below.
+	// Make a copy of the default configuration setup and add different setting
+	// updates.
+	//
+	// When using sql.defaults.vectorize as the setting name, note that it's ok
+	// that the default setup sets vectorize cluster setting to 'on' - we will
+	// override it with queries below.
 	defaultSetup := runConfig.clusterSetups[0]
 	runConfig.clusterSetups = append(runConfig.clusterSetups, make([]string, len(defaultSetup)))
 	copy(runConfig.clusterSetups[1], defaultSetup)
-	runConfig.clusterSetups[tpchPerfTestVecOffConfigIdx] = append(runConfig.clusterSetups[tpchPerfTestVecOffConfigIdx],
-		"SET CLUSTER SETTING sql.defaults.vectorize=off")
-	runConfig.clusterSetups[tpchPerfTestVecOnConfigIdx] = append(runConfig.clusterSetups[tpchPerfTestVecOnConfigIdx],
-		"SET CLUSTER SETTING sql.defaults.vectorize=on")
+	runConfig.clusterSetups[tpchPerfTestOffConfigIdx] = append(runConfig.clusterSetups[tpchPerfTestOffConfigIdx],
+		fmt.Sprintf("SET CLUSTER SETTING %s=off", p.settingName))
+	runConfig.clusterSetups[tpchPerfTestOnConfigIdx] = append(runConfig.clusterSetups[tpchPerfTestOnConfigIdx],
+		fmt.Sprintf("SET CLUSTER SETTING %s=on", p.settingName))
 	runConfig.setupNames = make([]string, 2)
-	runConfig.setupNames[tpchPerfTestVecOffConfigIdx] = "off"
-	runConfig.setupNames[tpchPerfTestVecOnConfigIdx] = "on"
+	runConfig.setupNames[tpchPerfTestOffConfigIdx] = fmt.Sprintf("%s=off", p.settingName)
+	runConfig.setupNames[tpchPerfTestOnConfigIdx] = fmt.Sprintf("%s=on", p.settingName)
 	return runConfig
-}
-
-func (p tpchVecPerfTest) preTestRunHook(
-	ctx context.Context, t test.Test, c cluster.Cluster, conn *gosql.DB, clusterSetup []string,
-) {
-	p.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, !p.disableStatsCreation /* createStats */)
 }
 
 func (p *tpchVecPerfTest) postQueryRunHook(t test.Test, output []byte, setupIdx int) {
@@ -213,44 +243,12 @@ func (p *tpchVecPerfTest) postTestRunHook(
 	ctx context.Context, t test.Test, c cluster.Cluster, conn *gosql.DB,
 ) {
 	runConfig := p.getRunConfig()
-	t.Status("comparing the runtimes (only median values for each query are compared)")
-	for _, queryNum := range runConfig.queriesToRun {
-		findMedian := func(times []float64) float64 {
-			sort.Float64s(times)
-			return times[len(times)/2]
-		}
-		vecOnTimes := p.timeByQueryNum[tpchPerfTestVecOnConfigIdx][queryNum]
-		vecOffTimes := p.timeByQueryNum[tpchPerfTestVecOffConfigIdx][queryNum]
-		if len(vecOnTimes) != runConfig.numRunsPerQuery {
-			t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
-				"recorded with vec ON config: %v", queryNum, vecOnTimes))
-		}
-		if len(vecOffTimes) != runConfig.numRunsPerQuery {
-			t.Fatal(fmt.Sprintf("[q%d] unexpectedly wrong number of run times "+
-				"recorded with vec OFF config: %v", queryNum, vecOffTimes))
-		}
-		vecOnTime := findMedian(vecOnTimes)
-		vecOffTime := findMedian(vecOffTimes)
-		if vecOffTime < vecOnTime {
-			t.L().Printf(
-				fmt.Sprintf("[q%d] vec OFF was faster by %.2f%%: "+
-					"%.2fs ON vs %.2fs OFF --- WARNING\n"+
-					"vec ON times: %v\t vec OFF times: %v",
-					queryNum, 100*(vecOnTime-vecOffTime)/vecOffTime,
-					vecOnTime, vecOffTime, vecOnTimes, vecOffTimes))
-		} else {
-			t.L().Printf(
-				fmt.Sprintf("[q%d] vec ON was faster by %.2f%%: "+
-					"%.2fs ON vs %.2fs OFF\n"+
-					"vec ON times: %v\t vec OFF times: %v",
-					queryNum, 100*(vecOffTime-vecOnTime)/vecOnTime,
-					vecOnTime, vecOffTime, vecOnTimes, vecOffTimes))
-		}
-		if vecOnTime >= tpchVecPerfSlownessThreshold*vecOffTime {
-			// For some reason, the vectorized engine executed the query a lot
-			// slower than the row-by-row engine which is unexpected. In order
-			// to understand where the slowness comes from, we will run EXPLAIN
-			// ANALYZE (DEBUG) of the query with all `vectorize` options
+	p.tpchVecPerfHelper.compareSetups(t, runConfig.numRunsPerQuery, func(queryNum int, onTime, offTime float64, onTimes, offTimes []float64) {
+		if onTime >= p.slownessThreshold*offTime {
+			// For some reason, the ON setup executed the query a lot slower
+			// than the OFF setup which is unexpected. In order to understand
+			// where the slowness comes from, we will run EXPLAIN ANALYZE
+			// (DEBUG) of the query with all setup options
 			// tpchPerfTestNumRunsPerQuery times (hoping at least one will
 			// "catch" the slowness).
 			for setupIdx, setup := range runConfig.clusterSetups {
@@ -312,11 +310,11 @@ func (p *tpchVecPerfTest) postTestRunHook(
 				}
 			}
 			t.Fatal(fmt.Sprintf(
-				"[q%d] vec ON is slower by %.2f%% than vec OFF\n"+
-					"vec ON times: %v\nvec OFF times: %v",
-				queryNum, 100*(vecOnTime-vecOffTime)/vecOffTime, vecOnTimes, vecOffTimes))
+				"[q%d] ON is slower by %.2f%% than OFF\n"+
+					"ON times: %v\nOFF times: %v",
+				queryNum, 100*(onTime-offTime)/offTime, onTimes, offTimes))
 		}
-	}
+	})
 }
 
 type tpchVecBenchTest struct {
@@ -324,33 +322,24 @@ type tpchVecBenchTest struct {
 	*tpchVecPerfHelper
 
 	numRunsPerQuery int
-	queriesToRun    []int
 	clusterSetups   [][]string
-	setupNames      []string
 }
 
 var _ tpchVecTestCase = &tpchVecBenchTest{}
 
-// queriesToRun can be omitted in which case all queries that are not skipped
-// for the given version will be run.
 func newTpchVecBenchTest(
-	numRunsPerQuery int, queriesToRun []int, clusterSetups [][]string, setupNames []string,
+	numRunsPerQuery int, clusterSetups [][]string, setupNames []string,
 ) *tpchVecBenchTest {
 	return &tpchVecBenchTest{
-		tpchVecPerfHelper: newTpchVecPerfHelper(len(setupNames)),
+		tpchVecPerfHelper: newTpchVecPerfHelper(setupNames),
 		numRunsPerQuery:   numRunsPerQuery,
-		queriesToRun:      queriesToRun,
 		clusterSetups:     clusterSetups,
-		setupNames:        setupNames,
 	}
 }
 
 func (b tpchVecBenchTest) getRunConfig() tpchVecTestRunConfig {
 	runConfig := b.tpchVecTestCaseBase.getRunConfig()
 	runConfig.numRunsPerQuery = b.numRunsPerQuery
-	if b.queriesToRun != nil {
-		runConfig.queriesToRun = b.queriesToRun
-	}
 	defaultSetup := runConfig.clusterSetups[0]
 	// We slice up defaultSetup to make sure that new slices are allocated in
 	// appends below.
@@ -361,12 +350,6 @@ func (b tpchVecBenchTest) getRunConfig() tpchVecTestRunConfig {
 		runConfig.clusterSetups[setupIdx] = append(defaultSetup, configSetup...)
 	}
 	return runConfig
-}
-
-func (b tpchVecBenchTest) preTestRunHook(
-	_ context.Context, t test.Test, _ cluster.Cluster, conn *gosql.DB, clusterSetup []string,
-) {
-	b.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, true /* createStats */)
 }
 
 func (b *tpchVecBenchTest) postQueryRunHook(t test.Test, output []byte, setupIdx int) {
@@ -383,7 +366,7 @@ func (b *tpchVecBenchTest) postTestRunHook(
 	// and then all query scores are summed. So the lower the total score, the
 	// better the config is.
 	scores := make([]float64, len(runConfig.setupNames))
-	for _, queryNum := range runConfig.queriesToRun {
+	for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
 		// findAvgTime finds the average of times excluding best and worst as
 		// possible outliers. It expects that len(times) >= 3.
 		findAvgTime := func(times []float64) float64 {
@@ -432,10 +415,9 @@ type tpchVecDiskTest struct {
 	tpchVecTestCaseBase
 }
 
-func (d tpchVecDiskTest) preTestRunHook(
-	ctx context.Context, t test.Test, c cluster.Cluster, conn *gosql.DB, clusterSetup []string,
-) {
-	d.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, true /* createStats */)
+func (d tpchVecDiskTest) getRunConfig() tpchVecTestRunConfig {
+	runConfig := d.tpchVecTestCaseBase.getRunConfig()
+
 	// In order to stress the disk spilling of the vectorized engine, we will
 	// set workmem limit to a random value in range [650KiB, 2000KiB).
 	//
@@ -449,11 +431,11 @@ func (d tpchVecDiskTest) preTestRunHook(
 	// of disk queues (limiting us to use at most 2 input partitions).
 	rng, _ := randutil.NewTestRand()
 	workmemInKiB := 650 + rng.Intn(1350)
-	workmem := fmt.Sprintf("%dKiB", workmemInKiB)
-	t.Status(fmt.Sprintf("setting workmem='%s'", workmem))
-	if _, err := conn.Exec(fmt.Sprintf("SET CLUSTER SETTING sql.distsql.temp_storage.workmem='%s'", workmem)); err != nil {
-		t.Fatal(err)
+	workmemQuery := fmt.Sprintf("SET CLUSTER SETTING sql.distsql.temp_storage.workmem='%dKiB'", workmemInKiB)
+	for i := range runConfig.clusterSetups {
+		runConfig.clusterSetups[i] = append(runConfig.clusterSetups[i], workmemQuery)
 	}
+	return runConfig
 }
 
 func baseTestRun(
@@ -461,14 +443,13 @@ func baseTestRun(
 ) {
 	firstNode := c.Node(1)
 	runConfig := tc.getRunConfig()
-	for setupIdx, setup := range runConfig.clusterSetups {
-		t.Status(fmt.Sprintf("running setup=%s", runConfig.setupNames[setupIdx]))
-		tc.preTestRunHook(ctx, t, c, conn, setup)
-		for _, queryNum := range runConfig.queriesToRun {
+	for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
+		for setupIdx, setup := range runConfig.clusterSetups {
+			tc.preQueryRunHook(t, conn, setup)
 			// Note that we use --default-vectorize flag which tells tpch
 			// workload to use the current cluster setting
 			// sql.defaults.vectorize which must have been set correctly in
-			// preTestRunHook.
+			// preQueryRunHook.
 			cmd := fmt.Sprintf("./workload run tpch --concurrency=1 --db=tpch "+
 				"--default-vectorize --max-ops=%d --queries=%d {pgurl:1} --enable-checks=true",
 				runConfig.numRunsPerQuery, queryNum)
@@ -491,10 +472,10 @@ type tpchVecSmithcmpTest struct {
 
 const tpchVecSmithcmp = "smithcmp"
 
-func (s tpchVecSmithcmpTest) preTestRunHook(
+func smithcmpPreTestRunHook(
 	ctx context.Context, t test.Test, c cluster.Cluster, conn *gosql.DB, clusterSetup []string,
 ) {
-	s.tpchVecTestCaseBase.preTestRunHook(t, conn, clusterSetup, true /* createStats */)
+	performClusterSetup(t, conn, clusterSetup)
 	const smithcmpSHA = "a3f41f5ba9273249c5ecfa6348ea8ee3ac4b77e3"
 	node := c.Node(1)
 	if c.IsLocal() && runtime.GOOS != "linux" {
@@ -521,7 +502,7 @@ func smithcmpTestRun(
 	ctx context.Context, t test.Test, c cluster.Cluster, conn *gosql.DB, tc tpchVecTestCase,
 ) {
 	runConfig := tc.getRunConfig()
-	tc.preTestRunHook(ctx, t, c, conn, runConfig.clusterSetups[0])
+	smithcmpPreTestRunHook(ctx, t, c, conn, runConfig.clusterSetups[0])
 	const (
 		configFile = `tpchvec_smithcmp.toml`
 		configURL  = `https://raw.githubusercontent.com/cockroachdb/cockroach/master/pkg/cmd/roachtest/tests/` + configFile
@@ -549,9 +530,10 @@ func runTPCHVec(
 	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
 	conn := c.Conn(ctx, t.L(), 1)
-	disableAutoStats(t, conn)
 	t.Status("restoring TPCH dataset for Scale Factor 1")
-	if err := loadTPCHDataset(ctx, t, c, 1 /* sf */, c.NewMonitor(ctx), c.All()); err != nil {
+	if err := loadTPCHDataset(
+		ctx, t, c, conn, 1 /* sf */, c.NewMonitor(ctx), c.All(), true, /* disableMergeQueue */
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -575,7 +557,10 @@ func registerTPCHVec(r registry.Registry) {
 		Owner:   registry.OwnerSQLQueries,
 		Cluster: r.MakeClusterSpec(tpchVecNodeCount),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runTPCHVec(ctx, t, c, newTpchVecPerfTest(false /* disableStatsCreation */), baseTestRun)
+			runTPCHVec(ctx, t, c, newTpchVecPerfTest(
+				"sql.defaults.vectorize", /* settingName */
+				1.5,                      /* slownessThreshold */
+			), baseTestRun)
 		},
 	})
 
@@ -583,8 +568,6 @@ func registerTPCHVec(r registry.Registry) {
 		Name:    "tpchvec/disk",
 		Owner:   registry.OwnerSQLQueries,
 		Cluster: r.MakeClusterSpec(tpchVecNodeCount),
-		// 19.2 version doesn't have disk spilling nor memory monitoring, so
-		// there is no point in running this config on that version.
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runTPCHVec(ctx, t, c, tpchVecDiskTest{}, baseTestRun)
 		},
@@ -601,11 +584,14 @@ func registerTPCHVec(r registry.Registry) {
 	})
 
 	r.Add(registry.TestSpec{
-		Name:    "tpchvec/perf_no_stats",
+		Name:    "tpchvec/streamer",
 		Owner:   registry.OwnerSQLQueries,
 		Cluster: r.MakeClusterSpec(tpchVecNodeCount),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runTPCHVec(ctx, t, c, newTpchVecPerfTest(true /* disableStatsCreation */), baseTestRun)
+			runTPCHVec(ctx, t, c, newTpchVecPerfTest(
+				"sql.distsql.use_streamer.enabled", /* settingName */
+				1.5,                                /* slownessThreshold */
+			), baseTestRun)
 		},
 	})
 
@@ -631,8 +617,7 @@ func registerTPCHVec(r registry.Registry) {
 				setupNames = append(setupNames, fmt.Sprintf("%d", batchSize))
 			}
 			benchTest := newTpchVecBenchTest(
-				5,   /* numRunsPerQuery */
-				nil, /* queriesToRun */
+				5, /* numRunsPerQuery */
 				clusterSetups,
 				setupNames,
 			)

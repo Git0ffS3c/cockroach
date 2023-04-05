@@ -11,50 +11,11 @@ package changefeedccl
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
-
-// encodeRow holds all the pieces necessary to encode a row change into a key or
-// value.
-type encodeRow struct {
-	// datums is the new value of a changed table row.
-	datums rowenc.EncDatumRow
-	// updated is the mvcc timestamp corresponding to the latest
-	// update in `datums` or, if the row is part of a backfill,
-	// the time at which the backfill was started.
-	updated hlc.Timestamp
-	// mvccTimestamp is the mvcc timestamp corresponding to the
-	// latest update in `datums`.
-	mvccTimestamp hlc.Timestamp
-	// deleted is true if row is a deletion. In this case, only the primary
-	// key columns are guaranteed to be set in `datums`.
-	deleted bool
-	// tableDesc is a TableDescriptor for the table containing `datums`.
-	// It's valid for interpreting the row at `updated`.
-	tableDesc catalog.TableDescriptor
-	// familyID indicates which column family is populated on this row.
-	// It's valid for interpreting the row at `updated`.
-	familyID descpb.FamilyID
-	// prevDatums is the old value of a changed table row. The field is set
-	// to nil if the before value for changes was not requested (OptDiff).
-	prevDatums rowenc.EncDatumRow
-	// prevDeleted is true if prevDatums is missing or is a deletion.
-	prevDeleted bool
-	// prevTableDesc is a TableDescriptor for the table containing `prevDatums`.
-	// It's valid for interpreting the row at `updated.Prev()`.
-	prevTableDesc catalog.TableDescriptor
-	// prevFamilyID indicates which column family is populated in prevDatums.
-	prevFamilyID descpb.FamilyID
-	// topic is set to the string to be included if TopicInValue is true
-	topic string
-}
 
 // Encoder turns a row into a serialized changefeed key, value, or resolved
 // timestamp. It represents one of the `format=` changefeed options.
@@ -63,12 +24,17 @@ type Encoder interface {
 	// datums are expected to match 1:1 with the `Columns` field of the
 	// `TableDescriptor`, but only the primary key fields will be used. The
 	// returned bytes are only valid until the next call to Encode*.
-	EncodeKey(context.Context, encodeRow) ([]byte, error)
+	EncodeKey(context.Context, cdcevent.Row) ([]byte, error)
 	// EncodeValue encodes the primary key of the given row. The columns of the
 	// datums are expected to match 1:1 with the `Columns` field of the
 	// `TableDescriptor`. The returned bytes are only valid until the next call
 	// to Encode*.
-	EncodeValue(context.Context, encodeRow) ([]byte, error)
+	EncodeValue(
+		ctx context.Context,
+		evCtx eventContext,
+		updatedRow cdcevent.Row,
+		prevRow cdcevent.Row,
+	) ([]byte, error)
 	// EncodeResolvedTimestamp encodes a resolved timestamp payload for the
 	// given topic name. The returned bytes are only valid until the next call
 	// to Encode*.
@@ -76,42 +42,32 @@ type Encoder interface {
 }
 
 func getEncoder(
-	opts map[string]string, targets []jobspb.ChangefeedTargetSpecification,
+	opts changefeedbase.EncodingOptions,
+	targets changefeedbase.Targets,
+	p externalConnectionProvider,
+	sliMetrics *sliMetrics,
 ) (Encoder, error) {
-	switch changefeedbase.FormatType(opts[changefeedbase.OptFormat]) {
-	case ``, changefeedbase.OptFormatJSON:
-		return makeJSONEncoder(opts, targets)
+	switch opts.Format {
+	case changefeedbase.OptFormatJSON:
+		return makeJSONEncoder(opts)
 	case changefeedbase.OptFormatAvro, changefeedbase.DeprecatedOptFormatAvro:
-		return newConfluentAvroEncoder(opts, targets)
-	case changefeedbase.OptFormatNative:
-		return &nativeEncoder{}, nil
+		return newConfluentAvroEncoder(opts, targets, p, sliMetrics)
 	case changefeedbase.OptFormatCSV:
 		return newCSVEncoder(opts), nil
+	case changefeedbase.OptFormatParquet:
+		//We will return no encoder for parquet format because there is a separate
+		//sink implemented for parquet format for cloud storage, which does the job
+		//of both encoder and sink. See parquet_sink_cloudstorage.go file for more
+		//information on why this was needed.
+		return nil, nil
 	default:
-		return nil, errors.Errorf(`unknown %s: %s`, changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
+		return nil, errors.AssertionFailedf(`unknown format: %s`, opts.Format)
 	}
 }
 
-// nativeEncoder only implements EncodeResolvedTimestamp.
-// Unfortunately, the encoder assumes that it operates with encodeRow -- something
-// that's just not the case when emitting raw KVs.
-// In addition, there is a kafka specific concept (topic) that's exposed at the Encoder level.
-// TODO(yevgeniy): Refactor encoder interface so that it operates on kvfeed events.
-// In addition, decouple the concept of topic from the Encoder.
-type nativeEncoder struct{}
-
-func (e *nativeEncoder) EncodeKey(ctx context.Context, row encodeRow) ([]byte, error) {
-	return nil, errors.New("EncodeKey unexpectedly called on nativeEncoder")
+// timestampToString converts an internal timestamp to the string form used in
+// all encoders. This could be made more efficient. And/or it could be configurable
+// to include the Synthetic flag when present, but that's unlikely to be needed.
+func timestampToString(t hlc.Timestamp) string {
+	return t.WithSynthetic(false).AsOfSystemTime()
 }
-
-func (e *nativeEncoder) EncodeValue(ctx context.Context, row encodeRow) ([]byte, error) {
-	return nil, errors.New("EncodeValue unexpectedly called on nativeEncoder")
-}
-
-func (e *nativeEncoder) EncodeResolvedTimestamp(
-	ctx context.Context, s string, ts hlc.Timestamp,
-) ([]byte, error) {
-	return protoutil.Marshal(&ts)
-}
-
-var _ Encoder = &nativeEncoder{}

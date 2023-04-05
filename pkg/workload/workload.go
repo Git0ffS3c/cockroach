@@ -44,6 +44,18 @@ type Generator interface {
 	Tables() []Table
 }
 
+// SupportsFixtures returns whether the Generator supports initialization
+// via fixtures.
+func SupportsFixtures(gen Generator) bool {
+	for _, t := range gen.Tables() {
+		if t.InitialRows.FillBatch == nil {
+			return false
+		}
+	}
+	// Don't use fixtures if there are no tables.
+	return len(gen.Tables()) != 0
+}
+
 // FlagMeta is metadata about a workload flag.
 type FlagMeta struct {
 	// RuntimeOnly may be set to true only if the corresponding flag has no
@@ -111,7 +123,7 @@ type Hooks struct {
 	// PostLoad is called after workload tables are created workload data is
 	// loaded. It called after restoring a fixture. This, for example, is where
 	// creating foreign keys should go. Implementations should be idempotent.
-	PostLoad func(*gosql.DB) error
+	PostLoad func(context.Context, *gosql.DB) error
 	// PostRun is called after workload run has ended, with the duration of the
 	// run. This is where any post-run special printing or validation can be done.
 	PostRun func(time.Duration) error
@@ -132,17 +144,20 @@ type Meta struct {
 	Name string
 	// Description is a short description of this generator.
 	Description string
+	// RandomSeed points to the random seed to be used by this
+	// generator, if any.
+	RandomSeed RandomSeed
 	// Details optionally allows specifying longer, more in-depth usage details.
 	Details string
 	// Version is a semantic version for this generator. It should be bumped
 	// whenever InitialRowFn or InitialRowCount change for any of the tables.
 	Version string
-	// PublicFacing indicates that this workload is also intended for use by
-	// users doing their own testing and evaluations. This allows hiding workloads
-	// that are only expected to be used in CockroachDB's internal development to
-	// avoid confusion. Workloads setting this to true should pay added attention
-	// to their documentation and help-text.
-	PublicFacing bool
+
+	// TestInfraOnly indicates that a workload was primarily designed for
+	// internal testing by one team Cockroach Labs, and is expected to
+	// be of limited teaching value to other teams or end-users.
+	TestInfraOnly bool
+
 	// New returns an unconfigured instance of this generator.
 	New func() Generator
 }

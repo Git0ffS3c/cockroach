@@ -13,6 +13,7 @@ package rangefeed
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -41,6 +42,7 @@ type config struct {
 	onCheckpoint         OnCheckpoint
 	onFrontierAdvance    OnFrontierAdvance
 	onSSTable            OnSSTable
+	onDeleteRange        OnDeleteRange
 	extraPProfLabels     []string
 }
 
@@ -62,6 +64,12 @@ type scanConfig struct {
 
 	// configures retry behavior
 	retryBehavior ScanRetryBehavior
+
+	// overSystemTable indicates whether this rangefeed is over a system table
+	// (used internally for CRDB's own functioning) and therefore should be
+	// treated with a more appropriate admission pri (NormalPri instead of
+	// BulkNormalPri).
+	overSystemTable bool
 }
 
 type optionFunc func(*config)
@@ -143,7 +151,7 @@ func WithRetry(options retry.Options) Option {
 }
 
 // OnCheckpoint is called when a rangefeed checkpoint occurs.
-type OnCheckpoint func(ctx context.Context, checkpoint *roachpb.RangeFeedCheckpoint)
+type OnCheckpoint func(ctx context.Context, checkpoint *kvpb.RangeFeedCheckpoint)
 
 // WithOnCheckpoint sets up a callback that's invoked whenever a check point
 // event is emitted.
@@ -157,6 +165,8 @@ func WithOnCheckpoint(f OnCheckpoint) Option {
 // provided, a catchup scan will be run instead that will include the contents
 // of these SSTs.
 //
+// 'registeredSpan' is a span of rangefeed registration that emits the SSTable.
+//
 // Note that the SST is emitted as it was ingested, so it may contain keys
 // outside of the rangefeed span, and the caller should prune the SST contents
 // as appropriate. Futhermore, these events do not contain previous values as
@@ -168,13 +178,35 @@ func WithOnCheckpoint(f OnCheckpoint) Option {
 // MVCCHistoryMutationError and thus will not be emitted here -- there should be
 // no such requests into spans with rangefeeds across them, but it is up to
 // callers to ensure this.
-type OnSSTable func(ctx context.Context, sst *roachpb.RangeFeedSSTable)
+type OnSSTable func(
+	ctx context.Context,
+	sst *kvpb.RangeFeedSSTable,
+	registeredSpan roachpb.Span,
+)
 
 // WithOnSSTable sets up a callback that's invoked whenever an SSTable is
 // ingested.
 func WithOnSSTable(f OnSSTable) Option {
 	return optionFunc(func(c *config) {
 		c.onSSTable = f
+	})
+}
+
+// OnDeleteRange is called when an MVCC range tombstone is written (e.g. when
+// DeleteRange is called with UseRangeTombstone, but not when the range is
+// deleted using point tombstones). If this callback is not provided, an error
+// is emitted when these are encountered.
+//
+// MVCC range tombstones are currently experimental, and requires the
+// MVCCRangeTombstones version gate. They are only expected during certain
+// operations like schema GC and IMPORT INTO (i.e. not across live tables).
+type OnDeleteRange func(ctx context.Context, value *kvpb.RangeFeedDeleteRange)
+
+// WithOnDeleteRange sets up a callback that's invoked whenever an MVCC range
+// deletion tombstone is written.
+func WithOnDeleteRange(f OnDeleteRange) Option {
+	return optionFunc(func(c *config) {
+		c.onDeleteRange = f
 	})
 }
 
@@ -260,5 +292,14 @@ func WithScanRetryBehavior(b ScanRetryBehavior) Option {
 func WithPProfLabel(key, value string) Option {
 	return optionFunc(func(c *config) {
 		c.extraPProfLabels = append(c.extraPProfLabels, key, value)
+	})
+}
+
+// WithSystemTablePriority communicates that the rangefeed is over a system
+// table and thus operates at a higher priority (this primarily affects
+// admission control).
+func WithSystemTablePriority() Option {
+	return optionFunc(func(c *config) {
+		c.overSystemTable = true
 	})
 }

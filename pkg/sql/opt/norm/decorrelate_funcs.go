@@ -62,6 +62,10 @@ func (c *CustomFuncs) deriveHasHoistableSubquery(scalar opt.ScalarExpr) bool {
 		// WHERE clause, it will be transformed to an Exists operator, so this case
 		// only occurs when the Any is nested, in a projection, etc.
 		return !t.Input.Relational().OuterCols.Empty()
+
+	case *memo.UDFExpr:
+		// Do not attempt to hoist UDFs.
+		return false
 	}
 
 	// If HasHoistableSubquery is true for any child, then it's true for this
@@ -87,13 +91,24 @@ func (c *CustomFuncs) deriveHasHoistableSubquery(scalar opt.ScalarExpr) bool {
 				// Determine whether this is the Else child.
 				if child == t.OrElse {
 					memo.BuildSharedProps(child, &sharedProps, c.f.evalCtx)
-					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakProof()
+					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakproof()
+				}
+
+			case *memo.CoalesceExpr:
+				// The first argument does not need to be leakproof because it
+				// is always evaluated.
+				for j := 1; j < len(t.Args); j++ {
+					memo.BuildSharedProps(t.Args[j], &sharedProps, c.f.evalCtx)
+					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakproof()
+					if !hasHoistableSubquery {
+						break
+					}
 				}
 
 			case *memo.WhenExpr:
 				if child == t.Value {
 					memo.BuildSharedProps(child, &sharedProps, c.f.evalCtx)
-					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakProof()
+					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakproof()
 				}
 
 			case *memo.IfErrExpr:
@@ -102,7 +117,7 @@ func (c *CustomFuncs) deriveHasHoistableSubquery(scalar opt.ScalarExpr) bool {
 				// it's at position 1.
 				if i == 1 {
 					memo.BuildSharedProps(child, &sharedProps, c.f.evalCtx)
-					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakProof()
+					hasHoistableSubquery = sharedProps.VolatilitySet.IsLeakproof()
 				}
 			}
 
@@ -118,14 +133,13 @@ func (c *CustomFuncs) deriveHasHoistableSubquery(scalar opt.ScalarExpr) bool {
 // subqueries. Any found queries are hoisted into LeftJoinApply or
 // InnerJoinApply operators, depending on subquery cardinality:
 //
-//   SELECT * FROM xy WHERE (SELECT u FROM uv WHERE u=x LIMIT 1) IS NULL
-//   =>
-//   SELECT xy.*
-//   FROM xy
-//   LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
-//   ON True
-//   WHERE u IS NULL
-//
+//	SELECT * FROM xy WHERE (SELECT u FROM uv WHERE u=x LIMIT 1) IS NULL
+//	=>
+//	SELECT xy.*
+//	FROM xy
+//	LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
+//	ON True
+//	WHERE u IS NULL
 func (c *CustomFuncs) HoistSelectSubquery(
 	input memo.RelExpr, filters memo.FiltersExpr,
 ) memo.RelExpr {
@@ -153,13 +167,12 @@ func (c *CustomFuncs) HoistSelectSubquery(
 // correlated subqueries. Any found queries are hoisted into LeftJoinApply
 // or InnerJoinApply operators, depending on subquery cardinality:
 //
-//   SELECT (SELECT max(u) FROM uv WHERE u=x) AS max FROM xy
-//   =>
-//   SELECT max
-//   FROM xy
-//   INNER JOIN LATERAL (SELECT max(u) FROM uv WHERE u=x)
-//   ON True
-//
+//	SELECT (SELECT max(u) FROM uv WHERE u=x) AS max FROM xy
+//	=>
+//	SELECT max
+//	FROM xy
+//	INNER JOIN LATERAL (SELECT max(u) FROM uv WHERE u=x)
+//	ON True
 func (c *CustomFuncs) HoistProjectSubquery(
 	input memo.RelExpr, projections memo.ProjectionsExpr, passthrough opt.ColSet,
 ) memo.RelExpr {
@@ -184,22 +197,21 @@ func (c *CustomFuncs) HoistProjectSubquery(
 // subqueries. Any found queries are hoisted into LeftJoinApply or
 // InnerJoinApply operators, depending on subquery cardinality:
 //
-//   SELECT y, z
-//   FROM xy
-//   FULL JOIN yz
-//   ON (SELECT u FROM uv WHERE u=x LIMIT 1) IS NULL
-//   =>
-//   SELECT y, z
-//   FROM xy
-//   FULL JOIN LATERAL
-//   (
-//     SELECT *
-//     FROM yz
-//     LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
-//     ON True
-//   )
-//   ON u IS NULL
-//
+//	SELECT y, z
+//	FROM xy
+//	FULL JOIN yz
+//	ON (SELECT u FROM uv WHERE u=x LIMIT 1) IS NULL
+//	=>
+//	SELECT y, z
+//	FROM xy
+//	FULL JOIN LATERAL
+//	(
+//	  SELECT *
+//	  FROM yz
+//	  LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
+//	  ON True
+//	)
+//	ON u IS NULL
 func (c *CustomFuncs) HoistJoinSubquery(
 	op opt.Operator, left, right memo.RelExpr, on memo.FiltersExpr, private *memo.JoinPrivate,
 ) memo.RelExpr {
@@ -228,18 +240,18 @@ func (c *CustomFuncs) HoistJoinSubquery(
 // subqueries. Any found queries are hoisted into LeftJoinApply or
 // InnerJoinApply operators, depending on subquery cardinality:
 //
-//   SELECT (VALUES (SELECT u FROM uv WHERE u=x LIMIT 1)) FROM xy
-//   =>
-//   SELECT
-//   (
-//     SELECT vals.*
-//     FROM (VALUES ())
-//     LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
-//     ON True
-//     INNER JOIN LATERAL (VALUES (u)) vals
-//     ON True
-//   )
-//   FROM xy
+//	SELECT (VALUES (SELECT u FROM uv WHERE u=x LIMIT 1)) FROM xy
+//	=>
+//	SELECT
+//	(
+//	  SELECT vals.*
+//	  FROM (VALUES ())
+//	  LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
+//	  ON True
+//	  INNER JOIN LATERAL (VALUES (u)) vals
+//	  ON True
+//	)
+//	FROM xy
 //
 // The dummy VALUES clause with a singleton empty row is added to the tree in
 // order to use the hoister, which requires an initial input query. While a
@@ -269,25 +281,24 @@ func (c *CustomFuncs) HoistValuesSubquery(
 // correlated subqueries. Any found queries are hoisted into LeftJoinApply or
 // InnerJoinApply operators, depending on subquery cardinality:
 //
-//   SELECT generate_series
-//   FROM xy
-//   INNER JOIN LATERAL ROWS FROM
-//   (
-//     generate_series(1, (SELECT v FROM uv WHERE u=x))
-//   )
-//   =>
-//   SELECT generate_series
-//   FROM xy
-//   ROWS FROM
-//   (
-//     SELECT generate_series
-//     FROM (VALUES ())
-//     LEFT JOIN LATERAL (SELECT v FROM uv WHERE u=x)
-//     ON True
-//     INNER JOIN LATERAL ROWS FROM (generate_series(1, v))
-//     ON True
-//   )
-//
+//	SELECT generate_series
+//	FROM xy
+//	INNER JOIN LATERAL ROWS FROM
+//	(
+//	  generate_series(1, (SELECT v FROM uv WHERE u=x))
+//	)
+//	=>
+//	SELECT generate_series
+//	FROM xy
+//	ROWS FROM
+//	(
+//	  SELECT generate_series
+//	  FROM (VALUES ())
+//	  LEFT JOIN LATERAL (SELECT v FROM uv WHERE u=x)
+//	  ON True
+//	  INNER JOIN LATERAL ROWS FROM (generate_series(1, v))
+//	  ON True
+//	)
 func (c *CustomFuncs) HoistProjectSetSubquery(input memo.RelExpr, zip memo.ZipExpr) memo.RelExpr {
 	newZip := make(memo.ZipExpr, 0, len(zip))
 
@@ -431,11 +442,10 @@ func (c *CustomFuncs) NonKeyCols(in memo.RelExpr) opt.ColSet {
 // sets of aggregate functions to be added to the resulting Aggregations
 // operator, with one set appended to the other, like this:
 //
-//   (Aggregations
-//     [(ConstAgg (Variable 1)) (ConstAgg (Variable 2)) (FirstAgg (Variable 3))]
-//     [1,2,3]
-//   )
-//
+//	(Aggregations
+//	  [(ConstAgg (Variable 1)) (ConstAgg (Variable 2)) (FirstAgg (Variable 3))]
+//	  [1,2,3]
+//	)
 func (c *CustomFuncs) MakeAggCols2(
 	aggOp opt.Operator, cols opt.ColSet, aggOp2 opt.Operator, cols2 opt.ColSet,
 ) memo.AggregationsExpr {
@@ -522,9 +532,9 @@ func (c *CustomFuncs) CanaryColSet(canaryCol opt.ColumnID) opt.ColSet {
 // AggsCanBeDecorrelated returns true if every aggregate satisfies one of the
 // following conditions:
 //
-//   * It is CountRows (because it will be translated into Count),
-//   * It ignores nulls (because nothing extra must be done for it)
-//   * It gives NULL on no input (because this is how we translate non-null
+//   - It is CountRows (because it will be translated into Count),
+//   - It ignores nulls (because nothing extra must be done for it)
+//   - It gives NULL on no input (because this is how we translate non-null
 //     ignoring aggregates)
 //
 // TODO(justin): we can lift the third condition if we have a function that
@@ -765,22 +775,22 @@ func (r *subqueryHoister) input() memo.RelExpr {
 // JoinApply operator to ensure that it has no effect on the cardinality of its
 // input. For example:
 //
-//   SELECT *
-//   FROM xy
-//   WHERE
-//     (SELECT u FROM uv WHERE u=x LIMIT 1) IS NOT NULL
-//     OR EXISTS(SELECT * FROM jk WHERE j=x)
-//   =>
-//   SELECT xy.*
-//   FROM xy
-//   LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
-//   ON True
-//   INNER JOIN LATERAL
-//   (
-//     SELECT (CONST_AGG(True) IS NOT NULL) AS exists FROM jk WHERE j=x
-//   )
-//   ON True
-//   WHERE u IS NOT NULL OR exists
+//	SELECT *
+//	FROM xy
+//	WHERE
+//	  (SELECT u FROM uv WHERE u=x LIMIT 1) IS NOT NULL
+//	  OR EXISTS(SELECT * FROM jk WHERE j=x)
+//	=>
+//	SELECT xy.*
+//	FROM xy
+//	LEFT JOIN LATERAL (SELECT u FROM uv WHERE u=x LIMIT 1)
+//	ON True
+//	INNER JOIN LATERAL
+//	(
+//	  SELECT (CONST_AGG(True) IS NOT NULL) AS exists FROM jk WHERE j=x
+//	)
+//	ON True
+//	WHERE u IS NOT NULL OR exists
 //
 // The choice of whether to use LeftJoinApply or InnerJoinApply depends on the
 // cardinality of the hoisted subquery. If zero rows can be returned from the
@@ -855,18 +865,18 @@ func (r *subqueryHoister) hoistAll(scalar opt.ScalarExpr) opt.ScalarExpr {
 
 // constructGroupByExists transforms a scalar Exists expression like this:
 //
-//   EXISTS(SELECT * FROM a WHERE a.x=b.x)
+//	EXISTS(SELECT * FROM a WHERE a.x=b.x)
 //
 // into a scalar GroupBy expression that returns a one row, one column relation:
 //
-//   SELECT (CONST_AGG(True) IS NOT NULL) AS exists
-//   FROM (SELECT * FROM a WHERE a.x=b.x)
+//	SELECT (CONST_AGG(True) IS NOT NULL) AS exists
+//	FROM (SELECT * FROM a WHERE a.x=b.x)
 //
 // The expression uses an internally-defined CONST_AGG aggregation function,
 // since it's able to short-circuit on the first non-null it encounters. The
 // above expression is equivalent to:
 //
-//   SELECT COUNT(True) > 0 FROM (SELECT * FROM a WHERE a.x=b.x)
+//	SELECT COUNT(True) > 0 FROM (SELECT * FROM a WHERE a.x=b.x)
 //
 // CONST_AGG (and COUNT) always return exactly one boolean value in the context
 // of a scalar GroupBy expression. Because its operand is always True, the only
@@ -906,80 +916,9 @@ func (r *subqueryHoister) constructGroupByExists(subquery memo.RelExpr) memo.Rel
 	)
 }
 
-// constructGroupByAny transforms a scalar Any expression like this:
-//
-//   z = ANY(SELECT x FROM xy)
-//
-// into a scalar GroupBy expression that returns a one row, one column relation
-// that is equivalent to this:
-//
-//   SELECT
-//     CASE
-//       WHEN bool_or(notnull) AND z IS NOT Null THEN True
-//       ELSE bool_or(notnull) IS NULL THEN False
-//       ELSE Null
-//     END
-//   FROM
-//   (
-//     SELECT x IS NOT Null AS notnull
-//     FROM xy
-//     WHERE (z=x) IS NOT False
-//   )
-//
-// BOOL_OR returns true if any input is true, else false if any input is false,
-// else null. This is a mismatch with ANY, which returns true if any input is
-// true, else null if any input is null, else false. In addition, the expression
-// needs to be easy to decorrelate, which means that the outer column reference
-// ("z" in the example) should not be part of a projection (since projections
-// are difficult to hoist above left joins). The following procedure solves the
-// mismatch between BOOL_OR and ANY, as well as avoids correlated projections:
-//
-//   1. Filter out false comparison rows with an initial filter. The result of
-//      ANY does not change, no matter how many false rows are added or removed.
-//      This step has the effect of mapping a set containing only false
-//      comparison rows to the empty set (which is desirable).
-//
-//   2. Step #1 leaves only true and null comparison rows. A null comparison row
-//      occurs when either the left or right comparison operand is null (Any
-//      only allows comparison operators that propagate nulls). Map each null
-//      row to a false row, but only in the case where the right operand is null
-//      (i.e. the operand that came from the subquery). The case where the left
-//      operand is null will be handled later.
-//
-//   3. Use the BOOL_OR aggregation function on the true/false values from step
-//      #2. If there is at least one true value, then BOOL_OR returns true. If
-//      there are no values (the empty set case), then BOOL_OR returns null.
-//      Because of the previous steps, this indicates that the original set
-//      contained only false values (or no values at all).
-//
-//   4. A True result from BOOL_OR is ambiguous. It could mean that the
-//      comparison returned true for one of the rows in the group. Or, it could
-//      mean that the left operand was null. The CASE statement ensures that
-//      True is only returned if the left operand was not null.
-//
-//   5. In addition, the CASE statement maps a null return value to false, and
-//      false to null. This matches ANY behavior.
-//
-// The following is a table showing the various interesting cases:
-//
-//         | subquery  | before        | after   | after
-//     z   | x values  | BOOL_OR       | BOOL_OR | CASE
-//   ------+-----------+---------------+---------+-------
-//     1   | (1)       | (true)        | true    | true
-//     1   | (1, null) | (true, false) | true    | true
-//     1   | (1, 2)    | (true)        | true    | true
-//     1   | (null)    | (false)       | false   | null
-//    null | (1)       | (true)        | true    | null
-//    null | (1, null) | (true, false) | true    | null
-//    null | (null)    | (false)       | false   | null
-//     2   | (1)       | (empty)       | null    | false
-//   *any* | (empty)   | (empty)       | null    | false
-//
-// It is important that the set given to BOOL_OR does not contain any null
-// values (the reason for step #2). Null is reserved for use by the
-// TryDecorrelateScalarGroupBy rule, which will push a left join into the
-// GroupBy. Null values produced by the left join will simply be ignored by
-// BOOL_OR, and so cannot be used for any other purpose.
+// constructGroupByAny transforms a scalar Any expression into a scalar GroupBy
+// expression that returns a one row, one column relation. See
+// CustomFuncs.ConstructGroupByAny for more details.
 func (r *subqueryHoister) constructGroupByAny(
 	scalar opt.ScalarExpr, cmp opt.Operator, input memo.RelExpr,
 ) memo.RelExpr {
@@ -992,59 +931,335 @@ func (r *subqueryHoister) constructGroupByAny(
 		r.hoisted = r.c.ProjectExtraCol(r.hoisted, scalar, scalarColID)
 		scalar = r.f.ConstructVariable(scalarColID)
 	}
+	return r.c.ConstructGroupByAny(scalar, cmp, input)
+}
 
-	inputVar := r.f.funcs.referenceSingleColumn(input)
-	notNullColID := r.f.Metadata().AddColumn("notnull", types.Bool)
-	aggColID := r.f.Metadata().AddColumn("bool_or", types.Bool)
-	aggVar := r.f.ConstructVariable(aggColID)
-	caseColID := r.f.Metadata().AddColumn("case", types.Bool)
+// ConstructGroupByAny transforms a scalar Any expression like this:
+//
+//	z = ANY(SELECT x FROM xy)
+//
+// into a scalar GroupBy expression that returns a one row, one column relation
+// that is equivalent to this:
+//
+//	SELECT
+//	  CASE
+//	    WHEN bool_or(notnull) AND z IS NOT Null THEN True
+//	    ELSE bool_or(notnull) IS NULL THEN False
+//	    ELSE Null
+//	  END
+//	FROM
+//	(
+//	  SELECT x IS NOT Null AS notnull
+//	  FROM xy
+//	  WHERE (z=x) IS NOT False
+//	)
+//
+// BOOL_OR returns true if any input is true, else false if any input is false,
+// else null. This is a mismatch with ANY, which returns true if any input is
+// true, else null if any input is null, else false. In addition, the expression
+// needs to be easy to decorrelate, which means that the outer column reference
+// ("z" in the example) should not be part of a projection (since projections
+// are difficult to hoist above left joins). The following procedure solves the
+// mismatch between BOOL_OR and ANY, as well as avoids correlated projections:
+//
+//  1. Filter out false comparison rows with an initial filter. The result of
+//     ANY does not change, no matter how many false rows are added or removed.
+//     This step has the effect of mapping a set containing only false
+//     comparison rows to the empty set (which is desirable).
+//
+//  2. Step #1 leaves only true and null comparison rows. A null comparison row
+//     occurs when either the left or right comparison operand is null (Any
+//     only allows comparison operators that propagate nulls). Map each null
+//     row to a false row, but only in the case where the right operand is null
+//     (i.e. the operand that came from the subquery). The case where the left
+//     operand is null will be handled later.
+//
+//  3. Use the BOOL_OR aggregation function on the true/false values from step
+//     #2. If there is at least one true value, then BOOL_OR returns true. If
+//     there are no values (the empty set case), then BOOL_OR returns null.
+//     Because of the previous steps, this indicates that the original set
+//     contained only false values (or no values at all).
+//
+//  4. A True result from BOOL_OR is ambiguous. It could mean that the
+//     comparison returned true for one of the rows in the group. Or, it could
+//     mean that the left operand was null. The CASE statement ensures that
+//     True is only returned if the left operand was not null.
+//
+//  5. In addition, the CASE statement maps a null return value to false, and
+//     false to null. This matches ANY behavior.
+//
+// The following is a table showing the various interesting cases:
+//
+//	      | subquery  | before        | after   | after
+//	  z   | x values  | BOOL_OR       | BOOL_OR | CASE
+//	------+-----------+---------------+---------+-------
+//	  1   | (1)       | (true)        | true    | true
+//	  1   | (1, null) | (true, false) | true    | true
+//	  1   | (1, 2)    | (true)        | true    | true
+//	  1   | (null)    | (false)       | false   | null
+//	 null | (1)       | (true)        | true    | null
+//	 null | (1, null) | (true, false) | true    | null
+//	 null | (null)    | (false)       | false   | null
+//	  2   | (1)       | (empty)       | null    | false
+//	*any* | (empty)   | (empty)       | null    | false
+//
+// It is important that the set given to BOOL_OR does not contain any null
+// values (the reason for step #2). Null is reserved for use by the
+// TryDecorrelateScalarGroupBy rule, which will push a left join into the
+// GroupBy. Null values produced by the left join will simply be ignored by
+// BOOL_OR, and so cannot be used for any other purpose.
+func (c *CustomFuncs) ConstructGroupByAny(
+	scalar opt.ScalarExpr, cmp opt.Operator, input memo.RelExpr,
+) memo.RelExpr {
+	inputVar := c.f.funcs.referenceSingleColumn(input)
+	notNullColID := c.f.Metadata().AddColumn("notnull", types.Bool)
+	aggColID := c.f.Metadata().AddColumn("bool_or", types.Bool)
+	aggVar := c.f.ConstructVariable(aggColID)
+	caseColID := c.f.Metadata().AddColumn("case", types.Bool)
 
-	return r.f.ConstructProject(
-		r.f.ConstructScalarGroupBy(
-			r.f.ConstructProject(
-				r.f.ConstructSelect(
+	var scalarNotNull opt.ScalarExpr
+	if scalar.DataType().Family() == types.TupleFamily {
+		scalarNotNull = c.f.ConstructIsTupleNotNull(scalar)
+	} else {
+		scalarNotNull = c.f.ConstructIsNot(scalar, memo.NullSingleton)
+	}
+
+	var inputNotNull opt.ScalarExpr
+	if inputVar.DataType().Family() == types.TupleFamily {
+		inputNotNull = c.f.ConstructIsTupleNotNull(inputVar)
+	} else {
+		inputNotNull = c.f.ConstructIsNot(inputVar, memo.NullSingleton)
+	}
+
+	return c.f.ConstructProject(
+		c.f.ConstructScalarGroupBy(
+			c.f.ConstructProject(
+				c.f.ConstructSelect(
 					input,
-					memo.FiltersExpr{r.f.ConstructFiltersItem(
-						r.f.ConstructIsNot(
-							r.f.funcs.ConstructBinary(cmp, scalar, inputVar),
+					memo.FiltersExpr{c.f.ConstructFiltersItem(
+						c.f.ConstructIsNot(
+							c.f.funcs.ConstructBinary(cmp, scalar, inputVar),
 							memo.FalseSingleton,
 						),
 					)},
 				),
-				memo.ProjectionsExpr{r.f.ConstructProjectionsItem(
-					r.f.ConstructIsNot(inputVar, memo.NullSingleton),
+				memo.ProjectionsExpr{c.f.ConstructProjectionsItem(
+					inputNotNull,
 					notNullColID,
 				)},
 				opt.ColSet{},
 			),
-			memo.AggregationsExpr{r.f.ConstructAggregationsItem(
-				r.f.ConstructBoolOr(
-					r.f.ConstructVariable(notNullColID),
+			memo.AggregationsExpr{c.f.ConstructAggregationsItem(
+				c.f.ConstructBoolOr(
+					c.f.ConstructVariable(notNullColID),
 				),
 				aggColID,
 			)},
 			memo.EmptyGroupingPrivate,
 		),
-		memo.ProjectionsExpr{r.f.ConstructProjectionsItem(
-			r.f.ConstructCase(
-				r.f.ConstructTrue(),
+		memo.ProjectionsExpr{c.f.ConstructProjectionsItem(
+			c.f.ConstructCase(
+				c.f.ConstructTrue(),
 				memo.ScalarListExpr{
-					r.f.ConstructWhen(
-						r.f.ConstructAnd(
+					c.f.ConstructWhen(
+						c.f.ConstructAnd(
 							aggVar,
-							r.f.ConstructIsNot(scalar, memo.NullSingleton),
+							scalarNotNull,
 						),
-						r.f.ConstructTrue(),
+						c.f.ConstructTrue(),
 					),
-					r.f.ConstructWhen(
-						r.f.ConstructIs(aggVar, memo.NullSingleton),
-						r.f.ConstructFalse(),
+					c.f.ConstructWhen(
+						c.f.ConstructIs(aggVar, memo.NullSingleton),
+						c.f.ConstructFalse(),
 					),
 				},
-				r.f.ConstructNull(types.Bool),
+				c.f.ConstructNull(types.Bool),
 			),
 			caseColID,
 		)},
 		opt.ColSet{},
 	)
+}
+
+// CanMaybeRemapOuterCols performs a best-effort check to minimize the cases
+// where TryRemapOuterCols is called unnecessarily.
+func (c *CustomFuncs) CanMaybeRemapOuterCols(input memo.RelExpr, filters memo.FiltersExpr) bool {
+	// The usages of ComputeEquivClosureNoCopy are ok because of the copy below.
+	outerCols := input.Relational().OuterCols.Copy()
+	equivGroup := input.Relational().FuncDeps.ComputeEquivClosureNoCopy(outerCols)
+	for i := range filters {
+		if equivGroup.Intersects(input.Relational().OutputCols) {
+			return true
+		}
+		equivGroup = filters[i].ScalarProps().FuncDeps.ComputeEquivClosureNoCopy(equivGroup)
+	}
+	return equivGroup.Intersects(input.Relational().OutputCols)
+}
+
+// TryRemapOuterCols attempts to replace outer column references in the given
+// expression with equivalent non-outer columns using equalities from the given
+// filters. It accomplishes this by traversing the operator tree for each outer
+// column with the set of equivalent non-outer columns, wherever it would be
+// valid to push down a filter on those non-outer columns. If a reference to the
+// outer column is discovered during this traversal, it is valid to replace it
+// with one of the non-outer columns in the set.
+func (c *CustomFuncs) TryRemapOuterCols(
+	expr memo.RelExpr, filters memo.FiltersExpr,
+) (remapped memo.RelExpr, wasRemapped bool) {
+	outerCols := expr.Relational().OuterCols
+	remapped = expr
+	for col, ok := outerCols.Next(0); ok; col, ok = outerCols.Next(col + 1) {
+		// substituteCols is the set of input columns for which it may be possible to
+		// push a filter constraining the column to be equal to an outer column.
+		// Doing so would allow the column to be substituted for the outer column.
+		substituteCols := expr.Relational().FuncDeps.ComputeEquivGroup(col)
+		for i := range filters {
+			// ComputeEquivClosureNoCopy is ok here because ComputeEquivGroup builds
+			// a new ColSet.
+			substituteCols = filters[i].ScalarProps().FuncDeps.ComputeEquivClosureNoCopy(substituteCols)
+		}
+		substituteCols.DifferenceWith(outerCols)
+		remapped = c.tryRemapOuterCols(remapped, col, substituteCols).(memo.RelExpr)
+	}
+	wasRemapped = remapped != expr
+	return remapped, wasRemapped
+}
+
+// tryRemapOuterCols handles the traversal and outer-column replacement for
+// TryRemapOuterCols. It returns the replacement expression and whether an
+// outer-column reference was successfully remapped.
+func (c *CustomFuncs) tryRemapOuterCols(
+	expr opt.Expr, outerCol opt.ColumnID, substituteCols opt.ColSet,
+) opt.Expr {
+	if substituteCols.Empty() {
+		// It is not possible to remap any references to the current outer
+		// column within this expression.
+		return expr
+	}
+	switch t := expr.(type) {
+	case *memo.VariableExpr:
+		if t.Col == outerCol {
+			if replaceCol, ok := substituteCols.Next(0); ok {
+				// This outer-column reference can be remapped.
+				return c.f.ConstructVariable(replaceCol)
+			}
+		}
+	case memo.RelExpr:
+		if !t.Relational().OuterCols.Contains(outerCol) {
+			// This expression does not reference the current outer column.
+			return t
+		}
+		// Modifications to substituteCols may be necessary in order to allow
+		// outer-column remapping within (the children of) a RelExpr. Note that
+		// getSubstituteColsRelExpr copies substituteCols before modifying it, so
+		// different branches of the traversal don't interact with the same ColSet.
+		substituteCols = c.getSubstituteColsRelExpr(t, substituteCols)
+	case opt.ScalarExpr:
+		// Any substitute columns that reach a ScalarExpr are valid candidates
+		// for outer-column replacement. No changes to substituteCols required.
+	}
+	replaceFn := func(e opt.Expr) opt.Expr {
+		return c.tryRemapOuterCols(e, outerCol, substituteCols)
+	}
+	return c.f.Replace(expr, replaceFn)
+}
+
+// getSubstituteColsRelExpr modifies the given set of substitute columns to
+// reflect the set of columns for which an equality with an outer column could
+// be pushed through the given expression. The logic of getSubstituteColsRelExpr
+// mirrors that of the filter push-down rules in select.opt and join.opt.
+// TODO(drewk): null-rejection has to push down a 'col IS NOT NULL' filter -
+// we should be able to share logic. Doing so would remove the issue of rule
+// cycles. Any other rules that reuse this logic should reconsider the
+// simplification made in getSubstituteColsSetOp.
+//
+// getSubstituteColsRelExpr copies substituteCols before performing any
+// modifications, so the original ColSet is not mutated.
+func (c *CustomFuncs) getSubstituteColsRelExpr(
+	expr memo.RelExpr, substituteCols opt.ColSet,
+) opt.ColSet {
+	// Remove any columns that are not in the output of this expression.
+	// Non-output columns can be in substituteCols after a recursive call
+	// into the input of an expression that either has multiple relational
+	// inputs (e.g. Joins) or can synthesize columns (e.g. Projects).
+	//
+	// Note that substituteCols is copied here, so subsequent mutations can be
+	// performed in place.
+	substituteCols = substituteCols.Intersection(expr.Relational().OutputCols)
+
+	// Depending on the expression, further modifications to substituteCols
+	// may be necessary.
+	switch t := expr.(type) {
+	case *memo.SelectExpr:
+		// [MergeSelects]
+		// No restrictions on push-down for the cols in substituteCols.
+	case *memo.ProjectExpr, *memo.ProjectSetExpr:
+		// [PushSelectIntoProject]
+		// [PushSelectIntoProjectSet]
+		// Filter push-down candidates can only reference input columns.
+		inputCols := t.Child(0).(memo.RelExpr).Relational().OutputCols
+		substituteCols.IntersectionWith(inputCols)
+	case *memo.InnerJoinExpr, *memo.InnerJoinApplyExpr:
+		// [MergeSelectInnerJoin]
+		// [PushFilterIntoJoinLeft]
+		// [PushFilterIntoJoinRight]
+		// No restrictions on push-down for the cols in substituteCols.
+	case *memo.LeftJoinExpr, *memo.LeftJoinApplyExpr, *memo.SemiJoinExpr,
+		*memo.SemiJoinApplyExpr, *memo.AntiJoinExpr, *memo.AntiJoinApplyExpr:
+		// [PushSelectIntoJoinLeft]
+		// [PushSelectCondLeftIntoJoinLeftAndRight]
+		substituteCols = getSubstituteColsLeftSemiAntiJoin(t, substituteCols)
+	case *memo.GroupByExpr, *memo.DistinctOnExpr:
+		// [PushSelectIntoGroupBy]
+		// Filters must refer only to grouping and ConstAgg columns.
+		private := t.Private().(*memo.GroupingPrivate)
+		aggs := t.Child(1).(*memo.AggregationsExpr)
+		substituteCols.IntersectionWith(c.GroupingAndConstCols(private, *aggs))
+	case *memo.UnionExpr, *memo.UnionAllExpr, *memo.IntersectExpr,
+		*memo.IntersectAllExpr, *memo.ExceptExpr, *memo.ExceptAllExpr:
+		// [PushFilterIntoSetOp]
+		substituteCols = getSubstituteColsSetOp(t, substituteCols)
+	default:
+		// Filter push-down through this expression is not supported.
+		substituteCols = opt.ColSet{}
+	}
+	return substituteCols
+}
+
+func getSubstituteColsLeftSemiAntiJoin(join memo.RelExpr, substituteCols opt.ColSet) opt.ColSet {
+	// It is always valid to push an equality between an outer and non-outer
+	// left column into the left input of a LeftJoin, SemiJoin, or AntiJoin. If
+	// one of the join filters constrains that left column to be equal to a right
+	// column, it is also possible to remap and push the equality into the right
+	// input. See the PushSelectCondLeftIntoJoinLeftAndRight rule for more info.
+	//
+	// We can satisfy these requirements by first restricting substituteCols
+	// to left input columns, then extending it with right input columns
+	// that are held equivalent by the join filters.
+	left := join.Child(0).(memo.RelExpr)
+	on := join.Child(2).(*memo.FiltersExpr)
+	substituteCols.IntersectionWith(left.Relational().OutputCols)
+	for i := range *on {
+		// The usage of ComputeEquivClosureNoCopy is ok because
+		// getSubstituteColsRelExpr copies the set.
+		substituteCols = (*on)[i].ScalarProps().FuncDeps.ComputeEquivClosureNoCopy(substituteCols)
+	}
+	return substituteCols
+}
+
+func getSubstituteColsSetOp(set memo.RelExpr, substituteCols opt.ColSet) opt.ColSet {
+	// Because TryRemapOuterCols is the equivalent of pushing down an
+	// equality filter between an input column and an outer column, we don't
+	// have to worry about composite sensitivity here (see CanMapOnSetOp).
+	// Map the output columns contained in substituteCols to the columns from
+	// both inputs.
+	var newSubstituteCols opt.ColSet
+	private := set.Private().(*memo.SetPrivate)
+	for i, outCol := range private.OutCols {
+		if substituteCols.Contains(outCol) {
+			newSubstituteCols.Add(private.LeftCols[i])
+			newSubstituteCols.Add(private.RightCols[i])
+		}
+	}
+	return newSubstituteCols
 }

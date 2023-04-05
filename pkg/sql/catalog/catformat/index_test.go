@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
@@ -74,7 +75,7 @@ func TestIndexForDisplay(t *testing.T) {
 		ID:                  0x0,
 		KeyColumnNames:      []string{"a", "b"},
 		KeyColumnIDs:        descpb.ColumnIDs{1, 2},
-		KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_DESC},
+		KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_DESC},
 	}
 
 	// UNIQUE INDEX baz (a ASC, b DESC)
@@ -99,8 +100,8 @@ func TestIndexForDisplay(t *testing.T) {
 	expressionIndex := baseIndex
 	expressionIndex.KeyColumnNames = []string{"a", "d", "b"}
 	expressionIndex.KeyColumnIDs = descpb.ColumnIDs{1, 4, 2}
-	expressionIndex.KeyColumnDirections = []descpb.IndexDescriptor_Direction{
-		descpb.IndexDescriptor_ASC, descpb.IndexDescriptor_DESC, descpb.IndexDescriptor_ASC,
+	expressionIndex.KeyColumnDirections = []catenumpb.IndexColumn_Direction{
+		catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_DESC, catenumpb.IndexColumn_ASC,
 	}
 
 	// Hash Sharded INDEX baz (a)
@@ -176,16 +177,16 @@ func TestIndexForDisplay(t *testing.T) {
 			tableName:   descpb.AnonymousTable,
 			partition:   "",
 			displayMode: IndexDisplayDefOnly,
-			expected:    "INVERTED INDEX baz (a ASC)",
-			pgExpected:  "INDEX baz USING gin (a ASC)",
+			expected:    "INVERTED INDEX baz (a)",
+			pgExpected:  "INDEX baz USING gin (a)",
 		},
 		{
 			index:       jsonbInvertedIndex,
 			tableName:   tableName,
 			partition:   "",
 			displayMode: IndexDisplayShowCreate,
-			expected:    "CREATE INVERTED INDEX baz ON foo.public.bar (a ASC)",
-			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING gin (a ASC)",
+			expected:    "CREATE INVERTED INDEX baz ON foo.public.bar (a)",
+			pgExpected:  "CREATE INDEX baz ON foo.public.bar USING gin (a)",
 		},
 		{
 			index:       storingIndex,

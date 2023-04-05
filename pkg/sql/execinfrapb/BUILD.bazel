@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
@@ -26,8 +27,10 @@ go_library(
         "//pkg/settings/cluster",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catalogkeys",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/fetchpb",
         "//pkg/sql/catalog/typedesc",
         "//pkg/sql/parser",
         "//pkg/sql/pgwire/pgcode",
@@ -46,12 +49,13 @@ go_library(
         "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/humanizeutil",
+        "//pkg/util/intsets",
         "//pkg/util/netutil",
         "//pkg/util/optional",
         "//pkg/util/protoutil",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
-        "//pkg/util/tracing",
+        "//pkg/util/timeutil",
         "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
@@ -71,6 +75,7 @@ go_test(
         "flow_diagram_external_test.go",
         "flow_diagram_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":execinfrapb"],
     deps = [
         "//pkg/base",
@@ -80,6 +85,7 @@ go_test(
         "//pkg/sql",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/fetchpb",
         "//pkg/sql/rowenc",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
@@ -102,13 +108,18 @@ proto_library(
         "processors_changefeeds.proto",
         "processors_sql.proto",
         "processors_table_stats.proto",
+        "processors_ttl.proto",
     ],
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/cloud/cloudpb:cloudpb_proto",
         "//pkg/jobs/jobspb:jobspb_proto",
+        "//pkg/kv/kvpb:kvpb_proto",
         "//pkg/roachpb:roachpb_proto",
+        "//pkg/sql/catalog/catenumpb:catenumpb_proto",
         "//pkg/sql/catalog/descpb:descpb_proto",
+        "//pkg/sql/catalog/fetchpb:fetchpb_proto",
         "//pkg/sql/inverted:inverted_proto",
         "//pkg/sql/sessiondatapb:sessiondatapb_proto",
         "//pkg/sql/types:types_proto",
@@ -118,6 +129,7 @@ proto_library(
         "@com_github_cockroachdb_errors//errorspb:errorspb_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
         "@com_google_protobuf//:any_proto",
+        "@com_google_protobuf//:duration_proto",
         "@com_google_protobuf//:timestamp_proto",
     ],
 )
@@ -129,10 +141,14 @@ go_proto_library(
     proto = ":execinfrapb_proto",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/cloud/cloudpb",
         "//pkg/jobs/jobspb",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
+        "//pkg/sql/catalog/catenumpb",
         "//pkg/sql/catalog/catpb",  # keep
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/fetchpb",
         "//pkg/sql/inverted",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",
@@ -148,3 +164,5 @@ disallowed_imports_test(
     "execinfrapb",
     ["//pkg/sql/sem/builtins"],
 )
+
+get_x_data(name = "get_x_data")

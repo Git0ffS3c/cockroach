@@ -15,7 +15,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"reflect"
 	"sort"
@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -174,13 +175,13 @@ func (p *paginationState) paginate(
 // <nodesQueried>|<inProgressNode>|<inProgressNodeIndex>|<nodesToQuery>
 //
 // Where:
-//  - nodesQueried is a comma-separated list of node IDs that have already been
-//    queried (matching p.nodesQueried).
-//  - inProgressNode is the ID of the node where the cursor is currently at.
-//  - inProgressNodeIndex is the index of the response from inProgressNode's
-//    node-local function where the cursor is currently at.
-//  - nodesToQuery is a comma-separated list of node IDs of nodes that are yet
-//    to be queried.
+//   - nodesQueried is a comma-separated list of node IDs that have already been
+//     queried (matching p.nodesQueried).
+//   - inProgressNode is the ID of the node where the cursor is currently at.
+//   - inProgressNodeIndex is the index of the response from inProgressNode's
+//     node-local function where the cursor is currently at.
+//   - nodesToQuery is a comma-separated list of node IDs of nodes that are yet
+//     to be queried.
 //
 // All node IDs and indices are represented as unsigned 32-bit ints, and
 // comma-separated lists are allowed to have trailing commas. The character
@@ -189,7 +190,7 @@ func (p *paginationState) UnmarshalText(text []byte) error {
 	decoder := base64.NewDecoder(base64.URLEncoding, bytes.NewReader(text))
 	var decodedText []byte
 	var err error
-	if decodedText, err = ioutil.ReadAll(decoder); err != nil {
+	if decodedText, err = io.ReadAll(decoder); err != nil {
 		return err
 	}
 	parts := strings.Split(string(decodedText), "|")
@@ -297,7 +298,7 @@ type rpcNodePaginator struct {
 	errorCtx     string
 	pagState     paginationState
 	responseChan chan paginatedNodeResponse
-	nodeStatuses map[roachpb.NodeID]nodeStatusWithLiveness
+	nodeStatuses map[serverID]livenesspb.NodeLivenessStatus
 
 	dialFn     func(ctx context.Context, id roachpb.NodeID) (client interface{}, err error)
 	nodeFn     func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (res interface{}, err error)
@@ -367,13 +368,13 @@ func (r *rpcNodePaginator) queryNode(ctx context.Context, nodeID roachpb.NodeID,
 		r.mu.currentIdx++
 		r.mu.turnCond.Broadcast()
 	}
-	if err := contextutil.RunWithTimeout(ctx, "dial node", base.NetworkTimeout, func(ctx context.Context) error {
+	if err := contextutil.RunWithTimeout(ctx, "dial node", base.DialTimeout, func(ctx context.Context) error {
 		var err error
 		client, err = r.dialFn(ctx, nodeID)
 		return err
 	}); err != nil {
 		err = errors.Wrapf(err, "failed to dial into node %d (%s)",
-			nodeID, r.nodeStatuses[nodeID].livenessStatus)
+			nodeID, r.nodeStatuses[serverID(nodeID)])
 		addNodeResp(paginatedNodeResponse{nodeID: nodeID, err: err})
 		return
 	}
@@ -381,7 +382,7 @@ func (r *rpcNodePaginator) queryNode(ctx context.Context, nodeID roachpb.NodeID,
 	res, err := r.nodeFn(ctx, client, nodeID)
 	if err != nil {
 		err = errors.Wrapf(err, "error requesting %s from node %d (%s)",
-			r.errorCtx, nodeID, r.nodeStatuses[nodeID].livenessStatus)
+			r.errorCtx, nodeID, r.nodeStatuses[serverID(nodeID)])
 	}
 	length := 0
 	value := reflect.ValueOf(res)

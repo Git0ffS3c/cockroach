@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -24,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	gomock "github.com/golang/mock/gomock"
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,8 +36,7 @@ type mockClient struct {
 		ctx context.Context,
 		spans []roachpb.Span,
 		startFrom hlc.Timestamp,
-		withDiff bool,
-		eventC chan<- *roachpb.RangeFeedEvent,
+		eventC chan<- kvcoord.RangeFeedMessage,
 	) error
 
 	scan func(
@@ -51,10 +52,10 @@ func (m *mockClient) RangeFeed(
 	ctx context.Context,
 	spans []roachpb.Span,
 	startFrom hlc.Timestamp,
-	withDiff bool,
-	eventC chan<- *roachpb.RangeFeedEvent,
+	eventC chan<- kvcoord.RangeFeedMessage,
+	opts ...kvcoord.RangeFeedOption,
 ) error {
-	return m.rangefeed(ctx, spans, startFrom, withDiff, eventC)
+	return m.rangefeed(ctx, spans, startFrom, eventC)
 }
 
 func (m *mockClient) Scan(
@@ -110,9 +111,9 @@ func TestRangeFeedMock(t *testing.T) {
 		}
 		f := rangefeed.NewFactoryWithDB(stopper, &mc, nil /* knobs */)
 		require.NotNil(t, f)
-		rows := make(chan *roachpb.RangeFeedValue)
+		rows := make(chan *kvpb.RangeFeedValue)
 
-		r, err := f.RangeFeed(ctx, "foo", []roachpb.Span{sp}, ts, func(ctx context.Context, value *roachpb.RangeFeedValue) {
+		r, err := f.RangeFeed(ctx, "foo", []roachpb.Span{sp}, ts, func(ctx context.Context, value *kvpb.RangeFeedValue) {
 			rows <- value
 		}, rangefeed.WithInitialScan(func(ctx context.Context) {
 			close(rows)
@@ -162,15 +163,15 @@ func TestRangeFeedMock(t *testing.T) {
 				return nil
 			},
 			rangefeed: func(
-				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, withDiff bool, eventC chan<- *roachpb.RangeFeedEvent,
+				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, eventC chan<- kvcoord.RangeFeedMessage,
 			) error {
-				assert.False(t, withDiff) // it was not set
 				sendEvent := func(ts hlc.Timestamp) {
-					eventC <- &roachpb.RangeFeedEvent{
-						Val: &roachpb.RangeFeedValue{
-							Key: sp.Key,
-						},
-					}
+					eventC <- kvcoord.RangeFeedMessage{
+						RangeFeedEvent: &kvpb.RangeFeedEvent{
+							Val: &kvpb.RangeFeedValue{
+								Key: sp.Key,
+							},
+						}}
 				}
 				iteration++
 				switch {
@@ -180,40 +181,42 @@ func TestRangeFeedMock(t *testing.T) {
 					return errors.New("boom")
 				case iteration == firstPartialCheckpoint:
 					assert.Equal(t, startFrom, initialTS)
-					eventC <- &roachpb.RangeFeedEvent{
-						Checkpoint: &roachpb.RangeFeedCheckpoint{
+					eventC <- kvcoord.RangeFeedMessage{RangeFeedEvent: &kvpb.RangeFeedEvent{
+						Checkpoint: &kvpb.RangeFeedCheckpoint{
 							Span: roachpb.Span{
 								Key:    sp.Key,
 								EndKey: sp.Key.PrefixEnd(),
 							},
 							ResolvedTS: nextTS,
 						},
-					}
+					}}
 					sendEvent(initialTS)
 					return errors.New("boom")
 				case iteration == secondPartialCheckpoint:
 					assert.Equal(t, startFrom, initialTS)
-					eventC <- &roachpb.RangeFeedEvent{
-						Checkpoint: &roachpb.RangeFeedCheckpoint{
-							Span: roachpb.Span{
-								Key:    sp.Key.PrefixEnd(),
-								EndKey: sp.EndKey,
+					eventC <- kvcoord.RangeFeedMessage{
+						RangeFeedEvent: &kvpb.RangeFeedEvent{
+							Checkpoint: &kvpb.RangeFeedCheckpoint{
+								Span: roachpb.Span{
+									Key:    sp.Key.PrefixEnd(),
+									EndKey: sp.EndKey,
+								},
+								ResolvedTS: nextTS,
 							},
-							ResolvedTS: nextTS,
-						},
-					}
+						}}
 					sendEvent(nextTS)
 					return errors.New("boom")
 				case iteration == fullCheckpoint:
 					// At this point the frontier should have a complete checkpoint at
 					// nextTS.
 					assert.Equal(t, startFrom, nextTS)
-					eventC <- &roachpb.RangeFeedEvent{
-						Checkpoint: &roachpb.RangeFeedCheckpoint{
-							Span:       sp,
-							ResolvedTS: lastTS,
-						},
-					}
+					eventC <- kvcoord.RangeFeedMessage{
+						RangeFeedEvent: &kvpb.RangeFeedEvent{
+							Checkpoint: &kvpb.RangeFeedCheckpoint{
+								Span:       sp,
+								ResolvedTS: lastTS,
+							},
+						}}
 					sendEvent(nextTS)
 					return errors.New("boom")
 				case iteration == lastEvent:
@@ -228,9 +231,9 @@ func TestRangeFeedMock(t *testing.T) {
 			},
 		}
 		f := rangefeed.NewFactoryWithDB(stopper, &mc, nil /* knobs */)
-		rows := make(chan *roachpb.RangeFeedValue)
+		rows := make(chan *kvpb.RangeFeedValue)
 		r, err := f.RangeFeed(ctx, "foo", []roachpb.Span{sp}, initialTS, func(
-			ctx context.Context, value *roachpb.RangeFeedValue,
+			ctx context.Context, value *kvpb.RangeFeedValue,
 		) {
 			rows <- value
 		}, rangefeed.WithRetry(shortRetryOptions))
@@ -263,22 +266,22 @@ func TestRangeFeedMock(t *testing.T) {
 				return nil
 			},
 			rangefeed: func(
-				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, withDiff bool, eventC chan<- *roachpb.RangeFeedEvent,
+				ctx context.Context, spans []roachpb.Span, startFrom hlc.Timestamp, eventC chan<- kvcoord.RangeFeedMessage,
 			) error {
-				assert.True(t, withDiff)
-				eventC <- &roachpb.RangeFeedEvent{
-					Val: &roachpb.RangeFeedValue{
-						Key: sp.Key,
-					},
-				}
+				eventC <- kvcoord.RangeFeedMessage{
+					RangeFeedEvent: &kvpb.RangeFeedEvent{
+						Val: &kvpb.RangeFeedValue{
+							Key: sp.Key,
+						},
+					}}
 				<-ctx.Done()
 				return ctx.Err()
 			},
 		}
 		f := rangefeed.NewFactoryWithDB(stopper, &mc, nil /* knobs */)
-		rows := make(chan *roachpb.RangeFeedValue)
+		rows := make(chan *kvpb.RangeFeedValue)
 		r, err := f.RangeFeed(ctx, "foo", []roachpb.Span{sp}, hlc.Timestamp{}, func(
-			ctx context.Context, value *roachpb.RangeFeedValue,
+			ctx context.Context, value *kvpb.RangeFeedValue,
 		) {
 			rows <- value
 		}, rangefeed.WithDiff(true))
@@ -296,7 +299,7 @@ func TestRangeFeedMock(t *testing.T) {
 		stopper.Stop(ctx)
 		f := rangefeed.NewFactoryWithDB(stopper, &mockClient{}, nil /* knobs */)
 		r, err := f.RangeFeed(ctx, "foo", []roachpb.Span{sp}, hlc.Timestamp{}, func(
-			ctx context.Context, value *roachpb.RangeFeedValue,
+			ctx context.Context, value *kvpb.RangeFeedValue,
 		) {
 		})
 		require.Nil(t, r)
@@ -319,7 +322,7 @@ func TestRangeFeedMock(t *testing.T) {
 		}, nil /* knobs */)
 		done := make(chan struct{})
 		r, err := f.RangeFeed(ctx, "foo", []roachpb.Span{sp}, hlc.Timestamp{}, func(
-			ctx context.Context, value *roachpb.RangeFeedValue,
+			ctx context.Context, value *kvpb.RangeFeedValue,
 		) {
 		},
 			rangefeed.WithInitialScan(nil),
@@ -359,7 +362,7 @@ func TestBackoffOnRangefeedFailure(t *testing.T) {
 		Times(3).
 		Return(errors.New("rangefeed failed"))
 	db.EXPECT().RangeFeed(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-		Do(func(context.Context, []roachpb.Span, hlc.Timestamp, bool, chan<- *roachpb.RangeFeedEvent) {
+		Do(func(context.Context, []roachpb.Span, hlc.Timestamp, chan<- kvcoord.RangeFeedMessage, ...kvcoord.RangeFeedOption) {
 			cancel()
 		}).
 		Return(nil)
@@ -368,7 +371,7 @@ func TestBackoffOnRangefeedFailure(t *testing.T) {
 	r, err := f.RangeFeed(ctx, "foo",
 		[]roachpb.Span{{Key: keys.MinKey, EndKey: keys.MaxKey}},
 		hlc.Timestamp{},
-		func(ctx context.Context, value *roachpb.RangeFeedValue) {},
+		func(ctx context.Context, value *kvpb.RangeFeedValue) {},
 		rangefeed.WithInitialScan(func(ctx context.Context) {}),
 		rangefeed.WithRetry(retry.Options{InitialBackoff: time.Millisecond}),
 	)

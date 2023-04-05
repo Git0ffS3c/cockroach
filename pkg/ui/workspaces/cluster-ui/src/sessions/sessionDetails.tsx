@@ -14,7 +14,7 @@ import { sessionAttr } from "src/util/constants";
 import { Helmet } from "react-helmet";
 import { Loading } from "../loading";
 import _ from "lodash";
-import { Link, RouteComponentProps } from "react-router-dom";
+import { RouteComponentProps } from "react-router-dom";
 
 import {
   getStatusClassname,
@@ -23,11 +23,13 @@ import {
 } from "./sessionsTable";
 
 import { SummaryCard, SummaryCardItem } from "../summaryCard";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 
-import { TimestampToMoment } from "src/util/convert";
-import { Bytes, DATE_FORMAT } from "src/util/format";
+import { DurationToMomentDuration, TimestampToMoment } from "src/util/convert";
+import { Bytes, DATE_FORMAT, Count } from "src/util/format";
 import { Col, Row } from "antd";
+import "antd/lib/col/style";
+import "antd/lib/row/style";
 
 import TerminateSessionModal, {
   TerminateSessionModalRef,
@@ -38,11 +40,8 @@ import TerminateQueryModal, {
 import { Button } from "../button";
 import { ArrowLeft } from "@cockroachlabs/icons";
 import { Text, TextTypes } from "../text";
-import { SqlBox } from "src/sql/box";
-import {
-  NodeLink,
-  StatementLinkTarget,
-} from "src/statementsTable/statementsTableContent";
+import { SqlBox, SqlBoxSize } from "src/sql/box";
+import { NodeLink } from "src/statementsTable/statementsTableContent";
 
 import {
   ICancelQueryRequest,
@@ -55,6 +54,8 @@ import styles from "./sessionDetails.module.scss";
 import classNames from "classnames/bind";
 import { commonStyles } from "src/common";
 import { CircleFilled } from "../icon";
+import { createTimeScaleFromDateRange, TimeScale } from "src/timeScaleDropdown";
+import moment from "moment";
 
 const cx = classNames.bind(styles);
 const statementsPageCx = classNames.bind(statementsPageStyles);
@@ -75,6 +76,7 @@ export interface OwnProps {
   onTerminateSessionClick?: () => void;
   onTerminateStatementClick?: () => void;
   onStatementClick?: () => void;
+  setTimeScale: (ts: TimeScale) => void;
 }
 
 export type SessionDetailsProps = OwnProps & RouteComponentProps;
@@ -92,17 +94,12 @@ export const MemoryUsageItem: React.FC<{
     value={
       Bytes(alloc_bytes?.toNumber()) + "/" + Bytes(max_alloc_bytes?.toNumber())
     }
-    className={cx("details-item")}
   />
 );
 
 export class SessionDetails extends React.Component<SessionDetailsProps> {
   terminateSessionRef: React.RefObject<TerminateSessionModalRef>;
   terminateQueryRef: React.RefObject<TerminateQueryModalRef>;
-  static defaultProps = {
-    uiConfig: { showGatewayNodeLink: true },
-    isTenant: false,
-  };
 
   componentDidMount(): void {
     if (!this.props.isTenant) {
@@ -165,7 +162,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                 "page--header__title",
               )}`}
             >
-              Session details
+              Session Details
             </h3>
             {showActionButtons && (
               <div className={cx("heading-controls-group")}>
@@ -183,7 +180,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                   type="secondary"
                   size="small"
                 >
-                  Cancel statement
+                  Cancel Statement
                 </Button>
                 <Button
                   onClick={() => {
@@ -196,7 +193,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                   type="secondary"
                   size="small"
                 >
-                  Cancel session
+                  Cancel Session
                 </Button>
               </div>
             )}
@@ -213,7 +210,7 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
             error={this.props.sessionError}
             render={this.renderContent}
             renderError={() =>
-              SQLActivityError({
+              LoadingError({
                 statsType: "sessions",
               })
             }
@@ -231,6 +228,29 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
     );
   }
 
+  onCachedTransactionFingerprintClick(fingerprintDec: string): void {
+    const session = this.props.session?.session;
+    if (session == null) return;
+
+    const now = moment.utc();
+    const end = session.end ? TimestampToMoment(session.end) : now;
+
+    // Round to the next hour if it is not in the future.
+    const roundToNextHour =
+      end.clone().endOf("hour").isBefore(now) &&
+      (end.minute() || end.second() || end.millisecond());
+
+    if (roundToNextHour) {
+      end.add(1, "hour").startOf("hour");
+    }
+
+    const start = TimestampToMoment(session.start).startOf("hour");
+    const range = { start, end };
+    const timeScale = createTimeScaleFromDateRange(range);
+    this.props.setTimeScale(timeScale);
+    this.props.history.push(`/transaction/${fingerprintDec}`);
+  }
+
   renderContent = (): React.ReactElement => {
     if (!this.props.session) {
       return null;
@@ -242,71 +262,68 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
       return (
         <section className={cx("section")}>
           <h3>Unable to find session</h3>
-          There is no currently active session with the id{" "}
+          There is no session with the id{" "}
           {getMatchParamByName(this.props.match, sessionAttr)}.
-          <div>
-            <Link className={cx("back-link")} to={"/sessions"}>
-              Back to Sessions
-            </Link>
-          </div>
         </section>
       );
     }
 
-    let txnInfo = <React.Fragment>No Active Transaction</React.Fragment>;
-    if (session.active_txn) {
+    let txnInfo = (
+      <SummaryCard className={cx("details-section")}>
+        No Active Transaction
+      </SummaryCard>
+    );
+    if (session.active_txn && session.end == null) {
       const txn = session.active_txn;
       const start = TimestampToMoment(txn.start);
       txnInfo = (
-        <Row gutter={16}>
-          <Col className="gutter-row" span={10}>
-            <SummaryCardItem
-              label={"Transaction Start Time"}
-              value={start.format(DATE_FORMAT)}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Number of Statements Executed"}
-              value={txn.num_statements_executed}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Number of Retries"}
-              value={txn.num_retries}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Number of Automatic Retries"}
-              value={txn.num_auto_retries}
-              className={cx("details-item")}
-            />
-          </Col>
-          <Col className="gutter-row" span={4} />
-          <Col className="gutter-row" span={10}>
-            <SummaryCardItem
-              label={"Read Only"}
-              value={yesOrNo(txn.read_only)}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"AS OF SYSTEM TIME?"}
-              value={yesOrNo(txn.is_historical)}
-              className={cx("details-item")}
-            />
-            <SummaryCardItem
-              label={"Priority"}
-              value={txn.priority}
-              className={cx("details-item")}
-            />
-            <MemoryUsageItem
-              alloc_bytes={txn.alloc_bytes}
-              max_alloc_bytes={txn.max_alloc_bytes}
-            />
-          </Col>
-        </Row>
+        <>
+          <Row gutter={24}>
+            <Col className="gutter-row" span={12}>
+              <SummaryCard className={cx("summary-card")}>
+                <SummaryCardItem
+                  label={"Transaction Start Time"}
+                  value={start.format(DATE_FORMAT)}
+                />
+                <SummaryCardItem
+                  label={"Number of Statements Executed"}
+                  value={txn.num_statements_executed}
+                />
+                <SummaryCardItem
+                  label={"Number of Retries"}
+                  value={txn.num_retries}
+                />
+                <SummaryCardItem
+                  label={"Number of Automatic Retries"}
+                  value={txn.num_auto_retries}
+                />
+              </SummaryCard>
+            </Col>
+            <Col className="gutter-row" span={12}>
+              <SummaryCard className={cx("summary-card")}>
+                <SummaryCardItem
+                  label={"Read Only"}
+                  value={yesOrNo(txn.read_only)}
+                />
+                <SummaryCardItem
+                  label={"AS OF SYSTEM TIME?"}
+                  value={yesOrNo(txn.is_historical)}
+                />
+                <SummaryCardItem label={"Priority"} value={txn.priority} />
+                <MemoryUsageItem
+                  alloc_bytes={txn.alloc_bytes}
+                  max_alloc_bytes={txn.max_alloc_bytes}
+                />
+              </SummaryCard>
+            </Col>
+          </Row>
+        </>
       );
     }
-    let curStmtInfo = (
+
+    let curStmtInfo = session.last_active_query ? (
+      <SqlBox value={session.last_active_query} size={SqlBoxSize.custom} />
+    ) : (
       <SummaryCard className={cx("details-section")}>
         No Active Statement
       </SummaryCard>
@@ -316,33 +333,13 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
       const stmt = session.active_queries[0];
       curStmtInfo = (
         <React.Fragment>
-          <SqlBox value={stmt.sql} />
+          <SqlBox value={stmt.sql} size={SqlBoxSize.custom} />
           <SummaryCard className={cx("details-section")}>
             <Row>
               <Col className="gutter-row" span={10}>
                 <SummaryCardItem
                   label={"Execution Start Time"}
                   value={TimestampToMoment(stmt.start).format(DATE_FORMAT)}
-                  className={cx("details-item")}
-                />
-                <SummaryCardItem
-                  label={
-                    <div className={cx("session-details-link")}>
-                      <Link
-                        to={StatementLinkTarget({
-                          statementFingerprintID: stmt.id,
-                          implicitTxn: session.active_txn?.implicit,
-                        })}
-                        onClick={() =>
-                          this.props.onStatementClick &&
-                          this.props.onStatementClick()
-                        }
-                      >
-                        View Statement Details
-                      </Link>
-                    </div>
-                  }
-                  value={""}
                   className={cx("details-item")}
                 />
               </Col>
@@ -361,20 +358,31 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
     }
 
     return (
-      <React.Fragment>
-        <SummaryCard className={cx("details-section")}>
-          <Row gutter={12}>
-            <Col className="gutter-row" span={10}>
+      <>
+        <Row gutter={24}>
+          <Col className="gutter-row" span={12}>
+            <SummaryCard className={cx("summary-card")}>
               <SummaryCardItem
-                label={"Session Start Time"}
+                label="Session Start Time"
                 value={TimestampToMoment(session.start).format(DATE_FORMAT)}
-                className={cx("details-item")}
+              />
+              {session.end && (
+                <SummaryCardItem
+                  label={"Session End Time"}
+                  value={TimestampToMoment(session.end).format(DATE_FORMAT)}
+                />
+              )}
+              <SummaryCardItem
+                label={"Session Active Duration"}
+                value={DurationToMomentDuration(
+                  session.total_active_time,
+                ).humanize()}
               />
               {!isTenant && (
                 <SummaryCardItem
                   label={"Gateway Node"}
                   value={
-                    this.props.uiConfig.showGatewayNodeLink ? (
+                    this.props.uiConfig?.showGatewayNodeLink ? (
                       <div className={cx("session-details-link")}>
                         <NodeLink
                           nodeId={session.node_id.toString()}
@@ -385,13 +393,11 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                       session.node_id.toString()
                     )
                   }
-                  className={cx("details-item")}
                 />
               )}
               <SummaryCardItem
-                label={"Application name"}
+                label={"Application Name"}
                 value={session.application_name}
-                className={cx("details-item")}
               />
               <SummaryCardItem
                 label={"Status"}
@@ -403,37 +409,63 @@ export class SessionDetails extends React.Component<SessionDetailsProps> {
                     <span>{getStatusString(session.status)}</span>
                   </div>
                 }
-                className={cx("details-item")}
               />
-            </Col>
-            <Col className="gutter-row" span={4} />
-            <Col className="gutter-row" span={10}>
+            </SummaryCard>
+          </Col>
+          <Col className="gutter-row" span={12}>
+            <SummaryCard className={cx("summary-card")}>
               <SummaryCardItem
                 label={"Client IP Address"}
                 value={session.client_address}
-                className={cx("details-item")}
               />
               <MemoryUsageItem
                 alloc_bytes={session.alloc_bytes}
                 max_alloc_bytes={session.max_alloc_bytes}
               />
+              <SummaryCardItem label={"User Name"} value={session.username} />
               <SummaryCardItem
-                label={"User name"}
-                value={session.username}
-                className={cx("details-item")}
+                label="Transaction Count"
+                value={Count(session.num_txns_executed)}
               />
-            </Col>
-          </Row>
-        </SummaryCard>
+            </SummaryCard>
+          </Col>
+        </Row>
         <Text textType={TextTypes.Heading5} className={cx("details-header")}>
           Transaction
         </Text>
-        <SummaryCard className={cx("details-section")}>{txnInfo}</SummaryCard>
+        {txnInfo}
         <Text textType={TextTypes.Heading5} className={cx("details-header")}>
           Most Recent Statement
         </Text>
         {curStmtInfo}
-      </React.Fragment>
+        <div>
+          <Text textType={TextTypes.Heading5} className={cx("details-header")}>
+            Most Recent Transaction Fingerprints Executed
+          </Text>
+          <Text textType={TextTypes.Caption}>
+            A list of the most recent transaction fingerprint IDs executed by
+            this session represented in hexadecimal.
+          </Text>
+          <SummaryCard
+            className={cx("details-section", "session-txn-fingerprints")}
+          >
+            {session.txn_fingerprint_ids.map((txnFingerprintID, i) => (
+              <Button
+                type="unstyled-link"
+                className={cx("link-txn-fingerprint-id")}
+                onClick={() =>
+                  this.onCachedTransactionFingerprintClick(
+                    txnFingerprintID.toString(10),
+                  )
+                }
+                key={i}
+              >
+                {txnFingerprintID.toString(16)}
+              </Button>
+            ))}
+          </SummaryCard>
+        </div>
+      </>
     );
   };
 }

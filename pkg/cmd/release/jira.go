@@ -24,9 +24,6 @@ const jiraBaseURL = "https://cockroachlabs.atlassian.net/"
 const dryRunProject = "REL"
 const sreDryRunProject = "RE"
 
-// for DeployToClusterIssue
-const customFieldHasSLAKey = "customfield_10073"
-
 // Jira uses Wiki syntax, see https://jira.atlassian.com/secure/WikiRendererHelpAction.jspa?section=all
 const trackingIssueTemplate = `
 * Version: *{{ .Version }}*
@@ -190,7 +187,9 @@ func createTrackingIssue(
 // - https://cockroachlabs.atlassian.net/browse/SREOPS-4037
 // - https://cockroachlabs.atlassian.net/rest/api/2/issue/SREOPS-4037
 // TODO(celia): [Future "week 0" work] We'll eventually want the ability to specify
-//  a qualification partition & friendly ID:
+//
+//	a qualification partition & friendly ID:
+//
 // During the stability period, release managers may be qualifying multiple candidates
 // at the same time. If that's the case, release managers will want the ability to
 // explicitly specify which partition to use, so that we don't "overwrite" the
@@ -207,18 +206,14 @@ func createSREIssue(client *jiraClient, release releaseInfo, dryRun bool) (jiraI
 	}
 	projectKey := "SREOPS"
 	summary := fmt.Sprintf("Deploy %s to release qualification cluster", release.nextReleaseVersion)
-	customFields := make(jira.CustomFields)
-	customFields[customFieldHasSLAKey] = "Yes"
 	if dryRun {
 		projectKey = sreDryRunProject
-		customFields = nil
 	}
 	issue := newIssue(&jiraIssue{
-		ProjectKey:   projectKey,
-		TypeName:     "Task",
-		Summary:      summary,
-		Description:  description,
-		CustomFields: customFields,
+		ProjectKey:  projectKey,
+		TypeName:    "Task",
+		Summary:     summary,
+		Description: description,
 	})
 	return createJiraIssue(client, issue)
 }

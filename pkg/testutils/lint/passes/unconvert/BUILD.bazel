@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 filegroup(
@@ -23,6 +24,7 @@ go_test(
     name = "unconvert_test",
     size = "small",
     srcs = ["unconvert_test.go"],
+    args = ["-test.timeout=55s"],
     data = [
         ":testdata",
         "@go_sdk//:files",
@@ -30,8 +32,10 @@ go_test(
     deps = [
         ":unconvert",
         "//pkg/build/bazel",
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/skip",
         "@org_golang_x_tools//go/analysis/analysistest",
     ],
 )
+
+get_x_data(name = "get_x_data")

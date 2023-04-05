@@ -29,7 +29,7 @@ func registerSecure(r registry.Registry) {
 		r.Add(registry.TestSpec{
 			Name:    fmt.Sprintf("smoketest/secure/nodes=%d", numNodes),
 			Tags:    []string{"smoketest", "weekly"},
-			Owner:   registry.OwnerKV, // TODO: OwnerTestEng once the open PR that introduces it has merged
+			Owner:   registry.OwnerTestEng,
 			Cluster: r.MakeClusterSpec(numNodes),
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				c.Put(ctx, t.Cockroach(), "./cockroach")
@@ -44,7 +44,7 @@ func registerSecure(r registry.Registry) {
 	}
 	r.Add(registry.TestSpec{
 		Name:    "smoketest/secure/multitenant",
-		Owner:   registry.OwnerServer,
+		Owner:   registry.OwnerMultiTenant,
 		Cluster: r.MakeClusterSpec(2),
 		Run:     multitenantSmokeTest,
 	})
@@ -66,7 +66,7 @@ func multitenantSmokeTest(ctx context.Context, t test.Test, c cluster.Cluster) {
 	tenID := 11
 	ten := createTenantNode(ctx, t, c, c.Node(1), tenID, 2, 8011, 9011)
 	runner := sqlutils.MakeSQLRunner(c.Conn(ctx, t.L(), 1))
-	runner.Exec(t, `SELECT crdb_internal.create_tenant($1)`, tenID)
+	runner.Exec(t, `SELECT crdb_internal.create_tenant($1::INT)`, tenID)
 	ten.start(ctx, t, c, "./cockroach")
 
 	// this doesn't work yet, roachprod knows nothing about tenants
@@ -80,7 +80,7 @@ func multitenantSmokeTest(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 	// init kv and check new database was done right
 	cmd := fmt.Sprintf("./cockroach workload init kv '%s'", ten.secureURL())
-	err = c.RunE(ctx, c.Node(1), cmd)
+	err = c.RunE(ctx, c.Node(2), cmd)
 	require.NoError(t, err)
 
 	sqlutils.MakeSQLRunner(db).CheckQueryResultsRetry(t, fmt.Sprintf(`

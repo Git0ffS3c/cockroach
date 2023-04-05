@@ -1,5 +1,9 @@
 @import "src/core/index.module";
 
+cl-table-container {
+  padding-top: 10px;
+}
+
 .cl-table-statistic {
   display: flex;
   justify-content: space-between;
@@ -8,18 +12,29 @@
   height: 32px;
 }
 
-.cl-count-title,
-.last-cleared-title {
+@mixin statistics-label {
   font-family: $font-family--base;
   font-size: 14px;
   padding: 0px;
   margin: 0px;
   color: $colors--neutral-6;
-  line-height: 1.57;
+  line-height: $line-height--large;
   letter-spacing: 0.1px;
+  display: flex;
   .label {
     font-family: $font-family--bold;
     color: $colors--neutral-7;
+  }
+}
+
+.cl-count-title,
+.last-cleared-title {
+  @include statistics-label;
+}
+
+.cl-table-statistic {
+  .cl-count-title {
+    @include statistics-label;
   }
 }
 
@@ -41,6 +56,10 @@
   margin-bottom: 0px;
 }
 
+.margin-bottom {
+  margin-bottom: 10px;
+}
+
 .root {
   flex-grow: 0;
   width: 100%;
@@ -49,7 +68,7 @@
 .table-area {
   position: relative;
   overflow-x: scroll;
-  min-height: 480px;
+  min-height: 590px;
 }
 
 .reset-btn-area {
@@ -91,4 +110,25 @@
   &:hover {
     text-decoration: underline;
   }
+}
+
+.filter-area {
+  height: 40px;
+}
+
+.float-right {
+  float: right;
+}
+
+.float-left {
+  float: left;
+}
+
+.margin-top {
+  margin-top: 20px;
+}
+
+.margin-adjusted {
+  margin-top: 5px;
+  margin-bottom: -15px;
 }

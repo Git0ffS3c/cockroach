@@ -28,30 +28,30 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	tu "github.com/cockroachdb/cockroach/pkg/testutils"
+	tu "github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
 
 // TestExprIsNeverNull runs data-driven testcases of the form
-//   <command> [<args>]...
-//   <SQL statement or expression>
-//   ----
-//   <expected results>
+//
+//	<command> [<args>]...
+//	<SQL statement or expression>
+//	----
+//	<expected results>
 //
 // See OptTester.Handle for supported commands. In addition to those, we
 // support:
 //
-//  - scalar-is-not-nullable [args]
+//   - scalar-is-not-nullable [args]
 //
-//    Builds a scalar expression using the input and performs a best-effort
-//    check to see if the scalar expression is nullable. It outputs this
-//    result as a boolean.
+//     Builds a scalar expression using the input and performs a best-effort
+//     check to see if the scalar expression is nullable. It outputs this
+//     result as a boolean.
 //
-//    The supported args (in addition to the ones supported by OptTester):
+//     The supported args (in addition to the ones supported by OptTester):
 //
-//      - vars=(var1 type1 [not null], var2 type2 [not null],...)
-//
+//   - vars=(var1 type1 [not null], var2 type2 [not null],...)
 func TestExprIsNeverNull(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -67,7 +67,7 @@ func TestExprIsNeverNull(t *testing.T) {
 				evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 				var o xform.Optimizer
-				o.Init(&evalCtx, catalog)
+				o.Init(ctx, &evalCtx, catalog)
 
 				var sv testutils.ScalarVars
 

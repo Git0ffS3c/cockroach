@@ -15,7 +15,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 )
 
 const (
@@ -24,13 +24,13 @@ const (
 	AuthParam = "AUTH"
 	// AuthParamImplicit is the query parameter for the implicit authentication
 	// mode in a URI.
-	AuthParamImplicit = roachpb.ExternalStorageAuthImplicit
+	AuthParamImplicit = cloudpb.ExternalStorageAuthImplicit
 	// AuthParamSpecified is the query parameter for the specified authentication
 	// mode in a URI.
-	AuthParamSpecified = roachpb.ExternalStorageAuthSpecified
-	// AuthParamAssume is the query parameter for AssumeRole authentication
-	// mode in a URI.
-	AuthParamAssume = roachpb.ExternalStorageAuthAssume
+	AuthParamSpecified = cloudpb.ExternalStorageAuthSpecified
+	// LocalityURLParam is the parameter name used when specifying a locality tag
+	// in a locality aware backup/restore.
+	LocalityURLParam = "COCKROACH_LOCALITY"
 )
 
 // GetPrefixBeforeWildcard gets the prefix of a path that does not contain glob-
@@ -79,4 +79,82 @@ func JoinPathPreservingTrailingSlash(prefix, suffix string) string {
 		out += "/"
 	}
 	return out
+}
+
+// ParseRoleString parses a comma separated string of roles into a list of
+// intermediate delegate roles and the final assumed role.
+func ParseRoleString(roleString string) (string, []string) {
+	roleProvider, delegateRoleProviders := ParseRoleProvidersString(roleString)
+
+	delegateRoles := make([]string, len(delegateRoleProviders))
+	for i := range delegateRoleProviders {
+		delegateRoles[i] = delegateRoleProviders[i].Role
+	}
+	return roleProvider.Role, delegateRoles
+}
+
+// ParseRoleProvidersString parses a comma separated list of role provider
+// strings.
+//
+// Each role provider string is in the format: "<role>;external_id=<id>"
+// The external ID portion of the format, including the ';', is optional and can
+// be omitted if there is no external ID needed when assuming the role.
+func ParseRoleProvidersString(
+	roleProvidersString string,
+) (
+	assumeRole cloudpb.ExternalStorage_AssumeRoleProvider,
+	delegateRoles []cloudpb.ExternalStorage_AssumeRoleProvider,
+) {
+	if roleProvidersString == "" {
+		return assumeRole, delegateRoles
+	}
+
+	roleProviders := strings.Split(roleProvidersString, ",")
+	delegateRoles = make([]cloudpb.ExternalStorage_AssumeRoleProvider, len(roleProviders)-1)
+
+	assumeRole = cloudpb.DecodeRoleProviderString(roleProviders[len(roleProviders)-1])
+	for i := 0; i < len(roleProviders)-1; i++ {
+		delegateRoles[i] = cloudpb.DecodeRoleProviderString(roleProviders[i])
+	}
+	return assumeRole, delegateRoles
+}
+
+// ConsumeURL is a helper struct which for "consuming" URL query
+// parameters from the underlying URL.
+type ConsumeURL struct {
+	*url.URL
+	q url.Values
+}
+
+// ConsumeParam returns the value of the parameter p from the underlying URL,
+// and deletes the parameter from the URL.
+func (u *ConsumeURL) ConsumeParam(p string) string {
+	if u.q == nil {
+		u.q = u.Query()
+	}
+	v := u.q.Get(p)
+	u.q.Del(p)
+	return v
+}
+
+// RemainingQueryParams returns the query parameters that have not been consumed
+// from the underlying URL.
+func (u *ConsumeURL) RemainingQueryParams() (res []string) {
+	if u.q == nil {
+		u.q = u.Query()
+	}
+	for p := range u.q {
+		// The `COCKROACH_LOCALITY` parameter is supported for all External Storage
+		// implementations and is not used when creating the External Storage, but
+		// instead during backup/restore resolution. So, this parameter is not
+		// "consumed" by the individual External Storage implementations in their
+		// parse functions and so it will always show up in this method. We should
+		// consider this param invisible when validating that all the passed in
+		// query parameters are supported for an External Storage URI.
+		if p == LocalityURLParam {
+			continue
+		}
+		res = append(res, p)
+	}
+	return
 }

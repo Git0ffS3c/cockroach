@@ -1,4 +1,5 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "colexecargs",
@@ -11,6 +12,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/col/coldata",
+        "//pkg/sql/catalog/descs",
         "//pkg/sql/colcontainer",
         "//pkg/sql/colexecerror",
         "//pkg/sql/colexecop",
@@ -28,10 +30,4 @@ go_library(
     ],
 )
 
-go_test(
-    name = "colexecargs_test",
-    srcs = ["dep_test.go"],
-    embed = [":colexecargs"],
-    tags = ["no-remote"],
-    deps = ["//pkg/testutils/buildutil"],
-)
+get_x_data(name = "get_x_data")

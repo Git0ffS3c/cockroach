@@ -24,6 +24,7 @@ import (
 )
 
 // PrivilegeDescVersion is a custom type for PrivilegeDescriptor versions.
+//
 //go:generate stringer -type=PrivilegeDescVersion
 type PrivilegeDescVersion uint32
 
@@ -126,15 +127,6 @@ func NewCustomSuperuserPrivilegeDescriptor(
 	}
 }
 
-// NewVirtualTablePrivilegeDescriptor is used to construct a privilege descriptor
-// owned by the node user which has SELECT privilege for the public role. It is
-// used for virtual tables.
-func NewVirtualTablePrivilegeDescriptor() *PrivilegeDescriptor {
-	return NewPrivilegeDescriptor(
-		username.PublicRoleName(), privilege.List{privilege.SELECT}, privilege.List{}, username.NodeUserName(),
-	)
-}
-
 // NewVirtualSchemaPrivilegeDescriptor is used to construct a privilege descriptor
 // owned by the node user which has USAGE privilege for the public role. It is
 // used for virtual schemas.
@@ -214,6 +206,9 @@ func NewPublicSchemaPrivilegeDescriptor() *PrivilegeDescriptor {
 func (p *PrivilegeDescriptor) CheckGrantOptions(
 	user username.SQLUsername, privList privilege.List,
 ) bool {
+	if p.Owner() == user {
+		return true
+	}
 	userPriv, exists := p.FindUser(user)
 	if !exists {
 		return false
@@ -276,11 +271,11 @@ func (p *PrivilegeDescriptor) Revoke(
 	privList privilege.List,
 	objectType privilege.ObjectType,
 	grantOptionFor bool,
-) {
+) error {
 	userPriv, ok := p.FindUser(user)
 	if !ok || userPriv.Privileges == 0 {
 		// Removing privileges from a user without privileges is a no-op.
-		return
+		return nil
 	}
 
 	bits := privList.ToBitField()
@@ -295,13 +290,16 @@ func (p *PrivilegeDescriptor) Revoke(
 			// fold sub-privileges into ALL
 			userPriv.Privileges = privilege.ALL.Mask()
 		}
-		return
+		return nil
 	}
 
 	if privilege.ALL.IsSetIn(userPriv.Privileges) && !grantOptionFor {
 		// User has 'ALL' privilege. Remove it and set
 		// all other privileges one.
-		validPrivs := privilege.GetValidPrivilegesForObject(objectType)
+		validPrivs, err := privilege.GetValidPrivilegesForObject(objectType)
+		if err != nil {
+			return err
+		}
 		userPriv.Privileges = 0
 		for _, v := range validPrivs {
 			if v != privilege.ALL {
@@ -314,7 +312,10 @@ func (p *PrivilegeDescriptor) Revoke(
 	if privilege.ALL.IsSetIn(userPriv.WithGrantOption) {
 		// User has 'ALL' grant option. Remove it and set
 		// all other grant options to one.
-		validPrivs := privilege.GetValidPrivilegesForObject(objectType)
+		validPrivs, err := privilege.GetValidPrivilegesForObject(objectType)
+		if err != nil {
+			return err
+		}
 		userPriv.WithGrantOption = 0
 		for _, v := range validPrivs {
 			if v != privilege.ALL {
@@ -333,34 +334,14 @@ func (p *PrivilegeDescriptor) Revoke(
 			p.RemoveUser(user)
 		}
 	}
-}
-
-// GrantPrivilegeToGrantOptions adjusts a user's grant option bits based on whether the GRANT or ALL
-// privilege was just granted or revoked. If GRANT/ALL was just granted, the user should obtain grant
-// options for each privilege it currently has. If GRANT/ALL was just revoked, the user should lose
-// grant options for each privilege it has
-// TODO(jackcwu): delete this function once the GRANT privilege is finally removed
-func (p *PrivilegeDescriptor) GrantPrivilegeToGrantOptions(
-	user username.SQLUsername, isGrant bool,
-) {
-	if isGrant {
-		userPriv := p.FindOrCreateUser(user)
-		userPriv.WithGrantOption = userPriv.Privileges
-	} else {
-		userPriv, ok := p.FindUser(user)
-		if !ok || userPriv.Privileges == 0 {
-			// Removing privileges from a user without privileges is a no-op.
-			return
-		}
-		userPriv.WithGrantOption = 0
-	}
+	return nil
 }
 
 // ValidateSuperuserPrivileges ensures that superusers have exactly the maximum
 // allowed privilege set for the object.
-// It requires the ID of the descriptor it is applied on to determine whether
-// it is is a system descriptor, because superusers do not always have full
-// privileges for those.
+// It requires the ID of the descriptor it is applied on to determine whether it
+// is a system descriptor, because superusers do not always have full privileges
+// for those.
 // It requires the objectType to determine the superset of privileges allowed
 // for regular users.
 func (p PrivilegeDescriptor) ValidateSuperuserPrivileges(
@@ -418,12 +399,19 @@ func (p PrivilegeDescriptor) Validate(
 		}
 	}
 
-	valid, u, remaining := p.IsValidPrivilegesForObjectType(objectType)
+	valid, u, remaining, err := p.IsValidPrivilegesForObjectType(objectType)
+	if err != nil {
+		return err
+	}
 	if !valid {
+		privList, err := privilege.ListFromBitField(remaining, privilege.Any)
+		if err != nil {
+			return err
+		}
 		return errors.AssertionFailedf(
 			"user %s must not have %s privileges on %s",
 			u.User(),
-			privilege.ListFromBitField(remaining, privilege.Any),
+			privList,
 			privilegeObject(parentID, objectType, objectName),
 		)
 	}
@@ -438,26 +426,12 @@ func (p PrivilegeDescriptor) Validate(
 // privileges.
 func (p PrivilegeDescriptor) IsValidPrivilegesForObjectType(
 	objectType privilege.ObjectType,
-) (bool, UserPrivileges, uint32) {
-	allowedPrivilegesBits := privilege.GetValidPrivilegesForObject(objectType).ToBitField()
-
-	// Validate can be called during the fix_privileges_migration introduced in
-	// 21.2. It is possible for have invalid privileges prior to 21.2 in certain
-	// cases due to bugs. We can strictly check privileges in 21.2 and onwards.
-	if p.Version < Version21_2 {
-		if objectType == privilege.Schema {
-			// Prior to 21_2, it was possible for a schema to have some database
-			// privileges on it. This was temporarily fixed by an upgrade on read
-			// but in 21.2 onwards, it should be permanently fixed with a migration.
-			allowedPrivilegesBits |= privilege.GetValidPrivilegesForObject(privilege.Database).ToBitField()
-		}
-		if objectType == privilege.Table || objectType == privilege.Database {
-			// Prior to 21_2, it was possible for a table or database to have USAGE
-			// privilege on it due to a bug when upgrading from 20.1 to 20.2.
-			// In 21.2 onwards, it should be permanently fixed with a migration.
-			allowedPrivilegesBits |= privilege.USAGE.Mask()
-		}
+) (bool, UserPrivileges, uint64, error) {
+	validPrivs, err := privilege.GetValidPrivilegesForObject(objectType)
+	if err != nil {
+		return false, UserPrivileges{}, 0, err
 	}
+	allowedPrivilegesBits := validPrivs.ToBitField()
 
 	// For all non-super users, privileges must not exceed the allowed privileges.
 	// Also the privileges must be valid on the object type.
@@ -468,11 +442,11 @@ func (p PrivilegeDescriptor) IsValidPrivilegesForObjectType(
 		}
 
 		if remaining := u.Privileges &^ allowedPrivilegesBits; remaining != 0 {
-			return false, u, remaining
+			return false, u, remaining, nil
 		}
 	}
 
-	return true, UserPrivileges{}, 0
+	return true, UserPrivileges{}, 0, nil
 }
 
 // UserPrivilege represents a User and its Privileges
@@ -483,10 +457,29 @@ type UserPrivilege struct {
 
 // Show returns the list of {username, privileges} sorted by username.
 // 'privileges' is a string of comma-separated sorted privilege names.
-func (p PrivilegeDescriptor) Show(objectType privilege.ObjectType) []UserPrivilege {
+// The owner always implicitly receives ALL privileges with the GRANT OPTION. If
+// showImplicitOwnerPrivs is true, then that implicit privilege is shown here.
+// Otherwise, only the privileges that were explicitly granted to the owner are
+// shown.
+func (p PrivilegeDescriptor) Show(
+	objectType privilege.ObjectType, showImplicitOwnerPrivs bool,
+) ([]UserPrivilege, error) {
 	ret := make([]UserPrivilege, 0, len(p.Users))
+	sawOwner := false
 	for _, userPriv := range p.Users {
-		privileges := privilege.PrivilegesFromBitFields(userPriv.Privileges, userPriv.WithGrantOption, objectType)
+		privBits := userPriv.Privileges
+		grantOptionBits := userPriv.WithGrantOption
+		if userPriv.User() == p.Owner() {
+			sawOwner = true
+			if showImplicitOwnerPrivs {
+				privBits = privilege.ALL.Mask()
+				grantOptionBits = privilege.ALL.Mask()
+			}
+		}
+		privileges, err := privilege.PrivilegesFromBitFields(privBits, grantOptionBits, objectType)
+		if err != nil {
+			return nil, err
+		}
 		sort.Slice(privileges, func(i, j int) bool {
 			return strings.Compare(privileges[i].Kind.String(), privileges[j].Kind.String()) < 0
 		})
@@ -495,11 +488,23 @@ func (p PrivilegeDescriptor) Show(objectType privilege.ObjectType) []UserPrivile
 			Privileges: privileges,
 		})
 	}
-	return ret
+
+	// The node user owns system tables, but since it's just an internal reserved
+	// name, we don't show node's privileges here.
+	if showImplicitOwnerPrivs && !sawOwner && !p.Owner().IsNodeUser() && !p.Owner().Undefined() {
+		ret = append(ret, UserPrivilege{
+			User:       p.Owner(),
+			Privileges: []privilege.Privilege{{Kind: privilege.ALL, GrantOption: true}},
+		})
+	}
+	return ret, nil
 }
 
 // CheckPrivilege returns true if 'user' has 'privilege' on this descriptor.
 func (p PrivilegeDescriptor) CheckPrivilege(user username.SQLUsername, priv privilege.Kind) bool {
+	if p.Owner() == user {
+		return true
+	}
 	userPriv, ok := p.FindUser(user)
 	if !ok {
 		// User "node" has all privileges.
@@ -528,22 +533,25 @@ func (p PrivilegeDescriptor) AnyPrivilege(user username.SQLUsername) bool {
 // ALL or having every privilege possible on the object.
 func (p PrivilegeDescriptor) HasAllPrivileges(
 	user username.SQLUsername, objectType privilege.ObjectType,
-) bool {
+) (bool, error) {
 	if p.CheckPrivilege(user, privilege.ALL) {
-		return true
+		return true, nil
 	}
 	// If ALL is not set, check if all other privileges would add up to all.
-	validPrivileges := privilege.GetValidPrivilegesForObject(objectType)
+	validPrivileges, err := privilege.GetValidPrivilegesForObject(objectType)
+	if err != nil {
+		return false, err
+	}
 	for _, priv := range validPrivileges {
 		if priv == privilege.ALL {
 			continue
 		}
 		if !p.CheckPrivilege(user, priv) {
-			return false
+			return false, nil
 		}
 	}
 
-	return true
+	return true, nil
 }
 
 // SetOwner sets the owner of the privilege descriptor to the provided string.

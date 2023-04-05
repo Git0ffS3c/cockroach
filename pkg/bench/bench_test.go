@@ -13,6 +13,7 @@ package bench
 import (
 	"bytes"
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -23,6 +24,13 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -33,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
+	"github.com/stretchr/testify/require"
 )
 
 func runBenchmarkSelect1(b *testing.B, db *sqlutils.SQLRunner) {
@@ -221,12 +230,12 @@ func BenchmarkTableResolution(b *testing.B) {
 	for _, createTempTables := range []bool{false, true} {
 		b.Run(fmt.Sprintf("temp_schema_exists:%t", createTempTables), func(b *testing.B) {
 			benchmarkCockroach(b, func(b *testing.B, db *sqlutils.SQLRunner) {
-				defer func() {
+				defer func(createTempTables bool) {
 					db.Exec(b, `DROP TABLE IF EXISTS bench.tbl`)
 					if createTempTables {
 						db.Exec(b, `DROP TABLE IF EXISTS bench.pg_temp.temp_tbl`)
 					}
-				}()
+				}(createTempTables)
 
 				db.Exec(b, `
 			USE bench;
@@ -301,13 +310,13 @@ func runBenchmarkInsert(b *testing.B, db *sqlutils.SQLRunner, count int) {
 func runBenchmarkInsertFK(b *testing.B, db *sqlutils.SQLRunner, count int) {
 	for _, nFks := range []int{1, 5, 10} {
 		b.Run(fmt.Sprintf("nFks=%d", nFks), func(b *testing.B) {
-			defer func() {
+			defer func(nFks int) {
 				dropStmt := "DROP TABLE IF EXISTS bench.insert"
 				for i := 0; i < nFks; i++ {
 					dropStmt += fmt.Sprintf(",bench.fk%d", i)
 				}
 				db.Exec(b, dropStmt)
-			}()
+			}(nFks)
 
 			for i := 0; i < nFks; i++ {
 				db.Exec(b, fmt.Sprintf(`CREATE TABLE bench.fk%d (k INT PRIMARY KEY)`, i))
@@ -376,6 +385,34 @@ func runBenchmarkInsertSecondaryIndex(b *testing.B, db *sqlutils.SQLRunner, coun
 	b.StopTimer()
 }
 
+// runBenchmarkInsertReturning benchmarks inserting count rows into a table
+// while performing rendering for the RETURNING clause.
+func runBenchmarkInsertReturning(b *testing.B, db *sqlutils.SQLRunner, count int) {
+	defer func() {
+		db.Exec(b, `DROP TABLE IF EXISTS bench.insert`)
+	}()
+
+	db.Exec(b, `CREATE TABLE bench.insert (k INT PRIMARY KEY)`)
+
+	b.ResetTimer()
+	var buf bytes.Buffer
+	val := 0
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		buf.WriteString(`INSERT INTO bench.insert VALUES `)
+		for j := 0; j < count; j++ {
+			if j > 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, "(%d)", val)
+			val++
+		}
+		buf.WriteString(` RETURNING k + 1, k - 1, k * 2, k / 2`)
+		db.Exec(b, buf.String())
+	}
+	b.StopTimer()
+}
+
 func BenchmarkSQL(b *testing.B) {
 	skip.UnderShort(b)
 	defer log.Scope(b).Close(b)
@@ -386,8 +423,10 @@ func BenchmarkSQL(b *testing.B) {
 			runBenchmarkInsertDistinct,
 			runBenchmarkInsertFK,
 			runBenchmarkInsertSecondaryIndex,
+			runBenchmarkInsertReturning,
 			runBenchmarkTrackChoices,
 			runBenchmarkUpdate,
+			runBenchmarkUpdateWithAssignmentCast,
 			runBenchmarkUpsert,
 		} {
 			fnName := runtime.FuncForPC(reflect.ValueOf(runFn).Pointer()).Name()
@@ -560,6 +599,44 @@ func runBenchmarkUpdate(b *testing.B, db *sqlutils.SQLRunner, count int) {
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
 		buf.WriteString(`UPDATE bench.update SET v = v + 1 WHERE k IN (`)
+		for j := 0; j < count; j++ {
+			if j > 0 {
+				buf.WriteString(", ")
+			}
+			fmt.Fprintf(&buf, `%d`, s.Intn(rows))
+		}
+		buf.WriteString(`)`)
+		db.Exec(b, buf.String())
+	}
+	b.StopTimer()
+}
+
+// runBenchmarkUpdateWithAssignmentCast benchmarks updating count random rows in
+// a table where we need to perform an assigment cast to get the updated values.
+func runBenchmarkUpdateWithAssignmentCast(b *testing.B, db *sqlutils.SQLRunner, count int) {
+	defer func() {
+		db.Exec(b, `DROP TABLE IF EXISTS bench.update`)
+	}()
+
+	const rows = 10000
+	db.Exec(b, `CREATE TABLE bench.update (k INT PRIMARY KEY, v INT)`)
+
+	var buf bytes.Buffer
+	buf.WriteString(`INSERT INTO bench.update VALUES `)
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		fmt.Fprintf(&buf, "(%d, %d)", i, i)
+	}
+	db.Exec(b, buf.String())
+
+	s := rand.New(rand.NewSource(5432))
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf.Reset()
+		buf.WriteString(`UPDATE bench.update SET v = (v + 1.0)::FLOAT WHERE k IN (`)
 		for j := 0; j < count; j++ {
 			if j > 0 {
 				buf.WriteString(", ")
@@ -891,6 +968,28 @@ CREATE TABLE bench.insert_distinct (
 `
 	db.Exec(b, schema)
 
+	// When running against SQL databases, create all the connections in advance.
+	// Without this, if the workers use the connection pool directly, on OSX and
+	// FreeBSD the server cannot accept connections fast enough and so opening
+	// some connections fails. This happens when we attempt to open 1000
+	// connections concurrently because of the default kernel limit of
+	// kern.ipc.somaxconn=128.
+	ctx := context.Background()
+	conns := make([]sqlutils.DBHandle, numUsers)
+	for i := 0; i < numUsers; i++ {
+		sqldb, ok := db.DB.(*gosql.DB)
+		if ok {
+			conn, err := sqldb.Conn(ctx)
+			require.NoError(b, err)
+			defer func() {
+				_ = conn.Close()
+			}()
+			conns[i] = conn
+		} else {
+			conns[i] = db.DB
+		}
+	}
+
 	b.ResetTimer()
 
 	errChan := make(chan error)
@@ -924,7 +1023,7 @@ CREATE TABLE bench.insert_distinct (
 						fmt.Fprintf(&buf, "(%d, %d)", zipf.Uint64(), n)
 					}
 
-					if _, err := db.DB.ExecContext(context.Background(), buf.String()); err != nil {
+					if _, err := conns[i].ExecContext(context.Background(), buf.String()); err != nil {
 						return err
 					}
 				}
@@ -1046,19 +1145,12 @@ func runBenchmarkWideTable(b *testing.B, db *sqlutils.SQLRunner, count int, bigC
 	b.StopTimer()
 }
 
-// BenchmarkVecSkipScan benchmarks the vectorized engine's performance
-// when skipping unneeded key values in the decoding process.
-func BenchmarkVecSkipScan(b *testing.B) {
+// BenchmarkSkipScan benchmarks the scan performance when skipping unneeded
+// columns in the decoding process.
+func BenchmarkSkipScan(b *testing.B) {
 	defer log.Scope(b).Close(b)
-	benchmarkCockroach(b, func(b *testing.B, db *sqlutils.SQLRunner) {
-		create := `
-CREATE TABLE bench.scan(
-	x INT, y INT, z INT, 
-	a INT, w INT, v INT, 
-	PRIMARY KEY (x, y, z, a, w, v)
-)
-`
-		db.Exec(b, create)
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		db.Exec(b, "CREATE TABLE bench.scan(pk INT PRIMARY KEY, val1 INT, val2 INT, val3 INT, val4 INT, val5 INT)")
 		const count = 1000
 		for i := 0; i < count; i++ {
 			db.Exec(
@@ -1069,12 +1161,22 @@ CREATE TABLE bench.scan(
 				),
 			)
 		}
-		b.ResetTimer()
-		b.Run("Bench scan with skip", func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				db.Exec(b, `SET vectorize=on; SELECT y FROM bench.scan`)
-			}
-		})
+		for _, tc := range []struct {
+			name   string
+			toScan string
+		}{
+			{name: "OnlyKey", toScan: "pk"},
+			{name: "OnlyValue", toScan: "val3"},
+			{name: "Both", toScan: "pk, val3"},
+		} {
+			b.Run(tc.name, func(b *testing.B) {
+				query := fmt.Sprintf("SELECT %s FROM bench.scan", tc.toScan)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					db.Exec(b, query)
+				}
+			})
+		}
 	})
 }
 
@@ -1136,8 +1238,58 @@ func BenchmarkPlanning(b *testing.B) {
 	})
 }
 
+func setupIndexJoinBenchmark(b *testing.B, db *sqlutils.SQLRunner) {
+	// The table will have an extra column not contained in the index to force a
+	// join with the PK.
+	create := `
+		 CREATE TABLE tidx (
+				 k INT NOT NULL,
+				 v INT NULL,
+				 extra STRING NULL,
+				 CONSTRAINT "primary" PRIMARY KEY (k ASC),
+				 INDEX idx (v ASC),
+				 FAMILY "primary" (k, v, extra)
+		 )
+		`
+	// We'll insert 1000 rows with random values below 1000 in the index.
+	// We'll then force scanning of the secondary index which will require
+	// performing an index join to get 'extra' column.
+	insert := "insert into tidx(k,v) select generate_series(1,1000), (random()*1000)::int"
+
+	db.Exec(b, create)
+	db.Exec(b, insert)
+}
+
 // BenchmarkIndexJoin measure an index-join with 1000 rows.
 func BenchmarkIndexJoin(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		setupIndexJoinBenchmark(b, db)
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			db.Exec(b, "select * from bench.tidx@idx where v < 1000")
+		}
+	})
+}
+
+// BenchmarkIndexJoinOrdering is the same as BenchmarkIndexJoin when the
+// ordering needs to be maintained.
+func BenchmarkIndexJoinOrdering(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		setupIndexJoinBenchmark(b, db)
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			db.Exec(b, "select * from bench.tidx@idx where v < 1000 order by v")
+		}
+	})
+}
+
+// BenchmarkIndexJoinColumnFamilies is the same as BenchmarkIndexJoin, only with
+// the table having two column families.
+func BenchmarkIndexJoinColumnFamilies(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
 		// The table will have an extra column not contained in the index to force a
@@ -1149,7 +1301,8 @@ func BenchmarkIndexJoin(b *testing.B) {
 				 extra STRING NULL,
 				 CONSTRAINT "primary" PRIMARY KEY (k ASC),
 				 INDEX idx (v ASC),
-				 FAMILY "primary" (k, v, extra)
+				 FAMILY f1 (k, v),
+				 FAMILY f2 (extra)
 		 )
 		`
 		// We'll insert 1000 rows with random values below 1000 in the index.
@@ -1163,6 +1316,75 @@ func BenchmarkIndexJoin(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			db.Exec(b, "select * from bench.tidx@idx where v < 1000")
+		}
+	})
+}
+
+// BenchmarkLookupJoinEqColsAreKeyNoOrdering measures a lookup-join with 1000
+// rows when equality columns are key and ordering doesn't have to be
+// maintained.
+func BenchmarkLookupJoinEqColsAreKeyNoOrdering(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		db.Exec(b, `CREATE TABLE t1 (a INT)`)
+		db.Exec(b, `INSERT INTO t1 SELECT generate_series(1, 1000)`)
+		db.Exec(b, `CREATE TABLE t2 (a INT PRIMARY KEY, b INT)`)
+		db.Exec(b, `INSERT INTO t2 SELECT generate_series(1, 1000), (random()*1000)::INT`)
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			db.Exec(b, `SELECT * FROM t1 INNER LOOKUP JOIN t2 ON t1.a = t2.a`)
+		}
+	})
+}
+
+// BenchmarkLookupJoinEqColsAreKeyOrdering measures a lookup-join with 1000 rows
+// when equality columns are key and ordering needs to be maintained.
+func BenchmarkLookupJoinEqColsAreKeyOrdering(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		db.Exec(b, `CREATE TABLE t1 (a INT PRIMARY KEY)`)
+		db.Exec(b, `INSERT INTO t1 SELECT generate_series(1, 1000)`)
+		db.Exec(b, `CREATE TABLE t2 (a INT PRIMARY KEY, b INT)`)
+		db.Exec(b, `INSERT INTO t2 SELECT generate_series(1, 1000), (random()*1000)::INT`)
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			db.Exec(b, `SELECT * FROM t1 INNER LOOKUP JOIN t2 ON t1.a = t2.a ORDER BY t1.a`)
+		}
+	})
+}
+
+// BenchmarkLookupJoinNoOrdering measures a lookup-join with 1000 rows and
+// ordering doesn't have to be maintained.
+func BenchmarkLookupJoinNoOrdering(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		db.Exec(b, `CREATE TABLE t1 (a INT)`)
+		db.Exec(b, `INSERT INTO t1 SELECT generate_series(1, 1000)`)
+		db.Exec(b, `CREATE TABLE t2 (a INT, INDEX (a))`)
+		db.Exec(b, `INSERT INTO t2 SELECT generate_series(1, 1000)`)
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			db.Exec(b, `SELECT * FROM t1 INNER LOOKUP JOIN t2 ON t1.a = t2.a`)
+		}
+	})
+}
+
+// BenchmarkLookupJoinOrdering measures a lookup-join with 1000 rows when
+// ordering needs to be maintained.
+func BenchmarkLookupJoinOrdering(b *testing.B) {
+	defer log.Scope(b).Close(b)
+	ForEachDB(b, func(b *testing.B, db *sqlutils.SQLRunner) {
+		db.Exec(b, `CREATE TABLE t1 (a INT PRIMARY KEY)`)
+		db.Exec(b, `INSERT INTO t1 SELECT generate_series(1, 1000)`)
+		db.Exec(b, `CREATE TABLE t2 (a INT, INDEX (a))`)
+		db.Exec(b, `INSERT INTO t2 SELECT generate_series(1, 1000)`)
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			db.Exec(b, `SELECT * FROM t1 INNER LOOKUP JOIN t2 ON t1.a = t2.a ORDER BY t1.a`)
 		}
 	})
 }
@@ -1231,4 +1453,102 @@ func BenchmarkNameResolution(b *testing.B) {
 		}
 		b.StopTimer()
 	})
+}
+
+func BenchmarkFuncExprTypeCheck(b *testing.B) {
+	skip.UnderShort(b)
+	defer log.Scope(b).Close(b)
+
+	s, db, kvDB := serverutils.StartServer(b, base.TestServerArgs{UseDatabase: "defaultdb"})
+	defer s.Stopper().Stop(context.Background())
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
+	sqlDB.ExecMultiple(b,
+		`CREATE SCHEMA sc1`,
+		`CREATE SCHEMA sc2`,
+		`CREATE FUNCTION abs(val INT) RETURNS INT CALLED ON NULL INPUT LANGUAGE SQL AS $$ SELECT val $$`,
+		`CREATE FUNCTION sc1.udf(val INT) RETURNS INT CALLED ON NULL INPUT LANGUAGE SQL AS $$ SELECT val $$`,
+		`CREATE FUNCTION sc1.udf(val STRING) RETURNS STRING LANGUAGE SQL AS $$ SELECT val $$`,
+		`CREATE FUNCTION sc1.udf(val FLOAT) RETURNS FLOAT LANGUAGE SQL AS $$ SELECT val $$`,
+		`CREATE FUNCTION sc2.udf(val INT) RETURNS INT LANGUAGE SQL AS $$ SELECT val $$`,
+	)
+
+	ctx := context.Background()
+	execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
+	p, cleanup := sql.NewInternalPlanner("type-check-benchmark",
+		kvDB.NewTxn(ctx, "type-check-benchmark-planner"),
+		username.RootUserName(),
+		&sql.MemoryMetrics{},
+		&execCfg,
+		sessiondatapb.SessionData{
+			Database: "defaultdb",
+		},
+	)
+
+	defer cleanup()
+	semaCtx := p.(sql.PlanHookState).SemaCtx()
+	sp := sessiondata.MakeSearchPath(append(sessiondata.DefaultSearchPath.GetPathArray(), "sc1", "sc2"))
+	semaCtx.SearchPath = &sp
+
+	testCases := []struct {
+		name    string
+		exprStr string
+	}{
+		{
+			name:    "builtin called on null input",
+			exprStr: "md5('some_string')",
+		},
+		{
+			name:    "builtin not called on null input",
+			exprStr: "parse_timetz('some_string')",
+		},
+		{
+			name:    "builtin aggregate",
+			exprStr: "corr(123, 321)",
+		},
+		{
+			name:    "builtin aggregate not called on null",
+			exprStr: "concat_agg(NULL)",
+		},
+		{
+			name:    "udf same name as builtin",
+			exprStr: "abs(123)",
+		},
+		{
+			name:    "udf across different schemas",
+			exprStr: "udf(123)",
+		},
+		{
+			name:    "unary operator",
+			exprStr: "-123",
+		},
+		{
+			name:    "binary operator",
+			exprStr: "123 + 321",
+		},
+		{
+			name:    "comparison operator",
+			exprStr: "123 > 321",
+		},
+		{
+			name:    "tuple comparison operator",
+			exprStr: "(1, 2, 3) > (1, 2, 4)",
+		},
+		{
+			name:    "tuple in operator",
+			exprStr: "1 in (1, 2, 3)",
+		},
+	}
+
+	for _, tc := range testCases {
+		b.Run(tc.name, func(b *testing.B) {
+			expr, err := parser.ParseExpr(tc.exprStr)
+			require.NoError(b, err)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := tree.TypeCheck(ctx, expr, semaCtx, types.Any)
+				require.NoError(b, err)
+			}
+		})
+	}
 }

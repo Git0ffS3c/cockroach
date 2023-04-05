@@ -43,6 +43,7 @@ func TestVectorizedInternalPanic(t *testing.T) {
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: cluster.MakeTestingClusterSettings()},
 	}
 
@@ -50,9 +51,10 @@ func TestVectorizedInternalPanic(t *testing.T) {
 	typs := types.OneIntCol
 	input := execinfra.NewRepeatableRowSource(typs, randgen.MakeIntRows(nRows, nCols))
 
-	col := colexec.NewBufferingColumnarizer(testAllocator, &flowCtx, 0 /* processorID */, input)
+	col := colexec.NewBufferingColumnarizerForTests(testAllocator, &flowCtx, 0 /* processorID */, input)
 	vee := newTestVectorizedInternalPanicEmitter(col)
 	mat := colexec.NewMaterializer(
+		nil, /* allocator */
 		&flowCtx,
 		1, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: vee},
@@ -78,6 +80,7 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: cluster.MakeTestingClusterSettings()},
 	}
 
@@ -85,9 +88,10 @@ func TestNonVectorizedPanicPropagation(t *testing.T) {
 	typs := types.OneIntCol
 	input := execinfra.NewRepeatableRowSource(typs, randgen.MakeIntRows(nRows, nCols))
 
-	col := colexec.NewBufferingColumnarizer(testAllocator, &flowCtx, 0 /* processorID */, input)
+	col := colexec.NewBufferingColumnarizerForTests(testAllocator, &flowCtx, 0 /* processorID */, input)
 	nvee := newTestNonVectorizedPanicEmitter(col)
 	mat := colexec.NewMaterializer(
+		nil, /* allocator */
 		&flowCtx,
 		1, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: nvee},

@@ -14,6 +14,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -53,9 +55,9 @@ func TestCollectIntentsUsesSameIterator(t *testing.T) {
 	ctx := context.Background()
 	key := roachpb.Key("key")
 	ts := hlc.Timestamp{WallTime: 123}
-	header := roachpb.Header{
+	header := kvpb.Header{
 		Timestamp:       ts,
-		ReadConsistency: roachpb.READ_UNCOMMITTED,
+		ReadConsistency: kvpb.READ_UNCOMMITTED,
 	}
 	evalCtx := (&MockEvalCtx{ClusterSettings: cluster.MakeTestingClusterSettings()}).EvalContext()
 
@@ -68,10 +70,10 @@ func TestCollectIntentsUsesSameIterator(t *testing.T) {
 		{
 			name: "get",
 			run: func(t *testing.T, db storage.ReadWriter) ([]roachpb.KeyValue, error) {
-				req := &roachpb.GetRequest{
-					RequestHeader: roachpb.RequestHeader{Key: key},
+				req := &kvpb.GetRequest{
+					RequestHeader: kvpb.RequestHeader{Key: key},
 				}
-				var resp roachpb.GetResponse
+				var resp kvpb.GetResponse
 				if _, err := Get(ctx, db, CommandArgs{Args: req, Header: header, EvalCtx: evalCtx}, &resp); err != nil {
 					return nil, err
 				}
@@ -86,10 +88,10 @@ func TestCollectIntentsUsesSameIterator(t *testing.T) {
 		{
 			name: "scan",
 			run: func(t *testing.T, db storage.ReadWriter) ([]roachpb.KeyValue, error) {
-				req := &roachpb.ScanRequest{
-					RequestHeader: roachpb.RequestHeader{Key: key, EndKey: key.Next()},
+				req := &kvpb.ScanRequest{
+					RequestHeader: kvpb.RequestHeader{Key: key, EndKey: key.Next()},
 				}
-				var resp roachpb.ScanResponse
+				var resp kvpb.ScanResponse
 				if _, err := Scan(ctx, db, CommandArgs{Args: req, Header: header, EvalCtx: evalCtx}, &resp); err != nil {
 					return nil, err
 				}
@@ -101,10 +103,10 @@ func TestCollectIntentsUsesSameIterator(t *testing.T) {
 		{
 			name: "reverse scan",
 			run: func(t *testing.T, db storage.ReadWriter) ([]roachpb.KeyValue, error) {
-				req := &roachpb.ReverseScanRequest{
-					RequestHeader: roachpb.RequestHeader{Key: key, EndKey: key.Next()},
+				req := &kvpb.ReverseScanRequest{
+					RequestHeader: kvpb.RequestHeader{Key: key, EndKey: key.Next()},
 				}
-				var resp roachpb.ReverseScanResponse
+				var resp kvpb.ReverseScanResponse
 				if _, err := ReverseScan(ctx, db, CommandArgs{Args: req, Header: header, EvalCtx: evalCtx}, &resp); err != nil {
 					return nil, err
 				}
@@ -126,12 +128,12 @@ func TestCollectIntentsUsesSameIterator(t *testing.T) {
 
 				// Write an intent.
 				val := roachpb.MakeValueFromBytes([]byte("val"))
-				txn := roachpb.MakeTransaction("test", key, roachpb.NormalUserPriority, ts, 0, 1)
+				txn := roachpb.MakeTransaction("test", key, isolation.Serializable, roachpb.NormalUserPriority, ts, 0, 1)
 				var err error
 				if delete {
-					err = storage.MVCCDelete(ctx, db, nil, key, ts, &txn)
+					_, err = storage.MVCCDelete(ctx, db, nil, key, ts, hlc.ClockTimestamp{}, &txn)
 				} else {
-					err = storage.MVCCPut(ctx, db, nil, key, ts, val, &txn)
+					err = storage.MVCCPut(ctx, db, nil, key, ts, hlc.ClockTimestamp{}, val, &txn)
 				}
 				require.NoError(t, err)
 

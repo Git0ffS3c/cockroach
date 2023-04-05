@@ -21,11 +21,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdecomp"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/scviz"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/datadriven"
@@ -40,7 +40,7 @@ func DecomposeToElements(t *testing.T, dir string, newCluster NewClusterFunc) {
 	ctx := context.Background()
 	datadriven.Walk(t, dir, func(t *testing.T, path string) {
 		// Create a test cluster.
-		db, cleanup := newCluster(t, nil /* knobs */)
+		_, db, cleanup := newCluster(t, nil /* knobs */)
 		tdb := sqlutils.MakeSQLRunner(db)
 		defer cleanup()
 		// We need to disable the declarative schema changer so that we don't end
@@ -57,6 +57,7 @@ func runDecomposeTest(
 ) string {
 	switch d.Cmd {
 	case "setup":
+		sqlutils.VerifyStatementPrettyRoundtrip(t, d.Input)
 		stmts, err := parser.Parse(d.Input)
 		require.NoError(t, err)
 		require.NotEmpty(t, stmts, "missing statement(s) for setup command")
@@ -71,7 +72,7 @@ func runDecomposeTest(
 		name := fields[0]
 		var desc catalog.Descriptor
 		allDescs := sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb)
-		_ = allDescs.ForEachDescriptorEntry(func(d catalog.Descriptor) error {
+		_ = allDescs.ForEachDescriptor(func(d catalog.Descriptor) error {
 			if d.GetName() == name {
 				desc = d
 			}
@@ -82,8 +83,11 @@ func runDecomposeTest(
 		visitor := func(status scpb.Status, element scpb.Element) {
 			m[element] = status
 		}
-		commentCache := sctestdeps.NewTestDependencies(sctestdeps.WithComments(sctestdeps.ReadCommentsFromDB(t, tdb)))
-		backRefs := scdecomp.WalkDescriptor(ctx, desc, allDescs.LookupDescriptorEntry, visitor, commentCache)
+		testDeps := sctestdeps.NewTestDependencies(
+			sctestdeps.WithComments(sctestdeps.ReadCommentsFromDB(t, tdb)),
+			sctestdeps.WithZoneConfigs(sctestdeps.ReadZoneConfigsFromDB(t, tdb, allDescs.Catalog)))
+		backRefs := scdecomp.WalkDescriptor(ctx, desc, allDescs.LookupDescriptor, visitor,
+			testDeps, testDeps, testDeps.ClusterSettings().Version.ActiveVersion(ctx))
 		return marshalResult(t, m, backRefs)
 
 	default:
@@ -113,7 +117,10 @@ func marshalResult(
 			}
 		}
 		elts = append(elts, e)
-		yaml, err := sctestutils.ProtoToYAML(e, protoreflect.FmtFlags{EmitDefaults: true})
+		const emitDefaults = true
+		yaml, err := sctestutils.ProtoToYAML(
+			e, emitDefaults, scviz.RewriteEmbeddedIntoParent,
+		)
 		require.NoError(t, err)
 		str[e] = yaml
 	}

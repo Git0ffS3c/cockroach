@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/kr/pretty"
+	"github.com/stretchr/testify/require"
 )
 
 type storeScore struct {
@@ -51,7 +52,7 @@ func TestOnlyValidAndHealthyDisk(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
-		valid, invalid, full, readAmpHigh int
+		valid, invalid, full, ioOverloaded int
 	}{
 		{0, 0, 0, 0},
 		{1, 0, 0, 0},
@@ -79,8 +80,8 @@ func TestOnlyValidAndHealthyDisk(t *testing.T) {
 			for i := 0; i < tc.full; i++ {
 				cl = append(cl, candidate{fullDisk: true})
 			}
-			for i := 0; i < tc.readAmpHigh; i++ {
-				cl = append(cl, candidate{highReadAmp: true})
+			for i := 0; i < tc.ioOverloaded; i++ {
+				cl = append(cl, candidate{ioOverloaded: true})
 			}
 			sort.Sort(sort.Reverse(byScore(cl)))
 
@@ -88,16 +89,15 @@ func TestOnlyValidAndHealthyDisk(t *testing.T) {
 			if a, e := len(valid), tc.valid; a != e {
 				t.Errorf("expected %d valid, actual %d", e, a)
 			}
-			if a, e := len(cl)-len(valid), tc.invalid+tc.full+tc.readAmpHigh; a != e {
+			if a, e := len(cl)-len(valid), tc.invalid+tc.full+tc.ioOverloaded; a != e {
 				t.Errorf("expected %d invalid, actual %d", e, a)
 			}
 		})
 	}
 }
 
-// TestSelectGoodPanic is a basic regression test against a former panic in
-// selectGood when called with just invalid/full stores.
-func TestSelectGoodPanic(t *testing.T) {
+// TestNilSelection verifies selection with just invalid/full stores.
+func TestNilSelection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -107,12 +107,11 @@ func TestSelectGoodPanic(t *testing.T) {
 		},
 	}
 	allocRand := makeAllocatorRand(rand.NewSource(0))
-	if good := cl.selectGood(allocRand); good != nil {
-		t.Errorf("cl.selectGood() got %v, want nil", good)
-	}
+	require.Nil(t, cl.selectBest(allocRand))
+	require.Nil(t, cl.selectGood(allocRand))
 }
 
-// TestCandidateSelection tests select{good,bad} and {best,worst}constraints.
+// TestCandidateSelection tests select{Best,Good,Worst} and {best,good,worst}constraints.
 func TestCandidateSelection(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -153,60 +152,76 @@ func TestCandidateSelection(t *testing.T) {
 	}
 
 	testCases := []struct {
-		candidates []scoreTuple
-		best       []scoreTuple
-		worst      []scoreTuple
-		good       scoreTuple
-		bad        scoreTuple
+		candidates  []scoreTuple
+		best        []scoreTuple
+		good        []scoreTuple
+		worst       []scoreTuple
+		bestChosen  scoreTuple
+		goodChosen  scoreTuple
+		worstChosen scoreTuple
 	}{
 		{
-			candidates: []scoreTuple{{0, 0}},
-			best:       []scoreTuple{{0, 0}},
-			worst:      []scoreTuple{{0, 0}},
-			good:       scoreTuple{0, 0},
-			bad:        scoreTuple{0, 0},
+			candidates:  []scoreTuple{{0, 0}},
+			best:        []scoreTuple{{0, 0}},
+			good:        []scoreTuple{{0, 0}},
+			worst:       []scoreTuple{{0, 0}},
+			bestChosen:  scoreTuple{0, 0},
+			goodChosen:  scoreTuple{0, 0},
+			worstChosen: scoreTuple{0, 0},
 		},
 		{
-			candidates: []scoreTuple{{0, 0}, {0, 1}},
-			best:       []scoreTuple{{0, 0}, {0, 1}},
-			worst:      []scoreTuple{{0, 0}, {0, 1}},
-			good:       scoreTuple{0, 0},
-			bad:        scoreTuple{0, 1},
+			candidates:  []scoreTuple{{0, 0}, {0, 1}},
+			best:        []scoreTuple{{0, 0}, {0, 1}},
+			good:        []scoreTuple{{0, 0}, {0, 1}},
+			worst:       []scoreTuple{{0, 0}, {0, 1}},
+			bestChosen:  scoreTuple{0, 0},
+			goodChosen:  scoreTuple{0, 1},
+			worstChosen: scoreTuple{0, 1},
 		},
 		{
-			candidates: []scoreTuple{{0, 0}, {0, 1}, {0, 2}},
-			best:       []scoreTuple{{0, 0}, {0, 1}, {0, 2}},
-			worst:      []scoreTuple{{0, 0}, {0, 1}, {0, 2}},
-			good:       scoreTuple{0, 1},
-			bad:        scoreTuple{0, 2},
+			candidates:  []scoreTuple{{0, 0}, {0, 1}, {0, 2}},
+			best:        []scoreTuple{{0, 0}, {0, 1}, {0, 2}},
+			good:        []scoreTuple{{0, 0}, {0, 1}, {0, 2}},
+			worst:       []scoreTuple{{0, 0}, {0, 1}, {0, 2}},
+			bestChosen:  scoreTuple{0, 0},
+			goodChosen:  scoreTuple{0, 0},
+			worstChosen: scoreTuple{0, 1},
 		},
 		{
-			candidates: []scoreTuple{{1, 0}, {0, 1}},
-			best:       []scoreTuple{{1, 0}},
-			worst:      []scoreTuple{{0, 1}},
-			good:       scoreTuple{1, 0},
-			bad:        scoreTuple{0, 1},
+			candidates:  []scoreTuple{{1, 0}, {0, 1}},
+			best:        []scoreTuple{{1, 0}},
+			good:        []scoreTuple{{1, 0}},
+			worst:       []scoreTuple{{0, 1}},
+			bestChosen:  scoreTuple{1, 0},
+			goodChosen:  scoreTuple{1, 0},
+			worstChosen: scoreTuple{0, 1},
 		},
 		{
-			candidates: []scoreTuple{{1, 0}, {0, 1}, {0, 2}},
-			best:       []scoreTuple{{1, 0}},
-			worst:      []scoreTuple{{0, 1}, {0, 2}},
-			good:       scoreTuple{1, 0},
-			bad:        scoreTuple{0, 2},
+			candidates:  []scoreTuple{{1, 0}, {0, 1}, {0, 2}},
+			best:        []scoreTuple{{1, 0}},
+			good:        []scoreTuple{{1, 0}},
+			worst:       []scoreTuple{{0, 1}, {0, 2}},
+			bestChosen:  scoreTuple{1, 0},
+			goodChosen:  scoreTuple{1, 0},
+			worstChosen: scoreTuple{0, 2},
 		},
 		{
-			candidates: []scoreTuple{{1, 0}, {1, 1}, {0, 2}},
-			best:       []scoreTuple{{1, 0}, {1, 1}},
-			worst:      []scoreTuple{{0, 2}},
-			good:       scoreTuple{1, 0},
-			bad:        scoreTuple{0, 2},
+			candidates:  []scoreTuple{{1, 0}, {1, 1}, {0, 2}},
+			best:        []scoreTuple{{1, 0}, {1, 1}},
+			good:        []scoreTuple{{1, 0}, {1, 1}},
+			worst:       []scoreTuple{{0, 2}},
+			bestChosen:  scoreTuple{1, 0},
+			goodChosen:  scoreTuple{1, 1},
+			worstChosen: scoreTuple{0, 2},
 		},
 		{
-			candidates: []scoreTuple{{1, 0}, {1, 1}, {0, 2}, {0, 3}},
-			best:       []scoreTuple{{1, 0}, {1, 1}},
-			worst:      []scoreTuple{{0, 2}, {0, 3}},
-			good:       scoreTuple{1, 0},
-			bad:        scoreTuple{0, 3},
+			candidates:  []scoreTuple{{1, 0}, {1, 1}, {0, 2}, {0, 3}},
+			best:        []scoreTuple{{1, 0}, {1, 1}},
+			good:        []scoreTuple{{1, 0}, {1, 1}},
+			worst:       []scoreTuple{{0, 2}, {0, 3}},
+			bestChosen:  scoreTuple{1, 0},
+			goodChosen:  scoreTuple{1, 0},
+			worstChosen: scoreTuple{0, 3},
 		},
 	}
 
@@ -215,6 +230,11 @@ func TestCandidateSelection(t *testing.T) {
 		cl := genCandidates(tc.candidates, 1)
 		t.Run(fmt.Sprintf("best-%s", formatter(cl)), func(t *testing.T) {
 			if a, e := cl.best(), genCandidates(tc.best, 1); !reflect.DeepEqual(a, e) {
+				t.Errorf("expected:%s actual:%s diff:%v", formatter(e), formatter(a), pretty.Diff(e, a))
+			}
+		})
+		t.Run(fmt.Sprintf("good-%s", formatter(cl)), func(t *testing.T) {
+			if a, e := cl.good(), genCandidates(tc.good, 1); !reflect.DeepEqual(a, e) {
 				t.Errorf("expected:%s actual:%s diff:%v", formatter(e), formatter(a), pretty.Diff(e, a))
 			}
 		})
@@ -227,24 +247,34 @@ func TestCandidateSelection(t *testing.T) {
 				t.Errorf("expected:%s actual:%s diff:%v", formatter(e), formatter(a), pretty.Diff(e, a))
 			}
 		})
-		t.Run(fmt.Sprintf("good-%s", formatter(cl)), func(t *testing.T) {
-			good := cl.selectGood(allocRand)
-			if good == nil {
-				t.Fatalf("no good candidate found")
+		t.Run(fmt.Sprintf("select-best-%s", formatter(cl)), func(t *testing.T) {
+			best := cl.selectBest(allocRand)
+			if best == nil {
+				t.Fatalf("no 'best' candidate found")
 			}
-			actual := scoreTuple{int(good.diversityScore + 0.5), good.rangeCount}
-			if actual != tc.good {
-				t.Errorf("expected:%v actual:%v", tc.good, actual)
+			actual := scoreTuple{int(best.diversityScore + 0.5), best.rangeCount}
+			if actual != tc.bestChosen {
+				t.Errorf("expected:%v actual:%v", tc.bestChosen, actual)
 			}
 		})
-		t.Run(fmt.Sprintf("bad-%s", formatter(cl)), func(t *testing.T) {
-			bad := cl.selectBad(allocRand)
-			if bad == nil {
-				t.Fatalf("no bad candidate found")
+		t.Run(fmt.Sprintf("select-good-%s", formatter(cl)), func(t *testing.T) {
+			good := cl.selectGood(allocRand)
+			if good == nil {
+				t.Fatalf("no 'good' candidate found")
 			}
-			actual := scoreTuple{int(bad.diversityScore + 0.5), bad.rangeCount}
-			if actual != tc.bad {
-				t.Errorf("expected:%v actual:%v", tc.bad, actual)
+			actual := scoreTuple{int(good.diversityScore + 0.5), good.rangeCount}
+			if actual != tc.goodChosen {
+				t.Errorf("expected:%v actual:%v", tc.goodChosen, actual)
+			}
+		})
+		t.Run(fmt.Sprintf("select-worst-%s", formatter(cl)), func(t *testing.T) {
+			worst := cl.selectWorst(allocRand)
+			if worst == nil {
+				t.Fatalf("no 'worst' candidate found")
+			}
+			actual := scoreTuple{int(worst.diversityScore + 0.5), worst.rangeCount}
+			if actual != tc.worstChosen {
+				t.Errorf("expected:%v actual:%v", tc.worstChosen, actual)
 			}
 		})
 	}
@@ -553,7 +583,13 @@ var (
 	}
 )
 
-func getTestStoreDesc(storeID roachpb.StoreID) (roachpb.StoreDescriptor, bool) {
+type mockStoreResolver struct{}
+
+var _ constraint.StoreResolver = mockStoreResolver{}
+
+func (m mockStoreResolver) GetStoreDescriptor(
+	storeID roachpb.StoreID,
+) (roachpb.StoreDescriptor, bool) {
 	desc, ok := testStores[storeID]
 	return desc, ok
 }
@@ -906,9 +942,7 @@ func TestAllocateConstraintsCheck(t *testing.T) {
 				Constraints: tc.constraints,
 				NumReplicas: tc.numReplicas,
 			}
-			analyzed := constraint.AnalyzeConstraints(
-				context.Background(), getTestStoreDesc, testStoreReplicas(tc.existing),
-				conf.NumReplicas, conf.Constraints)
+			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, testStoreReplicas(tc.existing), conf.NumReplicas, conf.Constraints)
 			for _, s := range testStores {
 				valid, necessary := allocateConstraintsCheck(s, analyzed)
 				if e, a := tc.expectedValid[s.StoreID], valid; e != a {
@@ -1041,8 +1075,7 @@ func TestRemoveConstraintsCheck(t *testing.T) {
 				Constraints: tc.constraints,
 				NumReplicas: tc.numReplicas,
 			}
-			analyzed := constraint.AnalyzeConstraints(
-				context.Background(), getTestStoreDesc, existing, conf.NumReplicas, conf.Constraints)
+			analyzed := constraint.AnalyzeConstraints(mockStoreResolver{}, existing, conf.NumReplicas, conf.Constraints)
 			for storeID, expected := range tc.expected {
 				valid, necessary := removeConstraintsCheck(testStores[storeID], analyzed)
 				if e, a := expected.valid, valid; e != a {
@@ -1063,7 +1096,9 @@ func TestShouldRebalanceDiversity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	options := &RangeCountScorerOptions{StoreHealthOptions: StoreHealthOptions{EnforcementLevel: StoreHealthNoAction}}
+	options := &RangeCountScorerOptions{
+		DiskCapacityOptions: defaultDiskCapacityOptions(),
+	}
 	newStore := func(id int, locality roachpb.Locality) roachpb.StoreDescriptor {
 		return roachpb.StoreDescriptor{
 			StoreID: roachpb.StoreID(id),
@@ -1495,6 +1530,7 @@ func TestBalanceScoreByRangeCount(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	options := RangeCountScorerOptions{
+		DiskCapacityOptions:     defaultDiskCapacityOptions(),
 		rangeRebalanceThreshold: 0.1,
 	}
 	storeList := storepool.StoreList{
@@ -1529,9 +1565,7 @@ func TestRebalanceBalanceScoreOnQPS(t *testing.T) {
 	storeList := storepool.StoreList{
 		CandidateQueriesPerSecond: storepool.Stat{Mean: 1000},
 	}
-	options := QPSScorerOptions{
-		QPSRebalanceThreshold: 0.1,
-	}
+	options := TestingQPSLoadScorerOptions(0, 0.1)
 
 	testCases := []struct {
 		QPS             float64
@@ -1581,7 +1615,9 @@ func TestRebalanceConvergesRangeCountOnMean(t *testing.T) {
 		{2000, false, true},
 	}
 
-	options := RangeCountScorerOptions{}
+	options := RangeCountScorerOptions{
+		DiskCapacityOptions: defaultDiskCapacityOptions(),
+	}
 	eqClass := equivalenceClass{
 		candidateSL: storeList,
 	}
@@ -1615,8 +1651,13 @@ func TestMaxCapacity(t *testing.T) {
 		testStoreEurope: true,
 	}
 
+	do := DiskCapacityOptions{
+		RebalanceToThreshold:     0.925,
+		ShedAndBlockAllThreshold: 0.95,
+	}
+
 	for _, s := range testStores {
-		if e, a := expectedCheck[s.StoreID], allocator.MaxCapacityCheck(s); e != a {
+		if e, a := expectedCheck[s.StoreID], do.maxCapacityCheck(s); e != a {
 			t.Errorf("store %d expected max capacity check: %t, actual %t", s.StoreID, e, a)
 		}
 	}

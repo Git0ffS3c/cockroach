@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -8,7 +9,7 @@ go_library(
         "demo_cluster.go",
         "demo_locality_list.go",
         "doc.go",
-        "region_latencies.go",
+        "session_persistence.go",
         "socket_unix.go",
         "socket_windows.go",
     ],
@@ -25,28 +26,37 @@ go_library(
         "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/security",
+        "//pkg/security/certnames",
         "//pkg/security/username",
         "//pkg/server",
         "//pkg/server/pgurl",
         "//pkg/server/serverpb",
         "//pkg/server/status",
+        "//pkg/sql",
         "//pkg/sql/catalog/catalogkeys",
         "//pkg/sql/distsql",
         "//pkg/sql/sem/catconstants",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/serverutils/regionlatency",
+        "//pkg/util/contextutil",
+        "//pkg/util/envutil",
         "//pkg/util/humanizeutil",
+        "//pkg/util/log",
         "//pkg/util/log/logcrash",
         "//pkg/util/log/logpb",
         "//pkg/util/log/severity",
         "//pkg/util/netutil/addr",
         "//pkg/util/retry",
         "//pkg/util/stop",
-        "//pkg/util/uuid",
+        "//pkg/util/syncutil",
         "//pkg/workload",
         "//pkg/workload/histogram",
         "//pkg/workload/workloadsql",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_errors//oserror",
         "@com_github_cockroachdb_logtags//:logtags",
+        "@com_github_cockroachdb_redact//:redact",
+        "@com_github_nightlyone_lockfile//:lockfile",
         "@org_golang_x_time//rate",
     ],
 )
@@ -54,6 +64,7 @@ go_library(
 go_test(
     name = "democluster_test",
     srcs = ["demo_cluster_test.go"],
+    args = ["-test.timeout=295s"],
     embed = [":democluster"],
     shard_count = 16,
     deps = [
@@ -62,10 +73,11 @@ go_test(
         "//pkg/cli/clisqlclient",
         "//pkg/cli/clisqlexec",
         "//pkg/roachpb",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
-        "//pkg/sql",
+        "//pkg/testutils",
+        "//pkg/testutils/serverutils/regionlatency",
         "//pkg/testutils/skip",
         "//pkg/util/leaktest",
         "//pkg/util/log",
@@ -75,3 +87,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

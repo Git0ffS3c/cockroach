@@ -42,7 +42,6 @@ The workload's main parameters are number of distinct values of a, b and c.
 Initial data batches each correspond to one a/b pair containing c rows. By
 default, batches are ordered by a then b (a=1/b=1, a=1/b=2, a=1,b=3, ...) though
 this can optionally be inverted (a=1/b=1, a=2,b=1, a=3,b=1,...).
-
 */
 package bulkingest
 
@@ -76,11 +75,12 @@ const (
 	defaultPayloadBytes = 100
 )
 
+var RandomSeed = workload.NewInt64RandomSeed()
+
 type bulkingest struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed                                 int64
 	aCount, bCount, cCount, payloadBytes int
 
 	generateBsFirst bool
@@ -92,19 +92,21 @@ func init() {
 }
 
 var bulkingestMeta = workload.Meta{
-	Name:        `bulkingest`,
-	Description: `bulkingest testdata is designed to produce a skewed distribution of KVs when ingested (in initial import or during later indexing)`,
-	Version:     `1.0.0`,
+	Name:          `bulkingest`,
+	Description:   `This workload is designed to produce a skewed distribution of KVs when ingested (in initial import or during later indexing).`,
+	Version:       `1.0.0`,
+	RandomSeed:    RandomSeed,
+	TestInfraOnly: true,
 	New: func() workload.Generator {
 		g := &bulkingest{}
 		g.flags.FlagSet = pflag.NewFlagSet(`bulkingest`, pflag.ContinueOnError)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Key hash seed.`)
-		g.flags.IntVar(&g.aCount, `a`, 10, `number of values of A (i.e. pk prefix)`)
-		g.flags.IntVar(&g.bCount, `b`, 10, `number of values of B (i.e. idx prefix)`)
-		g.flags.IntVar(&g.cCount, `c`, 1000, `number of values of C (i.e. rows per A/B pair)`)
-		g.flags.BoolVar(&g.generateBsFirst, `batches-by-b`, false, `generate all B batches for given A first`)
-		g.flags.BoolVar(&g.indexBCA, `index-b-c-a`, true, `include an index on (B, C, A)`)
+		g.flags.IntVar(&g.aCount, `a`, 10, `Number of values of A (i.e. pk prefix).`)
+		g.flags.IntVar(&g.bCount, `b`, 10, `Number of values of B (i.e. idx prefix).`)
+		g.flags.IntVar(&g.cCount, `c`, 1000, `Number of values of C (i.e. rows per A/B pair).`)
+		g.flags.BoolVar(&g.generateBsFirst, `batches-by-b`, false, `Generate all B batches for given A first.`)
+		g.flags.BoolVar(&g.indexBCA, `index-b-c-a`, true, `Include an index on (B, C, A).`)
 		g.flags.IntVar(&g.payloadBytes, `payload-bytes`, defaultPayloadBytes, `Size of the payload field in each row.`)
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -155,7 +157,7 @@ func (w *bulkingest) Tables() []workload.Table {
 				cCol := cb.ColVec(2).Int64()
 				payloadCol := cb.ColVec(3).Bytes()
 
-				rng := rand.New(rand.NewSource(w.seed + int64(ab)))
+				rng := rand.New(rand.NewSource(RandomSeed.Seed() + int64(ab)))
 				var payload []byte
 				*alloc, payload = alloc.Alloc(w.cCount*w.payloadBytes, 0 /* extraCap */)
 				randutil.ReadTestdataBytes(rng, payload)
@@ -201,7 +203,7 @@ func (w *bulkingest) Ops(
 
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
 	for i := 0; i < w.connFlags.Concurrency; i++ {
-		rng := rand.New(rand.NewSource(w.seed))
+		rng := rand.New(rand.NewSource(RandomSeed.Seed()))
 		hists := reg.GetHandle()
 		pad := make([]byte, w.payloadBytes)
 		workerFn := func(ctx context.Context) error {

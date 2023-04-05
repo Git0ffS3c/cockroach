@@ -24,11 +24,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	tu "github.com/cockroachdb/cockroach/pkg/testutils"
+	tu "github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -37,25 +38,24 @@ import (
 //
 //   - index-constraints [arg | arg=val | arg=(val1,val2, ...)]...
 //
-//   Takes a scalar expression, builds a memo for it, and computes index
-//   constraints. Arguments:
+//     Takes a scalar expression, builds a memo for it, and computes index
+//     constraints. Arguments:
 //
-//     - vars=(<column> <type> [not null], ...)
+//   - vars=(<column> <type> [not null], ...)
 //
-//       Information about the columns.
+//     Information about the columns.
 //
-//     - index=(<column> [ascending|asc|descending|desc], ...)
+//   - index=(<column> [ascending|asc|descending|desc], ...)
 //
-//       Information for the index (used by index-constraints).
+//     Information for the index (used by index-constraints).
 //
-//     - nonormalize
+//   - nonormalize
 //
-//       Disable the optimizer normalization rules.
+//     Disable the optimizer normalization rules.
 //
-//     - semtree-normalize
+//   - semtree-normalize
 //
-//       Run TypedExpr normalization before building the memo.
-//
+//     Run TypedExpr normalization before building the memo.
 func TestIndexConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -69,7 +69,7 @@ func TestIndexConstraints(t *testing.T) {
 			var err error
 
 			var f norm.Factory
-			f.Init(&evalCtx, nil /* catalog */)
+			f.Init(context.Background(), &evalCtx, nil /* catalog */)
 			md := f.Metadata()
 
 			for _, arg := range d.CmdArgs {
@@ -126,7 +126,7 @@ func TestIndexConstraints(t *testing.T) {
 				var ic idxconstraint.Instance
 				ic.Init(
 					filters, optionalFilters, indexCols, sv.NotNullCols(), computedCols,
-					true /* consolidate */, &evalCtx, &f, nil, /* prefixSorter */
+					true /* consolidate */, &evalCtx, &f, partition.PrefixSorter{},
 				)
 				result := ic.Constraint()
 				var buf bytes.Buffer
@@ -136,8 +136,9 @@ func TestIndexConstraints(t *testing.T) {
 				remainingFilter := ic.RemainingFilters()
 				if !remainingFilter.IsTrue() {
 					execBld := execbuilder.New(
-						nil /* execFactory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
+						context.Background(), nil /* execFactory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
 						&remainingFilter, &evalCtx, false, /* allowAutoCommit */
+						false, /* isANSIDML */
 					)
 					expr, err := execBld.BuildScalar()
 					if err != nil {
@@ -222,7 +223,7 @@ func BenchmarkIndexConstraints(b *testing.B) {
 	for _, tc := range testCases {
 		b.Run(tc.name, func(b *testing.B) {
 			var f norm.Factory
-			f.Init(&evalCtx, nil /* catalog */)
+			f.Init(context.Background(), &evalCtx, nil /* catalog */)
 			md := f.Metadata()
 			var sv testutils.ScalarVars
 			err := sv.Init(md, strings.Split(tc.vars, ", "))
@@ -242,7 +243,7 @@ func BenchmarkIndexConstraints(b *testing.B) {
 				ic.Init(
 					filters, nil /* optionalFilters */, indexCols, sv.NotNullCols(),
 					nil /* computedCols */, true, /* consolidate */
-					&evalCtx, &f, nil, /* prefixSorter */
+					&evalCtx, &f, partition.PrefixSorter{},
 				)
 				_ = ic.Constraint()
 				_ = ic.RemainingFilters()
@@ -253,7 +254,8 @@ func BenchmarkIndexConstraints(b *testing.B) {
 
 // parseIndexColumns parses descriptions of index columns; each
 // string corresponds to an index column and is of the form:
-//   @id [ascending|asc|descending|desc] [not null]
+//
+//	@id [ascending|asc|descending|desc] [not null]
 func parseIndexColumns(tb testing.TB, md *opt.Metadata, colStrs []string) []opt.OrderingColumn {
 	findCol := func(alias string) opt.ColumnID {
 		for i := 0; i < md.NumColumns(); i++ {

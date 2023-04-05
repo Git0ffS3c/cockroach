@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -55,30 +56,10 @@ const consistencyCheckRateBurstFactor = 8
 // churn on timers.
 const consistencyCheckRateMinWait = 100 * time.Millisecond
 
-// consistencyCheckAsyncConcurrency is the maximum number of asynchronous
-// consistency checks to run concurrently per store below Raft. The
-// server.consistency_check.max_rate limit is shared among these, so running too
-// many at the same time will cause them to time out. The rate is multiplied by
-// 10 (permittedRangeScanSlowdown) to obtain the per-check timeout. 7 gives
-// reasonable headroom, and also handles clusters with high replication factor
-// and/or many nodes -- recall that each node runs a separate consistency queue
-// which can schedule checks on other nodes, e.g. a 7-node cluster with a
-// replication factor of 7 could run 7 concurrent checks on every node.
-//
-// Note that checksum calculations below Raft are not tied to the caller's
-// context (especially on followers), and will continue to run even after the
-// caller has given up on them, which may cause them to build up.
-//
-// CHECK_STATS checks do not count towards this limit, as they are cheap and the
-// DistSender will parallelize them across all ranges (notably when calling
-// crdb_internal.check_consistency()).
-const consistencyCheckAsyncConcurrency = 7
-
-// consistencyCheckAsyncTimeout is a below-Raft timeout for asynchronous
-// consistency check calculations. These are not tied to the caller's context,
-// and thus will continue to run even after the caller has given up on them, so
-// we give them an upper timeout to prevent them from running forever.
-const consistencyCheckAsyncTimeout = time.Hour
+// consistencyCheckSyncTimeout is the max amount of time the consistency check
+// computation and the checksum collection request will wait for each other
+// before giving up.
+const consistencyCheckSyncTimeout = 5 * time.Second
 
 var testingAggressiveConsistencyChecks = envutil.EnvOrDefaultBool("COCKROACH_CONSISTENCY_AGGRESSIVE", false)
 
@@ -87,6 +68,8 @@ type consistencyQueue struct {
 	interval       func() time.Duration
 	replicaCountFn func() int
 }
+
+var _ queueImpl = &consistencyQueue{}
 
 // A data wrapper to allow for the shouldQueue method to be easier to test.
 type consistencyShouldQueueData struct {
@@ -110,7 +93,7 @@ func newConsistencyQueue(store *Store) *consistencyQueue {
 		queueConfig{
 			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
-			needsSystemConfig:    false,
+			needsSpanConfigs:     false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.ConsistencyQueueSuccesses,
 			failures:             store.metrics.ConsistencyQueueFailures,
@@ -186,7 +169,7 @@ func (q *consistencyQueue) process(
 		log.VErrEventf(ctx, 2, "failed to update last processed time: %v", err)
 	}
 
-	req := roachpb.CheckConsistencyRequest{
+	req := kvpb.CheckConsistencyRequest{
 		// Tell CheckConsistency that the caller is the queue. This triggers
 		// code to handle inconsistencies by recomputing with a diff and
 		// instructing the nodes in the minority to terminate with a fatal
@@ -194,7 +177,7 @@ func (q *consistencyQueue) process(
 		// inconsistency but the persisted stats are found to disagree with
 		// those reflected in the data. All of this really ought to be lifted
 		// into the queue in the future.
-		Mode: roachpb.ChecksumMode_CHECK_VIA_QUEUE,
+		Mode: kvpb.ChecksumMode_CHECK_VIA_QUEUE,
 	}
 	resp, pErr := repl.CheckConsistency(ctx, req)
 	if pErr != nil {
@@ -220,6 +203,11 @@ func (q *consistencyQueue) process(
 	return true, nil
 }
 
+func (*consistencyQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 	// An interval between replicas to space consistency checks out over
 	// the check interval.
@@ -236,5 +224,9 @@ func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 
 // purgatoryChan returns nil.
 func (*consistencyQueue) purgatoryChan() <-chan time.Time {
+	return nil
+}
+
+func (*consistencyQueue) updateChan() <-chan time.Time {
 	return nil
 }

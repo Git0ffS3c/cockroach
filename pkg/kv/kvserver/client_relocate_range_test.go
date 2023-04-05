@@ -21,11 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -43,6 +45,7 @@ func relocateAndCheck(
 	voterTargets []roachpb.ReplicationTarget,
 	nonVoterTargets []roachpb.ReplicationTarget,
 ) (retries int) {
+	t.Helper()
 	every := log.Every(1 * time.Second)
 	testutils.SucceedsSoon(t, func() error {
 		err := tc.Servers[0].DB().
@@ -140,7 +143,7 @@ func requireLeaseAt(
 	})
 }
 
-func usesAtomicReplicationChange(ops []roachpb.ReplicationChange) bool {
+func usesAtomicReplicationChange(ops []kvpb.ReplicationChange) bool {
 	// There are 4 sets of operations that are executed atomically:
 	// 1. Voter rebalances (ADD_VOTER, REMOVE_VOTER)
 	// 2. Non-voter promoted to voter (ADD_VOTER, REMOVE_NON_VOTER)
@@ -163,12 +166,13 @@ func usesAtomicReplicationChange(ops []roachpb.ReplicationChange) bool {
 
 func TestAdminRelocateRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	skip.WithIssue(t, 84242, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 
 	type intercept struct {
-		ops         []roachpb.ReplicationChange
+		ops         []kvpb.ReplicationChange
 		leaseTarget *roachpb.ReplicationTarget
 	}
 	var intercepted []intercept
@@ -199,7 +203,7 @@ func TestAdminRelocateRange(t *testing.T) {
 
 	knobs := base.TestingKnobs{
 		Store: &kvserver.StoreTestingKnobs{
-			OnRelocatedOne: func(ops []roachpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget) {
+			OnRelocatedOne: func(ops []kvpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget) {
 				intercepted = append(intercepted, intercept{
 					ops:         ops,
 					leaseTarget: leaseTarget,
@@ -467,8 +471,8 @@ func TestReplicaRemovalDuringGet(t *testing.T) {
 	resp, pErr := evalDuringReplicaRemoval(ctx, getArgs(key))
 	require.Nil(t, pErr)
 	require.NotNil(t, resp)
-	require.NotNil(t, resp.(*roachpb.GetResponse).Value)
-	val, err := resp.(*roachpb.GetResponse).Value.GetBytes()
+	require.NotNil(t, resp.(*kvpb.GetResponse).Value)
+	val, err := resp.(*kvpb.GetResponse).Value.GetBytes()
 	require.NoError(t, err)
 	require.Equal(t, []byte("foo"), val)
 }
@@ -497,7 +501,7 @@ func TestReplicaRemovalDuringCPut(t *testing.T) {
 	req := cPutArgs(key, []byte("bar"), []byte("foo"))
 	_, pErr = evalDuringReplicaRemoval(ctx, req)
 	require.NotNil(t, pErr)
-	require.IsType(t, &roachpb.AmbiguousResultError{}, pErr.GetDetail())
+	require.IsType(t, &kvpb.AmbiguousResultError{}, pErr.GetDetail())
 }
 
 // setupReplicaRemovalTest sets up a test cluster that can be used to test
@@ -510,7 +514,7 @@ func setupReplicaRemovalTest(
 ) (
 	*testcluster.TestCluster,
 	roachpb.Key,
-	func(context.Context, roachpb.Request) (roachpb.Response, *roachpb.Error),
+	func(context.Context, kvpb.Request) (kvpb.Response, *kvpb.Error),
 ) {
 	t.Helper()
 
@@ -518,7 +522,7 @@ func setupReplicaRemovalTest(
 
 	requestReadyC := make(chan struct{}) // signals main thread that request is teed up
 	requestEvalC := make(chan struct{})  // signals cluster to evaluate the request
-	evalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
+	evalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
 		if args.Ctx.Value(magicKey{}) != nil {
 			requestReadyC <- struct{}{}
 			<-requestEvalC
@@ -539,7 +543,7 @@ func setupReplicaRemovalTest(
 					AllowLeaseRequestProposalsWhenNotLeader: true,
 				},
 				Server: &server.TestingKnobs{
-					ClockSource: manual.UnixNano,
+					WallClock: manual,
 				},
 			},
 		},
@@ -552,11 +556,11 @@ func setupReplicaRemovalTest(
 
 	// Return a function that can be used to evaluate a delayed request
 	// during replica removal.
-	evalDuringReplicaRemoval := func(ctx context.Context, req roachpb.Request) (roachpb.Response, *roachpb.Error) {
+	evalDuringReplicaRemoval := func(ctx context.Context, req kvpb.Request) (kvpb.Response, *kvpb.Error) {
 		// Submit request and wait for it to block.
 		type result struct {
-			resp roachpb.Response
-			err  *roachpb.Error
+			resp kvpb.Response
+			err  *kvpb.Error
 		}
 		resultC := make(chan result)
 		srv := tc.Servers[0]

@@ -14,16 +14,30 @@
  */
 
 import { Action } from "redux";
+import { put, takeEvery, all } from "redux-saga/effects";
 import { PayloadAction } from "src/interfaces/action";
 import _ from "lodash";
-import { defaultTimeScaleOptions } from "@cockroachlabs/cluster-ui";
+import { defaultTimeScaleOptions, TimeScale } from "@cockroachlabs/cluster-ui";
 import moment from "moment";
+import { createSelector } from "reselect";
+import { AdminUIState } from "src/redux/state";
+import {
+  getValueFromSessionStorage,
+  setLocalSetting,
+} from "src/redux/localsettings";
+import {
+  invalidateExecutionInsights,
+  invalidateTxnInsights,
+  invalidateStatements,
+  invalidateTxns,
+} from "./apiReducers";
 
 export const SET_SCALE = "cockroachui/timewindow/SET_SCALE";
 export const SET_METRICS_MOVING_WINDOW =
   "cockroachui/timewindow/SET_METRICS_MOVING_WINDOW";
 export const SET_METRICS_FIXED_WINDOW =
   "cockroachui/timewindow/SET_METRICS_FIXED_WINDOW";
+const TIME_SCALE_SESSION_STORAGE_KEY = "time_scale";
 
 /**
  * TimeWindow represents an absolute window of time, defined with a start and
@@ -32,34 +46,6 @@ export const SET_METRICS_FIXED_WINDOW =
 export interface TimeWindow {
   start: moment.Moment;
   end: moment.Moment;
-}
-
-/**
- * TimeScale describes the requested dimensions of TimeWindows; it
- * prescribes a length for the window, along with a period of time that a
- * newly created TimeWindow will remain valid.
- */
-export interface TimeScale {
-  /**
-   * The key used to index in to the defaultTimeScaleOptions collection.
-   * The key is "Custom" when specifying a custom time that is not one of the default options
-   */
-  key?: string;
-  // The size of a global time window. Default is ten minutes.
-  windowSize: moment.Duration;
-  // The length of time the global time window is valid. The current time window
-  // is invalid if now > (metricsTime.currentWindow.end + windowValid). Default is ten
-  // seconds. If fixedWindowEnd is set this is ignored.
-  windowValid?: moment.Duration;
-  // The expected duration of individual samples for queries at this time scale.
-  sampleSize: moment.Duration;
-  /**
-   * The fixed end time of the window, or false if it should be a dynamically moving "now".
-   * Typically, when the `key` property is a default option, `fixedWindowEnd` should be false.
-   * And when the `key` property is "Custom" `fixedWindowEnd` should be a specific Moment.
-   * It is unclear if there are legitimate reasons for the two being out of sync.
-   */
-  fixedWindowEnd: moment.Moment | false;
 }
 
 export class TimeScaleState {
@@ -84,7 +70,22 @@ export class TimeScaleState {
   };
 
   constructor() {
-    this.scale = {
+    let timeScale: TimeScale;
+    try {
+      const val = getValueFromSessionStorage(TIME_SCALE_SESSION_STORAGE_KEY);
+      timeScale = {
+        key: val.key,
+        windowSize: val.windowSize && moment.duration(val.windowSize),
+        windowValid: val.windowValid && moment.duration(val.windowValid),
+        sampleSize: val.sampleSize && moment.duration(val.sampleSize),
+        fixedWindowEnd: val.fixedWindowEnd && moment(val.fixedWindowEnd),
+      };
+    } catch {
+      console.warn(
+        `Couldn't retrieve or parse TimeScale options from SessionStorage`,
+      );
+    }
+    this.scale = timeScale || {
       ...defaultTimeScaleOptions["Past 10 Minutes"],
       key: "Past 10 Minutes",
       fixedWindowEnd: false,
@@ -108,25 +109,24 @@ export function timeScaleReducer(
     case SET_SCALE: {
       const { payload: scale } = action as PayloadAction<TimeScale>;
       state = _.cloneDeep(state);
-      if (scale.key === "Custom") {
-        state.metricsTime.isFixedWindow = true;
-      } else {
-        state.metricsTime.isFixedWindow = false;
-      }
+      state.metricsTime.isFixedWindow = scale.key === "Custom";
       state.scale = scale;
       state.metricsTime.shouldUpdateMetricsWindowFromScale = true;
       return state;
     }
     case SET_METRICS_MOVING_WINDOW: {
       const { payload: tw } = action as PayloadAction<TimeWindow>;
-      state = _.cloneDeep(state);
+      // We don't want to deep clone the state here, because we're
+      // not changing the scale object here. For components observing
+      // timescale changes, we don't want to update them unnecessarily.
+      state = { ...state, metricsTime: _.cloneDeep(state.metricsTime) };
       state.metricsTime.currentWindow = tw;
       state.metricsTime.shouldUpdateMetricsWindowFromScale = false;
       return state;
     }
     case SET_METRICS_FIXED_WINDOW: {
       const { payload: data } = action as PayloadAction<TimeWindow>;
-      state = _.cloneDeep(state);
+      state = { ...state, metricsTime: _.cloneDeep(state.metricsTime) };
       state.metricsTime.currentWindow = data;
       state.metricsTime.isFixedWindow = true;
       state.metricsTime.shouldUpdateMetricsWindowFromScale = false;
@@ -161,6 +161,14 @@ export function setMetricsFixedWindow(
     payload: tw,
   };
 }
+
+export const selectTimeScale = createSelector(
+  (state: AdminUIState) => state.timeScale,
+  timeScaleState => timeScaleState.scale,
+);
+
+export const selectMetricsTime = (state: AdminUIState) =>
+  state.timeScale.metricsTime;
 
 export type AdjustTimeScaleReturnType = {
   timeScale: TimeScale;
@@ -215,11 +223,22 @@ export const adjustTimeScale = (
   }
 
   const resolution30minDate = now.subtract(resolution30mStorageTTL);
-  const isOutsideOf30minResolution = timeWindow.start.isBefore(
-    resolution30minDate,
-  );
+  const isOutsideOf30minResolution =
+    timeWindow.start.isBefore(resolution30minDate);
   if (isOutsideOf30minResolution) {
     result.adjustmentReason = "deleted_data_period";
   }
   return result;
 };
+
+export function* timeScaleSaga() {
+  yield takeEvery(SET_SCALE, function* ({ payload }: PayloadAction<TimeScale>) {
+    yield put(setLocalSetting(TIME_SCALE_SESSION_STORAGE_KEY, payload));
+    yield all([
+      put(invalidateStatements()),
+      put(invalidateExecutionInsights()),
+      put(invalidateTxnInsights()),
+      put(invalidateTxns()),
+    ]);
+  });
+}

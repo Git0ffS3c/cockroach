@@ -40,7 +40,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/lib/pq"
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgtype"
 	"github.com/spf13/cobra"
 )
 
@@ -175,6 +176,7 @@ func runDoctorExamine(
 		descTable,
 		namespaceTable,
 		jobsTable,
+		true, /*validateJobs*/
 		debugCtx.verbose,
 		out)
 	if err != nil {
@@ -198,6 +200,10 @@ func fromCluster(
 	retErr error,
 ) {
 	ctx := context.Background()
+	if err := sqlConn.EnsureConn(ctx); err != nil {
+		return nil, nil, nil, err
+	}
+
 	if timeout != 0 {
 		if err := sqlConn.Exec(ctx,
 			`SET statement_timeout = $1`, timeout.String()); err != nil {
@@ -211,8 +217,8 @@ FROM system.descriptor ORDER BY id`
 	_, err := sqlConn.QueryRow(ctx, checkColumnExistsStmt)
 	// On versions before 20.2, the system.descriptor won't have the builtin
 	// crdb_internal_mvcc_timestamp. If we can't find it, use NULL instead.
-	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
-		if pgcode.MakeCode(string(pqErr.Code)) == pgcode.UndefinedColumn {
+	if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
+		if pgcode.MakeCode(pgErr.Code) == pgcode.UndefinedColumn {
 			stmt = `
 SELECT id, descriptor, NULL AS mod_time_logical
 FROM system.descriptor ORDER BY id`
@@ -236,8 +242,12 @@ FROM system.descriptor ORDER BY id`
 		}
 		if vals[2] == nil {
 			row.ModTime = hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		} else if mt, ok := vals[2].([]byte); ok {
-			decimal, _, err := apd.NewFromString(string(mt))
+		} else if mt, ok := vals[2].(pgtype.Numeric); ok {
+			buf, err := mt.EncodeText(nil, nil)
+			if err != nil {
+				return err
+			}
+			decimal, _, err := apd.NewFromString(string(buf))
 			if err != nil {
 				return err
 			}
@@ -261,8 +271,8 @@ FROM system.descriptor ORDER BY id`
 	_, err = sqlConn.QueryRow(ctx, checkColumnExistsStmt)
 	// On versions before 20.1, table system.namespace does not have this column.
 	// In that case the ParentSchemaID for tables is 29 and for databases is 0.
-	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
-		if pgcode.MakeCode(string(pqErr.Code)) == pgcode.UndefinedColumn {
+	if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
+		if pgcode.MakeCode(pgErr.Code) == pgcode.UndefinedColumn {
 			stmt = `
 SELECT "parentID", CASE WHEN "parentID" = 0 THEN 0 ELSE 29 END AS "parentSchemaID", name, id
 FROM system.namespace`
@@ -300,7 +310,9 @@ FROM system.namespace`
 		return nil, nil, nil, err
 	}
 
-	stmt = `SELECT id, status, payload, progress FROM system.jobs`
+	stmt = `
+SELECT id, status, payload, progress FROM "".crdb_internal.system_jobs
+`
 	jobsTable = make(doctor.JobsTable, 0)
 
 	if err := selectRowsMap(sqlConn, stmt, make([]driver.Value, 4), func(vals []driver.Value) error {
@@ -339,7 +351,7 @@ func fromZipDir(
 	retErr error,
 ) {
 	// To make parsing user functions code happy.
-	_ = builtins.AllBuiltinNames
+	_ = builtins.AllBuiltinNames()
 
 	descTable = make(doctor.DescriptorTable, 0)
 	if err := slurp(zipDirPath, "system.descriptor.txt", func(row string) error {
@@ -417,12 +429,17 @@ func fromZipDir(
 		last := len(fields) - 1
 		payloadBytes, err := hx.DecodeString(fields[last-1])
 		if err != nil {
+			// TODO(postamar): remove this check once payload redaction is improved
+			if fields[last-1] == "NULL" {
+				return nil
+			}
 			return errors.Wrapf(err, "job %d: failed to decode hex payload", id)
 		}
 		md.Payload = &jobspb.Payload{}
 		if err := protoutil.Unmarshal(payloadBytes, md.Payload); err != nil {
 			return errors.Wrap(err, "failed unmarshalling job payload")
 		}
+
 		progressBytes, err := hx.DecodeString(fields[last])
 		if err != nil {
 			return errors.Wrapf(err, "job %d: failed to decode hex progress", id)

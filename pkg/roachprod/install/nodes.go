@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,12 +31,11 @@ type Nodes []Node
 // node ranges. Nodes are 1-indexed.
 //
 // Examples:
-//  - "all"
-//  - "1"
-//  - "1-3"
-//  - "1,3,5"
-//  - "1,2-4,7-8"
-//
+//   - "all"
+//   - "1"
+//   - "1-3"
+//   - "1,3,5"
+//   - "1,2-4,7-8"
 func ListNodes(s string, numNodesInCluster int) (Nodes, error) {
 	if s == "" {
 		return nil, errors.AssertionFailedf("empty node selector")
@@ -49,7 +48,7 @@ func ListNodes(s string, numNodesInCluster int) (Nodes, error) {
 		return allNodes(numNodesInCluster), nil
 	}
 
-	var set util.FastIntSet
+	var set intsets.Fast
 	for _, p := range strings.Split(s, ",") {
 		parts := strings.Split(p, "-")
 		switch len(parts) {

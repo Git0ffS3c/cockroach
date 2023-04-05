@@ -20,12 +20,6 @@ import (
 	"github.com/lib/pq/oid"
 )
 
-// SessionOptions configures options for how cast volatility is defined.
-type SessionOptions struct {
-	IntervalStyleEnabled bool
-	DateStyleEnabled     bool
-}
-
 // Context represents the contexts in which a cast can be performed. There
 // are three types of cast contexts: explicit, assignment, and implicit. Not all
 // casts can be performed in all contexts. See the description of each context
@@ -136,13 +130,6 @@ type Cast struct {
 	// set, it is used as an error hint suggesting a possible workaround when
 	// stable casts are not allowed.
 	VolatilityHint string
-	// intervalStyleAffected is true if the cast is a stable cast when
-	// SemaContext.IntervalStyleEnabled is true, and an immutable cast
-	// otherwise.
-	intervalStyleAffected bool
-	// dateStyleAffected is true if the cast is a stable cast when
-	// SemaContext.DateStyleEnabled is true, and an immutable cast otherwise.
-	dateStyleAffected bool
 }
 
 // ForEachCast calls fn for every valid cast from a source type to a target
@@ -194,7 +181,7 @@ func ValidCast(src, tgt *types.T, ctx Context) bool {
 
 	// If src and tgt are not both array or tuple types, check castMap for a
 	// valid cast.
-	c, ok := LookupCast(src, tgt, SessionOptions{})
+	c, ok := LookupCast(src, tgt)
 	if ok {
 		return c.MaxContext >= ctx
 	}
@@ -202,12 +189,19 @@ func ValidCast(src, tgt *types.T, ctx Context) bool {
 	return false
 }
 
+// OIDInCastMap checks to see if the cast is in the cast map. This bypasses
+// a few false equivalences found in LookupCast.
+// You are more likely using to use LookupCast.
+func OIDInCastMap(src, tgt oid.Oid) bool {
+	_, ok := castMap[src][tgt]
+	return ok
+}
+
 // LookupCast returns a cast that describes the cast from src to tgt if it
 // exists. If it does not exist, ok=false is returned.
-func LookupCast(src, tgt *types.T, so SessionOptions) (Cast, bool) {
+func LookupCast(src, tgt *types.T) (Cast, bool) {
 	srcFamily := src.Family()
 	tgtFamily := tgt.Family()
-	srcFamily.Name()
 
 	// Unknown is the type given to an expression that statically evaluates
 	// to NULL. NULL can be immutably cast to any type in any context.
@@ -288,12 +282,19 @@ func LookupCast(src, tgt *types.T, so SessionOptions) (Cast, bool) {
 		}, true
 	}
 
+	// Casts from int types to bit and varbit types are allowed only if the the
+	// length of the bit or varbit is defined
+	if srcFamily == types.IntFamily &&
+		tgtFamily == types.BitFamily &&
+		tgt.Width() != 0 {
+		return Cast{
+			MaxContext: ContextExplicit,
+			Volatility: volatility.Immutable,
+		}, true
+	}
+
 	if tgts, ok := castMap[src.Oid()]; ok {
 		if c, ok := tgts[tgt.Oid()]; ok {
-			if so.IntervalStyleEnabled && c.intervalStyleAffected ||
-				so.DateStyleEnabled && c.dateStyleAffected {
-				c.Volatility = volatility.Stable
-			}
 			return c, true
 		}
 	}
@@ -312,12 +313,12 @@ func LookupCast(src, tgt *types.T, so SessionOptions) (Cast, bool) {
 }
 
 // LookupCastVolatility returns the Volatility of a valid cast.
-func LookupCastVolatility(from, to *types.T, opts SessionOptions) (_ volatility.V, ok bool) {
+func LookupCastVolatility(from, to *types.T) (_ volatility.V, ok bool) {
 	fromFamily := from.Family()
 	toFamily := to.Family()
 	// Special case for casting between arrays.
 	if fromFamily == types.ArrayFamily && toFamily == types.ArrayFamily {
-		return LookupCastVolatility(from.ArrayContents(), to.ArrayContents(), opts)
+		return LookupCastVolatility(from.ArrayContents(), to.ArrayContents())
 	}
 	// Special case for casting between tuples.
 	if fromFamily == types.TupleFamily && toFamily == types.TupleFamily {
@@ -330,9 +331,9 @@ func LookupCastVolatility(from, to *types.T, opts SessionOptions) (_ volatility.
 		if len(fromTypes) != len(toTypes) {
 			return 0, false
 		}
-		maxVolatility := volatility.LeakProof
+		maxVolatility := volatility.Leakproof
 		for i := range fromTypes {
-			v, lookupOk := LookupCastVolatility(fromTypes[i], toTypes[i], opts)
+			v, lookupOk := LookupCastVolatility(fromTypes[i], toTypes[i])
 			if !lookupOk {
 				return 0, false
 			}
@@ -343,7 +344,7 @@ func LookupCastVolatility(from, to *types.T, opts SessionOptions) (_ volatility.
 		return maxVolatility, true
 	}
 
-	cast, ok := LookupCast(from, to, opts)
+	cast, ok := LookupCast(from, to)
 	if !ok {
 		return 0, false
 	}

@@ -79,19 +79,20 @@ func _ASSIGN(_, _, _, _, _, _ interface{}) {
 // projOpBase contains all of the fields for non-constant projections.
 type projOpBase struct {
 	colexecop.OneInputHelper
-	allocator *colmem.Allocator
-	col1Idx   int
-	col2Idx   int
-	outputIdx int
+	allocator         *colmem.Allocator
+	col1Idx           int
+	col2Idx           int
+	outputIdx         int
+	calledOnNullInput bool
 }
 
 // {{define "projOp"}}
 
 type _OP_NAME struct {
-	projOpBase
 	// {{if .NeedsBinaryOverloadHelper}}
 	colexecutils.BinaryOverloadHelper
 	// {{end}}
+	projOpBase
 }
 
 func (p _OP_NAME) Next() coldata.Batch {
@@ -102,6 +103,7 @@ func (p _OP_NAME) Next() coldata.Batch {
 	//     variable of type `colexecutils.BinaryOverloadHelper`.
 	// */}}
 	_overloadHelper := p.BinaryOverloadHelper
+	_ctx := p.Ctx
 	// {{end}}
 	batch := p.Input.Next()
 	n := batch.Length()
@@ -115,10 +117,12 @@ func (p _OP_NAME) Next() coldata.Batch {
 		vec2 := batch.ColVec(p.col2Idx)
 		col1 := vec1._L_TYP()
 		col2 := vec2._R_TYP()
+		// {{/*
 		// Some operators can result in NULL with non-NULL inputs, like the JSON
 		// fetch value operator, ->. Therefore, _outNulls is defined to allow
 		// updating the output Nulls from within _ASSIGN functions when the result
 		// of a projection is Null.
+		// */}}
 		_outNulls := projVec.Nulls()
 		if vec1.Nulls().MaybeHasNulls() || vec2.Nulls().MaybeHasNulls() {
 			_SET_PROJECTION(true)
@@ -137,6 +141,7 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 	// {{define "setProjection" -}}
 	// {{$hasNulls := $.HasNulls}}
 	// {{with $.Overload}}
+	// {{$isDatum := (and (eq .Left.VecMethod "Datum") (eq .Right.VecMethod "Datum"))}}
 	// {{if _HAS_NULLS}}
 	col1Nulls := vec1.Nulls()
 	col2Nulls := vec2.Nulls()
@@ -154,13 +159,21 @@ func _SET_PROJECTION(_HAS_NULLS bool) {
 			_SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS, false)
 		}
 	}
+	// {{/*
 	// _outNulls has been updated from within the _ASSIGN function to include
 	// any NULLs that resulted from the projection.
 	// If _HAS_NULLS is true, union _outNulls with the set of input Nulls.
 	// If _HAS_NULLS is false, then there are no input Nulls. _outNulls is
 	// projVec.Nulls() so there is no need to call projVec.SetNulls().
+	// */}}
 	// {{if _HAS_NULLS}}
-	projVec.SetNulls(_outNulls.Or(*col1Nulls).Or(*col2Nulls))
+	// {{if $isDatum}}
+	if !p.calledOnNullInput {
+		// {{end}}
+		projVec.SetNulls(_outNulls.Or(*col1Nulls).Or(*col2Nulls))
+		// {{if $isDatum}}
+	}
+	// {{end}}
 	// {{end}}
 	// {{end}}
 	// {{end}}
@@ -175,8 +188,9 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool, _HAS_SEL bool) { // */}}
 	// {{$hasNulls := $.HasNulls}}
 	// {{$hasSel := $.HasSel}}
 	// {{with $.Overload}}
+	// {{$isDatum := (and (eq .Left.VecMethod "Datum") (eq .Right.VecMethod "Datum"))}}
 	// {{if _HAS_NULLS}}
-	if !col1Nulls.NullAt(i) && !col2Nulls.NullAt(i) {
+	if p.calledOnNullInput || (!col1Nulls.NullAt(i) && !col2Nulls.NullAt(i)) {
 		// We only want to perform the projection operation if both values are not
 		// null.
 		// {{end}}
@@ -184,10 +198,28 @@ func _SET_SINGLE_TUPLE_PROJECTION(_HAS_NULLS bool, _HAS_SEL bool) { // */}}
 		//gcassert:bce
 		// {{end}}
 		arg1 := col1.Get(i)
+		// {{if (and _HAS_NULLS $isDatum)}}
+		if col1Nulls.NullAt(i) {
+			// {{/*
+			// If we entered this branch for a null value, calledOnNullInput must be
+			// true. This means the projection should be calculated on null arguments.
+			// When a value is null, the underlying data in the slice is invalid and
+			// can be anything, so we need to overwrite it here. calledOnNullInput is
+			// currently only true for ConcatDatumDatum, so only the datum case needs
+			// to be handled.
+			// */}}
+			arg1 = tree.DNull
+		}
+		// {{end}}
 		// {{if and (.Right.Sliceable) (not _HAS_SEL)}}
 		//gcassert:bce
 		// {{end}}
 		arg2 := col2.Get(i)
+		// {{if (and _HAS_NULLS $isDatum)}}
+		if col2Nulls.NullAt(i) {
+			arg2 = tree.DNull
+		}
+		// {{end}}
 		_ASSIGN(projCol[i], arg1, arg2, projCol, col1, col2)
 		// {{if _HAS_NULLS}}
 	}
@@ -241,14 +273,16 @@ func GetProjectionOperator(
 	evalCtx *eval.Context,
 	binOp tree.BinaryEvalOp,
 	cmpExpr *tree.ComparisonExpr,
+	calledOnNullInput bool,
 ) (colexecop.Operator, error) {
 	input = colexecutils.NewVectorTypeEnforcer(allocator, input, outputType, outputIdx)
 	projOpBase := projOpBase{
-		OneInputHelper: colexecop.MakeOneInputHelper(input),
-		allocator:      allocator,
-		col1Idx:        col1Idx,
-		col2Idx:        col2Idx,
-		outputIdx:      outputIdx,
+		OneInputHelper:    colexecop.MakeOneInputHelper(input),
+		allocator:         allocator,
+		col1Idx:           col1Idx,
+		col2Idx:           col2Idx,
+		outputIdx:         outputIdx,
+		calledOnNullInput: calledOnNullInput,
 	}
 
 	leftType, rightType := inputTypes[col1Idx], inputTypes[col2Idx]

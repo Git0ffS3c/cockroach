@@ -19,14 +19,16 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 // TestInitializeFromConfig is a placeholder for actual testing functions.
 func TestInitializeFromConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Create a temp dir for all certificate tests.
 	tempDir := t.TempDir()
@@ -53,7 +55,7 @@ func TestInitializeFromConfig(t *testing.T) {
 }
 
 func loadAllCertsFromDisk(ctx context.Context, cfg base.Config) (CertificateBundle, error) {
-	cl := security.MakeCertsLocator(cfg.SSLCertsDir)
+	cl := certnames.MakeLocator(cfg.SSLCertsDir)
 	bundleFromDisk, err := collectLocalCABundle(cfg.SSLCertsDir)
 	if err != nil {
 		return bundleFromDisk, err
@@ -207,6 +209,7 @@ func compareBundleServiceCerts(
 // TODO(aaron-crl): [tests] write unit tests.
 func TestDummyInitializeNodeFromBundle(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Create a temp dir for all certificate tests.
 	tempDir := t.TempDir()
@@ -274,6 +277,7 @@ func TestRotationOnUnintializedNode(t *testing.T) {
 
 func TestRotationOnIntializedNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Create a temp dir for all certificate tests.
 	tempDir := t.TempDir()
@@ -307,6 +311,7 @@ func TestRotationOnIntializedNode(t *testing.T) {
 
 func TestRotationOnPartialIntializedNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Create a temp dir for all certificate tests.
 	tempDir := t.TempDir()
@@ -323,7 +328,7 @@ func TestRotationOnPartialIntializedNode(t *testing.T) {
 		t.Fatalf("expected err=nil, got: %q", err)
 	}
 
-	cl := security.MakeCertsLocator(cfg.SSLCertsDir)
+	cl := certnames.MakeLocator(cfg.SSLCertsDir)
 	if err = os.Remove(cl.ClientCACertPath()); err != nil {
 		t.Fatalf("failed to remove test cert: %q", err)
 	}
@@ -363,6 +368,7 @@ func TestRotationOnPartialIntializedNode(t *testing.T) {
 // TestRotationOnBrokenIntializedNode in the partially provisioned case (remove the Client and UI CAs).
 func TestRotationOnBrokenIntializedNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Create a temp dir for all certificate tests.
 	tempDir := t.TempDir()
@@ -372,7 +378,7 @@ func TestRotationOnBrokenIntializedNode(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	cl := security.MakeCertsLocator(cfg.SSLCertsDir)
+	cl := certnames.MakeLocator(cfg.SSLCertsDir)
 	certBundle := CertificateBundle{}
 	err := certBundle.InitializeFromConfig(ctx, cfg)
 	if err != nil {

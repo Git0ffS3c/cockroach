@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -53,10 +52,10 @@ type Operator interface {
 	execopnode.OpNode
 }
 
-// DrainableOperator is an operator that also implements DrainMeta. Next and
-// DrainMeta may not be called concurrently.
-type DrainableOperator interface {
-	Operator
+// DrainableClosableOperator is a ClosableOperator that also implements
+// DrainMeta. Next, DrainMeta, and Close may not be called concurrently.
+type DrainableClosableOperator interface {
+	ClosableOperator
 	MetadataSource
 }
 
@@ -70,12 +69,22 @@ type KVReader interface {
 	// GetRowsRead returns the number of rows read from KV by this operator.
 	// It must be safe for concurrent use.
 	GetRowsRead() int64
-	// GetCumulativeContentionTime returns the amount of time KV reads spent
+	// GetBatchRequestsIssued returns the number of BatchRequests issued to KV
+	// by this operator. It must be safe for concurrent use.
+	GetBatchRequestsIssued() int64
+	// GetContentionTime returns the amount of time KV reads spent
 	// contending. It must be safe for concurrent use.
-	GetCumulativeContentionTime() time.Duration
+	GetContentionTime() time.Duration
 	// GetScanStats returns statistics about the scan that happened during the
 	// KV reads. It must be safe for concurrent use.
 	GetScanStats() execstats.ScanStats
+	// GetConsumedRU returns the number of RUs that were consumed during the
+	// KV reads.
+	GetConsumedRU() uint64
+	// GetKVCPUTime returns the CPU time consumed *on the current goroutine* by
+	// KV requests. It must be safe for concurrent use. It is used to calculate
+	// the SQL CPU time.
+	GetKVCPUTime() time.Duration
 }
 
 // ZeroInputNode is an execopnode.OpNode with no inputs.
@@ -144,39 +153,20 @@ type BufferingInMemoryOperator interface {
 type Closer interface {
 	// Close releases the resources associated with this Closer. If this Closer
 	// is an Operator, the implementation of Close must be safe to execute even
-	// if Operator.Init wasn't called.
+	// if Operator.Init wasn't called. Multiple calls to Close() are allowed,
+	// and most of the implementations should make all calls except for the
+	// first one no-ops.
 	//
 	// Unless the Closer derives its own context with a separate tracing span,
 	// the argument context rather than the one from Init() must be used
 	// (wherever necessary) by the implementation. This is so since the span in
 	// the context from Init() might be already finished when Close() is called
 	// whereas the argument context will contain an unfinished span.
-	//
-	// If this Closer is an execinfra.Releasable, the implementation must be
-	// safe to execute even after Release() was called.
-	// TODO(yuzefovich): refactor this because the Release()'d objects should
-	// not be used anymore.
 	Close(context.Context) error
 }
 
 // Closers is a slice of Closers.
 type Closers []Closer
-
-// CloseAndLogOnErr closes all Closers and logs the error if the log verbosity
-// is 1 or higher. The given prefix is prepended to the log message.
-// Note: this method should *only* be used when returning an error doesn't make
-// sense.
-func (c Closers) CloseAndLogOnErr(ctx context.Context, prefix string) {
-	if err := colexecerror.CatchVectorizedRuntimeError(func() {
-		for _, closer := range c {
-			if err := closer.Close(ctx); err != nil && log.V(1) {
-				log.Infof(ctx, "%s: error closing Closer: %v", prefix, err)
-			}
-		}
-	}); err != nil && log.V(1) {
-		log.Infof(ctx, "%s: runtime error closing the closers: %v", prefix, err)
-	}
-}
 
 // Close closes all Closers and returns the last error (if any occurs).
 func (c Closers) Close(ctx context.Context) error {
@@ -368,6 +358,55 @@ func (h *OneInputInitCloserHelper) Init(ctx context.Context) {
 		return
 	}
 	h.Input.Init(h.Ctx)
+}
+
+// MakeTwoInputInitHelper returns a new TwoInputInitHelper.
+func MakeTwoInputInitHelper(inputOne, inputTwo Operator) TwoInputInitHelper {
+	return TwoInputInitHelper{InputOne: inputOne, InputTwo: inputTwo}
+}
+
+// TwoInputInitHelper is an extension of InitHelper that additionally also is an
+// execopnode.OpNode with two Operator inputs and provides a reset helper.
+type TwoInputInitHelper struct {
+	InitHelper
+	InputOne Operator
+	InputTwo Operator
+}
+
+// Init initializes both inputs and returns true if this is the first time Init
+// was called.
+func (h *TwoInputInitHelper) Init(ctx context.Context) bool {
+	if !h.InitHelper.Init(ctx) {
+		return false
+	}
+	h.InputOne.Init(h.Ctx)
+	h.InputTwo.Init(h.Ctx)
+	return true
+}
+
+func (h *TwoInputInitHelper) ChildCount(verbose bool) int {
+	return 2
+}
+
+func (h *TwoInputInitHelper) Child(nth int, verbose bool) execopnode.OpNode {
+	switch nth {
+	case 0:
+		return h.InputOne
+	case 1:
+		return h.InputTwo
+	}
+	colexecerror.InternalError(errors.AssertionFailedf("invalid idx %d", nth))
+	// This code is unreachable, but the compiler cannot infer that.
+	return nil
+}
+
+func (h *TwoInputInitHelper) Reset(ctx context.Context) {
+	if r, ok := h.InputOne.(Resetter); ok {
+		r.Reset(ctx)
+	}
+	if r, ok := h.InputTwo.(Resetter); ok {
+		r.Reset(ctx)
+	}
 }
 
 type noopOperator struct {

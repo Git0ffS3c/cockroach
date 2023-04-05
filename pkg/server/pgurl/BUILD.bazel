@@ -1,8 +1,10 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "pgurl",
     srcs = [
+        "extended_options.go",
         "generate.go",
         "parse.go",
         "pgurl.go",
@@ -20,12 +22,15 @@ go_library(
 go_test(
     name = "pgurl_test",
     srcs = ["pgurl_test.go"],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":pgurl"],
     deps = [
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

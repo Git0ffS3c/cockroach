@@ -31,6 +31,30 @@ func CanProvide(expr memo.RelExpr, required *props.OrderingChoice) bool {
 	return funcMap[expr.Op()].canProvideOrdering(expr, required)
 }
 
+// CanEnforce returns true if the output of the given operator can be sorted
+// in order to satisfy the given required ordering.
+func CanEnforce(expr memo.RelExpr, required *props.OrderingChoice) bool {
+	if required.Any() {
+		return false
+	}
+	if buildutil.CrdbTestBuild {
+		checkRequired(expr, required)
+	}
+	switch t := expr.(type) {
+	case *memo.ExplainExpr:
+		return false
+	case *memo.LookupJoinExpr:
+		// For paired joins we use a boolean continuation column to handle false
+		// positive matches in the first join. This relies on the ordering being
+		// unchanged between the first and second joins, so adding a sort on top
+		// of this expression could lead to incorrect results.
+		return !t.IsFirstJoinInPairedJoiner
+	case *memo.InvertedJoinExpr:
+		return !t.IsFirstJoinInPairedJoiner
+	}
+	return true
+}
+
 // BuildChildRequired returns the ordering that must be required of its
 // given child in order to satisfy a required ordering. Can only be called if
 // CanProvide is true for the required ordering.
@@ -140,12 +164,12 @@ func init() {
 		buildProvidedOrdering: setOpBuildProvided,
 	}
 	funcMap[opt.IndexJoinOp] = funcs{
-		canProvideOrdering:    lookupOrIndexJoinCanProvideOrdering,
+		canProvideOrdering:    indexJoinCanProvideOrdering,
 		buildChildReqOrdering: lookupOrIndexJoinBuildChildReqOrdering,
 		buildProvidedOrdering: indexJoinBuildProvided,
 	}
 	funcMap[opt.LookupJoinOp] = funcs{
-		canProvideOrdering:    lookupOrIndexJoinCanProvideOrdering,
+		canProvideOrdering:    lookupJoinCanProvideOrdering,
 		buildChildReqOrdering: lookupOrIndexJoinBuildChildReqOrdering,
 		buildProvidedOrdering: lookupJoinBuildProvided,
 	}
@@ -340,10 +364,15 @@ func remapProvided(provided opt.Ordering, fds *props.FuncDepSet, outCols opt.Col
 				result = append(result, provided[i])
 			}
 		} else {
-			equivCols := fds.ComputeEquivClosure(opt.MakeColSet(col))
-			remappedCol, ok := equivCols.Intersection(outCols).Next(0)
+			equivCols := fds.ComputeEquivClosureNoCopy(opt.MakeColSet(col))
+			remappedCol, ok := equivCols.Next(0)
 			if !ok {
 				panic(errors.AssertionFailedf("no output column equivalent to %d", redact.Safe(col)))
+			}
+			// If the column is in the output use that.
+			remappedColFromOutput, ok := equivCols.Intersection(outCols).Next(0)
+			if ok {
+				remappedCol = remappedColFromOutput
 			}
 			if result == nil {
 				result = make(opt.Ordering, i, len(provided))
@@ -406,7 +435,7 @@ func checkRequired(expr memo.RelExpr, required *props.OrderingChoice) {
 	// Verify that columns in a column group are equivalent.
 	for i := range required.Columns {
 		c := &required.Columns[i]
-		if !c.Group.SubsetOf(rel.FuncDeps.ComputeEquivGroup(c.AnyID())) {
+		if !c.Group.SubsetOf(rel.FuncDeps.ComputeEquivGroup(c.AnyID())) && !rel.Cardinality.IsZero() {
 			panic(errors.AssertionFailedf(
 				"ordering column group %s contains non-equivalent columns (op %s)",
 				c.Group, expr.Op(),

@@ -57,13 +57,12 @@ func (op Operator) SyntaxTag() string {
 // or more children, and an optional private value. The entire tree can be
 // easily visited using a pattern like this:
 //
-//   var visit func(e Expr)
-//   visit := func(e Expr) {
-//     for i, n := 0, e.ChildCount(); i < n; i++ {
-//       visit(e.Child(i))
-//     }
-//   }
-//
+//	var visit func(e Expr)
+//	visit := func(e Expr) {
+//	  for i, n := 0, e.ChildCount(); i < n; i++ {
+//	    visit(e.Child(i))
+//	  }
+//	}
 type Expr interface {
 	// Op returns the operator type of the expression.
 	Op() Operator
@@ -146,6 +145,7 @@ var ComparisonOpReverseMap = map[Operator]treecmp.ComparisonOperatorSymbol{
 	OverlapsOp:       treecmp.Overlaps,
 	BBoxCoversOp:     treecmp.RegMatch,
 	BBoxIntersectsOp: treecmp.Overlaps,
+	TSMatchesOp:      treecmp.TSMatches,
 }
 
 // BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
@@ -184,6 +184,7 @@ var UnaryOpReverseMap = map[Operator]tree.UnaryOperatorSymbol{
 // aggregation function.
 var AggregateOpReverseMap = map[Operator]string{
 	ArrayAggOp:            "array_agg",
+	ArrayCatAggOp:         "array_cat_agg",
 	AvgOp:                 "avg",
 	BitAndAggOp:           "bit_and",
 	BitOrAggOp:            "bit_or",
@@ -305,15 +306,15 @@ func BoolOperatorRequiresNotNullArgs(op Operator) bool {
 // rows where its first argument evaluates to NULL. In other words, it always
 // evaluates to the same result even if those rows are filtered. For example:
 //
-//   SELECT string_agg(x, y)
-//   FROM (VALUES ('foo', ','), ('bar', ','), (NULL, ',')) t(x, y)
+//	SELECT string_agg(x, y)
+//	FROM (VALUES ('foo', ','), ('bar', ','), (NULL, ',')) t(x, y)
 //
 // In this example, the NULL row can be removed from the input, and the
 // string_agg function still returns the same result. Contrast this to the
 // array_agg function:
 //
-//   SELECT array_agg(x)
-//   FROM (VALUES ('foo'), (NULL), ('bar')) t(x)
+//	SELECT array_agg(x)
+//	FROM (VALUES ('foo'), (NULL), ('bar')) t(x)
 //
 // If the NULL row is removed here, array_agg returns {foo,bar} instead of
 // {foo,NULL,bar}.
@@ -329,8 +330,8 @@ func AggregateIgnoresNulls(op Operator) bool {
 		RegressionSXYOp, RegressionSYYOp, RegressionCountOp:
 		return true
 
-	case ArrayAggOp, ConcatAggOp, ConstAggOp, CountRowsOp, FirstAggOp, JsonAggOp,
-		JsonbAggOp, JsonObjectAggOp, JsonbObjectAggOp:
+	case ArrayAggOp, ArrayCatAggOp, ConcatAggOp, ConstAggOp, CountRowsOp,
+		FirstAggOp, JsonAggOp, JsonbAggOp, JsonObjectAggOp, JsonbObjectAggOp:
 		return false
 
 	default:
@@ -344,7 +345,7 @@ func AggregateIgnoresNulls(op Operator) bool {
 func AggregateIsNullOnEmpty(op Operator) bool {
 	switch op {
 
-	case AnyNotNullAggOp, ArrayAggOp, AvgOp, BitAndAggOp,
+	case AnyNotNullAggOp, ArrayAggOp, ArrayCatAggOp, AvgOp, BitAndAggOp,
 		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
 		ConstNotNullAggOp, CorrOp, FirstAggOp, JsonAggOp, JsonbAggOp,
 		MaxOp, MinOp, SqrDiffOp, StdDevOp, STMakeLineOp, StringAggOp, SumOp, SumIntOp,
@@ -373,19 +374,19 @@ func AggregateIsNullOnEmpty(op Operator) bool {
 func AggregateIsNeverNullOnNonNullInput(op Operator) bool {
 	switch op {
 
-	case AnyNotNullAggOp, ArrayAggOp, AvgOp, BitAndAggOp,
+	case AnyNotNullAggOp, ArrayAggOp, ArrayCatAggOp, AvgOp, BitAndAggOp,
 		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
 		ConstNotNullAggOp, CountOp, CountRowsOp, FirstAggOp,
-		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp, STMakeLineOp,
+		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp,
 		StringAggOp, SumOp, SumIntOp, XorAggOp, PercentileDiscOp, PercentileContOp,
-		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STExtentOp, STUnionOp,
+		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STUnionOp,
 		VarPopOp, CovarPopOp, RegressionAvgXOp, RegressionAvgYOp, RegressionSXXOp,
 		RegressionSXYOp, RegressionSYYOp, RegressionCountOp:
 		return true
 
 	case VarianceOp, StdDevOp, CorrOp, CovarSampOp, RegressionInterceptOp,
-		RegressionR2Op, RegressionSlopeOp:
-		// These aggregations return NULL if they are given a single not-NULL input.
+		RegressionR2Op, RegressionSlopeOp, STExtentOp, STMakeLineOp:
+		// These aggregations can return NULL even with non-null input values.
 		return false
 
 	default:
@@ -409,11 +410,11 @@ func AggregateIsNeverNull(op Operator) bool {
 // words, the inner-outer aggregate pair forms a valid "decomposition" of a
 // single aggregate. For example, the following pairs of queries are equivalent:
 //
-//   SELECT sum(s) FROM (SELECT sum(y) FROM xy GROUP BY x) AS f(s);
-//   SELECT sum(y) FROM xy;
+//	SELECT sum(s) FROM (SELECT sum(y) FROM xy GROUP BY x) AS f(s);
+//	SELECT sum(y) FROM xy;
 //
-//   SELECT sum_int(c) FROM (SELECT count(y) FROM xy GROUP BY x) AS f(c);
-//   SELECT count(y) FROM xy;
+//	SELECT sum_int(c) FROM (SELECT count(y) FROM xy GROUP BY x) AS f(c);
+//	SELECT count(y) FROM xy;
 //
 // Note: some aggregates like StringAggOp are decomposable in theory, but in
 // practice can not be easily merged as in the examples above.
@@ -430,7 +431,7 @@ func AggregatesCanMerge(inner, outer Operator) bool {
 		// while CountOp and CountRowsOp both output int values.
 		return outer == SumIntOp
 
-	case ArrayAggOp, AvgOp, ConcatAggOp, CorrOp, JsonAggOp, JsonbAggOp,
+	case ArrayAggOp, ArrayCatAggOp, AvgOp, ConcatAggOp, CorrOp, JsonAggOp, JsonbAggOp,
 		JsonObjectAggOp, JsonbObjectAggOp, PercentileContOp, PercentileDiscOp,
 		SqrDiffOp, STCollectOp, StdDevOp, StringAggOp, VarianceOp, StdDevPopOp,
 		VarPopOp, CovarPopOp, CovarSampOp, RegressionAvgXOp, RegressionAvgYOp,
@@ -451,8 +452,8 @@ func AggregateIgnoresDuplicates(op Operator) bool {
 		ConstAggOp, ConstNotNullAggOp, FirstAggOp, MaxOp, MinOp, STExtentOp, STUnionOp:
 		return true
 
-	case ArrayAggOp, AvgOp, ConcatAggOp, CountOp, CorrOp, CountRowsOp, SumIntOp,
-		SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, JsonAggOp, JsonbAggOp,
+	case ArrayAggOp, ArrayCatAggOp, AvgOp, ConcatAggOp, CountOp, CorrOp, CountRowsOp,
+		SumIntOp, SumOp, SqrDiffOp, VarianceOp, StdDevOp, XorAggOp, JsonAggOp, JsonbAggOp,
 		StringAggOp, PercentileDiscOp, PercentileContOp, StdDevPopOp, STMakeLineOp,
 		VarPopOp, JsonObjectAggOp, JsonbObjectAggOp, STCollectOp, CovarPopOp,
 		CovarSampOp, RegressionAvgXOp, RegressionAvgYOp, RegressionInterceptOp,
@@ -463,6 +464,26 @@ func AggregateIgnoresDuplicates(op Operator) bool {
 	default:
 		panic(errors.AssertionFailedf("unhandled op %s", redact.Safe(op)))
 	}
+}
+
+// CommuteEqualityOrInequalityOp returns the commuted version of the given
+// operator, e.g. '<' -> '>' and '=' -> '='. It only handles equality and
+// inequality operators. Note that commuting an operator is not the same as
+// negating it.
+func CommuteEqualityOrInequalityOp(op Operator) Operator {
+	switch op {
+	case EqOp:
+		return EqOp
+	case GeOp:
+		return LeOp
+	case GtOp:
+		return LtOp
+	case LeOp:
+		return GeOp
+	case LtOp:
+		return GtOp
+	}
+	panic(errors.AssertionFailedf("attempted to commute operator: %s", redact.Safe(op)))
 }
 
 // OpaqueMetadata is an object stored in OpaqueRelExpr and passed

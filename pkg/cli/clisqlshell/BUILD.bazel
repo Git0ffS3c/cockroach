@@ -1,11 +1,20 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "clisqlshell",
     srcs = [
         "api.go",
+        "complete.go",
         "context.go",
+        "describe.go",
         "doc.go",
+        "editor.go",
+        "editor_bimodal.go",
+        "editor_bubbline.go",
+        "editor_bufio.go",
+        "editor_editline.go",
+        "parser.go",
         "sql.go",
         "statement_diag.go",
         "statements_value.go",
@@ -28,9 +37,14 @@ go_library(
         "//pkg/sql/scanner",
         "//pkg/sql/sqlfsm",
         "//pkg/util/envutil",
-        "//pkg/util/errorutil/unimplemented",
         "//pkg/util/syncutil",
+        "//pkg/util/sysutil",
+        "@com_github_charmbracelet_bubbles//cursor",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_knz_bubbline//:bubbline",
+        "@com_github_knz_bubbline//computil",
+        "@com_github_knz_bubbline//editline",
+        "@com_github_knz_bubbline//history",
         "@com_github_knz_go_libedit//:go-libedit",
     ],
 )
@@ -38,10 +52,14 @@ go_library(
 go_test(
     name = "clisqlshell_test",
     srcs = [
+        "complete_test.go",
+        "describe_test.go",
+        "editor_bubbline_test.go",
         "main_test.go",
         "sql_internal_test.go",
         "sql_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":clisqlshell"],
     deps = [
@@ -51,12 +69,19 @@ go_test(
         "//pkg/cli/clicfg",
         "//pkg/cli/clisqlclient",
         "//pkg/cli/clisqlexec",
+        "//pkg/security/securityassets",
+        "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
+        "//pkg/sql/lexbase",
         "//pkg/sql/scanner",
         "//pkg/testutils/serverutils",
         "//pkg/util/leaktest",
         "//pkg/util/log",
+        "@com_github_cockroachdb_datadriven//:datadriven",
+        "@com_github_knz_bubbline//computil",
         "@com_github_stretchr_testify//assert",
     ],
 )
+
+get_x_data(name = "get_x_data")

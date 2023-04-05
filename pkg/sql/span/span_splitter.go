@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -44,8 +44,20 @@ func NoopSplitter() Splitter {
 // MakeSplitter returns a Splitter that splits spans into more specific spans
 // for the needed families. If span splitting is not possible/useful, returns
 // the NoopSplitter (which never splits).
+// Note: this splitter should **not** be used for deletes.
 func MakeSplitter(
-	table catalog.TableDescriptor, index catalog.Index, neededColOrdinals util.FastIntSet,
+	table catalog.TableDescriptor, index catalog.Index, neededColOrdinals intsets.Fast,
+) Splitter {
+	return MakeSplitterForDelete(table, index, neededColOrdinals, false /* forDelete */)
+}
+
+// MakeSplitterForDelete is the same as MakeSplitter but additionally specifies
+// whether the splitter will be used for deletes.
+func MakeSplitterForDelete(
+	table catalog.TableDescriptor,
+	index catalog.Index,
+	neededColOrdinals intsets.Fast,
+	forDelete bool,
 ) Splitter {
 	// We can only split a span into separate family specific point lookups if:
 	//
@@ -89,6 +101,13 @@ func MakeSplitter(
 	// TODO(radu): should we be using IndexKeysPerRow() instead?
 	numFamilies := len(table.GetFamilies())
 	if numFamilies > 1 && len(neededFamilies) == numFamilies {
+		return NoopSplitter()
+	}
+
+	// * If we're performing a delete, the table must have just one column
+	//   family, since we need to delete all column families during delete
+	//   operations.
+	if forDelete && numFamilies > 1 {
 		return NoopSplitter()
 	}
 

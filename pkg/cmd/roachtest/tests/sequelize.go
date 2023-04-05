@@ -39,9 +39,6 @@ func registerSequelize(r registry.Registry) {
 		node := c.Node(1)
 		t.Status("setting up cockroach")
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		if err := c.PutLibraries(ctx, "./lib"); err != nil {
-			t.Fatal(err)
-		}
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
@@ -99,7 +96,7 @@ func registerSequelize(r registry.Registry) {
 			c,
 			node,
 			"add nodesource repository",
-			`sudo apt install ca-certificates && curl -sL https://deb.nodesource.com/setup_12.x | sudo -E bash -`,
+			`sudo apt install ca-certificates && curl -sL https://deb.nodesource.com/setup_16.x | sudo -E bash -`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -153,10 +150,11 @@ func registerSequelize(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "sequelize",
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `orm`},
+		Name:       "sequelize",
+		Owner:      registry.OwnerSQLSessions,
+		Cluster:    r.MakeClusterSpec(1),
+		NativeLibs: registry.LibGEOS,
+		Tags:       []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runSequelize(ctx, t, c)
 		},

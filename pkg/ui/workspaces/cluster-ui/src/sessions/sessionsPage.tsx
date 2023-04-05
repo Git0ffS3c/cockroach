@@ -20,10 +20,8 @@ import {
 } from "./sessionsTable";
 import { RouteComponentProps } from "react-router-dom";
 import classNames from "classnames/bind";
-import { sessionsTable } from "src/util/docs";
 
-import emptyTableResultsIcon from "../assets/emptyState/empty-table-results.svg";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 import { Pagination } from "src/pagination";
 import {
   SortSetting,
@@ -32,8 +30,6 @@ import {
   ColumnDescriptor,
 } from "src/sortedtable";
 import { Loading } from "src/loading";
-import { Anchor } from "src/anchor";
-import { EmptyTable } from "src/empty";
 import {
   calculateActiveFilters,
   defaultFilters,
@@ -41,6 +37,7 @@ import {
   Filters,
   getTimeValueInSeconds,
   handleFiltersFromQueryString,
+  SelectedFilters,
 } from "../queryFilter";
 
 import TerminateQueryModal, {
@@ -60,16 +57,19 @@ import sessionPageStyles from "./sessionPage.module.scss";
 import ColumnsSelector, {
   SelectOption,
 } from "../columnsSelector/columnsSelector";
-import { TimestampToMoment } from "src/util";
+import { TimestampToMoment, unset } from "src/util";
 import moment from "moment";
 import {
   getLabel,
   StatisticTableColumnKeys,
 } from "../statsTableUtil/statsTableUtil";
 import { TableStatistics } from "../tableStatistics";
+import { EmptySessionsTablePlaceholder } from "./emptySessionsTablePlaceholder";
 
 const statementsPageCx = classNames.bind(statementsPageStyles);
 const sessionsPageCx = classNames.bind(sessionPageStyles);
+
+const sessionStatusFilterOptions = ["Active", "Closed", "Idle"];
 
 export interface OwnProps {
   sessions: SessionInfo[];
@@ -109,9 +109,7 @@ function getSessionAppFilterOptions(sessions: SessionInfo[]): string[] {
       if (s.session.application_name.startsWith("$ internal")) {
         return "$ internal";
       }
-      return s.session.application_name
-        ? s.session.application_name
-        : "(unset)";
+      return s.session.application_name ? s.session.application_name : unset;
     }),
   );
 
@@ -124,20 +122,13 @@ function getSessionUsernameFilterOptions(sessions: SessionInfo[]): string[] {
   return Array.from(uniqueUsernames).sort();
 }
 
-function getSessionStatusFilterOptions(sessions: SessionInfo[]): string[] {
-  const uniqueStatuses = new Set(
-    sessions.map(s => getStatusString(s.session.status)),
-  );
-
-  return Array.from(uniqueStatuses).sort();
-}
-
 export class SessionsPage extends React.Component<
   SessionsPageProps,
   SessionsPageState
 > {
   terminateSessionRef: React.RefObject<TerminateSessionModalRef>;
   terminateQueryRef: React.RefObject<TerminateQueryModalRef>;
+  refreshDataInterval: NodeJS.Timeout;
 
   constructor(props: SessionsPageProps) {
     super(props);
@@ -212,13 +203,24 @@ export class SessionsPage extends React.Component<
   };
 
   componentDidMount(): void {
-    this.props.refreshSessions();
+    if (!this.props.sessions || this.props.sessions.length === 0) {
+      this.props.refreshSessions();
+    }
+
+    this.refreshDataInterval = setInterval(
+      this.props.refreshSessions,
+      10 * 1000,
+    );
+  }
+
+  componentWillUnmount(): void {
+    if (!this.refreshDataInterval) return;
+    clearInterval(this.refreshDataInterval);
   }
 
   componentDidUpdate = (): void => {
     const { history, sortSetting } = this.props;
 
-    this.props.refreshSessions();
     updateSortSettingQueryParamsOnTab(
       "Sessions",
       sortSetting,
@@ -300,7 +302,7 @@ export class SessionsPage extends React.Component<
           if (apps.includes(internalAppNamePrefix)) {
             showInternal = true;
           }
-          if (apps.includes("(unset)")) {
+          if (apps.includes(unset)) {
             apps.push("");
           }
 
@@ -345,14 +347,12 @@ export class SessionsPage extends React.Component<
     const { pagination, filters } = this.state;
     const { columns: userSelectedColumnsToShow, onColumnsChange } = this.props;
 
-    const {
-      sessions: sessionsToDisplay,
-      activeFilters,
-    } = this.getFilteredSessionsData();
+    const { sessions: sessionsToDisplay, activeFilters } =
+      this.getFilteredSessionsData();
 
     const appNames = getSessionAppFilterOptions(sessionsData);
     const usernames = getSessionUsernameFilterOptions(sessionsData);
-    const sessionStatuses = getSessionStatusFilterOptions(sessionsData);
+    const sessionStatuses = sessionStatusFilterOptions;
     const columns = makeSessionsColumns(
       "session",
       this.terminateSessionRef,
@@ -381,7 +381,6 @@ export class SessionsPage extends React.Component<
         }),
       );
 
-    const timeLabel = "Session duration runs longer than";
     const displayColumns = columns.filter(c => isColumnSelected(c));
 
     return (
@@ -396,22 +395,27 @@ export class SessionsPage extends React.Component<
             sessionStatuses={sessionStatuses}
             activeFilters={activeFilters}
             filters={filters}
-            timeLabel={timeLabel}
+            timeLabel={"Session duration"}
+          />
+          <SelectedFilters
+            filters={filters}
+            onRemoveFilter={this.onSubmitFilters}
+            onClearFilters={this.onClearFilters}
           />
         </div>
-        <section>
+        <section className={sessionsPageCx("sessions-table-area")}>
           <div className={statementsPageCx("cl-table-statistic")}>
             <div className={"session-column-selector"}>
               <ColumnsSelector
                 options={tableColumns}
                 onSubmitColumns={onColumnsChange}
+                size={"small"}
               />
               <TableStatistics
                 pagination={pagination}
                 totalCount={sessionsToDisplay.length}
                 arrayItemName="sessions"
                 activeFilters={activeFilters}
-                onClearFilters={this.onClearFilters}
               />
             </div>
           </div>
@@ -420,14 +424,9 @@ export class SessionsPage extends React.Component<
             data={sessionsToDisplay}
             columns={displayColumns}
             renderNoResult={
-              <EmptyTable
-                title="No sessions are currently running"
-                icon={emptyTableResultsIcon}
-                message="Sessions show you which statements and transactions are running for the active session."
-                footer={
-                  <Anchor href={sessionsTable} target="_blank">
-                    Learn more about sessions
-                  </Anchor>
+              <EmptySessionsTablePlaceholder
+                isEmptySearchResults={
+                  activeFilters > 0 && sessionsToDisplay.length === 0
                 }
               />
             }
@@ -456,7 +455,7 @@ export class SessionsPage extends React.Component<
           error={this.props.sessionsError}
           render={this.renderSessions}
           renderError={() =>
-            SQLActivityError({
+            LoadingError({
               statsType: "sessions",
             })
           }

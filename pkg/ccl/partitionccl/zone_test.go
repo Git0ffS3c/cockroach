@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,7 +42,9 @@ func TestValidIndexPartitionSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantDisabled,
+	})
 	defer s.Stopper().Stop(context.Background())
 
 	sqlDB := sqlutils.MakeSQLRunner(db)
@@ -241,7 +245,9 @@ func TestInvalidIndexPartitionSetShowZones(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantDisabled,
+	})
 	defer s.Stopper().Stop(context.Background())
 
 	for i, tc := range []struct {
@@ -306,7 +312,7 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 			var actual []string
 			for _, span := range spans {
 				subzone := test.parsed.subzones[span.SubzoneIndex]
-				idx, err := test.parsed.tableDesc.FindIndexWithID(descpb.IndexID(subzone.IndexID))
+				idx, err := catalog.MustFindIndexByID(test.parsed.tableDesc, descpb.IndexID(subzone.IndexID))
 				if err != nil {
 					t.Fatalf("could not find index with ID %d: %+v", subzone.IndexID, err)
 				}
@@ -314,7 +320,7 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 				directions := []encoding.Direction{encoding.Ascending /* index ID */}
 				for i := 0; i < idx.NumKeyColumns(); i++ {
 					cd := idx.GetKeyColumnDirection(i)
-					ed, err := cd.ToEncodingDirection()
+					ed, err := catalogkeys.IndexColumnEncodingDirection(cd)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -329,20 +335,26 @@ func TestGenerateSubzoneSpans(t *testing.T) {
 				}
 
 				// Verify that we're always doing the space savings when we can.
+				var buf redact.StringBuilder
+				var buf2 redact.StringBuilder
 				if span.Key.PrefixEnd().Equal(span.EndKey) {
+					encoding.PrettyPrintValue(&buf, directions, span.Key, "/")
+					encoding.PrettyPrintValue(&buf2, directions, span.EndKey, "/")
 					t.Errorf("endKey should be omitted when equal to key.PrefixEnd [%s, %s)",
-						encoding.PrettyPrintValue(directions, span.Key, "/"),
-						encoding.PrettyPrintValue(directions, span.EndKey, "/"))
+						buf.String(),
+						buf2.String())
 				}
 				if len(span.EndKey) == 0 {
 					span.EndKey = span.Key.PrefixEnd()
 				}
 
 				// TODO(dan): Check that spans are sorted.
+				encoding.PrettyPrintValue(&buf, directions, span.Key, "/")
+				encoding.PrettyPrintValue(&buf2, directions, span.EndKey, "/")
 
 				actual = append(actual, fmt.Sprintf("%s %s-%s", subzoneShort,
-					encoding.PrettyPrintValue(directions, span.Key, "/"),
-					encoding.PrettyPrintValue(directions, span.EndKey, "/")))
+					buf.String(),
+					buf2.String()))
 			}
 
 			if len(actual) != len(test.parsed.generatedSpans) {
@@ -383,6 +395,7 @@ func TestZoneConfigAppliesToTemporaryIndex(t *testing.T) {
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
 
 	if _, err := sqlDB.Exec(`
+SET use_declarative_schema_changer='off';
 CREATE DATABASE t;
 CREATE TABLE t.test (k INT PRIMARY KEY, v INT);`); err != nil {
 		t.Fatal(err)
@@ -419,7 +432,7 @@ PARTITION p1 VALUES IN (DEFAULT));`)
 
 	// Find the temporary index corresponding to the new index.
 	tbl := desctestutils.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "public", "test")
-	newIndex, err := tbl.FindIndexWithName("idx")
+	newIndex, err := catalog.MustFindIndexByName(tbl, "idx")
 	if err != nil {
 		t.Fatal(err)
 	}

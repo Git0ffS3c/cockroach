@@ -10,6 +10,7 @@
 
 import React from "react";
 import { storiesOf } from "@storybook/react";
+import _ from "lodash";
 
 import { withBackground, withRouterProvider } from "src/storybook/decorators";
 import {
@@ -29,21 +30,27 @@ const withLoadingIndicator: DatabaseTablePageProps = {
   details: {
     loading: true,
     loaded: false,
+    lastError: undefined,
     createStatement: "",
     replicaCount: 0,
     indexNames: [],
     grants: [],
     statsLastUpdated: moment("0001-01-01T00:00:00Z"),
+    livePercentage: 2.7,
+    liveBytes: 12345,
+    totalBytes: 456789,
   },
   stats: {
     loading: true,
     loaded: false,
+    lastError: undefined,
     sizeInBytes: 0,
     rangeCount: 0,
   },
   indexStats: {
     loading: true,
     loaded: false,
+    lastError: undefined,
     stats: [],
     lastReset: moment("2021-09-04T13:55:00Z"),
   },
@@ -60,6 +67,7 @@ const withLoadingIndicator: DatabaseTablePageProps = {
   refreshIndexStats: () => {},
   resetIndexUsageStats: () => {},
   refreshSettings: () => {},
+  refreshUserSQLRoles: () => {},
 };
 
 const name = randomName();
@@ -71,6 +79,7 @@ const withData: DatabaseTablePageProps = {
   details: {
     loading: false,
     loaded: true,
+    lastError: null,
     createStatement: `
       CREATE TABLE public.${name} (
         id UUID NOT NULL,
@@ -87,15 +96,21 @@ const withData: DatabaseTablePageProps = {
     grants: [
       {
         user: randomRole(),
-        privilege: randomTablePrivilege(),
+        privileges: _.uniq(
+          new Array(_.random(1, 5)).map(() => randomTablePrivilege()),
+        ),
       },
     ],
     statsLastUpdated: moment("0001-01-01T00:00:00Z"),
+    livePercentage: 2.7,
+    liveBytes: 12345,
+    totalBytes: 456789,
   },
   showNodeRegionsSection: true,
   stats: {
     loading: false,
     loaded: true,
+    lastError: null,
     sizeInBytes: 44040192,
     rangeCount: 4200,
     nodesByRegionString:
@@ -104,6 +119,7 @@ const withData: DatabaseTablePageProps = {
   indexStats: {
     loading: false,
     loaded: true,
+    lastError: null,
     stats: [
       {
         totalReads: 0,
@@ -155,6 +171,7 @@ const withData: DatabaseTablePageProps = {
   refreshIndexStats: () => {},
   resetIndexUsageStats: () => {},
   refreshSettings: () => {},
+  refreshUserSQLRoles: () => {},
 };
 
 storiesOf("Database Table Page", module)

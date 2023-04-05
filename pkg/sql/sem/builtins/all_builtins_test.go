@@ -14,22 +14,25 @@ import (
 	"encoding/csv"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/lib/pq/oid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestOverloadsHaveVolatility(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	for name, builtin := range builtins {
-		for idx, overload := range builtin.overloads {
+	builtinsregistry.AddSubscription(func(name string, props *tree.FunctionProperties, overloads []tree.Overload) {
+		for idx, overload := range overloads {
 			assert.NotEqual(
 				t,
 				volatility.V(0),
@@ -39,24 +42,26 @@ func TestOverloadsHaveVolatility(t *testing.T) {
 				idx,
 			)
 		}
-	}
+	})
 }
 
 // TestOverloadsVolatilityMatchesPostgres that our overloads match Postgres'
 // overloads for Volatility.
 // Dump command below:
 // COPY (SELECT proname, args, rettype, provolatile, proleakproof FROM (
-//   SELECT
-//     lhs.oid, proname, pg2.typname as rettype, ARRAY_AGG(pg1.typname) as args, provolatile, proleakproof
-//     FROM
-//     (select oid, proname, unnest(proargtypes) as typ, proargnames, prorettype, provolatile, proleakproof from pg_proc) AS lhs
-//     JOIN pg_type AS pg1 ON (lhs.typ = pg1.oid)
-//     JOIN pg_type AS pg2 ON (lhs.prorettype = pg2.oid) GROUP BY lhs.oid, proname, pg2.typname, provolatile, proleakproof) a
-//     ORDER BY proname, args
+//
+//	SELECT
+//	  lhs.oid, proname, pg2.typname as rettype, ARRAY_AGG(pg1.typname) as args, provolatile, proleakproof
+//	  FROM
+//	  (select oid, proname, unnest(proargtypes) as typ, proargnames, prorettype, provolatile, proleakproof from pg_proc) AS lhs
+//	  JOIN pg_type AS pg1 ON (lhs.typ = pg1.oid)
+//	  JOIN pg_type AS pg2 ON (lhs.prorettype = pg2.oid) GROUP BY lhs.oid, proname, pg2.typname, provolatile, proleakproof) a
+//	  ORDER BY proname, args
+//
 // ) TO '/tmp/pg_proc_provolatile_dump.csv' WITH CSV DELIMITER '|' HEADER;
 func TestOverloadsVolatilityMatchesPostgres(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	csvPath := testutils.TestDataPath(t, "pg_proc_provolatile_dump.csv")
+	csvPath := datapathutils.TestDataPath(t, "pg_proc_provolatile_dump.csv")
 	f, err := os.Open(csvPath)
 	require.NoError(t, err)
 
@@ -140,8 +145,8 @@ func TestOverloadsVolatilityMatchesPostgres(t *testing.T) {
 	}
 
 	// Check each builtin against Postgres.
-	for name, builtin := range builtins {
-		for idx, overload := range builtin.overloads {
+	builtinsregistry.AddSubscription(func(name string, props *tree.FunctionProperties, overloads []tree.Overload) {
+		for idx, overload := range overloads {
 			if overload.IgnoreVolatilityCheck {
 				continue
 			}
@@ -160,5 +165,106 @@ func TestOverloadsVolatilityMatchesPostgres(t *testing.T) {
 				postgresVolatility,
 			)
 		}
+	})
+}
+
+func TestAddResolvedFuncDef(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		def           *tree.FunctionDefinition
+		resolved      map[string]*tree.ResolvedFunctionDefinition
+		oidToOverload map[oid.Oid]tree.QualifiedOverload
+	}{
+		{
+			def: &tree.FunctionDefinition{Name: "crdb_internal.fun", Definition: []*tree.Overload{{Oid: 1}, {Oid: 2}}},
+			resolved: map[string]*tree.ResolvedFunctionDefinition{
+				"crdb_internal.fun": {
+					Name: "crdb_internal.fun",
+					Overloads: []tree.QualifiedOverload{
+						{
+							Schema:   "crdb_internal",
+							Overload: &tree.Overload{Oid: 1},
+						},
+						{
+							Schema:   "crdb_internal",
+							Overload: &tree.Overload{Oid: 2},
+						},
+					},
+				},
+			},
+			oidToOverload: map[oid.Oid]tree.QualifiedOverload{
+				1: {
+					Schema:   "crdb_internal",
+					Overload: &tree.Overload{Oid: 1},
+				},
+				2: {
+					Schema:   "crdb_internal",
+					Overload: &tree.Overload{Oid: 2},
+				},
+			},
+		},
+		{
+			def: &tree.FunctionDefinition{Name: "fun", Definition: []*tree.Overload{{Oid: 1}}},
+			resolved: map[string]*tree.ResolvedFunctionDefinition{
+				"pg_catalog.fun": {
+					Name: "fun",
+					Overloads: []tree.QualifiedOverload{
+						{
+							Schema:   "pg_catalog",
+							Overload: &tree.Overload{Oid: 1},
+						},
+					},
+				},
+			},
+			oidToOverload: map[oid.Oid]tree.QualifiedOverload{
+				1: {
+					Schema:   "pg_catalog",
+					Overload: &tree.Overload{Oid: 1},
+				},
+			},
+		},
+		{
+			def: &tree.FunctionDefinition{
+				Name:               "fun",
+				Definition:         []*tree.Overload{{Oid: 1}},
+				FunctionProperties: tree.FunctionProperties{AvailableOnPublicSchema: true},
+			},
+			resolved: map[string]*tree.ResolvedFunctionDefinition{
+				"pg_catalog.fun": {
+					Name: "fun",
+					Overloads: []tree.QualifiedOverload{
+						{
+							Schema:   "pg_catalog",
+							Overload: &tree.Overload{Oid: 1},
+						},
+					},
+				},
+				"public.fun": {
+					Name: "fun",
+					Overloads: []tree.QualifiedOverload{
+						{
+							Schema:   "public",
+							Overload: &tree.Overload{Oid: 1},
+						},
+					},
+				},
+			},
+			oidToOverload: map[oid.Oid]tree.QualifiedOverload{
+				1: {
+					Schema:   "pg_catalog",
+					Overload: &tree.Overload{Oid: 1},
+				},
+			},
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			resolved := make(map[string]*tree.ResolvedFunctionDefinition)
+			oidToOverload := make(map[oid.Oid]tree.QualifiedOverload)
+			addResolvedFuncDef(resolved, oidToOverload, tc.def)
+			require.Equal(t, tc.resolved, resolved)
+		})
 	}
 }

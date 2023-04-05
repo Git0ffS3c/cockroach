@@ -22,17 +22,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/constraint"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/replicastats"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/gossiputil"
@@ -47,8 +46,8 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/tracker"
+	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/tracker"
 )
 
 var simpleSpanConfig = roachpb.SpanConfig{
@@ -103,6 +102,10 @@ func emptySpanConfig() roachpb.SpanConfig {
 	return roachpb.SpanConfig{}
 }
 
+func testingStartTime() time.Time {
+	return time.Date(2022, 12, 16, 11, 0, 0, 0, time.UTC)
+}
+
 var singleStore = []*roachpb.StoreDescriptor{
 	{
 		StoreID: 1,
@@ -125,7 +128,7 @@ var sameDCStores = []*roachpb.StoreDescriptor{
 		Attrs:   roachpb.Attributes{Attrs: []string{"ssd"}},
 		Node: roachpb.NodeDescriptor{
 			NodeID: 1,
-			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+			Attrs:  roachpb.Attributes{Attrs: []string{"a", "n1"}},
 		},
 		Capacity: roachpb.StoreCapacity{
 			Capacity:     200,
@@ -138,7 +141,7 @@ var sameDCStores = []*roachpb.StoreDescriptor{
 		Attrs:   roachpb.Attributes{Attrs: []string{"ssd"}},
 		Node: roachpb.NodeDescriptor{
 			NodeID: 2,
-			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+			Attrs:  roachpb.Attributes{Attrs: []string{"a", "n2"}},
 		},
 		Capacity: roachpb.StoreCapacity{
 			Capacity:     200,
@@ -151,7 +154,7 @@ var sameDCStores = []*roachpb.StoreDescriptor{
 		Attrs:   roachpb.Attributes{Attrs: []string{"hdd"}},
 		Node: roachpb.NodeDescriptor{
 			NodeID: 3,
-			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+			Attrs:  roachpb.Attributes{Attrs: []string{"a", "n3"}},
 		},
 		Capacity: roachpb.StoreCapacity{
 			Capacity:     200,
@@ -164,7 +167,7 @@ var sameDCStores = []*roachpb.StoreDescriptor{
 		Attrs:   roachpb.Attributes{Attrs: []string{"hdd"}},
 		Node: roachpb.NodeDescriptor{
 			NodeID: 4,
-			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+			Attrs:  roachpb.Attributes{Attrs: []string{"a", "n4"}},
 		},
 		Capacity: roachpb.StoreCapacity{
 			Capacity:     200,
@@ -177,7 +180,7 @@ var sameDCStores = []*roachpb.StoreDescriptor{
 		Attrs:   roachpb.Attributes{Attrs: []string{"mem"}},
 		Node: roachpb.NodeDescriptor{
 			NodeID: 5,
-			Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+			Attrs:  roachpb.Attributes{Attrs: []string{"a", "n5"}},
 		},
 		Capacity: roachpb.StoreCapacity{
 			Capacity:     200,
@@ -341,90 +344,90 @@ var oneStoreWithFullDisk = []*roachpb.StoreDescriptor{
 	},
 }
 
-var oneStoreHighReadAmp = []*roachpb.StoreDescriptor{
+var oneStoreHighIOOverload = []*roachpb.StoreDescriptor{
 	{
 		StoreID:  1,
 		Node:     roachpb.NodeDescriptor{NodeID: 1},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, L0Sublevels: MaxL0SublevelThreshold - 5},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold - 5)},
 	},
 	{
 		StoreID:  2,
 		Node:     roachpb.NodeDescriptor{NodeID: 2},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1800, L0Sublevels: MaxL0SublevelThreshold - 5},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1800, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold - 5)},
 	},
 	{
 		StoreID:  3,
 		Node:     roachpb.NodeDescriptor{NodeID: 3},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, L0Sublevels: MaxL0SublevelThreshold + 5},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 5)},
 	},
 	{
 		StoreID:  4,
 		Node:     roachpb.NodeDescriptor{NodeID: 4},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1200, L0Sublevels: MaxL0SublevelThreshold - 5},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1200, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold - 5)},
 	},
 }
 
-var allStoresHighReadAmp = []*roachpb.StoreDescriptor{
+var allStoresHighIOOverload = []*roachpb.StoreDescriptor{
 	{
 		StoreID:  1,
 		Node:     roachpb.NodeDescriptor{NodeID: 1},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1200, L0Sublevels: MaxL0SublevelThreshold + 1},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1200, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 1)},
 	},
 	{
 		StoreID:  2,
 		Node:     roachpb.NodeDescriptor{NodeID: 2},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 800, L0Sublevels: MaxL0SublevelThreshold + 1},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 800, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 1)},
 	},
 	{
 		StoreID:  3,
 		Node:     roachpb.NodeDescriptor{NodeID: 3},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, L0Sublevels: MaxL0SublevelThreshold + 1},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 1)},
 	},
 }
 
-var allStoresHighReadAmpSkewed = []*roachpb.StoreDescriptor{
+var allStoresHighIOOverloadSkewed = []*roachpb.StoreDescriptor{
 	{
 		StoreID:  1,
 		Node:     roachpb.NodeDescriptor{NodeID: 1},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1200, L0Sublevels: MaxL0SublevelThreshold + 1},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1200, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 1)},
 	},
 	{
 		StoreID:  2,
 		Node:     roachpb.NodeDescriptor{NodeID: 2},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 800, L0Sublevels: MaxL0SublevelThreshold + 50},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 800, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 50)},
 	},
 	{
 		StoreID:  3,
 		Node:     roachpb.NodeDescriptor{NodeID: 3},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, L0Sublevels: MaxL0SublevelThreshold + 55},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 600, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 55)},
 	},
 }
 
-var threeStoresHighReadAmpAscRangeCount = []*roachpb.StoreDescriptor{
+var threeStoresHighIOOverloadAscRangeCount = []*roachpb.StoreDescriptor{
 	{
 		StoreID:  1,
 		Node:     roachpb.NodeDescriptor{NodeID: 1},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 100, L0Sublevels: MaxL0SublevelThreshold + 10},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 100, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 10)},
 	},
 	{
 		StoreID:  2,
 		Node:     roachpb.NodeDescriptor{NodeID: 2},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 400, L0Sublevels: MaxL0SublevelThreshold + 10},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 400, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 10)},
 	},
 	{
 		StoreID:  3,
 		Node:     roachpb.NodeDescriptor{NodeID: 3},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1600, L0Sublevels: MaxL0SublevelThreshold + 10},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 1600, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold + 10)},
 	},
 	{
 		StoreID:  4,
 		Node:     roachpb.NodeDescriptor{NodeID: 4},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 6400, L0Sublevels: MaxL0SublevelThreshold - 10},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 6400, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold - 10)},
 	},
 	{
 		StoreID:  5,
 		Node:     roachpb.NodeDescriptor{NodeID: 5},
-		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 25000, L0Sublevels: MaxL0SublevelThreshold - 10},
+		Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 200, RangeCount: 25000, IOThreshold: TestingIOThresholdWithScore(DefaultReplicaIOOverloadThreshold - 10)},
 	},
 }
 
@@ -528,8 +531,7 @@ func mockStorePool(
 	for _, storeID := range suspectedStoreIDs {
 		liveNodeSet[roachpb.NodeID(storeID)] = livenesspb.NodeLivenessStatus_LIVE
 		detail := storePool.GetStoreDetailLocked(storeID)
-		detail.LastAvailable = storePool.Clock.Now().GoTime()
-		detail.LastUnavailable = storePool.Clock.Now().GoTime()
+		detail.LastUnavailable = storePool.Clock().Now().GoTime()
 		detail.Desc = &roachpb.StoreDescriptor{
 			StoreID: storeID,
 			Node:    roachpb.NodeDescriptor{NodeID: roachpb.NodeID(storeID)},
@@ -537,6 +539,7 @@ func mockStorePool(
 	}
 
 	// Set the node liveness function using the set we constructed.
+	// TODO(sarkesian): This override needs to be fixed to stop exporting this field.
 	storePool.NodeLivenessFn =
 		func(nodeID roachpb.NodeID, now time.Time, threshold time.Duration) livenesspb.NodeLivenessStatus {
 			if status, ok := liveNodeSet[nodeID]; ok {
@@ -551,13 +554,15 @@ func TestAllocatorSimpleRetrieval(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(singleStore, t)
 	result, _, err := a.AllocateVoter(
 		ctx,
+		sp,
 		simpleSpanConfig,
-		nil /* existingVoters */, nil, /* existingNonVoters */
+		nil /* existingVoters */, nil /* existingNonVoters */, nil, /* replacing */
+		Dead,
 	)
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %+v", err)
@@ -572,12 +577,14 @@ func TestAllocatorNoAvailableDisks(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, _, _, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
+	stopper, _, sp, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	result, _, err := a.AllocateVoter(
 		ctx,
+		sp,
 		simpleSpanConfig,
-		nil /* existingVoters */, nil, /* existingNonVoters */
+		nil /* existingVoters */, nil /* existingNonVoters */, nil, /* replacing */
+		Dead,
 	)
 	if !roachpb.Empty(result) {
 		t.Errorf("expected nil result: %+v", result)
@@ -587,70 +594,78 @@ func TestAllocatorNoAvailableDisks(t *testing.T) {
 	}
 }
 
-func TestAllocatorReadAmpCheck(t *testing.T) {
+func TestAllocatorAllocateVoterIOOverloadCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	type testCase struct {
-		name              string
-		stores            []*roachpb.StoreDescriptor
-		conf              roachpb.SpanConfig
-		expectedAddTarget roachpb.StoreID
-		enforcement       StoreHealthEnforcement
+		name   string
+		stores []*roachpb.StoreDescriptor
+		conf   roachpb.SpanConfig
+		// The expected store to add when replicas are alive. The allocator should
+		// pick one of the best stores, with low range count.
+		expectedTargetIfAlive roachpb.StoreID
+		// The expected store to add when a replica is dead or decommissioning. The
+		// allocator should pick a store that is good enough, ignoring the range
+		// count.
+		expectedTargetIfDead roachpb.StoreID
+		enforcement          IOOverloadEnforcementLevel
 	}
 	tests := []testCase{
 		{
-			name: "ignore read amp on allocation when StoreHealthNoAction enforcement",
-			// NB: All stores have high read amp, this should be ignored and
+			name:   "ignore io overload on allocation when ignore enforcement",
+			stores: allStoresHighIOOverload,
+			conf:   emptySpanConfig(),
+			// NB: All stores have high io overload, this should be ignored and
 			// allocate to the store with the lowest range count.
-			stores:            allStoresHighReadAmp,
-			conf:              emptySpanConfig(),
-			expectedAddTarget: roachpb.StoreID(3),
-			enforcement:       StoreHealthNoAction,
+			expectedTargetIfAlive: roachpb.StoreID(3),
+			// Recovery of a dead node can pick any valid store, not necessarily the
+			// one with the lowest range count.
+			expectedTargetIfDead: roachpb.StoreID(2),
+			enforcement:          IOOverloadThresholdIgnore,
 		},
 		{
-			name: "ignore read amp on allocation when storeHealthLogOnly enforcement",
-			// NB: All stores have high read amp, this should be ignored and
+			name: "ignore io overload on allocation when block rebalance to enforcement",
+			// NB: All stores have high io overload, this should be ignored and
 			// allocate to the store with the lowest range count.
-			stores:            allStoresHighReadAmp,
-			conf:              emptySpanConfig(),
-			expectedAddTarget: roachpb.StoreID(3),
-			enforcement:       StoreHealthLogOnly,
+			stores:                allStoresHighIOOverload,
+			conf:                  emptySpanConfig(),
+			expectedTargetIfAlive: roachpb.StoreID(3),
+			// Recovery of a dead node can pick any valid store, not necessarily the
+			// one with the lowest range count.
+			expectedTargetIfDead: roachpb.StoreID(2),
+			enforcement:          IOOverloadThresholdBlockTransfers,
 		},
 		{
-			name: "ignore read amp on allocation when StoreHealthBlockRebalanceTo enforcement",
-			// NB: All stores have high read amp, this should be ignored and
-			// allocate to the store with the lowest range count.
-			stores:            allStoresHighReadAmp,
-			conf:              emptySpanConfig(),
-			expectedAddTarget: roachpb.StoreID(3),
-			enforcement:       StoreHealthBlockRebalanceTo,
+			name: "don't allocate to stores when all have high io overload and block all enforcement",
+			// NB: All stores have high io overload (limit + 1), none are above the watermark, select the lowest range count.
+			stores:                allStoresHighIOOverload,
+			conf:                  emptySpanConfig(),
+			expectedTargetIfAlive: roachpb.StoreID(3),
+			// Recovery of a dead node can pick any valid store, not necessarily the
+			// one with the lowest range count.
+			expectedTargetIfDead: roachpb.StoreID(2),
+			enforcement:          IOOverloadThresholdBlockAll,
 		},
 		{
-			name: "don't allocate to stores when all have high read amp and StoreHealthBlockAll",
-			// NB: All stores have high read amp (limit + 1), none are above the watermark, select the lowest range count.
-			stores:            allStoresHighReadAmp,
-			conf:              emptySpanConfig(),
-			expectedAddTarget: roachpb.StoreID(3),
-			enforcement:       StoreHealthBlockAll,
+			name: "allocate to store below the mean when all have high io overload and block all enforcement",
+			// NB: All stores have high io overload, however store 1 is below the watermark mean io overload.
+			stores:                allStoresHighIOOverloadSkewed,
+			conf:                  emptySpanConfig(),
+			expectedTargetIfAlive: roachpb.StoreID(1),
+			expectedTargetIfDead:  roachpb.StoreID(1),
+			enforcement:           IOOverloadThresholdBlockAll,
 		},
 		{
-			name: "allocate to store below the mean when all have high read amp and StoreHealthBlockAll",
-			// NB: All stores have high read amp, however store 1 is below the watermark mean read amp.
-			stores:            allStoresHighReadAmpSkewed,
-			conf:              emptySpanConfig(),
-			expectedAddTarget: roachpb.StoreID(1),
-			enforcement:       StoreHealthBlockAll,
-		},
-		{
-			name: "allocate to lowest range count store without high read amp when StoreHealthBlockAll enforcement",
-			// NB: Store 1, 2 and 3 have high read amp and are above the watermark, the lowest range count (4)
+			name: "allocate to lowest range count store without high io overload when block all enforcement",
+			// NB: Store 1, 2 and 3 have high io overload and are above the watermark, the lowest range count (4)
 			// should be selected.
-			stores:            threeStoresHighReadAmpAscRangeCount,
-			conf:              emptySpanConfig(),
-			expectedAddTarget: roachpb.StoreID(4),
-			enforcement:       StoreHealthBlockAll,
+			stores:                threeStoresHighIOOverloadAscRangeCount,
+			conf:                  emptySpanConfig(),
+			expectedTargetIfAlive: roachpb.StoreID(4),
+			expectedTargetIfDead:  roachpb.StoreID(4),
+			enforcement:           IOOverloadThresholdBlockAll,
 		},
 	}
 
@@ -660,22 +675,47 @@ func TestAllocatorReadAmpCheck(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%d_%s", i+1, test.name), func(t *testing.T) {
-			stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
+			ReplicaIOOverloadThresholdEnforcement.Override(ctx, &a.st.SV, int64(test.enforcement))
 
-			// Enable read disk health checking in candidate exclusion.
-			l0SublevelsThresholdEnforce.Override(ctx, &a.StorePool.St.SV, int64(test.enforcement))
+			// Allocate a voter where all replicas are alive (e.g. up-replicating a valid range).
 			add, _, err := a.AllocateVoter(
 				ctx,
+				sp,
 				test.conf,
 				nil,
 				nil,
+				nil,
+				Alive,
 			)
 			require.NoError(t, err)
 			require.Truef(t,
-				chk(add, test.expectedAddTarget),
+				chk(add, test.expectedTargetIfAlive),
+				"the addition target %+v from AllocateVoter doesn't match expectation",
+				add)
+
+			// Allocate a voter where we have a dead (or decommissioning) replica.
+			add, _, err = a.AllocateVoter(
+				ctx,
+				sp,
+				test.conf,
+				nil,
+				nil,
+				nil,
+				// Dead and Decommissioning should behave the same here, use either.
+				func() ReplicaStatus {
+					if i%2 == 0 {
+						return Dead
+					}
+					return Decommissioning
+				}(),
+			)
+			require.NoError(t, err)
+			require.Truef(t,
+				chk(add, test.expectedTargetIfDead),
 				"the addition target %+v from AllocateVoter doesn't match expectation",
 				add)
 		})
@@ -687,24 +727,28 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(multiDCStores, t)
 	result1, _, err := a.AllocateVoter(
 		ctx,
+		sp,
 		multiDCConfigSSD,
-		nil /* existingVoters */, nil, /* existingNonVoters */
+		nil /* existingVoters */, nil /* existingNonVoters */, nil, /* replacing */
+		Dead,
 	)
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %+v", err)
 	}
 	result2, _, err := a.AllocateVoter(
 		ctx,
+		sp,
 		multiDCConfigSSD,
 		[]roachpb.ReplicaDescriptor{{
 			NodeID:  result1.NodeID,
 			StoreID: result1.StoreID,
-		}}, nil, /* existingNonVoters */
+		}}, nil /* existingNonVoters */, nil, /* replacing */
+		Dead,
 	)
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %+v", err)
@@ -717,6 +761,7 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 	// Verify that no result is forthcoming if we already have a replica.
 	result3, _, err := a.AllocateVoter(
 		ctx,
+		sp,
 		multiDCConfigSSD,
 		[]roachpb.ReplicaDescriptor{
 			{
@@ -727,7 +772,8 @@ func TestAllocatorTwoDatacenters(t *testing.T) {
 				NodeID:  result2.NodeID,
 				StoreID: result2.StoreID,
 			},
-		}, nil, /* existingNonVoters */
+		}, nil /* existingNonVoters */, nil, /* replacing */
+		Dead,
 	)
 	if err == nil {
 		t.Errorf("expected error on allocation without available stores: %+v", result3)
@@ -739,11 +785,12 @@ func TestAllocatorExistingReplica(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 1, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
 	result, _, err := a.AllocateVoter(
 		ctx,
+		sp,
 		roachpb.SpanConfig{
 			NumReplicas: 0,
 			Constraints: []roachpb.ConstraintsConjunction{
@@ -761,6 +808,8 @@ func TestAllocatorExistingReplica(t *testing.T) {
 				StoreID: 2,
 			},
 		}, nil, /* existingNonVoters */
+		nil, /* replacing */
+		Dead,
 	)
 	if err != nil {
 		t.Fatalf("Unable to perform allocation: %+v", err)
@@ -768,6 +817,142 @@ func TestAllocatorExistingReplica(t *testing.T) {
 	if !(result.StoreID == 3 || result.StoreID == 4) {
 		t.Errorf("expected result to have store ID 3 or 4: %+v", result)
 	}
+}
+
+func TestAllocatorReplaceDecommissioningReplica(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	storeDescriptors := sameDCStores
+
+	getNumNodes := func() int {
+		numNodes := 0
+		for _, storeDesc := range storeDescriptors {
+			if storeDesc.Node.NodeID == roachpb.NodeID(3) {
+				continue
+			}
+			numNodes++
+		}
+		return numNodes
+	}
+
+	ctx := context.Background()
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, getNumNodes(), false /* deterministic */)
+	defer stopper.Stop(ctx)
+	gossiputil.NewStoreGossiper(g).GossipStores(storeDescriptors, t)
+
+	// Override liveness of n3 to decommissioning so the only available target is s4.
+	oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration) livenesspb.NodeLivenessStatus {
+		if nid == roachpb.NodeID(3) {
+			return livenesspb.NodeLivenessStatus_DECOMMISSIONING
+		}
+
+		return sp.NodeLivenessFn(nid, now, timeUntilStoreDead)
+	}, getNumNodes)
+
+	result, _, err := a.AllocateVoter(
+		ctx,
+		oSp,
+		roachpb.SpanConfig{
+			NumReplicas: 3,
+			Constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "mem", Type: roachpb.Constraint_PROHIBITED},
+					},
+				},
+			},
+		},
+		[]roachpb.ReplicaDescriptor{
+			{
+				NodeID:    1,
+				StoreID:   1,
+				ReplicaID: 1,
+			},
+			{
+				NodeID:    2,
+				StoreID:   2,
+				ReplicaID: 2,
+			},
+		}, nil, /* existingNonVoters */
+		&roachpb.ReplicaDescriptor{
+			NodeID:    3,
+			StoreID:   3,
+			ReplicaID: 3,
+		},
+		Decommissioning,
+	)
+	if err != nil {
+		t.Fatalf("Unable to perform allocation: %+v", err)
+	}
+	if !(result.StoreID == 4) {
+		t.Errorf("expected result to have store ID 4: %+v", result)
+	}
+}
+
+func TestAllocatorReplaceFailsOnConstrainedDecommissioningReplica(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 5, false /* deterministic */)
+	defer stopper.Stop(ctx)
+	gossiputil.NewStoreGossiper(g).GossipStores(sameDCStores, t)
+
+	// Override liveness of n3 to decommissioning so the only available target is s4.
+	oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration) livenesspb.NodeLivenessStatus {
+		if nid == roachpb.NodeID(3) {
+			return livenesspb.NodeLivenessStatus_DECOMMISSIONING
+		}
+
+		return sp.NodeLivenessFn(nid, now, timeUntilStoreDead)
+	}, func() int {
+		return 4
+	})
+
+	_, _, err := a.AllocateVoter(
+		ctx,
+		oSp,
+		roachpb.SpanConfig{
+			NumReplicas: 3,
+			Constraints: []roachpb.ConstraintsConjunction{
+				{
+					Constraints: []roachpb.Constraint{
+						{Value: "mem", Type: roachpb.Constraint_PROHIBITED},
+					},
+				},
+				{
+					NumReplicas: 1,
+					Constraints: []roachpb.Constraint{
+						{Value: "n3", Type: roachpb.Constraint_REQUIRED},
+					},
+				},
+			},
+		},
+		[]roachpb.ReplicaDescriptor{
+			{
+				NodeID:    1,
+				StoreID:   1,
+				ReplicaID: 1,
+			},
+			{
+				NodeID:    2,
+				StoreID:   2,
+				ReplicaID: 2,
+			},
+		}, nil, /* existingNonVoters */
+		&roachpb.ReplicaDescriptor{
+			NodeID:    3,
+			StoreID:   3,
+			ReplicaID: 3,
+		},
+		Decommissioning,
+	)
+	require.Errorf(t, err, "Unable to perform allocation: "+
+		"0 of 4 live stores are able to take a new replica for the range "+
+		"(2 already have a voter, 0 already have a non-voter); "+
+		"replicas must match constraints [{-mem} {+n3:1}]; "+
+		"voting replicas must match voter_constraints []",
+	)
 }
 
 func TestAllocatorMultipleStoresPerNode(t *testing.T) {
@@ -808,7 +993,7 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 
@@ -863,7 +1048,8 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 	for _, tc := range testCases {
 		{
 			result, _, err := a.AllocateVoter(
-				ctx, emptySpanConfig(), tc.existing, nil,
+				ctx, sp, emptySpanConfig(), tc.existing, nil, nil,
+				Dead,
 			)
 			if e, a := tc.expectTargetAllocate, !roachpb.Empty(result); e != a {
 				t.Errorf(
@@ -877,6 +1063,7 @@ func TestAllocatorMultipleStoresPerNode(t *testing.T) {
 			var rangeUsageInfo allocator.RangeUsageInfo
 			target, _, details, ok := a.RebalanceVoter(
 				ctx,
+				sp,
 				emptySpanConfig(),
 				nil,
 				tc.existing,
@@ -940,7 +1127,7 @@ func TestAllocatorMultipleStoresPerNodeLopsided(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	storeGossiper := gossiputil.NewStoreGossiper(g)
 	storeGossiper.GossipStores(stores, t)
@@ -951,6 +1138,7 @@ func TestAllocatorMultipleStoresPerNodeLopsided(t *testing.T) {
 	for i := 1; i < 40; i++ {
 		add, remove, _, ok := a.RebalanceVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			nil,
 			ranges[i].InternalReplicas,
@@ -992,6 +1180,7 @@ func TestAllocatorMultipleStoresPerNodeLopsided(t *testing.T) {
 	for i := 1; i < 40; i++ {
 		_, _, _, ok := a.RebalanceVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			nil,
 			ranges[i].InternalReplicas,
@@ -1010,67 +1199,91 @@ func TestAllocatorRebalanceBasedOnRangeCount(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// We use the default disk capacity options:
+	// - block rebalancing towards a store with greater than 92.5% disk capacity
+	//   utilization
+	// - block rebalancing, allocation and also shed replicas from a store with
+	//   greater than 95% disk capacity utilization.
+	testingDiskCapacityOptions := defaultDiskCapacityOptions()
+
+	makeTestingStoreCapacity := func(rangeCount int32, diskUtilization float64) roachpb.StoreCapacity {
+		return roachpb.StoreCapacity{
+			RangeCount: rangeCount,
+			Capacity:   100,
+			Available:  100 - int64(diskUtilization*100),
+		}
+	}
+
 	stores := []*roachpb.StoreDescriptor{
 		{
 			StoreID:  1,
 			Node:     roachpb.NodeDescriptor{NodeID: 1},
-			Capacity: roachpb.StoreCapacity{Capacity: 100, Available: 100, RangeCount: 1},
+			Capacity: makeTestingStoreCapacity(1, 0),
 		},
 		{
 			StoreID:  2,
 			Node:     roachpb.NodeDescriptor{NodeID: 2},
-			Capacity: roachpb.StoreCapacity{Capacity: 100, Available: 50, RangeCount: 1},
+			Capacity: makeTestingStoreCapacity(1, 0.5),
 		},
 		{
-			StoreID: 3,
-			Node:    roachpb.NodeDescriptor{NodeID: 3},
-			Capacity: roachpb.StoreCapacity{
-				Capacity:   100,
-				Available:  100 - int64(100*float64(allocator.MaxFractionUsedThreshold)),
-				RangeCount: 5,
-			},
+			// This store has less than the avg number of ranges, it should not be
+			// rebalanced away from. The store should not be a target for rebalancing
+			// as it has greater than the rebalance to threshold disk storage
+			// utilization.
+			StoreID:  3,
+			Node:     roachpb.NodeDescriptor{NodeID: 3},
+			Capacity: makeTestingStoreCapacity(5, testingDiskCapacityOptions.RebalanceToThreshold),
 		},
 		{
-			// This store must not be rebalanced to, because it's too full.
-			StoreID: 4,
-			Node:    roachpb.NodeDescriptor{NodeID: 4},
-			Capacity: roachpb.StoreCapacity{
-				Capacity:   100,
-				Available:  (100 - int64(100*float64(allocator.MaxFractionUsedThreshold))) / 2,
-				RangeCount: 10,
-			},
+			// This store must not be rebalanced to and should be rebalanced away
+			// from, because it's too full.
+			StoreID:  4,
+			Node:     roachpb.NodeDescriptor{NodeID: 4},
+			Capacity: makeTestingStoreCapacity(10, testingDiskCapacityOptions.ShedAndBlockAllThreshold),
 		},
 		{
-			// This store will not be rebalanced to, because it already has more
-			// replicas than the mean range count.
-			StoreID: 5,
-			Node:    roachpb.NodeDescriptor{NodeID: 5},
-			Capacity: roachpb.StoreCapacity{
-				Capacity:   100,
-				Available:  100,
-				RangeCount: 10,
-			},
+			// Same as s4.
+			StoreID:  5,
+			Node:     roachpb.NodeDescriptor{NodeID: 5},
+			Capacity: makeTestingStoreCapacity(10, 1.0 /* 100% disk storage utilization */),
 		},
 	}
 
+	// expectedShouldRebalanceAwayFrom is the expected result of running
+	// options.shouldRebalanceBasedOnThresholds. The result only concerns itself
+	// with range count and not disk fullness. It is expected that the caller of
+	// options.shouldRebalanceBasedOnThresholds will group equivalence classes to
+	// only include equally or more preferable replacements. The
+	expectedShouldRebalanceAwayFrom := []bool{
+		false, /* s1 has < avg ranges */
+		false, /* s2 has < avg ranges */
+		false, /* s3 has < avg ranges */
+		true,  /* s4 has > avg ranges */
+		true,  /* s5 has > avg ranges */
+	}
+
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
+
+	options := a.ScorerOptions(ctx)
+	options.DiskCapacityOptions = testingDiskCapacityOptions
 
 	// Every rebalance target must be either store 1 or 2.
 	for i := 0; i < 10; i++ {
 		var rangeUsageInfo allocator.RangeUsageInfo
 		target, _, _, ok := a.RebalanceVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			nil,
 			[]roachpb.ReplicaDescriptor{{NodeID: 3, StoreID: 3}},
 			nil,
 			rangeUsageInfo,
 			storepool.StoreFilterThrottled,
-			a.ScorerOptions(ctx),
+			options,
 		)
 		if !ok {
 			i-- // loop until we find 10 candidates
@@ -1083,24 +1296,25 @@ func TestAllocatorRebalanceBasedOnRangeCount(t *testing.T) {
 		}
 	}
 
-	sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
+	sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
 	eqClass := equivalenceClass{
 		candidateSL: sl,
 	}
 	// Verify shouldRebalanceBasedOnThresholds results.
 	for i, store := range stores {
-		desc, ok := a.StorePool.GetStoreDescriptor(store.StoreID)
+		desc, ok := sp.GetStoreDescriptor(store.StoreID)
 		if !ok {
 			t.Fatalf("%d: unable to get store %d descriptor", i, store.StoreID)
 		}
 		eqClass.existing = desc
-		result := a.ScorerOptions(ctx).shouldRebalanceBasedOnThresholds(
+		result := options.shouldRebalanceBasedOnThresholds(
 			ctx,
 			eqClass,
 			a.Metrics,
 		)
-		if expResult := (i >= 2); expResult != result {
-			t.Errorf("%d: expected rebalance %t; got %t; desc %+v; sl: %+v", i, expResult, result, desc, sl)
+		if expResult := expectedShouldRebalanceAwayFrom[i]; expResult != result {
+			t.Errorf("%d: expected rebalance %t; got %t; desc %+v; sl: %+v",
+				i, expResult, result, desc, sl)
 		}
 	}
 }
@@ -1167,6 +1381,7 @@ func TestAllocatorRebalanceDeadNodes(t *testing.T) {
 			var rangeUsageInfo allocator.RangeUsageInfo
 			target, _, _, ok := a.RebalanceVoter(
 				ctx,
+				sp,
 				emptySpanConfig(),
 				nil,
 				c.existing,
@@ -1272,11 +1487,10 @@ func TestAllocatorRebalanceThrashing(t *testing.T) {
 			// Deterministic is required when stressing as test case 8 may rebalance
 			// to different configurations.
 			ctx := context.Background()
-			stopper, g, _, a, _ := CreateTestAllocator(ctx, 1, true /* deterministic */)
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 1, true /* deterministic */)
 			defer stopper.Stop(ctx)
 
-			st := a.StorePool.St
-			cluster := tc.cluster(st)
+			cluster := tc.cluster(a.st)
 
 			// It doesn't make sense to test sets of stores containing fewer than 4
 			// stores, because 4 stores is the minimum number of stores needed to
@@ -1301,7 +1515,7 @@ func TestAllocatorRebalanceThrashing(t *testing.T) {
 
 			// Ensure gossiped store descriptor changes have propagated.
 			testutils.SucceedsSoon(t, func() error {
-				sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
+				sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
 				for j, s := range sl.Stores {
 					if a, e := s.Capacity.RangeCount, cluster[j].rangeCount; a != e {
 						return errors.Errorf("range count for %d = %d != expected %d", j, a, e)
@@ -1309,13 +1523,13 @@ func TestAllocatorRebalanceThrashing(t *testing.T) {
 				}
 				return nil
 			})
-			sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
+			sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
 			eqClass := equivalenceClass{
 				candidateSL: sl,
 			}
 			// Verify shouldRebalanceBasedOnThresholds returns the expected value.
 			for j, store := range stores {
-				desc, ok := a.StorePool.GetStoreDescriptor(store.StoreID)
+				desc, ok := sp.GetStoreDescriptor(store.StoreID)
 				if !ok {
 					t.Fatalf("[store %d]: unable to get store %d descriptor", j, store.StoreID)
 				}
@@ -1410,6 +1624,7 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 	}
 
 	type testCase struct {
+		desc                                    string
 		testStores                              []*roachpb.StoreDescriptor
 		expectRebalance                         bool
 		expectedAddTarget, expectedRemoveTarget roachpb.StoreID
@@ -1418,18 +1633,21 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 		{
 			// We don't expect any QPS based rebalancing when all stores are serving
 			// the same QPS.
+			desc:            "no rebalancing, all stores equal",
 			testStores:      allStoresEqual,
 			expectRebalance: false,
 		},
 		{
 			// We don't expect any QPS based rebalancing when all stores are "close
 			// enough" to the mean.
+			desc:            "no rebalancing, all stores around the mean",
 			testStores:      allStoresAroundTheMean,
 			expectRebalance: false,
 		},
 		{
 			// When one store is overfull and another is underfull, we expect a QPS
 			// based rebalance from the overfull store to the underfull store.
+			desc:                 "rebalancing, one underfull and one overfull",
 			testStores:           oneOverfullAndOneUnderfull,
 			expectRebalance:      true,
 			expectedRemoveTarget: roachpb.StoreID(1),
@@ -1438,49 +1656,50 @@ func TestAllocatorRebalanceByQPS(t *testing.T) {
 	}
 
 	for _, subtest := range tests {
-		ctx := context.Background()
-		stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
-		defer stopper.Stop(ctx)
-		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
-		var rangeUsageInfo allocator.RangeUsageInfo
-		options := &QPSScorerOptions{
-			StoreHealthOptions:    StoreHealthOptions{EnforcementLevel: StoreHealthNoAction},
-			QPSPerReplica:         100,
-			QPSRebalanceThreshold: 0.2,
-		}
-		add, remove, _, ok := a.RebalanceVoter(
-			ctx,
-			emptySpanConfig(),
-			nil,
-			[]roachpb.ReplicaDescriptor{{StoreID: subtest.testStores[0].StoreID}},
-			nil,
-			rangeUsageInfo,
-			storepool.StoreFilterThrottled,
-			options,
-		)
-		if subtest.expectRebalance {
-			require.True(t, ok)
-			require.Equal(t, subtest.expectedAddTarget, add.StoreID)
-			require.Equal(t, subtest.expectedRemoveTarget, remove.StoreID)
-			// Verify shouldRebalanceBasedOnThresholds results.
-			if desc, descOk := a.StorePool.GetStoreDescriptor(remove.StoreID); descOk {
-				sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
-				eqClass := equivalenceClass{
-					existing:    desc,
-					candidateSL: sl,
+		t.Run(subtest.desc, func(t *testing.T) {
+			ctx := context.Background()
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+			defer stopper.Stop(ctx)
+			gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
+			var rangeUsageInfo allocator.RangeUsageInfo
+			options := TestingQPSLoadScorerOptions(100, 0.2)
+			options.IOOverloadOptions = IOOverloadOptions{ReplicaEnforcementLevel: IOOverloadThresholdIgnore}
+			add, remove, _, ok := a.RebalanceVoter(
+				ctx,
+				sp,
+				emptySpanConfig(),
+				nil,
+				[]roachpb.ReplicaDescriptor{{StoreID: subtest.testStores[0].StoreID}},
+				nil,
+				rangeUsageInfo,
+				storepool.StoreFilterThrottled,
+				options,
+			)
+			if subtest.expectRebalance {
+				require.True(t, ok)
+				require.Equal(t, subtest.expectedAddTarget, add.StoreID)
+				require.Equal(t, subtest.expectedRemoveTarget, remove.StoreID)
+				// Verify shouldRebalanceBasedOnThresholds results.
+				if desc, descOk := sp.GetStoreDescriptor(remove.StoreID); descOk {
+					sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
+					eqClass := equivalenceClass{
+						existing:    desc,
+						candidateSL: sl,
+					}
+					result := options.shouldRebalanceBasedOnThresholds(
+						ctx,
+						eqClass,
+						a.Metrics,
+					)
+					require.True(t, result)
+				} else {
+					t.Fatalf("unable to get store %d descriptor", remove.StoreID)
 				}
-				result := options.shouldRebalanceBasedOnThresholds(
-					ctx,
-					eqClass,
-					a.Metrics,
-				)
-				require.True(t, result)
 			} else {
-				t.Fatalf("unable to get store %d descriptor", remove.StoreID)
+				require.False(t, ok)
 			}
-		} else {
-			require.False(t, ok)
-		}
+
+		})
 	}
 }
 
@@ -1554,15 +1773,14 @@ func TestAllocatorRemoveBasedOnQPS(t *testing.T) {
 
 	for _, subtest := range tests {
 		ctx := context.Background()
-		stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+		stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 		defer stopper.Stop(ctx)
 		gossiputil.NewStoreGossiper(g).GossipStores(subtest.testStores, t)
-		options := &QPSScorerOptions{
-			StoreHealthOptions:    StoreHealthOptions{EnforcementLevel: StoreHealthNoAction},
-			QPSRebalanceThreshold: 0.1,
-		}
+		options := TestingQPSLoadScorerOptions(0, 0.1)
+		options.IOOverloadOptions = IOOverloadOptions{ReplicaEnforcementLevel: IOOverloadThresholdIgnore}
 		remove, _, err := a.RemoveVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			subtest.existingRepls,
 			subtest.existingRepls,
@@ -1606,7 +1824,7 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
@@ -1616,6 +1834,7 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 		var rangeUsageInfo allocator.RangeUsageInfo
 		result, _, _, ok := a.RebalanceVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			nil,
 			[]roachpb.ReplicaDescriptor{{StoreID: stores[0].StoreID}},
@@ -1631,11 +1850,11 @@ func TestAllocatorRebalanceByCount(t *testing.T) {
 
 	// Verify shouldRebalanceBasedOnThresholds results.
 	for i, store := range stores {
-		desc, ok := a.StorePool.GetStoreDescriptor(store.StoreID)
+		desc, ok := sp.GetStoreDescriptor(store.StoreID)
 		if !ok {
 			t.Fatalf("%d: unable to get store %d descriptor", i, store.StoreID)
 		}
-		sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
+		sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
 		eqClass := equivalenceClass{
 			existing:    desc,
 			candidateSL: sl,
@@ -1663,6 +1882,7 @@ func (r *mockRepl) RaftStatus() *raft.Status {
 	raftStatus := &raft.Status{
 		Progress: make(map[uint64]tracker.Progress),
 	}
+	raftStatus.RaftState = raft.StateLeader
 	for i := int32(1); i <= r.replicationFactor; i++ {
 		state := tracker.StateReplicate
 		if _, ok := r.replsInNeedOfSnapshot[roachpb.ReplicaID(i)]; ok {
@@ -1673,8 +1893,15 @@ func (r *mockRepl) RaftStatus() *raft.Status {
 	return raftStatus
 }
 
+func (r *mockRepl) GetFirstIndex() uint64 {
+	return 0
+}
+
 func (r *mockRepl) StoreID() roachpb.StoreID {
 	return r.storeID
+}
+func (r *mockRepl) Desc() *roachpb.RangeDescriptor {
+	return &roachpb.RangeDescriptor{}
 }
 
 func (r *mockRepl) GetRangeID() roachpb.RangeID {
@@ -1692,7 +1919,7 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// 3 stores where the lease count for each store is equal to 10x the store
@@ -1716,37 +1943,38 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 
 	// TODO(peter): Add test cases for non-empty constraints.
 	testCases := []struct {
-		existing       []roachpb.ReplicaDescriptor
-		leaseholder    roachpb.StoreID
-		allowLeaseRepl bool
-		expected       roachpb.StoreID
+		existing         []roachpb.ReplicaDescriptor
+		leaseholder      roachpb.StoreID
+		excludeLeaseRepl bool
+		expected         roachpb.StoreID
 	}{
 		// No existing lease holder, nothing to do.
-		{existing: existing, leaseholder: 0, allowLeaseRepl: true, expected: 0},
+		{existing: existing, leaseholder: 0, excludeLeaseRepl: false, expected: 0},
 		// Store 1 is not a lease transfer source.
-		{existing: existing, leaseholder: 1, allowLeaseRepl: true, expected: 0},
-		{existing: existing, leaseholder: 1, allowLeaseRepl: false, expected: 2},
+		{existing: existing, leaseholder: 1, excludeLeaseRepl: false, expected: 0},
+		{existing: existing, leaseholder: 1, excludeLeaseRepl: true, expected: 2},
 		// Store 2 is not a lease transfer source.
-		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 0},
-		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 1},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: false, expected: 0},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: true, expected: 1},
 		// Store 3 is a lease transfer source.
-		{existing: existing, leaseholder: 3, allowLeaseRepl: true, expected: 1},
-		{existing: existing, leaseholder: 3, allowLeaseRepl: false, expected: 1},
+		{existing: existing, leaseholder: 3, excludeLeaseRepl: false, expected: 1},
+		{existing: existing, leaseholder: 3, excludeLeaseRepl: true, expected: 1},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
+				sp,
 				emptySpanConfig(),
 				c.existing,
 				&mockRepl{
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
-				false, /* forceDecisionWithoutStats */
+				allocator.RangeUsageInfo{}, /* stats */
+				false,                      /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
-					ExcludeLeaseRepl:       !c.allowLeaseRepl,
+					ExcludeLeaseRepl:       c.excludeLeaseRepl,
 					CheckCandidateFullness: true,
 				},
 			)
@@ -1755,6 +1983,133 @@ func TestAllocatorTransferLeaseTarget(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAllocatorTransferLeaseTargetIOOverloadCheck(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	floats := func(nums ...float64) []float64 {
+		return nums
+	}
+
+	// We want the shed threshold to be 0.9 and the overload threhsold to be 0.5
+	// i.e. block transfers at >=0.5 and block transfers + shed leases at >=0.9.
+	const shedThreshold = 0.9
+	const threshold = 0.5
+
+	testCases := []struct {
+		name                  string
+		leaseCounts, IOScores []float64
+		leaseholder           roachpb.StoreID
+		excludeLeaseRepl      bool
+		expected              roachpb.StoreID
+		enforcement           IOOverloadEnforcementLevel
+	}{
+		{
+			name:        "don't move off of store with high io overload when block enforcement",
+			leaseCounts: floats(100, 100, 100, 100, 100),
+			IOScores:    floats(2.5, 1.5, 0.5, 0, 0),
+			leaseholder: 1,
+			expected:    0,
+			enforcement: IOOverloadThresholdBlockTransfers,
+		},
+		{
+			name:        "move off of store with high io overload when shed enforcement",
+			leaseCounts: floats(100, 100, 100, 100, 100),
+			IOScores:    floats(2.5, 1.5, 0.5, 0, 0),
+			leaseholder: 1,
+			// Store 3 is above the threshold (1.0 > 0.8), but equal to the avg (1.0), so
+			// it is still considered a non-IO-overloaded candidate.
+			expected:    3,
+			enforcement: IOOverloadThresholdShed,
+		},
+		{
+			name:        "don't transfer to io overloaded store when block enforcement",
+			leaseCounts: floats(0, 100, 100, 400, 400),
+			IOScores:    floats(2.5, 1.5, 0.5, 0, 0),
+			leaseholder: 5,
+			expected:    3,
+			enforcement: IOOverloadThresholdBlockTransfers,
+		},
+		{
+			name:        "don't transfer to io overloaded store when shed enforcement",
+			leaseCounts: floats(0, 100, 100, 400, 400),
+			IOScores:    floats(2.5, 1.5, 0.5, 0, 0),
+			leaseholder: 5,
+			expected:    3,
+			enforcement: IOOverloadThresholdShed,
+		},
+		{
+			name:        "still transfer to io overloaded store when no action enforcement",
+			leaseCounts: floats(0, 100, 100, 400, 400),
+			IOScores:    floats(2.5, 1.5, 0.5, 0, 0),
+			leaseholder: 5,
+			expected:    2,
+			enforcement: IOOverloadThresholdIgnore,
+		},
+		{
+			name:        "move off of store with high io overload with skewed lease counts shed enforcement",
+			leaseCounts: floats(0, 0, 10000, 10000, 10000),
+			IOScores:    floats(2.5, 1.5, 0.5, 0, 0),
+			leaseholder: 1,
+			expected:    3,
+			enforcement: IOOverloadThresholdShed,
+		},
+		{
+			name:        "don't move off of store with high io overload but less than shed threshold with shed enforcement",
+			leaseCounts: floats(0, 0, 0, 0, 0),
+			IOScores:    floats(0.89, 0, 0, 0, 0),
+			leaseholder: 1,
+			expected:    0,
+			enforcement: IOOverloadThresholdShed,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+			defer stopper.Stop(ctx)
+			n := len(tc.leaseCounts)
+			stores := make([]*roachpb.StoreDescriptor, n)
+			existing := make([]roachpb.ReplicaDescriptor, 0, n)
+			for i := range tc.leaseCounts {
+				existing = append(existing, replicas(roachpb.StoreID(i+1))...)
+				stores[i] = &roachpb.StoreDescriptor{
+					StoreID: roachpb.StoreID(i + 1),
+					Node:    roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)},
+					Capacity: roachpb.StoreCapacity{
+						LeaseCount:  int32(tc.leaseCounts[i]),
+						IOThreshold: TestingIOThresholdWithScore(tc.IOScores[i]),
+					},
+				}
+			}
+
+			sg := gossiputil.NewStoreGossiper(g)
+			sg.GossipStores(stores, t)
+			LeaseIOOverloadThresholdEnforcement.Override(ctx, &a.st.SV, int64(tc.enforcement))
+			LeaseIOOverloadThreshold.Override(ctx, &a.st.SV, threshold)
+			LeaseIOOverloadShedThreshold.Override(ctx, &a.st.SV, shedThreshold)
+
+			target := a.TransferLeaseTarget(
+				ctx,
+				sp,
+				emptySpanConfig(),
+				existing,
+				&mockRepl{
+					replicationFactor: int32(n),
+					storeID:           tc.leaseholder,
+				},
+				allocator.RangeUsageInfo{}, /* stats */
+				false,                      /* forceDecisionWithoutStats */
+				allocator.TransferLeaseOptions{
+					CheckCandidateFullness: true,
+				},
+			)
+			require.Equal(t, tc.expected, target.StoreID)
+		})
+	}
+
 }
 
 func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
@@ -1768,7 +2123,7 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 		{StoreID: 4, NodeID: 4, ReplicaID: 4},
 	}
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// 4 stores where the lease count for each store is equal to 10x the store
@@ -1788,56 +2143,56 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 		existing          []roachpb.ReplicaDescriptor
 		replsNeedingSnaps []roachpb.ReplicaID
 		leaseholder       roachpb.StoreID
-		allowLeaseRepl    bool
+		excludeLeaseRepl  bool
 		transferTarget    roachpb.StoreID
 	}{
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       3,
-			allowLeaseRepl:    true,
+			excludeLeaseRepl:  false,
 			transferTarget:    0,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       3,
-			allowLeaseRepl:    false,
+			excludeLeaseRepl:  true,
 			transferTarget:    2,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       4,
-			allowLeaseRepl:    true,
+			excludeLeaseRepl:  false,
 			transferTarget:    2,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1},
 			leaseholder:       4,
-			allowLeaseRepl:    false,
+			excludeLeaseRepl:  true,
 			transferTarget:    2,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1, 2},
 			leaseholder:       4,
-			allowLeaseRepl:    false,
+			excludeLeaseRepl:  true,
 			transferTarget:    3,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1, 2},
 			leaseholder:       4,
-			allowLeaseRepl:    true,
+			excludeLeaseRepl:  false,
 			transferTarget:    0,
 		},
 		{
 			existing:          existing,
 			replsNeedingSnaps: []roachpb.ReplicaID{1, 2, 3},
 			leaseholder:       4,
-			allowLeaseRepl:    true,
+			excludeLeaseRepl:  false,
 			transferTarget:    0,
 		},
 	}
@@ -1853,13 +2208,14 @@ func TestAllocatorTransferLeaseToReplicasNeedingSnapshot(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
+				sp,
 				emptySpanConfig(),
 				c.existing,
 				repl,
-				nil,
+				allocator.RangeUsageInfo{},
 				false, /* alwaysAllowDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
-					ExcludeLeaseRepl:       !c.allowLeaseRepl,
+					ExcludeLeaseRepl:       c.excludeLeaseRepl,
 					CheckCandidateFullness: true,
 				},
 			)
@@ -1874,7 +2230,7 @@ func TestAllocatorTransferLeaseTargetConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// 6 stores with the following setup
@@ -1944,13 +2300,14 @@ func TestAllocatorTransferLeaseTargetConstraints(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				context.Background(),
+				sp,
 				c.conf,
 				c.existing,
 				&mockRepl{
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       false,
@@ -1970,11 +2327,12 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, _, storePool, nl := storepool.CreateTestStorePool(ctx,
+	st := cluster.MakeTestingClusterSettings()
+	stopper, g, _, storePool, nl := storepool.CreateTestStorePool(ctx, st,
 		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
-	a := MakeAllocator(storePool, func(string) (time.Duration, bool) {
+	a := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
 		return 0, true
 	}, nil)
 	defer stopper.Stop(ctx)
@@ -2019,51 +2377,52 @@ func TestAllocatorTransferLeaseTargetDraining(t *testing.T) {
 	}
 
 	testCases := []struct {
-		existing       []roachpb.ReplicaDescriptor
-		leaseholder    roachpb.StoreID
-		allowLeaseRepl bool
-		expected       roachpb.StoreID
-		conf           roachpb.SpanConfig
+		existing         []roachpb.ReplicaDescriptor
+		leaseholder      roachpb.StoreID
+		excludeLeaseRepl bool
+		expected         roachpb.StoreID
+		conf             roachpb.SpanConfig
 	}{
 		// No existing lease holder, nothing to do.
-		{existing: existing, leaseholder: 0, allowLeaseRepl: true, expected: 0, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 0, excludeLeaseRepl: false, expected: 0, conf: emptySpanConfig()},
 		// Store 1 is draining, so it will try to transfer its lease if
 		// excludeLeaseRepl is false. This behavior isn't relied upon,
 		// though; leases are manually transferred when draining.
-		{existing: existing, leaseholder: 1, allowLeaseRepl: true, expected: 0, conf: emptySpanConfig()},
-		{existing: existing, leaseholder: 1, allowLeaseRepl: false, expected: 2, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 1, excludeLeaseRepl: false, expected: 0, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 1, excludeLeaseRepl: true, expected: 2, conf: emptySpanConfig()},
 		// Store 2 is not a lease transfer source.
-		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 0, conf: emptySpanConfig()},
-		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 3, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: false, expected: 0, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: true, expected: 3, conf: emptySpanConfig()},
 		// Store 3 is a lease transfer source, but won't transfer to
 		// node 1 because it's draining.
-		{existing: existing, leaseholder: 3, allowLeaseRepl: true, expected: 2, conf: emptySpanConfig()},
-		{existing: existing, leaseholder: 3, allowLeaseRepl: false, expected: 2, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 3, excludeLeaseRepl: false, expected: 2, conf: emptySpanConfig()},
+		{existing: existing, leaseholder: 3, excludeLeaseRepl: true, expected: 2, conf: emptySpanConfig()},
 		// Verify that lease preferences dont impact draining.
 		// If the store that is within the lease preferences (store 1) is draining,
 		// we'd like the lease to stay on the next best store (which is store 2).
-		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 0, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: false, expected: 0, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
 		// If the current lease on store 2 needs to be shed (indicated by
 		// excludeLeaseRepl = false), and store 1 is draining, then store 3
 		// is the only reasonable lease transfer target.
-		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
-		{existing: existing, leaseholder: 2, allowLeaseRepl: true, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
-		{existing: existing, leaseholder: 2, allowLeaseRepl: false, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: true, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferDC1}},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: false, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
+		{existing: existing, leaseholder: 2, excludeLeaseRepl: true, expected: 3, conf: roachpb.SpanConfig{LeasePreferences: preferRegion1}},
 	}
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
 			target := a.TransferLeaseTarget(
 				ctx,
+				storePool,
 				c.conf,
 				c.existing,
 				&mockRepl{
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
-					ExcludeLeaseRepl:       !c.allowLeaseRepl,
+					ExcludeLeaseRepl:       c.excludeLeaseRepl,
 					CheckCandidateFullness: true,
 				},
 			)
@@ -2079,7 +2438,7 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// Set up 8 stores -- 2 in each of the first 2 localities, and 4 in the third.
@@ -2194,6 +2553,7 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 		var rangeUsageInfo allocator.RangeUsageInfo
 		result, _, details, ok := a.RebalanceVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			nil,
 			tc.existing,
@@ -2266,6 +2626,7 @@ func TestAllocatorRebalanceDifferentLocalitySizes(t *testing.T) {
 		var rangeUsageInfo allocator.RangeUsageInfo
 		result, _, details, ok := a.RebalanceVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			nil,
 			tc.existing,
@@ -2296,7 +2657,7 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// 4 stores where the lease count for each store is equal to 10x the store
@@ -2335,13 +2696,14 @@ func TestAllocatorShouldTransferLease(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			result := a.ShouldTransferLease(
 				ctx,
+				sp,
 				emptySpanConfig(),
 				c.existing,
 				&mockRepl{
 					storeID:           c.leaseholder,
 					replicationFactor: int32(len(c.existing)),
 				},
-				nil, /* replicaStats */
+				allocator.RangeUsageInfo{},
 			)
 			if c.expected != result {
 				t.Fatalf("expected %v, but found %v", c.expected, result)
@@ -2354,11 +2716,12 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, _, storePool, nl := storepool.CreateTestStorePool(ctx,
+	st := cluster.MakeTestingClusterSettings()
+	stopper, g, _, storePool, nl := storepool.CreateTestStorePool(ctx, st,
 		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
-	a := MakeAllocator(storePool, func(string) (time.Duration, bool) {
+	a := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
 		return 0, true
 	}, nil)
 	defer stopper.Stop(context.Background())
@@ -2401,13 +2764,14 @@ func TestAllocatorShouldTransferLeaseDraining(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			result := a.ShouldTransferLease(
 				ctx,
+				storePool,
 				emptySpanConfig(),
 				c.existing,
 				&mockRepl{
 					storeID:           c.leaseholder,
 					replicationFactor: int32(len(c.existing)),
 				},
-				nil, /* replicaStats */
+				allocator.RangeUsageInfo{},
 			)
 			if c.expected != result {
 				t.Fatalf("expected %v, but found %v", c.expected, result)
@@ -2420,11 +2784,12 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, clock, storePool, nl := storepool.CreateTestStorePool(ctx,
+	st := cluster.MakeTestingClusterSettings()
+	stopper, g, clock, storePool, nl := storepool.CreateTestStorePool(ctx, st,
 		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
-	a := MakeAllocator(storePool, func(string) (time.Duration, bool) {
+	a := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
 		return 0, true
 	}, nil)
 	defer stopper.Stop(context.Background())
@@ -2446,14 +2811,15 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 		t.Helper()
 		result := a.ShouldTransferLease(
 			ctx,
+			storePool,
 			emptySpanConfig(),
 			replicas(1, 2, 3),
 			&mockRepl{storeID: 2, replicationFactor: 3},
-			nil, /* replicaStats */
+			allocator.RangeUsageInfo{},
 		)
 		require.Equal(t, expected, result)
 	}
-	timeAfterStoreSuspect := storepool.TimeAfterStoreSuspect.Get(&storePool.St.SV)
+	timeAfterStoreSuspect := storepool.TimeAfterStoreSuspect.Get(&a.st.SV)
 	// Based on capacity node 1 is desirable.
 	assertShouldTransferLease(true)
 	// Flip node 1 to unavailable, there should be no lease transfer now.
@@ -2463,7 +2829,7 @@ func TestAllocatorShouldTransferSuspected(t *testing.T) {
 	nl.SetNodeStatus(1, livenesspb.NodeLivenessStatus_LIVE)
 	assertShouldTransferLease(false)
 	// Wait out the suspected store timeout, verify that lease transfers are back.
-	clock.Increment(timeAfterStoreSuspect.Nanoseconds() + time.Millisecond.Nanoseconds())
+	clock.Advance(timeAfterStoreSuspect + time.Millisecond)
 	assertShouldTransferLease(true)
 }
 
@@ -2471,7 +2837,7 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// 4 stores with distinct localities, store attributes, and node attributes
@@ -2586,13 +2952,14 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 			conf := roachpb.SpanConfig{LeasePreferences: c.preferences}
 			result := a.ShouldTransferLease(
 				ctx,
+				sp,
 				conf,
 				c.existing,
 				&mockRepl{
 					storeID:           c.leaseholder,
 					replicationFactor: int32(len(c.existing)),
 				},
-				nil, /* replicaStats */
+				allocator.RangeUsageInfo{},
 			)
 			expectTransfer := c.expectAllowLeaseRepl != 0
 			if expectTransfer != result {
@@ -2600,13 +2967,14 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 			}
 			target := a.TransferLeaseTarget(
 				ctx,
+				sp,
 				conf,
 				c.existing,
 				&mockRepl{
 					replicationFactor: 5,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       false,
@@ -2618,13 +2986,14 @@ func TestAllocatorLeasePreferences(t *testing.T) {
 			}
 			target = a.TransferLeaseTarget(
 				ctx,
+				sp,
 				conf,
 				c.existing,
 				&mockRepl{
 					replicationFactor: 5,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       true,
@@ -2642,7 +3011,7 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	// 6 stores, 2 in each of 3 distinct localities.
@@ -2710,13 +3079,14 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 			conf := roachpb.SpanConfig{LeasePreferences: c.preferences}
 			target := a.TransferLeaseTarget(
 				ctx,
+				sp,
 				conf,
 				c.existing,
 				&mockRepl{
 					replicationFactor: 6,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       false,
@@ -2729,13 +3099,14 @@ func TestAllocatorLeasePreferencesMultipleStoresPerLocality(t *testing.T) {
 
 			target = a.TransferLeaseTarget(
 				ctx,
+				sp,
 				conf,
 				c.existing,
 				&mockRepl{
 					replicationFactor: 6,
 					storeID:           c.leaseholder,
 				},
-				nil,   /* stats */
+				allocator.RangeUsageInfo{},
 				false, /* forceDecisionWithoutStats */
 				allocator.TransferLeaseOptions{
 					ExcludeLeaseRepl:       true,
@@ -2760,7 +3131,7 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
@@ -2809,6 +3180,7 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 	for _, c := range testCases {
 		targetVoter, details, err := a.RemoveVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			c.existingVoters, /* voterCandidates */
 			c.existingVoters,
@@ -2828,6 +3200,7 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 		// diversity score calculations, we would fail here.
 		targetVoter, _, err = a.RemoveVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			c.existingVoters,
 			c.existingVoters,
@@ -2841,6 +3214,7 @@ func TestAllocatorRemoveBasedOnDiversity(t *testing.T) {
 
 		targetNonVoter, _, err := a.RemoveNonVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			c.existingNonVoters, /* nonVoterCandidates */
 			c.existingVoters,
@@ -2903,7 +3277,7 @@ func TestAllocatorConstraintsAndVoterConstraints(t *testing.T) {
 	for i, test := range testCases {
 		t.Run(fmt.Sprintf("%d:%s", i+1, test.name), func(t *testing.T) {
 			ctx := context.Background()
-			stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
@@ -2911,7 +3285,7 @@ func TestAllocatorConstraintsAndVoterConstraints(t *testing.T) {
 			// Allocate the voting replica first, before the non-voter. This is the
 			// order in which we'd expect the allocator to repair a given range. See
 			// TestAllocatorComputeAction.
-			voterTarget, _, err := a.AllocateVoter(ctx, test.conf, test.existingVoters, test.existingNonVoters)
+			voterTarget, _, err := a.AllocateVoter(ctx, sp, test.conf, test.existingVoters, test.existingNonVoters, nil, Dead)
 			if test.shouldVoterAllocFail {
 				require.Errorf(t, err, "expected voter allocation to fail; got %v as a valid target instead", voterTarget)
 			} else {
@@ -2920,7 +3294,7 @@ func TestAllocatorConstraintsAndVoterConstraints(t *testing.T) {
 				test.existingVoters = append(test.existingVoters, replicas(voterTarget.StoreID)...)
 			}
 
-			nonVoterTarget, _, err := a.AllocateNonVoter(ctx, test.conf, test.existingVoters, test.existingNonVoters)
+			nonVoterTarget, _, err := a.AllocateNonVoter(ctx, sp, test.conf, test.existingVoters, test.existingNonVoters, nil /* replacing */, Dead)
 			if test.shouldNonVoterAllocFail {
 				require.Errorf(t, err, "expected non-voter allocation to fail; got %v as a valid target instead", nonVoterTarget)
 			} else {
@@ -2936,7 +3310,7 @@ func TestAllocatorAllocateTargetLocality(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
@@ -2994,7 +3368,7 @@ func TestAllocatorAllocateTargetLocality(t *testing.T) {
 				StoreID: storeID,
 			}
 		}
-		targetStore, details, err := a.AllocateVoter(ctx, emptySpanConfig(), existingRepls, nil)
+		targetStore, details, err := a.AllocateVoter(ctx, sp, emptySpanConfig(), existingRepls, nil, nil, Dead)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3016,7 +3390,7 @@ func TestAllocatorRebalanceTargetLocality(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	stores := []*roachpb.StoreDescriptor{
@@ -3115,6 +3489,7 @@ func TestAllocatorRebalanceTargetLocality(t *testing.T) {
 		var rangeUsageInfo allocator.RangeUsageInfo
 		target, _, details, ok := a.RebalanceVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			nil,
 			existingRepls,
@@ -3289,11 +3664,11 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(stores, t)
-	sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
+	sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
 
 	testCases := []struct {
 		existing roachpb.StoreID
@@ -3328,14 +3703,12 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 		}
 		// No constraints.
 		conf := roachpb.SpanConfig{}
-		analyzed := constraint.AnalyzeConstraints(
-			ctx, a.StorePool.GetStoreDescriptor, existingRepls, conf.NumReplicas,
-			conf.Constraints)
+		analyzed := constraint.AnalyzeConstraints(sp, existingRepls, conf.NumReplicas, conf.Constraints)
 		allocationConstraintsChecker := voterConstraintsCheckerForAllocation(analyzed, constraint.EmptyAnalyzedConstraints)
 		removalConstraintsChecker := voterConstraintsCheckerForRemoval(analyzed, constraint.EmptyAnalyzedConstraints)
 		rebalanceConstraintsChecker := voterConstraintsCheckerForRebalance(analyzed, constraint.EmptyAnalyzedConstraints)
 
-		a.StorePool.IsStoreReadyForRoutineReplicaTransfer = func(_ context.Context, storeID roachpb.StoreID) bool {
+		sp.OverrideIsStoreReadyForRoutineReplicaTransferFn = func(_ context.Context, storeID roachpb.StoreID) bool {
 			for _, s := range tc.excluded {
 				if s == storeID {
 					return false
@@ -3350,10 +3723,12 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 				sl,
 				allocationConstraintsChecker,
 				existingRepls,
-				a.StorePool.GetLocalitiesByStore(existingRepls),
-				a.StorePool.IsStoreReadyForRoutineReplicaTransfer,
+				nil,
+				sp.GetLocalitiesByStore(existingRepls),
+				sp.IsStoreReadyForRoutineReplicaTransfer,
 				false, /* allowMultipleReplsPerNode */
 				a.ScorerOptions(ctx),
+				VoterTarget,
 			)
 
 			if !expectedStoreIDsMatch(tc.expected, candidates) {
@@ -3370,8 +3745,8 @@ func TestAllocateCandidatesExcludeNonReadyNodes(t *testing.T) {
 				rebalanceConstraintsChecker,
 				existingRepls,
 				nil,
-				a.StorePool.GetLocalitiesByStore(existingRepls),
-				a.StorePool.IsStoreReadyForRoutineReplicaTransfer,
+				sp.GetLocalitiesByStore(existingRepls),
+				sp.IsStoreReadyForRoutineReplicaTransfer,
 				a.ScorerOptions(ctx),
 				a.Metrics,
 			)
@@ -3455,12 +3830,12 @@ func TestAllocatorNonVoterAllocationExcludesVoterNodes(t *testing.T) {
 	for i, test := range testCases {
 		t.Run(fmt.Sprintf("%d:%s", i+1, test.name), func(t *testing.T) {
 			ctx := context.Background()
-			stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
 
-			result, _, err := a.AllocateNonVoter(ctx, test.conf, test.existingVoters, test.existingNonVoters)
+			result, _, err := a.AllocateNonVoter(ctx, sp, test.conf, test.existingVoters, test.existingNonVoters, nil /* replacing */, Dead)
 			if test.shouldFail {
 				require.Error(t, err)
 				require.Regexp(t, test.expError, err)
@@ -3477,11 +3852,12 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
-	sg.GossipStores(multiDiversityDCStores, t)
-	sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
+	stores := multiDiversityDCStores
+	sg.GossipStores(stores, t)
+	sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
 
 	// Given a set of existing replicas for a range, rank which of the remaining
 	// stores from multiDiversityDCStores would be the best addition to the range
@@ -3682,9 +4058,7 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 			}
 		}
 		conf := roachpb.SpanConfig{Constraints: tc.constraints}
-		analyzed := constraint.AnalyzeConstraints(
-			ctx, a.StorePool.GetStoreDescriptor, existingRepls, conf.NumReplicas,
-			conf.Constraints)
+		analyzed := constraint.AnalyzeConstraints(sp, existingRepls, conf.NumReplicas, conf.Constraints)
 		checkFn := voterConstraintsCheckerForAllocation(analyzed, constraint.EmptyAnalyzedConstraints)
 
 		candidates := rankedCandidateListForAllocation(
@@ -3692,10 +4066,12 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 			sl,
 			checkFn,
 			existingRepls,
-			a.StorePool.GetLocalitiesByStore(existingRepls),
+			nil,
+			sp.GetLocalitiesByStore(existingRepls),
 			func(context.Context, roachpb.StoreID) bool { return true },
 			false, /* allowMultipleReplsPerNode */
 			a.ScorerOptions(ctx),
+			VoterTarget,
 		)
 		best := candidates.best()
 		match := true
@@ -3713,8 +4089,8 @@ func TestAllocateCandidatesNumReplicasConstraints(t *testing.T) {
 			}
 		}
 		if !match {
-			t.Errorf("%d: expected rankedCandidateListForAllocation(%v) = %v, but got %v",
-				testIdx, tc.existing, tc.expected, candidates)
+			t.Errorf("%d: expected rankedCandidateListForAllocation(%v) = %v constraints = %v but got %v",
+				testIdx, tc.existing, tc.expected, tc.constraints, candidates)
 		}
 	}
 }
@@ -3724,7 +4100,7 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
@@ -3904,7 +4280,7 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 	}
 
 	for testIdx, tc := range testCases {
-		sl, _, _ := a.StorePool.GetStoreListFromIDs(tc.existing, storepool.StoreFilterNone)
+		sl, _, _ := sp.GetStoreListFromIDs(tc.existing, storepool.StoreFilterNone)
 		existingRepls := make([]roachpb.ReplicaDescriptor, len(tc.existing))
 		for i, storeID := range tc.existing {
 			existingRepls[i] = roachpb.ReplicaDescriptor{
@@ -3912,15 +4288,14 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 				StoreID: storeID,
 			}
 		}
-		analyzed := constraint.AnalyzeConstraints(ctx, a.StorePool.GetStoreDescriptor, existingRepls,
-			0 /* numReplicas */, tc.constraints)
+		analyzed := constraint.AnalyzeConstraints(sp, existingRepls, 0 /* numReplicas */, tc.constraints)
 
 		// Check behavior in a span config where `voter_constraints` are empty.
 		checkFn := voterConstraintsCheckerForRemoval(analyzed, constraint.EmptyAnalyzedConstraints)
 		candidates := candidateListForRemoval(ctx,
 			sl,
 			checkFn,
-			a.StorePool.GetLocalitiesByStore(existingRepls),
+			sp.GetLocalitiesByStore(existingRepls),
 			a.ScorerOptions(ctx))
 		if !expectedStoreIDsMatch(tc.expected, candidates.worst()) {
 			t.Errorf("%d (with `constraints`): expected candidateListForRemoval(%v)"+
@@ -3934,7 +4309,7 @@ func TestRemoveCandidatesNumReplicasConstraints(t *testing.T) {
 		candidates = candidateListForRemoval(ctx,
 			sl,
 			checkFn,
-			a.StorePool.GetLocalitiesByStore(existingRepls),
+			sp.GetLocalitiesByStore(existingRepls),
 			a.ScorerOptions(ctx))
 		if !expectedStoreIDsMatch(tc.expected, candidates.worst()) {
 			t.Errorf("%d (with `voter_constraints`): expected candidateListForRemoval(%v)"+
@@ -4075,13 +4450,14 @@ func TestAllocatorRebalanceNonVoters(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%d_%s", i+1, test.name), func(t *testing.T) {
-			stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
 			// Enable read disk health checking in candidate exclusion.
 			add, remove, _, ok := a.RebalanceNonVoter(
 				ctx,
+				sp,
 				test.conf,
 				nil,
 				test.existingVoters,
@@ -4107,14 +4483,14 @@ func TestAllocatorRebalanceNonVoters(t *testing.T) {
 	}
 }
 
-// TestAllocatorRebalanceReadAmpCheck ensures that rebalancing voters:
-// (1) Respects storeHealthEnforcement setting, by ignoring L0 Sublevels in
-// 	   rebalancing decisions when disabled or set to log only.
-// (2) Considers L0 sublevels when set to rebalanceOnly or allocate in
-// 	   conjunction with the mean.
-// (3) Does not attempt to rebalance off of the store when read amplification
-//     is high, as this setting is only used for filtering candidates.
-func TestAllocatorRebalanceReadAmpCheck(t *testing.T) {
+// TestAllocatorRebalanceIOOverloadCheck ensures that rebalancing voters:
+// (1) Respects replica IO overload enforcement setting, by ignoring IO
+// overload in rebalancing decisions when disabled or set to log only.
+// (2) Considers IO overload when set to block_rebalance_to or allocate in
+// conjunction with the mean.
+// (3) Does not attempt to rebalance off of the store when io overload
+// is high, as this setting is only used for filtering candidates.
+func TestAllocatorRebalanceIOOverloadCheck(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
@@ -4125,67 +4501,67 @@ func TestAllocatorRebalanceReadAmpCheck(t *testing.T) {
 		existingVoters                            []roachpb.ReplicaDescriptor
 		expectNoAction                            bool
 		expectedRemoveTargets, expectedAddTargets []roachpb.StoreID
-		enforcement                               StoreHealthEnforcement
+		enforcement                               IOOverloadEnforcementLevel
 	}
 	tests := []testCase{
 		{
-			name: "don't move off of nodes with high read amp when StoreHealthBlockRebalanceTo",
-			// NB: Store 1,2, 4 have okay read amp. Store 3 has high read amp.
-			// We expect high read amplifaction to only be considered for
+			name: "don't move off of nodes with high io overload when block rebalance to",
+			// NB: Store 1,2, 4 have okay io overload. Store 3 has high io overload.
+			// We expect high io overload to only be considered for
 			// exlcuding targets, not for triggering rebalancing.
-			stores:         threeStoresHighReadAmpAscRangeCount,
+			stores:         threeStoresHighIOOverloadAscRangeCount,
 			conf:           emptySpanConfig(),
 			existingVoters: replicas(3, 1),
 			expectNoAction: true,
-			enforcement:    StoreHealthBlockRebalanceTo,
+			enforcement:    IOOverloadThresholdBlockTransfers,
 		},
 		{
-			name: "don't move off of nodes with high read amp when StoreHealthBlockAll",
-			// NB: Store 1,2, 4 have okay read amp. Store 3 has high read amp.
-			// We expect high read amplifaction to only be considered for
+			name: "don't move off of nodes with high io overload when block all",
+			// NB: Store 1,2, 4 have okay io overload. Store 3 has high io overload.
+			// We expect high io overload to only be considered for
 			// exlcuding targets, not for triggering rebalancing.
-			stores:         threeStoresHighReadAmpAscRangeCount,
+			stores:         threeStoresHighIOOverloadAscRangeCount,
 			conf:           emptySpanConfig(),
 			existingVoters: replicas(3, 1),
 			expectNoAction: true,
-			enforcement:    StoreHealthBlockAll,
+			enforcement:    IOOverloadThresholdBlockAll,
 		},
 		{
-			name: "don't take action when enforcement is not StoreHealthNoAction",
-			// NB: Store 3 has L0Sublevels > threshold. Store 2 has 3 x higher
+			name: "don't take action when enforcement is ignore",
+			// NB: Store 3 has IOOverload > threshold. Store 2 has 3 x higher
 			// ranges as other stores. Should move to candidate to 4, however
 			// enforcement for rebalancing is not enabled so will pick
 			// candidate 3 which has a lower range count.
-			stores:                oneStoreHighReadAmp,
+			stores:                oneStoreHighIOOverload,
 			conf:                  emptySpanConfig(),
 			existingVoters:        replicas(1, 2),
 			expectedRemoveTargets: []roachpb.StoreID{2},
 			expectedAddTargets:    []roachpb.StoreID{3},
-			enforcement:           StoreHealthNoAction,
+			enforcement:           IOOverloadThresholdIgnore,
 		},
 		{
-			name: "don't rebalance to nodes with high read amp when StoreHealthBlockRebalanceTo enforcement",
-			// NB: Store 3 has L0Sublevels > threshold. Store 2 has 3 x higher
+			name: "don't rebalance to nodes with high io overload when block rebalance to",
+			// NB: Store 3 has IOOverload > threshold. Store 2 has 3 x higher
 			// ranges as other stores. Should move to candidate to 4, which
-			// doesn't have high read amp.
-			stores:                oneStoreHighReadAmp,
+			// doesn't have high io overload.
+			stores:                oneStoreHighIOOverload,
 			conf:                  emptySpanConfig(),
 			existingVoters:        replicas(1, 2),
 			expectedRemoveTargets: []roachpb.StoreID{2},
 			expectedAddTargets:    []roachpb.StoreID{4},
-			enforcement:           StoreHealthBlockRebalanceTo,
+			enforcement:           IOOverloadThresholdBlockTransfers,
 		},
 		{
-			name: "don't rebalance to nodes with high read amp when StoreHealthBlockAll enforcement",
-			// NB: Store 3 has L0Sublevels > threshold. Store 2 has 3 x higher
+			name: "don't rebalance to nodes with high io overload when block all enforcement",
+			// NB: Store 3 has IOOverload > threshold. Store 2 has 3 x higher
 			// ranges as other stores. Should move to candidate to 4, which
-			// doesn't have high read amp.
-			stores:                oneStoreHighReadAmp,
+			// doesn't have high io overload.
+			stores:                oneStoreHighIOOverload,
 			conf:                  emptySpanConfig(),
 			existingVoters:        replicas(1, 2),
 			expectedRemoveTargets: []roachpb.StoreID{2},
 			expectedAddTargets:    []roachpb.StoreID{4},
-			enforcement:           StoreHealthBlockAll,
+			enforcement:           IOOverloadThresholdBlockAll,
 		},
 	}
 
@@ -4201,15 +4577,16 @@ func TestAllocatorRebalanceReadAmpCheck(t *testing.T) {
 
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%d_%s", i+1, test.name), func(t *testing.T) {
-			stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
+			stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, true /* deterministic */)
 			defer stopper.Stop(ctx)
 			sg := gossiputil.NewStoreGossiper(g)
 			sg.GossipStores(test.stores, t)
 			// Enable read disk health checking in candidate exclusion.
 			options := a.ScorerOptions(ctx)
-			options.StoreHealthOptions = StoreHealthOptions{EnforcementLevel: test.enforcement, L0SublevelThreshold: 20}
+			options.IOOverloadOptions = IOOverloadOptions{ReplicaEnforcementLevel: test.enforcement, ReplicaIOOverloadThreshold: 1}
 			add, remove, _, ok := a.RebalanceVoter(
 				ctx,
+				sp,
 				test.conf,
 				nil,
 				test.existingVoters,
@@ -4241,7 +4618,7 @@ func TestVotersCanRebalanceToNonVoterStores(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
@@ -4267,6 +4644,7 @@ func TestVotersCanRebalanceToNonVoterStores(t *testing.T) {
 	existingVoters := replicas(3, 4)
 	add, remove, _, ok := a.RebalanceVoter(
 		ctx,
+		sp,
 		conf,
 		nil,
 		existingVoters,
@@ -4294,7 +4672,7 @@ func TestNonVotersCannotRebalanceToVoterStores(t *testing.T) {
 		context.Background(), tracing.NewTracer(), "test",
 	)
 
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 2, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 2, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 
@@ -4326,6 +4704,7 @@ func TestNonVotersCannotRebalanceToVoterStores(t *testing.T) {
 	var rangeUsageInfo allocator.RangeUsageInfo
 	add, remove, _, ok := a.RebalanceNonVoter(
 		ctx,
+		sp,
 		emptySpanConfig(),
 		nil,
 		existingVoters,
@@ -4353,11 +4732,11 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(multiDiversityDCStores, t)
-	sl, _, _ := a.StorePool.GetStoreList(storepool.StoreFilterThrottled)
+	sl, _, _ := sp.GetStoreList(storepool.StoreFilterThrottled)
 
 	// Given a set of existing replicas for a range, rank which of the remaining
 	// stores would be best to remove if we had to remove one purely on the basis
@@ -5114,9 +5493,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			Constraints: tc.constraints,
 			NumReplicas: tc.numReplicas,
 		}
-		analyzed := constraint.AnalyzeConstraints(
-			ctx, a.StorePool.GetStoreDescriptor, existingRepls,
-			conf.NumReplicas, conf.Constraints)
+		analyzed := constraint.AnalyzeConstraints(sp, existingRepls, conf.NumReplicas, conf.Constraints)
 		removalConstraintsChecker := voterConstraintsCheckerForRemoval(
 			analyzed,
 			constraint.EmptyAnalyzedConstraints,
@@ -5133,7 +5510,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			rebalanceConstraintsChecker,
 			existingRepls,
 			nil,
-			a.StorePool.GetLocalitiesByStore(existingRepls),
+			sp.GetLocalitiesByStore(existingRepls),
 			func(context.Context, roachpb.StoreID) bool { return true },
 			a.ScorerOptions(ctx),
 			a.Metrics,
@@ -5161,6 +5538,7 @@ func TestRebalanceCandidatesNumReplicasConstraints(t *testing.T) {
 			// the final rebalance choice.
 			target, _, details, ok := a.RebalanceVoter(
 				ctx,
+				sp,
 				conf,
 				nil,
 				existingRepls,
@@ -5194,7 +5572,8 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, storePool, _ := storepool.CreateTestStorePool(ctx,
+	st := cluster.MakeTestingClusterSettings()
+	stopper, g, _, storePool, _ := storepool.CreateTestStorePool(ctx, st,
 		storepool.TestTimeUntilStoreDeadOff, true, /* deterministic */
 		func() int { return 10 }, /* nodeCount */
 		livenesspb.NodeLivenessStatus_LIVE)
@@ -5236,33 +5615,32 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	localityFn := func(nodeID roachpb.NodeID) string {
 		return localities[nodeID]
 	}
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	now := testingStartTime()
 
 	// Set up four different load distributions. Record a bunch of requests to
 	// the unknown node 99 in evenlyBalanced to verify that requests from
 	// unknown localities don't affect the algorithm.
-	evenlyBalanced := replicastats.NewReplicaStats(clock, localityFn)
-	evenlyBalanced.RecordCount(1, 1)
-	evenlyBalanced.RecordCount(1, 2)
-	evenlyBalanced.RecordCount(1, 3)
-	imbalanced1 := replicastats.NewReplicaStats(clock, localityFn)
-	imbalanced2 := replicastats.NewReplicaStats(clock, localityFn)
-	imbalanced3 := replicastats.NewReplicaStats(clock, localityFn)
+	evenlyBalanced := replicastats.NewReplicaStats(now, localityFn)
+	evenlyBalanced.RecordCount(now, 1, 1)
+	evenlyBalanced.RecordCount(now, 1, 2)
+	evenlyBalanced.RecordCount(now, 1, 3)
+	imbalanced1 := replicastats.NewReplicaStats(now, localityFn)
+	imbalanced2 := replicastats.NewReplicaStats(now, localityFn)
+	imbalanced3 := replicastats.NewReplicaStats(now, localityFn)
 	for i := 0; i < 100*int(MinLeaseTransferStatsDuration.Seconds()); i++ {
-		evenlyBalanced.RecordCount(1, 99)
-		imbalanced1.RecordCount(1, 1)
-		imbalanced2.RecordCount(1, 2)
-		imbalanced3.RecordCount(1, 3)
+		evenlyBalanced.RecordCount(now, 1, 99)
+		imbalanced1.RecordCount(now, 1, 1)
+		imbalanced3.RecordCount(now, 1, 3)
+		imbalanced2.RecordCount(now, 1, 2)
 	}
 
-	manual.Increment(int64(MinLeaseTransferStatsDuration))
+	now = now.Add(MinLeaseTransferStatsDuration)
 
-	noLatency := map[string]time.Duration{}
-	highLatency := map[string]time.Duration{
-		stores[0].Node.Address.String(): 50 * time.Millisecond,
-		stores[1].Node.Address.String(): 50 * time.Millisecond,
-		stores[2].Node.Address.String(): 50 * time.Millisecond,
+	noLatency := map[roachpb.NodeID]time.Duration{}
+	highLatency := map[roachpb.NodeID]time.Duration{
+		stores[0].Node.NodeID: 50 * time.Millisecond,
+		stores[1].Node.NodeID: 50 * time.Millisecond,
+		stores[2].Node.NodeID: 50 * time.Millisecond,
 	}
 
 	existing := []roachpb.ReplicaDescriptor{
@@ -5272,90 +5650,97 @@ func TestAllocatorTransferLeaseTargetLoadBased(t *testing.T) {
 	}
 
 	testCases := []struct {
-		leaseholder    roachpb.StoreID
-		latency        map[string]time.Duration
-		stats          *replicastats.ReplicaStats
-		allowLeaseRepl bool
-		expected       roachpb.StoreID
+		leaseholder      roachpb.StoreID
+		latency          map[roachpb.NodeID]time.Duration
+		stats            *replicastats.ReplicaStats
+		excludeLeaseRepl bool
+		expected         roachpb.StoreID
 	}{
 		// No existing lease holder, nothing to do.
-		{leaseholder: 0, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 0, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 0, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 0, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: noLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 2, latency: noLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 3, latency: noLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 0, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 0, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced1, allowLeaseRepl: true, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced1, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 0, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 2},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 1},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced2, allowLeaseRepl: true, expected: 2},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced2, allowLeaseRepl: false, expected: 2},
-		{leaseholder: 0, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 3},
-		{leaseholder: 1, latency: highLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 3},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 3},
-		{leaseholder: 2, latency: highLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 3},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced3, allowLeaseRepl: true, expected: 0},
-		{leaseholder: 3, latency: highLatency, stats: imbalanced3, allowLeaseRepl: false, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: evenlyBalanced, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: evenlyBalanced, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: evenlyBalanced, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced1, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced1, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced1, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced2, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced2, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced2, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 0, latency: noLatency, stats: imbalanced3, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced3, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: noLatency, stats: imbalanced3, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced3, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 2, latency: noLatency, stats: imbalanced3, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced3, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: noLatency, stats: imbalanced3, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 0, latency: highLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: evenlyBalanced, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 2, latency: highLatency, stats: evenlyBalanced, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: evenlyBalanced, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 0, latency: highLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced1, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced1, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced1, excludeLeaseRepl: false, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced1, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 0, latency: highLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 2},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced2, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced2, excludeLeaseRepl: true, expected: 1},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced2, excludeLeaseRepl: false, expected: 2},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced2, excludeLeaseRepl: true, expected: 2},
+		{leaseholder: 0, latency: highLatency, stats: imbalanced3, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced3, excludeLeaseRepl: true, expected: 3},
+		{leaseholder: 1, latency: highLatency, stats: imbalanced3, excludeLeaseRepl: true, expected: 3},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced3, excludeLeaseRepl: false, expected: 3},
+		{leaseholder: 2, latency: highLatency, stats: imbalanced3, excludeLeaseRepl: true, expected: 3},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced3, excludeLeaseRepl: false, expected: 0},
+		{leaseholder: 3, latency: highLatency, stats: imbalanced3, excludeLeaseRepl: true, expected: 1},
 	}
 
 	for _, c := range testCases {
 		t.Run("", func(t *testing.T) {
-			a := MakeAllocator(storePool, func(addr string) (time.Duration, bool) {
-				return c.latency[addr], true
+			a := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
+				return c.latency[id], true
 			}, nil)
+			localitySummary := c.stats.SnapshotRatedSummary(now)
+			usage := allocator.RangeUsageInfo{}
+			usage.RequestLocality = &allocator.RangeRequestLocalityInfo{
+				Counts:   localitySummary.LocalityCounts,
+				Duration: localitySummary.Duration,
+			}
+
 			target := a.TransferLeaseTarget(
 				ctx,
+				storePool,
 				emptySpanConfig(),
 				existing,
 				&mockRepl{
 					replicationFactor: 3,
 					storeID:           c.leaseholder,
 				},
-				c.stats,
+				usage,
 				false,
 				allocator.TransferLeaseOptions{
-					ExcludeLeaseRepl:       !c.allowLeaseRepl,
+					ExcludeLeaseRepl:       c.excludeLeaseRepl,
 					CheckCandidateFullness: true,
-					DryRun:                 false,
 				},
 			)
 			if c.expected != target.StoreID {
@@ -5371,7 +5756,7 @@ func TestLoadBasedLeaseRebalanceScore(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	enableLoadBasedLeaseRebalancing.Override(ctx, &st.SV, true)
+	EnableLoadBasedLeaseRebalancing.Override(ctx, &st.SV, true)
 
 	remoteStore := roachpb.StoreDescriptor{
 		Node: roachpb.NodeDescriptor{
@@ -5541,7 +5926,7 @@ func TestAllocatorRemoveTargetBasedOnCapacity(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	sg := gossiputil.NewStoreGossiper(g)
 	sg.GossipStores(stores, t)
@@ -5550,6 +5935,7 @@ func TestAllocatorRemoveTargetBasedOnCapacity(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		targetRepl, _, err := a.RemoveVoter(
 			ctx,
+			sp,
 			emptySpanConfig(),
 			replicas,
 			replicas,
@@ -5669,7 +6055,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 						StoreID:   4,
 						NodeID:    4,
 						ReplicaID: 4,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -5745,7 +6131,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 						StoreID:   4,
 						NodeID:    4,
 						ReplicaID: 4,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -6023,13 +6409,13 @@ func TestAllocatorComputeAction(t *testing.T) {
 						StoreID:   4,
 						NodeID:    4,
 						ReplicaID: 4,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 					{
 						StoreID:   6,
 						NodeID:    6,
 						ReplicaID: 6,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -6081,7 +6467,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 						StoreID:   6,
 						NodeID:    6,
 						ReplicaID: 6,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -6104,13 +6490,13 @@ func TestAllocatorComputeAction(t *testing.T) {
 						StoreID:   2,
 						NodeID:    2,
 						ReplicaID: 2,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 					{
 						StoreID:   6,
 						NodeID:    6,
 						ReplicaID: 6,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -6134,13 +6520,13 @@ func TestAllocatorComputeAction(t *testing.T) {
 						StoreID:   2,
 						NodeID:    2,
 						ReplicaID: 2,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 					{
 						StoreID:   3,
 						NodeID:    3,
 						ReplicaID: 3,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -6248,7 +6634,7 @@ func TestAllocatorComputeAction(t *testing.T) {
 
 	lastPriority := float64(999999999)
 	for i, tcase := range testCases {
-		action, priority := a.ComputeAction(ctx, tcase.conf, &tcase.desc)
+		action, priority := a.ComputeAction(ctx, sp, tcase.conf, &tcase.desc)
 		if tcase.expectedAction != action {
 			t.Errorf("Test case %d expected action %q, got action %q",
 				i, allocatorActionNames[tcase.expectedAction], allocatorActionNames[action])
@@ -6345,10 +6731,117 @@ func TestAllocatorComputeActionRemoveDead(t *testing.T) {
 
 	for i, tcase := range testCases {
 		mockStorePool(sp, tcase.live, nil, tcase.dead, nil, nil, nil)
-		action, _ := a.ComputeAction(ctx, conf, &tcase.desc)
+		action, _ := a.ComputeAction(ctx, sp, conf, &tcase.desc)
 		if tcase.expectedAction != action {
 			t.Errorf("Test case %d expected action %d, got action %d", i, tcase.expectedAction, action)
 		}
+	}
+}
+
+func TestAllocatorComputeActionWithStorePoolRemoveDead(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	conf := roachpb.SpanConfig{NumReplicas: 3}
+	threeReplDesc := roachpb.RangeDescriptor{
+		InternalReplicas: []roachpb.ReplicaDescriptor{
+			{
+				StoreID:   1,
+				NodeID:    1,
+				ReplicaID: 1,
+			},
+			{
+				StoreID:   2,
+				NodeID:    2,
+				ReplicaID: 2,
+			},
+			{
+				StoreID:   3,
+				NodeID:    3,
+				ReplicaID: 3,
+			},
+		},
+	}
+	fourReplDesc := threeReplDesc
+	fourReplDesc.InternalReplicas = append(fourReplDesc.InternalReplicas, roachpb.ReplicaDescriptor{
+		StoreID:   4,
+		NodeID:    4,
+		ReplicaID: 4,
+	})
+
+	// Each test case should describe a repair situation which has a lower
+	// priority than the previous test case.
+	testCases := []struct {
+		desc           roachpb.RangeDescriptor
+		live           []roachpb.StoreID
+		dead           []roachpb.StoreID
+		expectedAction AllocatorAction
+	}{
+		// Needs three replicas, one is dead, and there's no replacement. Since
+		// there's no replacement we can't do anything, but an action is still
+		// emitted.
+		{
+			desc:           threeReplDesc,
+			live:           []roachpb.StoreID{1, 2},
+			dead:           []roachpb.StoreID{3},
+			expectedAction: AllocatorReplaceDeadVoter,
+		},
+		// Needs three replicas, one is dead, but there is a replacement.
+		{
+			desc:           threeReplDesc,
+			live:           []roachpb.StoreID{1, 2, 4},
+			dead:           []roachpb.StoreID{3},
+			expectedAction: AllocatorReplaceDeadVoter,
+		},
+		// Needs three replicas, two are dead (i.e. the range lacks a quorum).
+		{
+			desc:           threeReplDesc,
+			live:           []roachpb.StoreID{1, 4},
+			dead:           []roachpb.StoreID{2, 3},
+			expectedAction: AllocatorRangeUnavailable,
+		},
+		// Needs three replicas, has four, one is dead.
+		{
+			desc:           fourReplDesc,
+			live:           []roachpb.StoreID{1, 2, 4},
+			dead:           []roachpb.StoreID{3},
+			expectedAction: AllocatorRemoveDeadVoter,
+		},
+		// Needs three replicas, has four, two are dead (i.e. the range lacks a quorum).
+		{
+			desc:           fourReplDesc,
+			live:           []roachpb.StoreID{1, 4},
+			dead:           []roachpb.StoreID{2, 3},
+			expectedAction: AllocatorRangeUnavailable,
+		},
+	}
+
+	for i, tcase := range testCases {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			ctx := context.Background()
+			getNumNodes := func() int {
+				return len(tcase.live) + len(tcase.dead)
+			}
+			stopper, _, sp, a, _ := CreateTestAllocator(ctx, getNumNodes(), false /* deterministic */)
+			defer stopper.Stop(ctx)
+
+			// Mark all dead nodes as alive, so we can override later.
+			all := append(tcase.live, tcase.dead...)
+			mockStorePool(sp, all, nil, nil, nil, nil, nil)
+			oSp := storepool.NewOverrideStorePool(sp, func(nid roachpb.NodeID, now time.Time, timeUntilStoreDead time.Duration) livenesspb.NodeLivenessStatus {
+				for _, deadStoreID := range tcase.dead {
+					if nid == roachpb.NodeID(deadStoreID) {
+						return livenesspb.NodeLivenessStatus_DEAD
+					}
+				}
+
+				return sp.NodeLivenessFn(nid, now, timeUntilStoreDead)
+			}, getNumNodes)
+			action, _ := a.ComputeAction(ctx, oSp, conf, &tcase.desc)
+			if tcase.expectedAction != action {
+				t.Errorf("Test case %d expected action %d, got action %d", i, tcase.expectedAction, action)
+			}
+		})
 	}
 }
 
@@ -6418,7 +6911,7 @@ func TestAllocatorComputeActionSuspect(t *testing.T) {
 
 	for i, tcase := range testCases {
 		mockStorePool(sp, tcase.live, nil, nil, nil, nil, tcase.suspect)
-		action, _ := a.ComputeAction(ctx, conf, &tcase.desc)
+		action, _ := a.ComputeAction(ctx, sp, conf, &tcase.desc)
 		if tcase.expectedAction != action {
 			t.Errorf("Test case %d expected action %d, got action %d", i, tcase.expectedAction, action)
 		}
@@ -6523,7 +7016,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 					},
 				},
 			},
-			expectedAction:  AllocatorRemoveDeadVoter,
+			expectedAction:  AllocatorReplaceDeadVoter,
 			live:            []roachpb.StoreID{1, 4},
 			dead:            []roachpb.StoreID{2},
 			decommissioning: []roachpb.StoreID{3},
@@ -6556,7 +7049,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 					},
 				},
 			},
-			expectedAction:  AllocatorRemoveDeadVoter,
+			expectedAction:  AllocatorReplaceDeadVoter,
 			live:            []roachpb.StoreID{1, 4},
 			dead:            nil,
 			decommissioning: []roachpb.StoreID{3},
@@ -6616,7 +7109,7 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 					},
 				},
 			},
-			expectedAction:  AllocatorRemoveDecommissioningVoter,
+			expectedAction:  AllocatorReplaceDecommissioningVoter,
 			live:            []roachpb.StoreID{4},
 			dead:            nil,
 			decommissioning: []roachpb.StoreID{1, 2, 3},
@@ -6637,19 +7130,19 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 						StoreID:   4,
 						NodeID:    4,
 						ReplicaID: 4,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 					{
 						StoreID:   6,
 						NodeID:    6,
 						ReplicaID: 6,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 					{
 						StoreID:   7,
 						NodeID:    7,
 						ReplicaID: 7,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -6674,13 +7167,13 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 						StoreID:   4,
 						NodeID:    4,
 						ReplicaID: 4,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 					{
 						StoreID:   6,
 						NodeID:    6,
 						ReplicaID: 6,
-						Type:      roachpb.ReplicaTypeNonVoter(),
+						Type:      roachpb.NON_VOTER,
 					},
 				},
 			},
@@ -6697,11 +7190,309 @@ func TestAllocatorComputeActionDecommission(t *testing.T) {
 
 	for i, tcase := range testCases {
 		mockStorePool(sp, tcase.live, nil, tcase.dead, tcase.decommissioning, tcase.decommissioned, nil)
-		action, _ := a.ComputeAction(ctx, tcase.conf, &tcase.desc)
+		action, _ := a.ComputeAction(ctx, sp, tcase.conf, &tcase.desc)
 		if tcase.expectedAction != action {
 			t.Errorf("Test case %d expected action %s, got action %s", i, tcase.expectedAction, action)
 			continue
 		}
+	}
+}
+
+func TestAllocatorComputeActionWithStorePoolDecommission(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testCases := []struct {
+		conf            roachpb.SpanConfig
+		desc            roachpb.RangeDescriptor
+		expectedAction  AllocatorAction
+		live            []roachpb.StoreID
+		dead            []roachpb.StoreID
+		decommissioning []roachpb.StoreID
+		decommissioned  []roachpb.StoreID
+	}{
+		// Has three replicas, but one is in decommissioning status. We can't
+		// replace it (nor add a new replica) since there isn't a live target,
+		// but that's still the action being emitted.
+		{
+			conf: roachpb.SpanConfig{NumReplicas: 3},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   2,
+						NodeID:    2,
+						ReplicaID: 2,
+					},
+					{
+						StoreID:   3,
+						NodeID:    3,
+						ReplicaID: 3,
+					},
+				},
+			},
+			expectedAction:  AllocatorReplaceDecommissioningVoter,
+			live:            []roachpb.StoreID{1, 2},
+			dead:            nil,
+			decommissioning: []roachpb.StoreID{3},
+		},
+		// Has three replicas, one is in decommissioning status, and one is on a
+		// dead node. Replacing the dead replica is more important.
+		{
+			conf: roachpb.SpanConfig{NumReplicas: 3},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   2,
+						NodeID:    2,
+						ReplicaID: 2,
+					},
+					{
+						StoreID:   3,
+						NodeID:    3,
+						ReplicaID: 3,
+					},
+				},
+			},
+			expectedAction:  AllocatorReplaceDeadVoter,
+			live:            []roachpb.StoreID{1},
+			dead:            []roachpb.StoreID{2},
+			decommissioning: []roachpb.StoreID{3},
+		},
+		// Needs three replicas, has four, where one is decommissioning and one is
+		// dead.
+		{
+			conf: roachpb.SpanConfig{NumReplicas: 3},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   2,
+						NodeID:    2,
+						ReplicaID: 2,
+					},
+					{
+						StoreID:   3,
+						NodeID:    3,
+						ReplicaID: 3,
+					},
+					{
+						StoreID:   4,
+						NodeID:    4,
+						ReplicaID: 4,
+					},
+				},
+			},
+			expectedAction:  AllocatorReplaceDeadVoter,
+			live:            []roachpb.StoreID{1, 4},
+			dead:            []roachpb.StoreID{2},
+			decommissioning: []roachpb.StoreID{3},
+		},
+		// Needs three replicas, has four, where one is decommissioning and one is
+		// decommissioned.
+		{
+			conf: roachpb.SpanConfig{NumReplicas: 3},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   2,
+						NodeID:    2,
+						ReplicaID: 2,
+					},
+					{
+						StoreID:   3,
+						NodeID:    3,
+						ReplicaID: 3,
+					},
+					{
+						StoreID:   4,
+						NodeID:    4,
+						ReplicaID: 4,
+					},
+				},
+			},
+			expectedAction:  AllocatorReplaceDeadVoter,
+			live:            []roachpb.StoreID{1, 4},
+			dead:            nil,
+			decommissioning: []roachpb.StoreID{3},
+			decommissioned:  []roachpb.StoreID{2},
+		},
+		// Needs three replicas, has three, all decommissioning
+		{
+			conf: roachpb.SpanConfig{NumReplicas: 3},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   2,
+						NodeID:    2,
+						ReplicaID: 2,
+					},
+					{
+						StoreID:   3,
+						NodeID:    3,
+						ReplicaID: 3,
+					},
+				},
+			},
+			expectedAction:  AllocatorReplaceDecommissioningVoter,
+			live:            nil,
+			dead:            nil,
+			decommissioning: []roachpb.StoreID{1, 2, 3},
+		},
+		// Needs 3. Has 1 live, 3 decommissioning.
+		{
+			conf: roachpb.SpanConfig{NumReplicas: 3},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   2,
+						NodeID:    2,
+						ReplicaID: 2,
+					},
+					{
+						StoreID:   3,
+						NodeID:    3,
+						ReplicaID: 3,
+					},
+					{
+						StoreID:   4,
+						NodeID:    4,
+						ReplicaID: 4,
+					},
+				},
+			},
+			expectedAction:  AllocatorReplaceDecommissioningVoter,
+			live:            []roachpb.StoreID{4},
+			dead:            nil,
+			decommissioning: []roachpb.StoreID{1, 2, 3},
+		},
+		{
+			conf: roachpb.SpanConfig{
+				NumVoters:   1,
+				NumReplicas: 3,
+			},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   4,
+						NodeID:    4,
+						ReplicaID: 4,
+						Type:      roachpb.NON_VOTER,
+					},
+					{
+						StoreID:   6,
+						NodeID:    6,
+						ReplicaID: 6,
+						Type:      roachpb.NON_VOTER,
+					},
+					{
+						StoreID:   7,
+						NodeID:    7,
+						ReplicaID: 7,
+						Type:      roachpb.NON_VOTER,
+					},
+				},
+			},
+			expectedAction:  AllocatorRemoveDecommissioningNonVoter,
+			live:            []roachpb.StoreID{1, 4, 6},
+			dead:            nil,
+			decommissioning: []roachpb.StoreID{7},
+		},
+		{
+			conf: roachpb.SpanConfig{
+				NumVoters:   1,
+				NumReplicas: 3,
+			},
+			desc: roachpb.RangeDescriptor{
+				InternalReplicas: []roachpb.ReplicaDescriptor{
+					{
+						StoreID:   1,
+						NodeID:    1,
+						ReplicaID: 1,
+					},
+					{
+						StoreID:   4,
+						NodeID:    4,
+						ReplicaID: 4,
+						Type:      roachpb.NON_VOTER,
+					},
+					{
+						StoreID:   6,
+						NodeID:    6,
+						ReplicaID: 6,
+						Type:      roachpb.NON_VOTER,
+					},
+				},
+			},
+			expectedAction:  AllocatorReplaceDecommissioningNonVoter,
+			live:            []roachpb.StoreID{1, 2, 3, 4, 6},
+			dead:            nil,
+			decommissioning: []roachpb.StoreID{4},
+		},
+	}
+
+	for i, tcase := range testCases {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			ctx := context.Background()
+			getNumNodes := func() int {
+				return len(tcase.live) + len(tcase.dead)
+			}
+
+			stopper, _, sp, a, _ := CreateTestAllocator(ctx, getNumNodes(), false /* deterministic */)
+			defer stopper.Stop(ctx)
+
+			// Mark all decommissioning and decommissioned nodes as alive, so we can override later.
+			all := append(tcase.live, tcase.decommissioning...)
+			all = append(all, tcase.decommissioned...)
+			overrideLivenessMap := make(map[roachpb.NodeID]livenesspb.NodeLivenessStatus)
+			for _, sID := range tcase.decommissioned {
+				overrideLivenessMap[roachpb.NodeID(sID)] = livenesspb.NodeLivenessStatus_DECOMMISSIONED
+			}
+			for _, sID := range tcase.decommissioning {
+				overrideLivenessMap[roachpb.NodeID(sID)] = livenesspb.NodeLivenessStatus_DECOMMISSIONING
+			}
+			mockStorePool(sp, all, nil, tcase.dead, nil, nil, nil)
+			oSp := storepool.NewOverrideStorePool(sp,
+				storepool.OverrideNodeLivenessFunc(overrideLivenessMap, sp.NodeLivenessFn), getNumNodes,
+			)
+			action, _ := a.ComputeAction(ctx, oSp, tcase.conf, &tcase.desc)
+			if tcase.expectedAction != action {
+				t.Errorf("Test case %d expected action %s, got action %s", i, tcase.expectedAction, action)
+			}
+		})
 	}
 }
 
@@ -6710,7 +7501,6 @@ func TestAllocatorRemoveLearner(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	conf := roachpb.SpanConfig{NumReplicas: 3}
-	learnerType := roachpb.LEARNER
 	rangeWithLearnerDesc := roachpb.RangeDescriptor{
 		InternalReplicas: []roachpb.ReplicaDescriptor{
 			{
@@ -6722,7 +7512,7 @@ func TestAllocatorRemoveLearner(t *testing.T) {
 				StoreID:   2,
 				NodeID:    2,
 				ReplicaID: 2,
-				Type:      &learnerType,
+				Type:      roachpb.LEARNER,
 			},
 		},
 	}
@@ -6734,7 +7524,7 @@ func TestAllocatorRemoveLearner(t *testing.T) {
 	defer stopper.Stop(ctx)
 	live, dead := []roachpb.StoreID{1, 2}, []roachpb.StoreID{3}
 	mockStorePool(sp, live, nil, dead, nil, nil, nil)
-	action, _ := a.ComputeAction(ctx, conf, &rangeWithLearnerDesc)
+	action, _ := a.ComputeAction(ctx, sp, conf, &rangeWithLearnerDesc)
 	require.Equal(t, AllocatorRemoveLearner, action)
 }
 
@@ -6746,6 +7536,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 	// set. We are checking that the effective replication factor is rounded down
 	// to the number of stores which are not decommissioned or decommissioning.
 	testCases := []struct {
+		name                string
 		storeList           []roachpb.StoreID
 		expectedNumReplicas int
 		expectedAction      AllocatorAction
@@ -6758,9 +7549,10 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 			// Four known stores, three of them are decommissioning, so effective
 			// replication factor would be 1 if we hadn't decided that we'll never
 			// drop past 3, so 3 it is.
+			name:                "four replicas with three decommissioning",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4},
 			expectedNumReplicas: 3,
-			expectedAction:      AllocatorRemoveDecommissioningVoter,
+			expectedAction:      AllocatorReplaceDecommissioningVoter,
 			live:                []roachpb.StoreID{4},
 			unavailable:         nil,
 			dead:                nil,
@@ -6768,6 +7560,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		},
 		{
 			// Ditto.
+			name:                "three replicas with three decommissioning",
 			storeList:           []roachpb.StoreID{1, 2, 3},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorReplaceDecommissioningVoter,
@@ -6781,6 +7574,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 			// factor would be even (four), in which case we drop down one more
 			// to three. Then the right thing becomes removing the dead replica
 			// from the range at hand, rather than trying to replace it.
+			name:                "four replicas with one dead",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorRemoveDeadVoter,
@@ -6794,6 +7588,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 			// in the system which amounts to an effective replication factor
 			// of three (avoiding the even number). Adding a replica is more
 			// important than replacing the dead one.
+			name:                "two replicas with one dead",
 			storeList:           []roachpb.StoreID{1, 4},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorAddVoter,
@@ -6804,6 +7599,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		},
 		{
 			// Similar to above, but nothing to do.
+			name:                "three replicas with nothing to do",
 			storeList:           []roachpb.StoreID{1, 2, 3},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorConsiderRebalance,
@@ -6816,6 +7612,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 			// Effective replication factor can't dip below three (unless the
 			// span config explicitly asks for that, which it does not), so three
 			// it is and we are under-replicaed.
+			name:                "RF stays above three",
 			storeList:           []roachpb.StoreID{1, 2},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorAddVoter,
@@ -6826,6 +7623,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		},
 		{
 			// Three and happy.
+			name:                "three and happy",
 			storeList:           []roachpb.StoreID{1, 2, 3},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorConsiderRebalance,
@@ -6836,6 +7634,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		},
 		{
 			// Three again, on account of avoiding the even four.
+			name:                "avoid even replicas",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorRemoveVoter,
@@ -6847,6 +7646,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		{
 			// The usual case in which there are enough nodes to accommodate the
 			// span config.
+			name:                "five and happy",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4, 5},
 			expectedNumReplicas: 5,
 			expectedAction:      AllocatorConsiderRebalance,
@@ -6858,6 +7658,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		{
 			// No dead or decommissioning node and enough nodes around, so
 			// sticking with the span config.
+			name:                "five and happy with one unavailable",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4, 5},
 			expectedNumReplicas: 5,
 			expectedAction:      AllocatorConsiderRebalance,
@@ -6868,6 +7669,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		},
 		{
 			// Ditto.
+			name:                "five and happy with two unavailable",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4, 5},
 			expectedNumReplicas: 5,
 			expectedAction:      AllocatorConsiderRebalance,
@@ -6878,6 +7680,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		},
 		{
 			// Ditto, but we've lost quorum.
+			name:                "five with lost quorum",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4, 5},
 			expectedNumReplicas: 5,
 			expectedAction:      AllocatorRangeUnavailable,
@@ -6890,6 +7693,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 			// Ditto (dead nodes don't reduce NumReplicas, only decommissioning
 			// or decommissioned do, and both correspond to the 'decommissioning'
 			// slice in these tests).
+			name:                "five with lost quorum on one dead and one unavailable",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4, 5},
 			expectedNumReplicas: 5,
 			expectedAction:      AllocatorReplaceDeadVoter,
@@ -6901,6 +7705,7 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		{
 			// Avoiding four, so getting three, and since there is no dead store
 			// the most important thing is removing a decommissioning replica.
+			name:                "five with one decommissioning and one unavailable",
 			storeList:           []roachpb.StoreID{1, 2, 3, 4, 5},
 			expectedNumReplicas: 3,
 			expectedAction:      AllocatorRemoveDecommissioningVoter,
@@ -6913,11 +7718,12 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 
 	var numNodes int
 	ctx := context.Background()
-	stopper, _, _, sp, _ := storepool.CreateTestStorePool(ctx,
+	st := cluster.MakeTestingClusterSettings()
+	stopper, _, _, sp, _ := storepool.CreateTestStorePool(ctx, st,
 		storepool.TestTimeUntilStoreDeadOff, false, /* deterministic */
 		func() int { return numNodes },
 		livenesspb.NodeLivenessStatus_LIVE)
-	a := MakeAllocator(sp, func(string) (time.Duration, bool) {
+	a := MakeAllocator(st, false /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
 		return 0, true
 	}, nil)
 
@@ -6929,18 +7735,18 @@ func TestAllocatorComputeActionDynamicNumReplicas(t *testing.T) {
 		roachpb.RKey(keys.SystemPrefix),
 	} {
 		for _, c := range testCases {
-			t.Run(prefixKey.String(), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s%s", c.name, prefixKey), func(t *testing.T) {
 				numNodes = len(c.storeList) - len(c.decommissioning)
 				mockStorePool(sp, c.live, c.unavailable, c.dead,
 					c.decommissioning, nil, nil)
 				desc := makeDescriptor(c.storeList)
 				desc.EndKey = prefixKey
 
-				clusterNodes := a.StorePool.ClusterNodeCount()
+				clusterNodes := sp.ClusterNodeCount()
 				effectiveNumReplicas := GetNeededVoters(conf.NumReplicas, clusterNodes)
 				require.Equal(t, c.expectedNumReplicas, effectiveNumReplicas, "clusterNodes=%d", clusterNodes)
 
-				action, _ := a.ComputeAction(ctx, conf, &desc)
+				action, _ := a.ComputeAction(ctx, sp, conf, &desc)
 				require.Equal(t, c.expectedAction.String(), action.String())
 			})
 		}
@@ -7023,8 +7829,8 @@ func TestAllocatorComputeActionNoStorePool(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	a := MakeAllocator(nil, nil, nil)
-	action, priority := a.ComputeAction(context.Background(), roachpb.SpanConfig{}, nil)
+	a := MakeAllocator(nil, false, nil, nil)
+	action, priority := a.ComputeAction(context.Background(), nil, roachpb.SpanConfig{}, nil)
 	if action != AllocatorNoop {
 		t.Errorf("expected AllocatorNoop, but got %v", action)
 	}
@@ -7137,6 +7943,7 @@ func TestFilterBehindReplicas(t *testing.T) {
 				Progress: make(map[uint64]tracker.Progress),
 			}
 			status.Lead = c.leader
+			status.RaftState = raft.StateLeader
 			status.Commit = c.commit
 			var replicas []roachpb.ReplicaDescriptor
 			for j, v := range c.progress {
@@ -7209,6 +8016,7 @@ func TestFilterUnremovableReplicas(t *testing.T) {
 			// Use an invalid replica ID for the leader. TestFilterBehindReplicas covers
 			// valid replica IDs.
 			status.Lead = 99
+			status.RaftState = raft.StateLeader
 			status.Commit = c.commit
 			var replicas []roachpb.ReplicaDescriptor
 			for j, v := range c.progress {
@@ -7266,6 +8074,7 @@ func TestSimulateFilterUnremovableReplicas(t *testing.T) {
 			// Use an invalid replica ID for the leader. TestFilterBehindReplicas covers
 			// valid replica IDs.
 			status.Lead = 99
+			status.RaftState = raft.StateLeader
 			status.Commit = c.commit
 			var replicas []roachpb.ReplicaDescriptor
 			for j, v := range c.progress {
@@ -7296,6 +8105,85 @@ func TestSimulateFilterUnremovableReplicas(t *testing.T) {
 	}
 }
 
+// TestAllocatorRebalanceDeterminism tests that calls to RebalanceVoter are
+// deterministic.
+func TestAllocatorRebalanceDeterminism(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	stores := []*roachpb.StoreDescriptor{
+		{
+			StoreID:    1,
+			Attrs:      roachpb.Attributes{},
+			Node:       roachpb.NodeDescriptor{NodeID: 1},
+			Capacity:   roachpb.StoreCapacity{LeaseCount: 934, RangeCount: 934},
+			Properties: roachpb.StoreProperties{},
+		},
+		{
+			StoreID:  2,
+			Node:     roachpb.NodeDescriptor{NodeID: 3},
+			Capacity: roachpb.StoreCapacity{LeaseCount: 0, RangeCount: 933},
+		},
+		{
+			StoreID:  3,
+			Node:     roachpb.NodeDescriptor{NodeID: 3},
+			Capacity: roachpb.StoreCapacity{LeaseCount: 0, RangeCount: 934},
+		},
+		{
+			StoreID:  4,
+			Node:     roachpb.NodeDescriptor{NodeID: 4},
+			Capacity: roachpb.StoreCapacity{LeaseCount: 118, RangeCount: 349},
+		},
+		{
+			StoreID:  5,
+			Node:     roachpb.NodeDescriptor{NodeID: 5},
+			Capacity: roachpb.StoreCapacity{LeaseCount: 115, RangeCount: 351},
+		},
+		{
+			StoreID:  6,
+			Node:     roachpb.NodeDescriptor{NodeID: 6},
+			Capacity: roachpb.StoreCapacity{LeaseCount: 118, RangeCount: 349},
+		},
+		{
+			StoreID:  7,
+			Node:     roachpb.NodeDescriptor{NodeID: 7},
+			Capacity: roachpb.StoreCapacity{LeaseCount: 105, RangeCount: 350},
+		},
+	}
+
+	runner := func() func() (roachpb.ReplicationTarget, roachpb.ReplicationTarget) {
+		ctx := context.Background()
+		stopper, g, sp, a, _ := CreateTestAllocator(ctx, 7 /* numNodes */, true /* deterministic */)
+		defer stopper.Stop(ctx)
+		gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
+		return func() (roachpb.ReplicationTarget, roachpb.ReplicationTarget) {
+			var rangeUsageInfo allocator.RangeUsageInfo
+			// Ensure that we wouldn't normally rebalance when all stores have the same
+			// replica count.
+			add, remove, _, _ := a.RebalanceVoter(
+				ctx,
+				sp,
+				roachpb.TestingDefaultSpanConfig(),
+				nil,
+				replicas(1, 2, 5),
+				nil,
+				rangeUsageInfo,
+				storepool.StoreFilterThrottled,
+				a.ScorerOptions(ctx),
+			)
+			return add, remove
+		}
+	}
+
+	ra, rb := runner(), runner()
+	for i := 0; i < 2000; i++ {
+		addA, removeA := ra()
+		addB, removeB := rb()
+		require.Equal(t, addA, addB, "%d iters", i)
+		require.Equal(t, removeA, removeB, "%d iters", i)
+	}
+}
+
 // TestAllocatorRebalanceWithScatter tests that when `scatter` is set to true,
 // the allocator will produce rebalance opportunities even when it normally
 // wouldn't.
@@ -7304,7 +8192,7 @@ func TestAllocatorRebalanceWithScatter(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10 /* numNodes */, true /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10 /* numNodes */, true /* deterministic */)
 	defer stopper.Stop(ctx)
 
 	stores := []*roachpb.StoreDescriptor{
@@ -7345,6 +8233,7 @@ func TestAllocatorRebalanceWithScatter(t *testing.T) {
 	// replica count.
 	_, _, _, ok := a.RebalanceVoter(
 		ctx,
+		sp,
 		emptySpanConfig(),
 		nil,
 		replicas(1),
@@ -7358,6 +8247,7 @@ func TestAllocatorRebalanceWithScatter(t *testing.T) {
 	// Ensure that we would produce a rebalance target when running with scatter.
 	_, _, _, ok = a.RebalanceVoter(
 		ctx,
+		sp,
 		emptySpanConfig(),
 		nil,
 		replicas(1),
@@ -7457,7 +8347,7 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	stopper, g, _, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
 	defer stopper.Stop(ctx)
 	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
 
@@ -7472,6 +8362,7 @@ func TestAllocatorRebalanceAway(t *testing.T) {
 			var rangeUsageInfo allocator.RangeUsageInfo
 			actual, _, _, ok := a.RebalanceVoter(
 				ctx,
+				sp,
 				roachpb.SpanConfig{Constraints: []roachpb.ConstraintsConjunction{constraints}},
 				nil,
 				existingReplicas,
@@ -7505,14 +8396,14 @@ func (ts *testStore) add(bytes int64, qps float64) {
 	ts.Capacity.QueriesPerSecond += qps
 }
 
-func (ts *testStore) rebalance(ots *testStore, bytes int64, qps float64) {
+func (ts *testStore) rebalance(ots *testStore, bytes int64, qps float64, do DiskCapacityOptions) {
 	if ts.Capacity.RangeCount == 0 || (ts.Capacity.Capacity-ts.Capacity.Available) < bytes {
 		return
 	}
 	// Mimic a real Store's behavior of not considering target stores that are
 	// almost out of disk. (In a real allocator this is, for example, in
 	// rankedCandidateListFor{Allocation,Rebalancing}).
-	if !allocator.MaxCapacityCheck(ots.StoreDescriptor) {
+	if !do.maxCapacityCheck(ots.StoreDescriptor) {
 		log.Infof(
 			context.Background(),
 			"s%d too full to accept snapshot from s%d: %v", ots.StoreID, ts.StoreID, ots.Capacity,
@@ -7549,19 +8440,9 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 	st := cluster.MakeTestingClusterSettings()
 	tr := tracing.NewTracer()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 
-	// Model a set of stores in a cluster doing rebalancing, with ranges being
-	// randomly added occasionally.
-	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID: roachpb.SystemTenantID,
-		Config:   &base.Config{Insecure: true},
-		Clock:    clock,
-		Stopper:  stopper,
-		Settings: st,
-	})
-	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	g := gossip.NewTest(1, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
 	storepool.TimeUntilStoreDead.Override(ctx, &st.SV, storepool.TestTimeUntilStoreDeadOff)
 
@@ -7582,17 +8463,26 @@ func TestAllocatorFullDisks(t *testing.T) {
 		mockNodeLiveness.NodeLivenessFunc,
 		false, /* deterministic */
 	)
-	alloc := MakeAllocator(sp, func(string) (time.Duration, bool) {
+	alloc := MakeAllocator(st, false /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
 		return 0, false
 	}, nil)
 
 	var wg sync.WaitGroup
-	g.RegisterCallback(gossip.MakePrefixPattern(gossip.KeyStorePrefix),
+	g.RegisterCallback(gossip.MakePrefixPattern(gossip.KeyStoreDescPrefix),
 		func(_ string, _ roachpb.Value) { wg.Done() },
 		// Redundant callbacks are required by this test.
 		gossip.Redundant)
 
-	rangesPerNode := int(math.Floor(capacity * rebalanceToMaxFractionUsedThreshold / rangeSize))
+	do := makeDiskCapacityOptions(&st.SV)
+
+	// Each range is equally sized (16mb), we want the number of ranges per node,
+	// when their size is added, to be no greater than the full disk rebalance
+	// threshold (0.925%) e.g for below:
+	//   capacity  = 1024mb
+	//   rangeSize = 16mb
+	//   threshold = 0.925
+	//   rangesPerNode =  ⌊1024mb * 0.925 / 16mb⌋ = 59
+	rangesPerNode := int(math.Floor(capacity * do.RebalanceToThreshold / rangeSize))
 	rangesToAdd := rangesPerNode * nodes
 
 	// Initialize testStores.
@@ -7630,7 +8520,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 				mockNodeLiveness.SetNodeStatus(roachpb.NodeID(j), livenesspb.NodeLivenessStatus_DEAD)
 			}
 			wg.Add(1)
-			if err := g.AddInfoProto(gossip.MakeStoreKey(roachpb.StoreID(j)), &ts.StoreDescriptor, 0); err != nil {
+			if err := g.AddInfoProto(gossip.MakeStoreDescKey(roachpb.StoreID(j)), &ts.StoreDescriptor, 0); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -7648,6 +8538,7 @@ func TestAllocatorFullDisks(t *testing.T) {
 					var rangeUsageInfo allocator.RangeUsageInfo
 					target, _, details, ok := alloc.RebalanceVoter(
 						ctx,
+						sp,
 						emptySpanConfig(),
 						nil,
 						[]roachpb.ReplicaDescriptor{{NodeID: ts.Node.NodeID, StoreID: ts.StoreID}},
@@ -7660,13 +8551,13 @@ func TestAllocatorFullDisks(t *testing.T) {
 						if log.V(1) {
 							log.Infof(ctx, "rebalancing to %v; details: %s", target, details)
 						}
-						testStores[k].rebalance(&testStores[int(target.StoreID)], rangeSize, 0 /* qps */)
+						testStores[k].rebalance(&testStores[int(target.StoreID)], rangeSize, 0 /* qps */, do)
 					}
 				}
 				// Gossip occasionally, as real Stores do when replicas move around.
 				if j%3 == 2 {
 					wg.Add(1)
-					if err := g.AddInfoProto(gossip.MakeStoreKey(roachpb.StoreID(j)), &ts.StoreDescriptor, 0); err != nil {
+					if err := g.AddInfoProto(gossip.MakeStoreDescKey(roachpb.StoreID(j)), &ts.StoreDescriptor, 0); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -7690,10 +8581,11 @@ func TestAllocatorFullDisks(t *testing.T) {
 
 func Example_rangeCountRebalancing() {
 	testStores := make([]testStore, 20)
-	rebalanceFn := func(ctx context.Context, ts *testStore, testStores []testStore, alloc *Allocator) {
+	rebalanceFn := func(ctx context.Context, ts *testStore, testStores []testStore, alloc *Allocator, storePool *storepool.StorePool) {
 		var rangeUsageInfo allocator.RangeUsageInfo
 		target, _, details, ok := alloc.RebalanceVoter(
 			ctx,
+			storePool,
 			emptySpanConfig(),
 			nil,
 			[]roachpb.ReplicaDescriptor{{NodeID: ts.Node.NodeID, StoreID: ts.StoreID}},
@@ -7704,7 +8596,12 @@ func Example_rangeCountRebalancing() {
 		)
 		if ok {
 			log.Infof(ctx, "rebalancing to %v; details: %s", target, details)
-			ts.rebalance(&testStores[int(target.StoreID)], alloc.randGen.Int63n(1<<20), 0 /* qps */)
+			ts.rebalance(
+				&testStores[int(target.StoreID)],
+				alloc.randGen.Int63n(1<<20),
+				0, /* qps */
+				alloc.DiskOptions(),
+			)
 		}
 	}
 
@@ -7789,18 +8686,21 @@ func Example_rangeCountRebalancing() {
 }
 
 func qpsBasedRebalanceFn(
-	ctx context.Context, candidate *testStore, testStores []testStore, alloc *Allocator,
+	ctx context.Context,
+	candidate *testStore,
+	testStores []testStore,
+	alloc *Allocator,
+	storePool *storepool.StorePool,
 ) {
 	avgQPS := candidate.Capacity.QueriesPerSecond / float64(candidate.Capacity.RangeCount)
 	jitteredQPS := avgQPS * (1 + alloc.randGen.Float64())
-	opts := &QPSScorerOptions{
-		StoreHealthOptions:    StoreHealthOptions{EnforcementLevel: StoreHealthNoAction},
-		QPSPerReplica:         jitteredQPS,
-		QPSRebalanceThreshold: 0.2,
-	}
+
+	opts := TestingQPSLoadScorerOptions(jitteredQPS, 0.2)
+	opts.Deterministic = false
 	var rangeUsageInfo allocator.RangeUsageInfo
 	add, remove, details, ok := alloc.RebalanceVoter(
 		ctx,
+		storePool,
 		emptySpanConfig(),
 		nil,
 		[]roachpb.ReplicaDescriptor{{NodeID: candidate.Node.NodeID, StoreID: candidate.StoreID}},
@@ -7811,7 +8711,7 @@ func qpsBasedRebalanceFn(
 	)
 	if ok {
 		log.Infof(ctx, "rebalancing from %v to %v; details: %s", remove, add, details)
-		candidate.rebalance(&testStores[int(add.StoreID)], alloc.randGen.Int63n(1<<20), jitteredQPS)
+		candidate.rebalance(&testStores[int(add.StoreID)], alloc.randGen.Int63n(1<<20), jitteredQPS, opts.DiskOptions)
 	}
 }
 
@@ -7838,58 +8738,58 @@ func Example_qpsRebalancingSingleRegion() {
 	// +-----+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+
 	// | gen |  store 0   |  store 1   |  store 2   |  store 3   |  store 4   |  store 5   |  store 6   |  store 7   |  store 8   |  store 9   |
 	// +-----+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+
-	// |   0 | 2 29943.92 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   2 | 3 17950.57 | 2 11993.35 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   4 |  3 7473.51 |  3 6220.99 |  2 7930.67 |  2 8318.76 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   6 |  3 3411.46 |  4 3478.11 |  3 4735.76 |  3 4775.10 |  2 2598.82 | 4 10944.68 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   8 |  5 3411.46 |  6 3478.11 |  4 3392.44 |  4 2972.12 |  4 2598.82 |  4 4107.39 |  3 4636.29 |  2 5347.30 |     0 0.00 |     0 0.00 |
-	// |  10 |  7 3411.46 |  8 3478.11 |  6 3392.44 |  6 2972.12 |  6 2598.82 |  5 2743.76 |  4 2814.28 |  3 2757.89 |  3 3205.33 |  1 2569.71 |
-	// |  12 |  9 3411.46 | 10 3478.11 |  8 3392.44 |  8 2972.12 |  8 2598.82 |  7 2743.76 |  6 2814.28 |  5 2757.89 |  5 3205.33 |  3 2569.71 |
-	// |  14 | 11 3411.46 | 12 3478.11 | 10 3392.44 | 10 2972.12 | 10 2598.82 |  9 2743.76 |  8 2814.28 |  7 2757.89 |  7 3205.33 |  5 2569.71 |
-	// |  16 | 13 3411.46 | 14 3478.11 | 12 3392.44 | 12 2972.12 | 12 2598.82 | 11 2743.76 | 10 2814.28 |  9 2757.89 |  9 3205.33 |  7 2569.71 |
-	// |  18 | 15 3411.46 | 16 3478.11 | 14 3392.44 | 14 2972.12 | 14 2598.82 | 13 2743.76 | 12 2814.28 | 11 2757.89 | 11 3205.33 |  9 2569.71 |
-	// |  20 | 17 3411.46 | 18 3478.11 | 16 3392.44 | 16 2972.12 | 16 2598.82 | 15 2743.76 | 14 2814.28 | 13 2757.89 | 13 3205.33 | 11 2569.71 |
-	// |  22 | 19 3411.46 | 20 3478.11 | 18 3392.44 | 18 2972.12 | 18 2598.82 | 17 2743.76 | 16 2814.28 | 15 2757.89 | 15 3205.33 | 13 2569.71 |
-	// |  24 | 21 3411.46 | 22 3478.11 | 20 3392.44 | 20 2972.12 | 20 2598.82 | 19 2743.76 | 18 2814.28 | 17 2757.89 | 17 3205.33 | 15 2569.71 |
-	// |  26 | 23 3411.46 | 24 3478.11 | 22 3392.44 | 22 2972.12 | 22 2598.82 | 21 2743.76 | 20 2814.28 | 19 2757.89 | 19 3205.33 | 17 2569.71 |
-	// |  28 | 25 3411.46 | 26 3478.11 | 24 3392.44 | 24 2972.12 | 24 2598.82 | 23 2743.76 | 22 2814.28 | 21 2757.89 | 21 3205.33 | 19 2569.71 |
-	// |  30 | 27 3411.46 | 28 3478.11 | 26 3392.44 | 26 2972.12 | 26 2598.82 | 25 2743.76 | 24 2814.28 | 23 2757.89 | 23 3205.33 | 21 2569.71 |
-	// |  32 | 29 3411.46 | 30 3478.11 | 28 3392.44 | 28 2972.12 | 28 2598.82 | 27 2743.76 | 26 2814.28 | 25 2757.89 | 25 3205.33 | 23 2569.71 |
-	// |  34 | 31 3411.46 | 32 3478.11 | 30 3392.44 | 30 2972.12 | 30 2598.82 | 29 2743.76 | 28 2814.28 | 27 2757.89 | 27 3205.33 | 25 2569.71 |
-	// |  36 | 33 3411.46 | 34 3478.11 | 32 3392.44 | 32 2972.12 | 32 2598.82 | 31 2743.76 | 30 2814.28 | 29 2757.89 | 29 3205.33 | 27 2569.71 |
-	// |  38 | 35 3411.46 | 36 3478.11 | 34 3392.44 | 34 2972.12 | 34 2598.82 | 33 2743.76 | 32 2814.28 | 31 2757.89 | 31 3205.33 | 29 2569.71 |
-	// |  40 | 37 3411.46 | 38 3478.11 | 36 3392.44 | 36 2972.12 | 36 2598.82 | 35 2743.76 | 34 2814.28 | 33 2757.89 | 33 3205.33 | 31 2569.71 |
-	// |  42 | 39 3411.46 | 40 3478.11 | 38 3392.44 | 38 2972.12 | 38 2598.82 | 37 2743.76 | 36 2814.28 | 35 2757.89 | 35 3205.33 | 33 2569.71 |
-	// |  44 | 41 3411.46 | 42 3478.11 | 40 3392.44 | 40 2972.12 | 40 2598.82 | 39 2743.76 | 38 2814.28 | 37 2757.89 | 37 3205.33 | 35 2569.71 |
-	// |  46 | 43 3411.46 | 44 3478.11 | 42 3392.44 | 42 2972.12 | 42 2598.82 | 41 2743.76 | 40 2814.28 | 39 2757.89 | 39 3205.33 | 37 2569.71 |
-	// |  48 | 45 3411.46 | 46 3478.11 | 44 3392.44 | 44 2972.12 | 44 2598.82 | 43 2743.76 | 42 2814.28 | 41 2757.89 | 41 3205.33 | 39 2569.71 |
-	// |  50 | 47 3411.46 | 48 3478.11 | 46 3392.44 | 46 2972.12 | 46 2598.82 | 45 2743.76 | 44 2814.28 | 43 2757.89 | 43 3205.33 | 41 2569.71 |
-	// |  52 | 49 3411.46 | 50 3478.11 | 48 3392.44 | 48 2972.12 | 48 2598.82 | 47 2743.76 | 46 2814.28 | 45 2757.89 | 45 3205.33 | 43 2569.71 |
-	// |  54 | 51 3411.46 | 52 3478.11 | 50 3392.44 | 50 2972.12 | 50 2598.82 | 49 2743.76 | 48 2814.28 | 47 2757.89 | 47 3205.33 | 45 2569.71 |
-	// |  56 | 53 3411.46 | 54 3478.11 | 52 3392.44 | 52 2972.12 | 52 2598.82 | 51 2743.76 | 50 2814.28 | 49 2757.89 | 49 3205.33 | 47 2569.71 |
-	// |  58 | 55 3411.46 | 56 3478.11 | 54 3392.44 | 54 2972.12 | 54 2598.82 | 53 2743.76 | 52 2814.28 | 51 2757.89 | 51 3205.33 | 49 2569.71 |
-	// |  60 | 57 3411.46 | 58 3478.11 | 56 3392.44 | 56 2972.12 | 56 2598.82 | 55 2743.76 | 54 2814.28 | 53 2757.89 | 53 3205.33 | 51 2569.71 |
-	// |  62 | 59 3411.46 | 60 3478.11 | 58 3392.44 | 58 2972.12 | 58 2598.82 | 57 2743.76 | 56 2814.28 | 55 2757.89 | 55 3205.33 | 53 2569.71 |
-	// |  64 | 61 3411.46 | 62 3478.11 | 60 3392.44 | 60 2972.12 | 60 2598.82 | 59 2743.76 | 58 2814.28 | 57 2757.89 | 57 3205.33 | 55 2569.71 |
-	// |  66 | 63 3411.46 | 64 3478.11 | 62 3392.44 | 62 2972.12 | 62 2598.82 | 61 2743.76 | 60 2814.28 | 59 2757.89 | 59 3205.33 | 57 2569.71 |
-	// |  68 | 65 3411.46 | 66 3478.11 | 64 3392.44 | 64 2972.12 | 64 2598.82 | 63 2743.76 | 62 2814.28 | 61 2757.89 | 61 3205.33 | 59 2569.71 |
-	// |  70 | 67 3411.46 | 68 3478.11 | 66 3392.44 | 66 2972.12 | 66 2598.82 | 65 2743.76 | 64 2814.28 | 63 2757.89 | 63 3205.33 | 61 2569.71 |
-	// |  72 | 69 3411.46 | 70 3478.11 | 68 3392.44 | 68 2972.12 | 68 2598.82 | 67 2743.76 | 66 2814.28 | 65 2757.89 | 65 3205.33 | 63 2569.71 |
-	// |  74 | 71 3411.46 | 72 3478.11 | 70 3392.44 | 70 2972.12 | 70 2598.82 | 69 2743.76 | 68 2814.28 | 67 2757.89 | 67 3205.33 | 65 2569.71 |
-	// |  76 | 73 3411.46 | 74 3478.11 | 72 3392.44 | 72 2972.12 | 72 2598.82 | 71 2743.76 | 70 2814.28 | 69 2757.89 | 69 3205.33 | 67 2569.71 |
-	// |  78 | 75 3411.46 | 76 3478.11 | 74 3392.44 | 74 2972.12 | 74 2598.82 | 73 2743.76 | 72 2814.28 | 71 2757.89 | 71 3205.33 | 69 2569.71 |
-	// |  80 | 77 3411.46 | 78 3478.11 | 76 3392.44 | 76 2972.12 | 76 2598.82 | 75 2743.76 | 74 2814.28 | 73 2757.89 | 73 3205.33 | 71 2569.71 |
-	// |  82 | 79 3411.46 | 80 3478.11 | 78 3392.44 | 78 2972.12 | 78 2598.82 | 77 2743.76 | 76 2814.28 | 75 2757.89 | 75 3205.33 | 73 2569.71 |
-	// |  84 | 81 3411.46 | 82 3478.11 | 80 3392.44 | 80 2972.12 | 80 2598.82 | 79 2743.76 | 78 2814.28 | 77 2757.89 | 77 3205.33 | 75 2569.71 |
-	// |  86 | 83 3411.46 | 84 3478.11 | 82 3392.44 | 82 2972.12 | 82 2598.82 | 81 2743.76 | 80 2814.28 | 79 2757.89 | 79 3205.33 | 77 2569.71 |
-	// |  88 | 85 3411.46 | 86 3478.11 | 84 3392.44 | 84 2972.12 | 84 2598.82 | 83 2743.76 | 82 2814.28 | 81 2757.89 | 81 3205.33 | 79 2569.71 |
-	// |  90 | 87 3411.46 | 88 3478.11 | 86 3392.44 | 86 2972.12 | 86 2598.82 | 85 2743.76 | 84 2814.28 | 83 2757.89 | 83 3205.33 | 81 2569.71 |
-	// |  92 | 89 3411.46 | 90 3478.11 | 88 3392.44 | 88 2972.12 | 88 2598.82 | 87 2743.76 | 86 2814.28 | 85 2757.89 | 85 3205.33 | 83 2569.71 |
-	// |  94 | 91 3411.46 | 92 3478.11 | 90 3392.44 | 90 2972.12 | 90 2598.82 | 89 2743.76 | 88 2814.28 | 87 2757.89 | 87 3205.33 | 85 2569.71 |
-	// |  96 | 93 3411.46 | 94 3478.11 | 92 3392.44 | 92 2972.12 | 92 2598.82 | 91 2743.76 | 90 2814.28 | 89 2757.89 | 89 3205.33 | 87 2569.71 |
-	// |  98 | 95 3411.46 | 96 3478.11 | 94 3392.44 | 94 2972.12 | 94 2598.82 | 93 2743.76 | 92 2814.28 | 91 2757.89 | 91 3205.33 | 89 2569.71 |
+	// |   0 | 1 13326.98 | 1 16616.94 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |   2 |  2 3955.65 |  2 6238.15 |  1 1500.16 | 2 18249.96 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |   4 |  3 2011.65 |  3 2823.93 |  3 1500.16 | 3 11773.06 |  2 1886.72 |  2 9948.41 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |   6 |  5 2011.65 |  5 2823.93 |  5 1500.16 |  3 3866.48 |  4 1886.72 |  2 3672.19 |  2 5461.94 |  3 8720.85 |     0 0.00 |     0 0.00 |
+	// |   8 |  7 2011.65 |  7 2823.93 |  7 1500.16 |  4 2580.55 |  6 1886.72 |  3 1526.99 |  3 2376.77 |  4 5101.76 |  4 7951.01 |  1 2184.39 |
+	// |  10 |  9 2011.65 |  9 2823.93 | 10 5059.90 |  6 2580.55 |  8 1886.72 |  8 5128.17 |  5 2376.77 |  4 2730.05 |  4 3161.80 |  3 2184.39 |
+	// |  12 | 11 2011.65 | 11 2823.93 | 11 4567.11 |  8 2580.55 | 12 3116.29 |  9 4391.38 |  7 2376.77 |  6 2730.05 |  6 3161.80 |  5 2184.39 |
+	// |  14 | 13 2011.65 | 13 2823.93 | 13 4567.11 | 10 2580.55 | 14 3116.29 | 11 4391.38 |  9 2376.77 |  8 2730.05 |  8 3161.80 |  7 2184.39 |
+	// |  16 | 15 2011.65 | 15 2823.93 | 15 4567.11 | 12 2580.55 | 16 3116.29 | 13 4391.38 | 11 2376.77 | 10 2730.05 | 10 3161.80 |  9 2184.39 |
+	// |  18 | 17 2011.65 | 17 2823.93 | 17 4567.11 | 14 2580.55 | 18 3116.29 | 15 4391.38 | 13 2376.77 | 12 2730.05 | 12 3161.80 | 11 2184.39 |
+	// |  20 | 19 2011.65 | 19 2823.93 | 19 4567.11 | 16 2580.55 | 20 3116.29 | 17 4391.38 | 15 2376.77 | 14 2730.05 | 14 3161.80 | 13 2184.39 |
+	// |  22 | 21 2011.65 | 21 2823.93 | 21 4567.11 | 18 2580.55 | 22 3116.29 | 19 4391.38 | 17 2376.77 | 16 2730.05 | 16 3161.80 | 15 2184.39 |
+	// |  24 | 23 2011.65 | 23 2823.93 | 23 4567.11 | 20 2580.55 | 24 3116.29 | 21 4391.38 | 19 2376.77 | 18 2730.05 | 18 3161.80 | 17 2184.39 |
+	// |  26 | 25 2011.65 | 25 2823.93 | 25 4567.11 | 22 2580.55 | 26 3116.29 | 23 4391.38 | 21 2376.77 | 20 2730.05 | 20 3161.80 | 19 2184.39 |
+	// |  28 | 27 2011.65 | 27 2823.93 | 27 4567.11 | 24 2580.55 | 28 3116.29 | 25 4391.38 | 23 2376.77 | 22 2730.05 | 22 3161.80 | 21 2184.39 |
+	// |  30 | 29 2011.65 | 29 2823.93 | 29 4567.11 | 26 2580.55 | 30 3116.29 | 27 4391.38 | 25 2376.77 | 24 2730.05 | 24 3161.80 | 23 2184.39 |
+	// |  32 | 31 2011.65 | 31 2823.93 | 31 4567.11 | 28 2580.55 | 32 3116.29 | 29 4391.38 | 27 2376.77 | 26 2730.05 | 26 3161.80 | 25 2184.39 |
+	// |  34 | 33 2011.65 | 33 2823.93 | 33 4567.11 | 30 2580.55 | 34 3116.29 | 31 4391.38 | 29 2376.77 | 28 2730.05 | 28 3161.80 | 27 2184.39 |
+	// |  36 | 35 2011.65 | 35 2823.93 | 35 4567.11 | 32 2580.55 | 36 3116.29 | 33 4391.38 | 31 2376.77 | 30 2730.05 | 30 3161.80 | 29 2184.39 |
+	// |  38 | 37 2011.65 | 37 2823.93 | 37 4567.11 | 34 2580.55 | 38 3116.29 | 35 4391.38 | 33 2376.77 | 32 2730.05 | 32 3161.80 | 31 2184.39 |
+	// |  40 | 39 2011.65 | 39 2823.93 | 39 4567.11 | 36 2580.55 | 40 3116.29 | 37 4391.38 | 35 2376.77 | 34 2730.05 | 34 3161.80 | 33 2184.39 |
+	// |  42 | 41 2011.65 | 41 2823.93 | 41 4567.11 | 38 2580.55 | 42 3116.29 | 39 4391.38 | 37 2376.77 | 36 2730.05 | 36 3161.80 | 35 2184.39 |
+	// |  44 | 43 2011.65 | 43 2823.93 | 43 4567.11 | 40 2580.55 | 44 3116.29 | 41 4391.38 | 39 2376.77 | 38 2730.05 | 38 3161.80 | 37 2184.39 |
+	// |  46 | 45 2011.65 | 45 2823.93 | 45 4567.11 | 42 2580.55 | 46 3116.29 | 43 4391.38 | 41 2376.77 | 40 2730.05 | 40 3161.80 | 39 2184.39 |
+	// |  48 | 47 2011.65 | 47 2823.93 | 47 4567.11 | 44 2580.55 | 48 3116.29 | 45 4391.38 | 43 2376.77 | 42 2730.05 | 42 3161.80 | 41 2184.39 |
+	// |  50 | 49 2011.65 | 49 2823.93 | 49 4567.11 | 46 2580.55 | 50 3116.29 | 47 4391.38 | 45 2376.77 | 44 2730.05 | 44 3161.80 | 43 2184.39 |
+	// |  52 | 51 2011.65 | 51 2823.93 | 51 4567.11 | 48 2580.55 | 52 3116.29 | 49 4391.38 | 47 2376.77 | 46 2730.05 | 46 3161.80 | 45 2184.39 |
+	// |  54 | 53 2011.65 | 53 2823.93 | 53 4567.11 | 50 2580.55 | 54 3116.29 | 51 4391.38 | 49 2376.77 | 48 2730.05 | 48 3161.80 | 47 2184.39 |
+	// |  56 | 55 2011.65 | 55 2823.93 | 55 4567.11 | 52 2580.55 | 56 3116.29 | 53 4391.38 | 51 2376.77 | 50 2730.05 | 50 3161.80 | 49 2184.39 |
+	// |  58 | 57 2011.65 | 57 2823.93 | 57 4567.11 | 54 2580.55 | 58 3116.29 | 55 4391.38 | 53 2376.77 | 52 2730.05 | 52 3161.80 | 51 2184.39 |
+	// |  60 | 59 2011.65 | 59 2823.93 | 59 4567.11 | 56 2580.55 | 60 3116.29 | 57 4391.38 | 55 2376.77 | 54 2730.05 | 54 3161.80 | 53 2184.39 |
+	// |  62 | 61 2011.65 | 61 2823.93 | 61 4567.11 | 58 2580.55 | 62 3116.29 | 59 4391.38 | 57 2376.77 | 56 2730.05 | 56 3161.80 | 55 2184.39 |
+	// |  64 | 63 2011.65 | 63 2823.93 | 63 4567.11 | 60 2580.55 | 64 3116.29 | 61 4391.38 | 59 2376.77 | 58 2730.05 | 58 3161.80 | 57 2184.39 |
+	// |  66 | 65 2011.65 | 65 2823.93 | 65 4567.11 | 62 2580.55 | 66 3116.29 | 63 4391.38 | 61 2376.77 | 60 2730.05 | 60 3161.80 | 59 2184.39 |
+	// |  68 | 67 2011.65 | 67 2823.93 | 67 4567.11 | 64 2580.55 | 68 3116.29 | 65 4391.38 | 63 2376.77 | 62 2730.05 | 62 3161.80 | 61 2184.39 |
+	// |  70 | 69 2011.65 | 69 2823.93 | 69 4567.11 | 66 2580.55 | 70 3116.29 | 67 4391.38 | 65 2376.77 | 64 2730.05 | 64 3161.80 | 63 2184.39 |
+	// |  72 | 71 2011.65 | 71 2823.93 | 71 4567.11 | 68 2580.55 | 72 3116.29 | 69 4391.38 | 67 2376.77 | 66 2730.05 | 66 3161.80 | 65 2184.39 |
+	// |  74 | 73 2011.65 | 73 2823.93 | 73 4567.11 | 70 2580.55 | 74 3116.29 | 71 4391.38 | 69 2376.77 | 68 2730.05 | 68 3161.80 | 67 2184.39 |
+	// |  76 | 75 2011.65 | 75 2823.93 | 75 4567.11 | 72 2580.55 | 76 3116.29 | 73 4391.38 | 71 2376.77 | 70 2730.05 | 70 3161.80 | 69 2184.39 |
+	// |  78 | 77 2011.65 | 77 2823.93 | 77 4567.11 | 74 2580.55 | 78 3116.29 | 75 4391.38 | 73 2376.77 | 72 2730.05 | 72 3161.80 | 71 2184.39 |
+	// |  80 | 79 2011.65 | 79 2823.93 | 79 4567.11 | 76 2580.55 | 80 3116.29 | 77 4391.38 | 75 2376.77 | 74 2730.05 | 74 3161.80 | 73 2184.39 |
+	// |  82 | 81 2011.65 | 81 2823.93 | 81 4567.11 | 78 2580.55 | 82 3116.29 | 79 4391.38 | 77 2376.77 | 76 2730.05 | 76 3161.80 | 75 2184.39 |
+	// |  84 | 83 2011.65 | 83 2823.93 | 83 4567.11 | 80 2580.55 | 84 3116.29 | 81 4391.38 | 79 2376.77 | 78 2730.05 | 78 3161.80 | 77 2184.39 |
+	// |  86 | 85 2011.65 | 85 2823.93 | 85 4567.11 | 82 2580.55 | 86 3116.29 | 83 4391.38 | 81 2376.77 | 80 2730.05 | 80 3161.80 | 79 2184.39 |
+	// |  88 | 87 2011.65 | 87 2823.93 | 87 4567.11 | 84 2580.55 | 88 3116.29 | 85 4391.38 | 83 2376.77 | 82 2730.05 | 82 3161.80 | 81 2184.39 |
+	// |  90 | 89 2011.65 | 89 2823.93 | 89 4567.11 | 86 2580.55 | 90 3116.29 | 87 4391.38 | 85 2376.77 | 84 2730.05 | 84 3161.80 | 83 2184.39 |
+	// |  92 | 91 2011.65 | 91 2823.93 | 91 4567.11 | 88 2580.55 | 92 3116.29 | 89 4391.38 | 87 2376.77 | 86 2730.05 | 86 3161.80 | 85 2184.39 |
+	// |  94 | 93 2011.65 | 93 2823.93 | 93 4567.11 | 90 2580.55 | 94 3116.29 | 91 4391.38 | 89 2376.77 | 88 2730.05 | 88 3161.80 | 87 2184.39 |
+	// |  96 | 95 2011.65 | 95 2823.93 | 95 4567.11 | 92 2580.55 | 96 3116.29 | 93 4391.38 | 91 2376.77 | 90 2730.05 | 90 3161.80 | 89 2184.39 |
+	// |  98 | 97 2011.65 | 97 2823.93 | 97 4567.11 | 94 2580.55 | 98 3116.29 | 95 4391.38 | 93 2376.77 | 92 2730.05 | 92 3161.80 | 91 2184.39 |
 	// +-----+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+
-	// Total bytes=477376096, ranges=939
+	// Total bytes=489775145, ranges=956
 }
 
 func Example_qpsRebalancingMultiRegion() {
@@ -7931,63 +8831,63 @@ func Example_qpsRebalancingMultiRegion() {
 	// +-----+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+
 	// | gen |  store 0   |  store 1   |  store 2   |  store 3   |  store 4   |  store 5   |  store 6   |  store 7   |  store 8   |  store 9   |  store 10  |  store 11  |  store 12  |  store 13  |  store 14  |
 	// +-----+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+
-	// |   0 | 2 29943.92 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   2 | 3 17950.57 | 2 11993.35 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   4 |  3 7473.51 |  3 6220.99 |  2 7930.67 |  2 8318.76 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   6 |  3 3411.46 |  3 1788.05 |  3 5620.53 |  3 5486.53 |  3 4928.13 |  4 8709.23 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |   8 |  4 1954.26 |  5 1788.05 |  3 2121.87 |  3 2138.62 |  3 1269.93 |  4 3938.09 |  5 7465.02 |  5 9268.08 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |  10 |  6 1954.26 |  7 1788.05 |  5 2121.87 |  5 2138.62 |  5 1269.93 |  4 1738.27 |  5 3800.32 |  5 5472.52 |  3 3550.29 |  4 6109.78 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |  12 |  8 1954.26 |  9 1788.05 |  7 2121.87 |  7 2138.62 |  7 1269.93 |  6 1738.27 |  5 2038.40 |  5 3055.35 |  4 2027.79 |  4 2656.52 |  4 3698.73 |  4 5456.13 |     0 0.00 |     0 0.00 |     0 0.00 |
-	// |  14 | 10 1954.26 | 11 1788.05 |  9 2121.87 |  9 2138.62 |  9 1269.93 |  8 1738.27 |  7 2038.40 |  6 2169.10 |  6 2027.79 |  5 1608.05 |  5 2380.65 |  4 3152.09 |  4 3451.23 |  2 2105.61 |     0 0.00 |
-	// |  16 | 12 1954.26 | 13 1788.05 | 11 2121.87 | 11 2138.62 | 11 1269.93 | 10 1738.27 |  9 2038.40 |  8 2169.10 |  8 2027.79 |  7 1608.05 |  7 2380.65 |  5 2041.69 |  5 2161.29 |  4 2105.61 |  3 2400.34 |
-	// |  18 | 14 1954.26 | 15 1788.05 | 13 2121.87 | 13 2138.62 | 14 1881.00 | 12 1738.27 | 11 2038.40 | 10 2169.10 | 10 2027.79 |  9 1608.05 |  9 2380.65 |  7 2041.69 |  7 2161.29 |  6 2105.61 |  4 1789.27 |
-	// |  20 | 16 1954.26 | 17 1788.05 | 15 2121.87 | 15 2138.62 | 16 1881.00 | 14 1738.27 | 13 2038.40 | 12 2169.10 | 12 2027.79 | 11 1608.05 | 11 2380.65 |  9 2041.69 |  9 2161.29 |  8 2105.61 |  6 1789.27 |
-	// |  22 | 18 1954.26 | 19 1788.05 | 17 2121.87 | 17 2138.62 | 18 1881.00 | 16 1738.27 | 15 2038.40 | 14 2169.10 | 14 2027.79 | 13 1608.05 | 13 2380.65 | 11 2041.69 | 11 2161.29 | 10 2105.61 |  8 1789.27 |
-	// |  24 | 20 1954.26 | 21 1788.05 | 19 2121.87 | 19 2138.62 | 20 1881.00 | 18 1738.27 | 17 2038.40 | 16 2169.10 | 16 2027.79 | 15 1608.05 | 15 2380.65 | 13 2041.69 | 13 2161.29 | 12 2105.61 | 10 1789.27 |
-	// |  26 | 22 1954.26 | 23 1788.05 | 21 2121.87 | 21 2138.62 | 22 1881.00 | 20 1738.27 | 19 2038.40 | 18 2169.10 | 18 2027.79 | 17 1608.05 | 17 2380.65 | 15 2041.69 | 15 2161.29 | 14 2105.61 | 12 1789.27 |
-	// |  28 | 24 1954.26 | 25 1788.05 | 23 2121.87 | 23 2138.62 | 24 1881.00 | 22 1738.27 | 21 2038.40 | 20 2169.10 | 20 2027.79 | 19 1608.05 | 19 2380.65 | 17 2041.69 | 17 2161.29 | 16 2105.61 | 14 1789.27 |
-	// |  30 | 26 1954.26 | 27 1788.05 | 25 2121.87 | 25 2138.62 | 26 1881.00 | 24 1738.27 | 23 2038.40 | 22 2169.10 | 22 2027.79 | 21 1608.05 | 21 2380.65 | 19 2041.69 | 19 2161.29 | 18 2105.61 | 16 1789.27 |
-	// |  32 | 28 1954.26 | 29 1788.05 | 27 2121.87 | 27 2138.62 | 28 1881.00 | 26 1738.27 | 25 2038.40 | 24 2169.10 | 24 2027.79 | 23 1608.05 | 23 2380.65 | 21 2041.69 | 21 2161.29 | 20 2105.61 | 18 1789.27 |
-	// |  34 | 30 1954.26 | 31 1788.05 | 29 2121.87 | 29 2138.62 | 30 1881.00 | 28 1738.27 | 27 2038.40 | 26 2169.10 | 26 2027.79 | 25 1608.05 | 25 2380.65 | 23 2041.69 | 23 2161.29 | 22 2105.61 | 20 1789.27 |
-	// |  36 | 32 1954.26 | 33 1788.05 | 31 2121.87 | 31 2138.62 | 32 1881.00 | 30 1738.27 | 29 2038.40 | 28 2169.10 | 28 2027.79 | 27 1608.05 | 27 2380.65 | 25 2041.69 | 25 2161.29 | 24 2105.61 | 22 1789.27 |
-	// |  38 | 34 1954.26 | 35 1788.05 | 33 2121.87 | 33 2138.62 | 34 1881.00 | 32 1738.27 | 31 2038.40 | 30 2169.10 | 30 2027.79 | 29 1608.05 | 29 2380.65 | 27 2041.69 | 27 2161.29 | 26 2105.61 | 24 1789.27 |
-	// |  40 | 36 1954.26 | 37 1788.05 | 35 2121.87 | 35 2138.62 | 36 1881.00 | 34 1738.27 | 33 2038.40 | 32 2169.10 | 32 2027.79 | 31 1608.05 | 31 2380.65 | 29 2041.69 | 29 2161.29 | 28 2105.61 | 26 1789.27 |
-	// |  42 | 38 1954.26 | 39 1788.05 | 37 2121.87 | 37 2138.62 | 38 1881.00 | 36 1738.27 | 35 2038.40 | 34 2169.10 | 34 2027.79 | 33 1608.05 | 33 2380.65 | 31 2041.69 | 31 2161.29 | 30 2105.61 | 28 1789.27 |
-	// |  44 | 40 1954.26 | 41 1788.05 | 39 2121.87 | 39 2138.62 | 40 1881.00 | 38 1738.27 | 37 2038.40 | 36 2169.10 | 36 2027.79 | 35 1608.05 | 35 2380.65 | 33 2041.69 | 33 2161.29 | 32 2105.61 | 30 1789.27 |
-	// |  46 | 42 1954.26 | 43 1788.05 | 41 2121.87 | 41 2138.62 | 42 1881.00 | 40 1738.27 | 39 2038.40 | 38 2169.10 | 38 2027.79 | 37 1608.05 | 37 2380.65 | 35 2041.69 | 35 2161.29 | 34 2105.61 | 32 1789.27 |
-	// |  48 | 44 1954.26 | 45 1788.05 | 43 2121.87 | 43 2138.62 | 44 1881.00 | 42 1738.27 | 41 2038.40 | 40 2169.10 | 40 2027.79 | 39 1608.05 | 39 2380.65 | 37 2041.69 | 37 2161.29 | 36 2105.61 | 34 1789.27 |
-	// |  50 | 46 1954.26 | 47 1788.05 | 45 2121.87 | 45 2138.62 | 46 1881.00 | 44 1738.27 | 43 2038.40 | 42 2169.10 | 42 2027.79 | 41 1608.05 | 41 2380.65 | 39 2041.69 | 39 2161.29 | 38 2105.61 | 36 1789.27 |
-	// |  52 | 48 1954.26 | 49 1788.05 | 47 2121.87 | 47 2138.62 | 48 1881.00 | 46 1738.27 | 45 2038.40 | 44 2169.10 | 44 2027.79 | 43 1608.05 | 43 2380.65 | 41 2041.69 | 41 2161.29 | 40 2105.61 | 38 1789.27 |
-	// |  54 | 50 1954.26 | 51 1788.05 | 49 2121.87 | 49 2138.62 | 50 1881.00 | 48 1738.27 | 47 2038.40 | 46 2169.10 | 46 2027.79 | 45 1608.05 | 45 2380.65 | 43 2041.69 | 43 2161.29 | 42 2105.61 | 40 1789.27 |
-	// |  56 | 52 1954.26 | 53 1788.05 | 51 2121.87 | 51 2138.62 | 52 1881.00 | 50 1738.27 | 49 2038.40 | 48 2169.10 | 48 2027.79 | 47 1608.05 | 47 2380.65 | 45 2041.69 | 45 2161.29 | 44 2105.61 | 42 1789.27 |
-	// |  58 | 54 1954.26 | 55 1788.05 | 53 2121.87 | 53 2138.62 | 54 1881.00 | 52 1738.27 | 51 2038.40 | 50 2169.10 | 50 2027.79 | 49 1608.05 | 49 2380.65 | 47 2041.69 | 47 2161.29 | 46 2105.61 | 44 1789.27 |
-	// |  60 | 56 1954.26 | 57 1788.05 | 55 2121.87 | 55 2138.62 | 56 1881.00 | 54 1738.27 | 53 2038.40 | 52 2169.10 | 52 2027.79 | 51 1608.05 | 51 2380.65 | 49 2041.69 | 49 2161.29 | 48 2105.61 | 46 1789.27 |
-	// |  62 | 58 1954.26 | 59 1788.05 | 57 2121.87 | 57 2138.62 | 58 1881.00 | 56 1738.27 | 55 2038.40 | 54 2169.10 | 54 2027.79 | 53 1608.05 | 53 2380.65 | 51 2041.69 | 51 2161.29 | 50 2105.61 | 48 1789.27 |
-	// |  64 | 60 1954.26 | 61 1788.05 | 59 2121.87 | 59 2138.62 | 60 1881.00 | 58 1738.27 | 57 2038.40 | 56 2169.10 | 56 2027.79 | 55 1608.05 | 55 2380.65 | 53 2041.69 | 53 2161.29 | 52 2105.61 | 50 1789.27 |
-	// |  66 | 62 1954.26 | 63 1788.05 | 61 2121.87 | 61 2138.62 | 62 1881.00 | 60 1738.27 | 59 2038.40 | 58 2169.10 | 58 2027.79 | 57 1608.05 | 57 2380.65 | 55 2041.69 | 55 2161.29 | 54 2105.61 | 52 1789.27 |
-	// |  68 | 64 1954.26 | 65 1788.05 | 63 2121.87 | 63 2138.62 | 64 1881.00 | 62 1738.27 | 61 2038.40 | 60 2169.10 | 60 2027.79 | 59 1608.05 | 59 2380.65 | 57 2041.69 | 57 2161.29 | 56 2105.61 | 54 1789.27 |
-	// |  70 | 66 1954.26 | 67 1788.05 | 65 2121.87 | 65 2138.62 | 66 1881.00 | 64 1738.27 | 63 2038.40 | 62 2169.10 | 62 2027.79 | 61 1608.05 | 61 2380.65 | 59 2041.69 | 59 2161.29 | 58 2105.61 | 56 1789.27 |
-	// |  72 | 68 1954.26 | 69 1788.05 | 67 2121.87 | 67 2138.62 | 68 1881.00 | 66 1738.27 | 65 2038.40 | 64 2169.10 | 64 2027.79 | 63 1608.05 | 63 2380.65 | 61 2041.69 | 61 2161.29 | 60 2105.61 | 58 1789.27 |
-	// |  74 | 70 1954.26 | 71 1788.05 | 69 2121.87 | 69 2138.62 | 70 1881.00 | 68 1738.27 | 67 2038.40 | 66 2169.10 | 66 2027.79 | 65 1608.05 | 65 2380.65 | 63 2041.69 | 63 2161.29 | 62 2105.61 | 60 1789.27 |
-	// |  76 | 72 1954.26 | 73 1788.05 | 71 2121.87 | 71 2138.62 | 72 1881.00 | 70 1738.27 | 69 2038.40 | 68 2169.10 | 68 2027.79 | 67 1608.05 | 67 2380.65 | 65 2041.69 | 65 2161.29 | 64 2105.61 | 62 1789.27 |
-	// |  78 | 74 1954.26 | 75 1788.05 | 73 2121.87 | 73 2138.62 | 74 1881.00 | 72 1738.27 | 71 2038.40 | 70 2169.10 | 70 2027.79 | 69 1608.05 | 69 2380.65 | 67 2041.69 | 67 2161.29 | 66 2105.61 | 64 1789.27 |
-	// |  80 | 76 1954.26 | 77 1788.05 | 75 2121.87 | 75 2138.62 | 76 1881.00 | 74 1738.27 | 73 2038.40 | 72 2169.10 | 72 2027.79 | 71 1608.05 | 71 2380.65 | 69 2041.69 | 69 2161.29 | 68 2105.61 | 66 1789.27 |
-	// |  82 | 78 1954.26 | 79 1788.05 | 77 2121.87 | 77 2138.62 | 78 1881.00 | 76 1738.27 | 75 2038.40 | 74 2169.10 | 74 2027.79 | 73 1608.05 | 73 2380.65 | 71 2041.69 | 71 2161.29 | 70 2105.61 | 68 1789.27 |
-	// |  84 | 80 1954.26 | 81 1788.05 | 79 2121.87 | 79 2138.62 | 80 1881.00 | 78 1738.27 | 77 2038.40 | 76 2169.10 | 76 2027.79 | 75 1608.05 | 75 2380.65 | 73 2041.69 | 73 2161.29 | 72 2105.61 | 70 1789.27 |
-	// |  86 | 82 1954.26 | 83 1788.05 | 81 2121.87 | 81 2138.62 | 82 1881.00 | 80 1738.27 | 79 2038.40 | 78 2169.10 | 78 2027.79 | 77 1608.05 | 77 2380.65 | 75 2041.69 | 75 2161.29 | 74 2105.61 | 72 1789.27 |
-	// |  88 | 84 1954.26 | 85 1788.05 | 83 2121.87 | 83 2138.62 | 84 1881.00 | 82 1738.27 | 81 2038.40 | 80 2169.10 | 80 2027.79 | 79 1608.05 | 79 2380.65 | 77 2041.69 | 77 2161.29 | 76 2105.61 | 74 1789.27 |
-	// |  90 | 86 1954.26 | 87 1788.05 | 85 2121.87 | 85 2138.62 | 86 1881.00 | 84 1738.27 | 83 2038.40 | 82 2169.10 | 82 2027.79 | 81 1608.05 | 81 2380.65 | 79 2041.69 | 79 2161.29 | 78 2105.61 | 76 1789.27 |
-	// |  92 | 88 1954.26 | 89 1788.05 | 87 2121.87 | 87 2138.62 | 88 1881.00 | 86 1738.27 | 85 2038.40 | 84 2169.10 | 84 2027.79 | 83 1608.05 | 83 2380.65 | 81 2041.69 | 81 2161.29 | 80 2105.61 | 78 1789.27 |
-	// |  94 | 90 1954.26 | 91 1788.05 | 89 2121.87 | 89 2138.62 | 90 1881.00 | 88 1738.27 | 87 2038.40 | 86 2169.10 | 86 2027.79 | 85 1608.05 | 85 2380.65 | 83 2041.69 | 83 2161.29 | 82 2105.61 | 80 1789.27 |
-	// |  96 | 92 1954.26 | 93 1788.05 | 91 2121.87 | 91 2138.62 | 92 1881.00 | 90 1738.27 | 89 2038.40 | 88 2169.10 | 88 2027.79 | 87 1608.05 | 87 2380.65 | 85 2041.69 | 85 2161.29 | 84 2105.61 | 82 1789.27 |
-	// |  98 | 94 1954.26 | 95 1788.05 | 93 2121.87 | 93 2138.62 | 94 1881.00 | 92 1738.27 | 91 2038.40 | 90 2169.10 | 90 2027.79 | 89 1608.05 | 89 2380.65 | 87 2041.69 | 87 2161.29 | 86 2105.61 | 84 1789.27 |
+	// |   0 | 1 13326.98 | 1 16616.94 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |   2 |  2 3955.65 |  2 6238.15 |  1 1500.16 | 2 18249.96 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |   4 |  3 2011.65 |  2 1579.59 |  3 1500.16 | 3 12179.64 |  2 2480.10 | 3 10192.77 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |   6 |  5 2011.65 |  4 1579.59 |  5 1500.16 |  3 5261.26 |  3 1401.80 |  3 5277.33 |  3 3581.00 |  3 9331.13 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |   8 |  7 2011.65 |  6 1579.59 |  7 1500.16 |  4 3149.47 |  5 1401.80 |  3 1932.54 |  4 2094.91 |  3 4187.30 |  4 6384.09 |  3 5702.41 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |  10 |  9 2011.65 |  8 1579.59 |  9 1500.16 |  4 1579.69 |  7 1401.80 |  5 1932.54 |  6 2094.91 |  3 1698.58 |  4 3619.15 |  3 1914.40 |  4 4255.69 |  5 6355.75 |     0 0.00 |     0 0.00 |     0 0.00 |
+	// |  12 | 11 2011.65 | 10 1579.59 | 11 1500.16 |  6 1579.69 |  9 1401.80 |  7 1932.54 |  8 2094.91 |  5 1698.58 |  4 1754.07 |  5 1914.40 |  4 1731.22 |  5 3551.83 |  3 2448.48 |  4 4745.00 |     0 0.00 |
+	// |  14 | 13 2011.65 | 12 1579.59 | 13 1500.16 |  8 1579.69 | 14 4023.20 |  9 1932.54 | 10 2094.91 |  7 1698.58 |  6 1754.07 |  7 1914.40 |  6 1731.22 |  5 1906.08 |  4 1628.85 |  4 2732.90 |  3 1856.07 |
+	// |  16 | 15 2011.65 | 16 2068.79 | 16 2223.63 | 10 1579.69 | 14 3379.37 | 11 1932.54 | 12 2094.91 |  9 1698.58 |  8 1754.07 |  9 1914.40 |  8 1731.22 |  7 1906.08 |  6 1628.85 |  5 2164.05 |  5 1856.07 |
+	// |  18 | 17 2011.65 | 18 2068.79 | 18 2223.63 | 13 1902.73 | 14 2687.28 | 13 1932.54 | 14 2094.91 | 11 1698.58 | 10 1754.07 | 11 1914.40 | 10 1731.22 |  9 1906.08 |  9 1997.92 |  7 2164.05 |  7 1856.07 |
+	// |  20 | 19 2011.65 | 20 2068.79 | 20 2223.63 | 15 1902.73 | 15 2395.33 | 15 1932.54 | 16 2094.91 | 14 1990.53 | 12 1754.07 | 13 1914.40 | 12 1731.22 | 11 1906.08 | 11 1997.92 |  9 2164.05 |  9 1856.07 |
+	// |  22 | 21 2011.65 | 22 2068.79 | 22 2223.63 | 17 1902.73 | 17 2395.33 | 17 1932.54 | 18 2094.91 | 16 1990.53 | 14 1754.07 | 15 1914.40 | 14 1731.22 | 13 1906.08 | 13 1997.92 | 11 2164.05 | 11 1856.07 |
+	// |  24 | 23 2011.65 | 24 2068.79 | 24 2223.63 | 19 1902.73 | 19 2395.33 | 19 1932.54 | 20 2094.91 | 18 1990.53 | 16 1754.07 | 17 1914.40 | 16 1731.22 | 15 1906.08 | 15 1997.92 | 13 2164.05 | 13 1856.07 |
+	// |  26 | 25 2011.65 | 26 2068.79 | 26 2223.63 | 21 1902.73 | 21 2395.33 | 21 1932.54 | 22 2094.91 | 20 1990.53 | 18 1754.07 | 19 1914.40 | 18 1731.22 | 17 1906.08 | 17 1997.92 | 15 2164.05 | 15 1856.07 |
+	// |  28 | 27 2011.65 | 28 2068.79 | 28 2223.63 | 23 1902.73 | 23 2395.33 | 23 1932.54 | 24 2094.91 | 22 1990.53 | 20 1754.07 | 21 1914.40 | 20 1731.22 | 19 1906.08 | 19 1997.92 | 17 2164.05 | 17 1856.07 |
+	// |  30 | 29 2011.65 | 30 2068.79 | 30 2223.63 | 25 1902.73 | 25 2395.33 | 25 1932.54 | 26 2094.91 | 24 1990.53 | 22 1754.07 | 23 1914.40 | 22 1731.22 | 21 1906.08 | 21 1997.92 | 19 2164.05 | 19 1856.07 |
+	// |  32 | 31 2011.65 | 32 2068.79 | 32 2223.63 | 27 1902.73 | 27 2395.33 | 27 1932.54 | 28 2094.91 | 26 1990.53 | 24 1754.07 | 25 1914.40 | 24 1731.22 | 23 1906.08 | 23 1997.92 | 21 2164.05 | 21 1856.07 |
+	// |  34 | 33 2011.65 | 34 2068.79 | 34 2223.63 | 29 1902.73 | 29 2395.33 | 29 1932.54 | 30 2094.91 | 28 1990.53 | 26 1754.07 | 27 1914.40 | 26 1731.22 | 25 1906.08 | 25 1997.92 | 23 2164.05 | 23 1856.07 |
+	// |  36 | 35 2011.65 | 36 2068.79 | 36 2223.63 | 31 1902.73 | 31 2395.33 | 31 1932.54 | 32 2094.91 | 30 1990.53 | 28 1754.07 | 29 1914.40 | 28 1731.22 | 27 1906.08 | 27 1997.92 | 25 2164.05 | 25 1856.07 |
+	// |  38 | 37 2011.65 | 38 2068.79 | 38 2223.63 | 33 1902.73 | 33 2395.33 | 33 1932.54 | 34 2094.91 | 32 1990.53 | 30 1754.07 | 31 1914.40 | 30 1731.22 | 29 1906.08 | 29 1997.92 | 27 2164.05 | 27 1856.07 |
+	// |  40 | 39 2011.65 | 40 2068.79 | 40 2223.63 | 35 1902.73 | 35 2395.33 | 35 1932.54 | 36 2094.91 | 34 1990.53 | 32 1754.07 | 33 1914.40 | 32 1731.22 | 31 1906.08 | 31 1997.92 | 29 2164.05 | 29 1856.07 |
+	// |  42 | 41 2011.65 | 42 2068.79 | 42 2223.63 | 37 1902.73 | 37 2395.33 | 37 1932.54 | 38 2094.91 | 36 1990.53 | 34 1754.07 | 35 1914.40 | 34 1731.22 | 33 1906.08 | 33 1997.92 | 31 2164.05 | 31 1856.07 |
+	// |  44 | 43 2011.65 | 44 2068.79 | 44 2223.63 | 39 1902.73 | 39 2395.33 | 39 1932.54 | 40 2094.91 | 38 1990.53 | 36 1754.07 | 37 1914.40 | 36 1731.22 | 35 1906.08 | 35 1997.92 | 33 2164.05 | 33 1856.07 |
+	// |  46 | 45 2011.65 | 46 2068.79 | 46 2223.63 | 41 1902.73 | 41 2395.33 | 41 1932.54 | 42 2094.91 | 40 1990.53 | 38 1754.07 | 39 1914.40 | 38 1731.22 | 37 1906.08 | 37 1997.92 | 35 2164.05 | 35 1856.07 |
+	// |  48 | 47 2011.65 | 48 2068.79 | 48 2223.63 | 43 1902.73 | 43 2395.33 | 43 1932.54 | 44 2094.91 | 42 1990.53 | 40 1754.07 | 41 1914.40 | 40 1731.22 | 39 1906.08 | 39 1997.92 | 37 2164.05 | 37 1856.07 |
+	// |  50 | 49 2011.65 | 50 2068.79 | 50 2223.63 | 45 1902.73 | 45 2395.33 | 45 1932.54 | 46 2094.91 | 44 1990.53 | 42 1754.07 | 43 1914.40 | 42 1731.22 | 41 1906.08 | 41 1997.92 | 39 2164.05 | 39 1856.07 |
+	// |  52 | 51 2011.65 | 52 2068.79 | 52 2223.63 | 47 1902.73 | 47 2395.33 | 47 1932.54 | 48 2094.91 | 46 1990.53 | 44 1754.07 | 45 1914.40 | 44 1731.22 | 43 1906.08 | 43 1997.92 | 41 2164.05 | 41 1856.07 |
+	// |  54 | 53 2011.65 | 54 2068.79 | 54 2223.63 | 49 1902.73 | 49 2395.33 | 49 1932.54 | 50 2094.91 | 48 1990.53 | 46 1754.07 | 47 1914.40 | 46 1731.22 | 45 1906.08 | 45 1997.92 | 43 2164.05 | 43 1856.07 |
+	// |  56 | 55 2011.65 | 56 2068.79 | 56 2223.63 | 51 1902.73 | 51 2395.33 | 51 1932.54 | 52 2094.91 | 50 1990.53 | 48 1754.07 | 49 1914.40 | 48 1731.22 | 47 1906.08 | 47 1997.92 | 45 2164.05 | 45 1856.07 |
+	// |  58 | 57 2011.65 | 58 2068.79 | 58 2223.63 | 53 1902.73 | 53 2395.33 | 53 1932.54 | 54 2094.91 | 52 1990.53 | 50 1754.07 | 51 1914.40 | 50 1731.22 | 49 1906.08 | 49 1997.92 | 47 2164.05 | 47 1856.07 |
+	// |  60 | 59 2011.65 | 60 2068.79 | 60 2223.63 | 55 1902.73 | 55 2395.33 | 55 1932.54 | 56 2094.91 | 54 1990.53 | 52 1754.07 | 53 1914.40 | 52 1731.22 | 51 1906.08 | 51 1997.92 | 49 2164.05 | 49 1856.07 |
+	// |  62 | 61 2011.65 | 62 2068.79 | 62 2223.63 | 57 1902.73 | 57 2395.33 | 57 1932.54 | 58 2094.91 | 56 1990.53 | 54 1754.07 | 55 1914.40 | 54 1731.22 | 53 1906.08 | 53 1997.92 | 51 2164.05 | 51 1856.07 |
+	// |  64 | 63 2011.65 | 64 2068.79 | 64 2223.63 | 59 1902.73 | 59 2395.33 | 59 1932.54 | 60 2094.91 | 58 1990.53 | 56 1754.07 | 57 1914.40 | 56 1731.22 | 55 1906.08 | 55 1997.92 | 53 2164.05 | 53 1856.07 |
+	// |  66 | 65 2011.65 | 66 2068.79 | 66 2223.63 | 61 1902.73 | 61 2395.33 | 61 1932.54 | 62 2094.91 | 60 1990.53 | 58 1754.07 | 59 1914.40 | 58 1731.22 | 57 1906.08 | 57 1997.92 | 55 2164.05 | 55 1856.07 |
+	// |  68 | 67 2011.65 | 68 2068.79 | 68 2223.63 | 63 1902.73 | 63 2395.33 | 63 1932.54 | 64 2094.91 | 62 1990.53 | 60 1754.07 | 61 1914.40 | 60 1731.22 | 59 1906.08 | 59 1997.92 | 57 2164.05 | 57 1856.07 |
+	// |  70 | 69 2011.65 | 70 2068.79 | 70 2223.63 | 65 1902.73 | 65 2395.33 | 65 1932.54 | 66 2094.91 | 64 1990.53 | 62 1754.07 | 63 1914.40 | 62 1731.22 | 61 1906.08 | 61 1997.92 | 59 2164.05 | 59 1856.07 |
+	// |  72 | 71 2011.65 | 72 2068.79 | 72 2223.63 | 67 1902.73 | 67 2395.33 | 67 1932.54 | 68 2094.91 | 66 1990.53 | 64 1754.07 | 65 1914.40 | 64 1731.22 | 63 1906.08 | 63 1997.92 | 61 2164.05 | 61 1856.07 |
+	// |  74 | 73 2011.65 | 74 2068.79 | 74 2223.63 | 69 1902.73 | 69 2395.33 | 69 1932.54 | 70 2094.91 | 68 1990.53 | 66 1754.07 | 67 1914.40 | 66 1731.22 | 65 1906.08 | 65 1997.92 | 63 2164.05 | 63 1856.07 |
+	// |  76 | 75 2011.65 | 76 2068.79 | 76 2223.63 | 71 1902.73 | 71 2395.33 | 71 1932.54 | 72 2094.91 | 70 1990.53 | 68 1754.07 | 69 1914.40 | 68 1731.22 | 67 1906.08 | 67 1997.92 | 65 2164.05 | 65 1856.07 |
+	// |  78 | 77 2011.65 | 78 2068.79 | 78 2223.63 | 73 1902.73 | 73 2395.33 | 73 1932.54 | 74 2094.91 | 72 1990.53 | 70 1754.07 | 71 1914.40 | 70 1731.22 | 69 1906.08 | 69 1997.92 | 67 2164.05 | 67 1856.07 |
+	// |  80 | 79 2011.65 | 80 2068.79 | 80 2223.63 | 75 1902.73 | 75 2395.33 | 75 1932.54 | 76 2094.91 | 74 1990.53 | 72 1754.07 | 73 1914.40 | 72 1731.22 | 71 1906.08 | 71 1997.92 | 69 2164.05 | 69 1856.07 |
+	// |  82 | 81 2011.65 | 82 2068.79 | 82 2223.63 | 77 1902.73 | 77 2395.33 | 77 1932.54 | 78 2094.91 | 76 1990.53 | 74 1754.07 | 75 1914.40 | 74 1731.22 | 73 1906.08 | 73 1997.92 | 71 2164.05 | 71 1856.07 |
+	// |  84 | 83 2011.65 | 84 2068.79 | 84 2223.63 | 79 1902.73 | 79 2395.33 | 79 1932.54 | 80 2094.91 | 78 1990.53 | 76 1754.07 | 77 1914.40 | 76 1731.22 | 75 1906.08 | 75 1997.92 | 73 2164.05 | 73 1856.07 |
+	// |  86 | 85 2011.65 | 86 2068.79 | 86 2223.63 | 81 1902.73 | 81 2395.33 | 81 1932.54 | 82 2094.91 | 80 1990.53 | 78 1754.07 | 79 1914.40 | 78 1731.22 | 77 1906.08 | 77 1997.92 | 75 2164.05 | 75 1856.07 |
+	// |  88 | 87 2011.65 | 88 2068.79 | 88 2223.63 | 83 1902.73 | 83 2395.33 | 83 1932.54 | 84 2094.91 | 82 1990.53 | 80 1754.07 | 81 1914.40 | 80 1731.22 | 79 1906.08 | 79 1997.92 | 77 2164.05 | 77 1856.07 |
+	// |  90 | 89 2011.65 | 90 2068.79 | 90 2223.63 | 85 1902.73 | 85 2395.33 | 85 1932.54 | 86 2094.91 | 84 1990.53 | 82 1754.07 | 83 1914.40 | 82 1731.22 | 81 1906.08 | 81 1997.92 | 79 2164.05 | 79 1856.07 |
+	// |  92 | 91 2011.65 | 92 2068.79 | 92 2223.63 | 87 1902.73 | 87 2395.33 | 87 1932.54 | 88 2094.91 | 86 1990.53 | 84 1754.07 | 85 1914.40 | 84 1731.22 | 83 1906.08 | 83 1997.92 | 81 2164.05 | 81 1856.07 |
+	// |  94 | 93 2011.65 | 94 2068.79 | 94 2223.63 | 89 1902.73 | 89 2395.33 | 89 1932.54 | 90 2094.91 | 88 1990.53 | 86 1754.07 | 87 1914.40 | 86 1731.22 | 85 1906.08 | 85 1997.92 | 83 2164.05 | 83 1856.07 |
+	// |  96 | 95 2011.65 | 96 2068.79 | 96 2223.63 | 91 1902.73 | 91 2395.33 | 91 1932.54 | 92 2094.91 | 90 1990.53 | 88 1754.07 | 89 1914.40 | 88 1731.22 | 87 1906.08 | 87 1997.92 | 85 2164.05 | 85 1856.07 |
+	// |  98 | 97 2011.65 | 98 2068.79 | 98 2223.63 | 93 1902.73 | 93 2395.33 | 93 1932.54 | 94 2094.91 | 92 1990.53 | 90 1754.07 | 91 1914.40 | 90 1731.22 | 89 1906.08 | 89 1997.92 | 87 2164.05 | 87 1856.07 |
 	// +-----+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+------------+
-	// Total bytes=709837749, ranges=1369
+	// Total bytes=708507194, ranges=1396
 }
 
 func exampleRebalancing(
 	testStores []testStore,
-	rebalanceFn func(context.Context, *testStore, []testStore, *Allocator),
+	rebalanceFn func(context.Context, *testStore, []testStore, *Allocator, *storepool.StorePool),
 	printFn func([]testStore, *tablewriter.Table),
 ) {
 	stopper := stop.NewStopper()
@@ -7996,19 +8896,11 @@ func exampleRebalancing(
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	ambientCtx := log.MakeTestingAmbientContext(stopper.Tracer())
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(nil)
 
 	// Model a set of stores in a cluster,
 	// adding / rebalancing ranges of random sizes.
-	rpcContext := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID: roachpb.SystemTenantID,
-		Config:   &base.Config{Insecure: true},
-		Clock:    clock,
-		Stopper:  stopper,
-		Settings: st,
-	})
-	server := rpc.NewServer(rpcContext) // never started
-	g := gossip.NewTest(1, rpcContext, server, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
+	g := gossip.NewTest(1, stopper, metric.NewRegistry(), zonepb.DefaultZoneConfigRef())
 
 	storepool.TimeUntilStoreDead.Override(ctx, &st.SV, storepool.TestTimeUntilStoreDeadOff)
 
@@ -8027,12 +8919,12 @@ func exampleRebalancing(
 		storepool.NewMockNodeLiveness(livenesspb.NodeLivenessStatus_LIVE).NodeLivenessFunc,
 		/* deterministic */ true,
 	)
-	alloc := MakeAllocator(sp, func(string) (time.Duration, bool) {
+	alloc := MakeAllocator(st, true /* deterministic */, func(id roachpb.NodeID) (time.Duration, bool) {
 		return 0, false
 	}, nil)
 
 	var wg sync.WaitGroup
-	g.RegisterCallback(gossip.MakePrefixPattern(gossip.KeyStorePrefix),
+	g.RegisterCallback(gossip.MakePrefixPattern(gossip.KeyStoreDescPrefix),
 		func(_ string, _ roachpb.Value) { wg.Done() },
 		// Redundant callbacks are required by this test.
 		gossip.Redundant)
@@ -8065,7 +8957,7 @@ func exampleRebalancing(
 				testStores[j].add(alloc.randGen.Int63n(1<<20), 0)
 			}
 			if err := g.AddInfoProto(
-				gossip.MakeStoreKey(roachpb.StoreID(j)),
+				gossip.MakeStoreDescKey(roachpb.StoreID(j)),
 				&testStores[j].StoreDescriptor,
 				0,
 			); err != nil {
@@ -8080,7 +8972,7 @@ func exampleRebalancing(
 			if ts.Capacity.RangeCount == 0 {
 				continue
 			}
-			rebalanceFn(ctx, ts, testStores, &alloc)
+			rebalanceFn(ctx, ts, testStores, &alloc, sp)
 		}
 
 		printFn(testStores, table)
@@ -8109,4 +9001,133 @@ func initTestStores(testStores []testStore, firstRangeSize int64, firstStoreQPS 
 
 	// Initialize the cluster with a single range.
 	testStores[0].add(firstRangeSize, firstStoreQPS)
+}
+
+func TestNonVoterPrioritizationInVoterAdditions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	stores := []*roachpb.StoreDescriptor{
+		{
+			StoreID:  1,
+			Node:     roachpb.NodeDescriptor{NodeID: 1},
+			Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 100, RangeCount: 514},
+		},
+		{
+			StoreID:  2,
+			Node:     roachpb.NodeDescriptor{NodeID: 2},
+			Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 100, RangeCount: 520},
+		},
+		{
+			StoreID:  3,
+			Node:     roachpb.NodeDescriptor{NodeID: 3},
+			Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 100, RangeCount: 470},
+		},
+		{
+			StoreID: 4,
+			Node: roachpb.NodeDescriptor{
+				NodeID: 4,
+				Attrs:  roachpb.Attributes{Attrs: []string{"a"}},
+			},
+			Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 100, RangeCount: 480},
+		},
+		{
+			StoreID:  5,
+			Node:     roachpb.NodeDescriptor{NodeID: 5},
+			Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 100, RangeCount: 516},
+		},
+		{
+			StoreID:  6,
+			Node:     roachpb.NodeDescriptor{NodeID: 6},
+			Capacity: roachpb.StoreCapacity{Capacity: 200, Available: 100, RangeCount: 500},
+		},
+	}
+
+	ctx := context.Background()
+	stopper, g, sp, a, _ := CreateTestAllocator(ctx, 10, false /* deterministic */)
+	defer stopper.Stop(ctx)
+	gossiputil.NewStoreGossiper(g).GossipStores(stores, t)
+
+	testCases := []struct {
+		existingVoters         []roachpb.ReplicaDescriptor
+		existingNonVoters      []roachpb.ReplicaDescriptor
+		spanConfig             roachpb.SpanConfig
+		expectedTargetAllocate roachpb.ReplicationTarget
+	}{
+		// NB: Store 5 has a non-voter and range count 516 and store 4 can add a
+		// voter and has range count 480. Allocator should select store 5 with the
+		// non-voter despite having higher range count than store 4 with the voter.
+		{
+			existingVoters: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1},
+				{NodeID: 2, StoreID: 2},
+				{NodeID: 3, StoreID: 3},
+			},
+			existingNonVoters: []roachpb.ReplicaDescriptor{
+				{NodeID: 5, StoreID: 5},
+			},
+			spanConfig:             emptySpanConfig(),
+			expectedTargetAllocate: roachpb.ReplicationTarget{NodeID: 5, StoreID: 5},
+		},
+		// NB: Store 3 can add a voter and has range count 470 (underfull), and
+		// stores 4 and 5 have non-voters and range counts > 475 (not underfull).
+		// Allocator should select store 3 with the lower balance score despite
+		// not having a non-voter like stores 4 and 5.
+		{
+			existingVoters: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1},
+				{NodeID: 2, StoreID: 2},
+			},
+			existingNonVoters: []roachpb.ReplicaDescriptor{
+				{NodeID: 4, StoreID: 4},
+				{NodeID: 5, StoreID: 5},
+			},
+			spanConfig:             emptySpanConfig(),
+			expectedTargetAllocate: roachpb.ReplicationTarget{NodeID: 3, StoreID: 3},
+		},
+		// NB: Store 4 can add a voter and satisfies the voter constraints, and
+		// store 5 has a non-voter but does not satisfy the voter constraints.
+		// Allocator should select store 4 that satisfies the voter constraints
+		// despite not having a non-voter like store 5.
+		{
+			existingVoters: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1},
+				{NodeID: 2, StoreID: 2},
+				{NodeID: 3, StoreID: 3},
+			},
+			existingNonVoters: []roachpb.ReplicaDescriptor{
+				{NodeID: 5, StoreID: 5},
+			},
+			spanConfig: roachpb.SpanConfig{
+				VoterConstraints: []roachpb.ConstraintsConjunction{
+					{
+						Constraints: []roachpb.Constraint{
+							{Value: "a", Type: roachpb.Constraint_REQUIRED},
+						},
+					},
+				},
+			},
+			expectedTargetAllocate: roachpb.ReplicationTarget{NodeID: 4, StoreID: 4},
+		},
+	}
+
+	for i, tc := range testCases {
+		result, _, _ := a.AllocateVoter(ctx, sp, tc.spanConfig, tc.existingVoters, tc.existingNonVoters, nil, Alive)
+		assert.Equal(t, tc.expectedTargetAllocate, result, "Unexpected replication target returned by allocate voter in test %d", i)
+	}
+}
+
+func TestingQPSLoadScorerOptions(
+	qpsPerReplica float64, qpsRebalanceThreshold float64,
+) *LoadScorerOptions {
+	options := &LoadScorerOptions{
+		DiskOptions:                  defaultDiskCapacityOptions(),
+		Deterministic:                true,
+		LoadDims:                     []load.Dimension{load.Queries},
+		LoadThreshold:                MakeQPSOnlyDim(qpsRebalanceThreshold),
+		MinLoadThreshold:             LoadMinThresholds(load.Queries),
+		MinRequiredRebalanceLoadDiff: MakeQPSOnlyDim(0),
+		RebalanceImpact:              MakeQPSOnlyDim(qpsPerReplica),
+	}
+	return options
 }

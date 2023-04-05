@@ -12,21 +12,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/licenseccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher/systemconfigwatchertest"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance/instancestorage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -49,7 +51,11 @@ func TestSQLServer(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		// We need to disable the default test tenant because we're going to create
+		// our own.
+		DefaultTestTenant: base.TestTenantDisabled,
+	}})
 	defer tc.Stopper().Stop(ctx)
 
 	_, db := serverutils.StartTenant(
@@ -74,11 +80,13 @@ func TestTenantCannotSetClusterSetting(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantDisabled,
+	}})
 	defer tc.Stopper().Stop(ctx)
 
 	// StartTenant with the default permissions to
-	_, db := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: serverutils.TestTenantID(), AllowSettingClusterSettings: false})
+	_, db := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: serverutils.TestTenantID()})
 	defer db.Close()
 	_, err := db.Exec(`SET CLUSTER SETTING sql.defaults.vectorize=off`)
 	require.NoError(t, err)
@@ -99,13 +107,15 @@ func TestTenantCanUseEnterpriseFeatures(t *testing.T) {
 		Type: licenseccl.License_Enterprise,
 	}).Encode()
 
-	defer utilccl.TestingDisableEnterprise()()
+	defer ccl.TestingDisableEnterprise()()
 	defer envutil.TestSetEnv(t, "COCKROACH_TENANT_LICENSE", license)()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantDisabled,
+	}})
 	defer tc.Stopper().Stop(context.Background())
 
-	_, db := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: serverutils.TestTenantID(), AllowSettingClusterSettings: false})
+	_, db := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{TenantID: serverutils.TestTenantID()})
 	defer db.Close()
 
 	_, err := db.Exec(`BACKUP INTO 'userfile:///backup'`)
@@ -119,21 +129,23 @@ func TestTenantUnauthenticatedAccess(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantProbabilistic,
+	}})
 	defer tc.Stopper().Stop(ctx)
 
 	_, err := tc.Server(0).StartTenant(ctx,
 		base.TestTenantArgs{
-			TenantID: roachpb.MakeTenantID(security.EmbeddedTenantIDs()[0]),
+			TenantID: roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[0]),
 			TestingKnobs: base.TestingKnobs{
 				TenantTestingKnobs: &sql.TenantTestingKnobs{
 					// Configure the SQL server to access the wrong tenant keyspace.
-					TenantIDCodecOverride: roachpb.MakeTenantID(security.EmbeddedTenantIDs()[1]),
+					TenantIDCodecOverride: roachpb.MustMakeTenantID(security.EmbeddedTenantIDs()[1]),
 				},
 			},
 		})
 	require.Error(t, err)
-	require.Regexp(t, `Unauthenticated desc = requested key .* not fully contained in tenant keyspace /Tenant/1{0-1}`, err)
+	require.Regexp(t, `requested key .* not fully contained in tenant keyspace /Tenant/1{0-1}.*Unauthenticated`, err)
 }
 
 // TestTenantHTTP verifies that SQL tenant servers expose metrics and debugging endpoints.
@@ -142,7 +154,9 @@ func TestTenantHTTP(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantDisabled,
+	}})
 	defer tc.Stopper().Stop(ctx)
 
 	tenant, err := tc.Server(0).StartTenant(ctx,
@@ -158,7 +172,7 @@ func TestTenantHTTP(t *testing.T) {
 		resp, err := httpClient.Get(tenant.AdminURL() + "/_status/vars")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "sql_ddl_started_count_internal")
 	})
@@ -169,7 +183,7 @@ func TestTenantHTTP(t *testing.T) {
 		resp, err := httpClient.Get(tenant.AdminURL() + "/debug/pprof/goroutine?debug=2")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "goroutine")
 	})
@@ -181,17 +195,20 @@ func TestNonExistentTenant(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TestTenantDisabled,
+		},
+	})
 	defer tc.Stopper().Stop(ctx)
 
 	_, err := tc.Server(0).StartTenant(ctx,
 		base.TestTenantArgs{
-			TenantID:        serverutils.TestTenantID(),
-			Existing:        true,
-			SkipTenantCheck: true,
+			TenantID:            serverutils.TestTenantID(),
+			DisableCreateTenant: true,
+			SkipTenantCheck:     true,
 		})
-	require.Error(t, err)
-	require.Equal(t, "system DB uninitialized, check if tenant is non existent", err.Error())
+	require.EqualError(t, err, `database "[1]" does not exist`)
 }
 
 // TestTenantRowIDs confirms `unique_rowid()` works as expected in a
@@ -201,7 +218,9 @@ func TestTenantRowIDs(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantDisabled,
+	}})
 	defer tc.Stopper().Stop(ctx)
 	const numRows = 10
 	tenant, db := serverutils.StartTenant(
@@ -231,25 +250,45 @@ func TestTenantRowIDs(t *testing.T) {
 	require.Equal(t, numRows, rowCount)
 }
 
-// TestNoInflightTracesVirtualTableOnTenant verifies that internal inflight traces table
-// is correctly handled by tenants (which don't provide this functionality as of now).
-func TestNoInflightTracesVirtualTableOnTenant(t *testing.T) {
+// TestTenantInstanceIDReclaimLoop confirms that the sql_instances reclaim loop
+// has been started.
+func TestTenantInstanceIDReclaimLoop(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	args := base.TestClusterArgs{}
-	tc := testcluster.StartTestCluster(t, 2 /* nodes */, args)
+	settings := cluster.MakeTestingClusterSettings()
+	tc := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			Settings: settings,
+			// Don't use a default test tenant. We will explicitly create one.
+			DefaultTestTenant: base.TestTenantDisabled,
+		},
+	})
 	defer tc.Stopper().Stop(ctx)
 
-	tenn, err := tc.Server(0).StartTenant(ctx, base.TestTenantArgs{TenantID: serverutils.TestTenantID()})
-	require.NoError(t, err, "Failed to start tenant node")
-	ex := tenn.DistSQLServer().(*distsql.ServerImpl).ServerConfig.Executor
-	_, err = ex.Exec(ctx, "get table", nil, /* txn */
-		"select * from crdb_internal.cluster_inflight_traces WHERE trace_id = 4;")
-	require.Error(t, err, "cluster_inflight_traces should be unsupported")
-	require.Contains(t, err.Error(), "table crdb_internal.cluster_inflight_traces is not implemented on tenants")
+	clusterSettings := tc.Server(0).ClusterSettings()
+	instancestorage.ReclaimLoopInterval.Override(ctx, &clusterSettings.SV, 250*time.Millisecond)
+	instancestorage.PreallocatedCount.Override(ctx, &clusterSettings.SV, 5)
+
+	_, db := serverutils.StartTenant(
+		t,
+		tc.Server(0),
+		base.TestTenantArgs{TenantID: serverutils.TestTenantID(), Settings: settings},
+	)
+	defer db.Close()
+	sqlDB := sqlutils.MakeSQLRunner(db)
+
+	var rowCount int64
+	testutils.SucceedsSoon(t, func() error {
+		sqlDB.QueryRow(t, `SELECT count(*) FROM system.sql_instances WHERE addr IS NULL`).Scan(&rowCount)
+		// We set PreallocatedCount to 5. When the tenant gets started, it drops
+		// to 4. Eventually this will be 5 if the reclaim loop runs.
+		if rowCount == 5 {
+			return nil
+		}
+		return fmt.Errorf("waiting for preallocated rows")
+	})
 }
 
 func TestSystemConfigWatcherCache(t *testing.T) {

@@ -13,6 +13,7 @@ package delegate
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/deprecatedshowranges"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
@@ -58,6 +59,9 @@ func TryDelegate(
 	case *tree.ShowCreate:
 		return d.delegateShowCreate(t)
 
+	case *tree.ShowCreateFunction:
+		return d.delegateShowCreateFunction(t)
+
 	case *tree.ShowCreateAllSchemas:
 		return d.delegateShowCreateAllSchemas()
 
@@ -95,6 +99,13 @@ func TryDelegate(
 		return d.delegateShowQueries(t)
 
 	case *tree.ShowRanges:
+		// Remove in v23.2.
+		//
+		// This chooses a different implementation of the SHOW statement
+		// depending on a run-time config setting.
+		if deprecatedshowranges.EnableDeprecatedBehavior(ctx, evalCtx.Settings, evalCtx.ClientNoticeSender) {
+			return d.delegateShowRangesDEPRECATED(t)
+		}
 		return d.delegateShowRanges(t)
 
 	case *tree.ShowRangeForRow:
@@ -124,6 +135,9 @@ func TryDelegate(
 	case *tree.ShowSyntax:
 		return d.delegateShowSyntax(t)
 
+	case *tree.ShowFunctions:
+		return d.delegateShowFunctions(t)
+
 	case *tree.ShowTables:
 		return d.delegateShowTables(t)
 
@@ -139,14 +153,8 @@ func TryDelegate(
 	case *tree.ShowZoneConfig:
 		return d.delegateShowZoneConfig(t)
 
-	case *tree.ShowTransactionStatus:
-		return d.delegateShowVar(&tree.ShowVar{Name: "transaction_status"})
-
 	case *tree.ShowSchedules:
 		return d.delegateShowSchedules(t)
-
-	case *tree.ShowCompletions:
-		return d.delegateShowCompletions(t)
 
 	case *tree.ControlJobsForSchedules:
 		return d.delegateJobControl(ControlJobsDelegate{
@@ -194,7 +202,11 @@ type delegator struct {
 	evalCtx *eval.Context
 }
 
-func parse(sql string) (tree.Statement, error) {
+func (d *delegator) parse(sql string) (tree.Statement, error) {
 	s, err := parser.ParseOne(sql)
+	if err != nil {
+		return s.AST, err
+	}
+	d.evalCtx.Planner.MaybeReallocateAnnotations(s.NumAnnotations)
 	return s.AST, err
 }

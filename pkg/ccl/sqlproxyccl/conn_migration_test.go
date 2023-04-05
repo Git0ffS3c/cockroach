@@ -91,6 +91,7 @@ func TestForwarder_tryBeginTransfer(t *testing.T) {
 		f := &forwarder{}
 		f.mu.request = &processor{}
 		f.mu.response = &processor{}
+		f.mu.isInitialized = true
 
 		started, cleanupFn := f.tryBeginTransfer()
 		require.False(t, started)
@@ -107,6 +108,7 @@ func TestForwarder_tryBeginTransfer(t *testing.T) {
 		f := &forwarder{}
 		f.mu.request = &processor{}
 		f.mu.response = &processor{}
+		f.mu.isInitialized = true
 
 		started, cleanupFn := f.tryBeginTransfer()
 		require.True(t, started)
@@ -768,12 +770,12 @@ func TestWaitForShowTransferState(t *testing.T) {
 			defer client.Close()
 
 			doneCh := make(chan struct{})
-			go func() {
-				for _, m := range tc.sendSequence {
+			go func(sequence []pgproto3.BackendMessage) {
+				for _, m := range sequence {
 					writeServerMsg(server, m)
 				}
 				close(doneCh)
-			}()
+			}(tc.sendSequence)
 
 			msgCh := make(chan pgproto3.BackendMessage, 10)
 			go func() {
@@ -968,12 +970,12 @@ func TestRunAndWaitForDeserializeSession(t *testing.T) {
 			defer serverProxy.Close()
 			defer server.Close()
 			doneCh := make(chan struct{})
-			go func() {
-				for _, m := range tc.sendSequence {
+			go func(sequence []pgproto3.BackendMessage) {
+				for _, m := range sequence {
 					writeServerMsg(server, m)
 				}
 				close(doneCh)
-			}()
+			}(tc.sendSequence)
 
 			msgCh := make(chan pgproto3.FrontendMessage, 1)
 			go func() {

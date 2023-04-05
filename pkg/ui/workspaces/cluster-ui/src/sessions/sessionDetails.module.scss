@@ -10,7 +10,7 @@
 
 @import "../core/index.module.scss";
 
-.sessions-details{
+.sessions-details {
   font-family: $font-family--base;
   width: 100%;
   max-width: 1200px;
@@ -40,6 +40,7 @@
 }
 
 .details-header {
+  margin-top: 12px;
   margin-bottom: 12px;
 }
 
@@ -73,5 +74,16 @@
     height: 10px;
     width: 20px;
     fill: $colors--neutral-4;
+  }
+}
+
+.session-txn-fingerprints {
+  margin-top: 12px;
+  max-height: 300px;
+  overflow-y: scroll;
+
+  .link-txn-fingerprint-id {
+    display: block;
+    margin-bottom: 8px;
   }
 }

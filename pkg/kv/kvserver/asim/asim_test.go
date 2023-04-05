@@ -12,120 +12,81 @@ package asim_test
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/config"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/metrics"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/state"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
 	"github.com/stretchr/testify/require"
 )
 
-func TestStateUpdates(t *testing.T) {
-	s := asim.NewState()
-	s.AddNode()
-	require.Equal(t, 1, len(s.Nodes))
-	require.Equal(t, 1, len(s.Nodes[1].Stores))
-}
-
 func TestRunAllocatorSimulator(t *testing.T) {
 	ctx := context.Background()
-	rwg := make([]asim.WorkloadGenerator, 1)
-	rwg[0] = &asim.RandomWorkloadGenerator{}
-	start := time.Date(2022, 03, 21, 11, 0, 0, 0, time.UTC)
-	end := start.Add(25 * time.Second)
-	interval := 10 * time.Second
-	s := asim.LoadConfig(asim.SingleRegionConfig)
-	sim := asim.NewSimulator(start, end, interval, rwg, s)
+	settings := config.DefaultSimulationSettings()
+	duration := 1000 * time.Second
+	settings.TickInterval = 10 * time.Second
+	rwg := make([]workload.Generator, 1)
+	rwg[0] = workload.TestCreateWorkloadGenerator(settings.Seed, settings.StartTime, 1, 10)
+	m := metrics.NewTracker(settings.MetricsInterval, metrics.NewClusterMetricsTracker(os.Stdout))
+	s := state.LoadConfig(state.ComplexConfig, state.SingleRangeConfig, settings)
+
+	sim := asim.NewSimulator(duration, rwg, s, settings, m)
 	sim.RunSim(ctx)
 }
 
-func TestRangeMap(t *testing.T) {
-	m := asim.NewRangeMap()
+func TestAllocatorSimulatorDeterministic(t *testing.T) {
 
-	r1 := m.AddRange("b")
-	r2 := m.AddRange("f")
-	r3 := m.AddRange("x")
+	settings := config.DefaultSimulationSettings()
 
-	// Assert that the range is segmented into [minKey, EndKey) intervals.
-	require.Equal(t, roachpb.RKey("f"), r1.Desc.EndKey)
-	require.Equal(t, roachpb.RKey("x"), r2.Desc.EndKey)
-	require.Equal(t, roachpb.RKeyMax, r3.Desc.EndKey)
+	runs := 3
+	duration := 15 * time.Minute
+	settings.TickInterval = 2 * time.Second
 
-	require.Equal(t, (*asim.Range)(nil), m.GetRange("a"))
-	require.Equal(t, r1.MinKey, m.GetRange("b").MinKey)
-	require.Equal(t, r1.MinKey, m.GetRange("c").MinKey)
-	require.Equal(t, r2.MinKey, m.GetRange("g").MinKey)
-	require.Equal(t, r3.MinKey, m.GetRange("z").MinKey)
-}
+	stores := 7
+	replsPerRange := 3
+	replicasPerStore := 100
+	// NB: We want 100 replicas per store, so the number of ranges required
+	// will be 1/3 of the total replicas.
+	ranges := (replicasPerStore * stores) / replsPerRange
+	// NB: In this test we are using a uniform workload and expect to see at
+	// most 3 splits occur due to range size, therefore the keyspace need not
+	// be larger than 3 keys per range.
+	keyspace := 3 * ranges
+	// Track the run to compare against for determinism.
+	var refRun asim.History
 
-func TestAddReplica(t *testing.T) {
-	s := asim.NewState()
-	s.Ranges = asim.NewRangeMap()
-	rm := s.Ranges
+	for run := 0; run < runs; run++ {
+		rwg := make([]workload.Generator, 1)
+		rwg[0] = workload.TestCreateWorkloadGenerator(settings.Seed, settings.StartTime, stores, int64(keyspace))
+		m := metrics.NewTracker(settings.TickInterval) // no output
+		replicaDistribution := make([]float64, stores)
 
-	r1 := rm.AddRange("b")
-	r2 := rm.AddRange("h")
-
-	n1 := s.AddNode()
-	n2 := s.AddNode()
-
-	// Add two replicas on s1, one on s2.
-	r1repl0 := s.AddReplica(r1, n1)
-	r2repl0 := s.AddReplica(r2, n1)
-	r1repl1 := s.AddReplica(r2, n2)
-
-	require.Equal(t, 0, r1repl0)
-	require.Equal(t, 0, r2repl0)
-	require.Equal(t, 1, r1repl1)
-
-	s1 := s.Nodes[n1].Stores[0]
-	s2 := s.Nodes[n2].Stores[0]
-
-	require.Len(t, s1.Replicas, 2)
-	require.Len(t, s2.Replicas, 1)
-}
-
-// TestWorkloadApply asserts that applying workload on a key, will be reflected
-// on the leaseholder for the range that key is contained within.
-func TestWorkloadApply(t *testing.T) {
-	ctx := context.Background()
-
-	s := asim.NewState()
-	s.Ranges = asim.NewRangeMap()
-	n1 := s.AddNode()
-	n2 := s.AddNode()
-	n3 := s.AddNode()
-
-	r1 := s.Ranges.AddRange("100")
-	r2 := s.Ranges.AddRange("1000")
-	r3 := s.Ranges.AddRange("10000")
-
-	s.AddReplica(r1, n1)
-	s.AddReplica(r2, n2)
-	s.AddReplica(r3, n3)
-
-	applyLoadToStats := func(key int64, count int) {
-		for i := 0; i < count; i++ {
-			s.ApplyLoad(ctx, asim.LoadEvent{Key: key})
+		// NB: Here create half of the stores with equal replica counts, the
+		// other half have no replicas. This will lead to a flurry of activity
+		// rebalancing towards these stores, based on the replica count
+		// imbalance.
+		for i := 0; i < stores/2; i++ {
+			replicaDistribution[i] = 1.0 / float64(stores/2)
 		}
+		for i := stores / 2; i < stores; i++ {
+			replicaDistribution[i] = 0
+		}
+
+		s := state.NewStateWithDistribution(replicaDistribution, ranges, replsPerRange, keyspace, settings)
+		sim := asim.NewSimulator(duration, rwg, s, settings, m)
+
+		ctx := context.Background()
+		sim.RunSim(ctx)
+		history := sim.History()
+
+		if run == 0 {
+			refRun = history
+			continue
+		}
+		require.Equal(t, refRun, history)
 	}
-
-	applyLoadToStats(100, 100)
-	applyLoadToStats(1000, 1000)
-	applyLoadToStats(10000, 10000)
-
-	// Assert that the leaseholder replica load correctly matches the number of
-	// requests made.
-	require.Equal(t, int64(100), r1.Leaseholder.ReplicaLoad.ReadKeys)
-	require.Equal(t, int64(1000), r2.Leaseholder.ReplicaLoad.ReadKeys)
-	require.Equal(t, int64(10000), r3.Leaseholder.ReplicaLoad.ReadKeys)
-
-	expectedLoad := asim.StoreLoad{ReadKeys: 100, LeaseCount: 1, RangeCount: 1}
-
-	// Assert that the store load is also updated upon request GetStoreLoad.
-	require.Equal(t, expectedLoad, s.Nodes[n1].Stores[0].GetStoreLoad())
-	expectedLoad.ReadKeys *= 10
-	require.Equal(t, expectedLoad, s.Nodes[n2].Stores[0].GetStoreLoad())
-	expectedLoad.ReadKeys *= 10
-	require.Equal(t, expectedLoad, s.Nodes[n3].Stores[0].GetStoreLoad())
 }

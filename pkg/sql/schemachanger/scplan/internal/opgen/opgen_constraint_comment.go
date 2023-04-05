@@ -20,32 +20,23 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.ConstraintComment) scop.Op {
+				emit(func(this *scpb.ConstraintComment) *scop.UpsertConstraintComment {
 					return &scop.UpsertConstraintComment{
 						TableID:      this.TableID,
 						ConstraintID: this.ConstraintID,
 						Comment:      this.Comment,
 					}
 				}),
-				emit(func(this *scpb.ConstraintComment, md *targetsWithElementMap) scop.Op {
-					return newLogEventOp(this, md)
-				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
-				// TODO(postamar): remove revertibility constraint when possible
-				revertible(false),
-				emit(func(this *scpb.ConstraintComment) scop.Op {
+				emit(func(this *scpb.ConstraintComment) *scop.RemoveConstraintComment {
 					return &scop.RemoveConstraintComment{
 						TableID:      this.TableID,
 						ConstraintID: this.ConstraintID,
 					}
-				}),
-				emit(func(this *scpb.ConstraintComment, md *targetsWithElementMap) scop.Op {
-					return newLogEventOp(this, md)
 				}),
 			),
 		),

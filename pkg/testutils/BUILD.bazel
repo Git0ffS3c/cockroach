@@ -1,15 +1,16 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "testutils",
     srcs = [
         "base.go",
-        "data_path.go",
         "dir.go",
         "error.go",
         "files.go",
         "hook.go",
         "keys.go",
+        "listener.go",
         "net.go",
         "pprof.go",
         "soon.go",
@@ -23,12 +24,11 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/build/bazel",
-        "//pkg/roachpb",
-        "//pkg/security",
+        "//pkg/kv/kvpb",
+        "//pkg/security/certnames",
         "//pkg/security/username",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/util",
-        "//pkg/util/envutil",
         "//pkg/util/fileutil",
         "//pkg/util/log",
         "//pkg/util/retry",
@@ -47,6 +47,7 @@ go_test(
         "net_test.go",
         "soon_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":testutils"],
     deps = [
         "//pkg/util",
@@ -58,3 +59,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

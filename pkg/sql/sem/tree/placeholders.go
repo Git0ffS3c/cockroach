@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/errors"
 )
 
 // PlaceholderIdx is the 0-based index of a placeholder. Placeholder "$1"
@@ -135,7 +134,12 @@ func (p *PlaceholderTypesInfo) SetType(idx PlaceholderIdx, typ *types.T) error {
 				pgcode.DatatypeMismatch,
 				"placeholder %s already has type %s, cannot assign %s", idx, t, typ)
 		}
-		return nil
+		// If `t` is not ambiguous or if `typ` is ambiguous, then we shouldn't
+		// change the type that's already set. Otherwise, we can use `typ` since
+		// it is more specific.
+		if !t.IsAmbiguous() || typ.IsAmbiguous() {
+			return nil
+		}
 	}
 	p.Types[idx] = typ
 	return nil
@@ -151,13 +155,11 @@ type PlaceholderInfo struct {
 // Init initializes a PlaceholderInfo structure appropriate for the given number
 // of placeholders, and with the given (optional) type hints.
 func (p *PlaceholderInfo) Init(numPlaceholders int, typeHints PlaceholderTypes) error {
-	p.Types = make(PlaceholderTypes, numPlaceholders)
 	if typeHints == nil {
 		p.TypeHints = make(PlaceholderTypes, numPlaceholders)
+		p.Types = make(PlaceholderTypes, numPlaceholders)
 	} else {
-		if err := checkPlaceholderArity(len(typeHints), numPlaceholders); err != nil {
-			return err
-		}
+		p.Types = make(PlaceholderTypes, len(typeHints))
 		p.TypeHints = typeHints
 	}
 	p.Values = nil
@@ -168,26 +170,21 @@ func (p *PlaceholderInfo) Init(numPlaceholders int, typeHints PlaceholderTypes) 
 // If src is nil, a new structure is initialized.
 func (p *PlaceholderInfo) Assign(src *PlaceholderInfo, numPlaceholders int) error {
 	if src != nil {
-		if err := checkPlaceholderArity(len(src.Types), numPlaceholders); err != nil {
-			return err
-		}
 		*p = *src
 		return nil
 	}
 	return p.Init(numPlaceholders, nil /* typeHints */)
 }
 
-func checkPlaceholderArity(numTypes, numPlaceholders int) error {
-	if numTypes > numPlaceholders {
-		return errors.AssertionFailedf(
-			"unexpected placeholder types: got %d, expected %d",
-			numTypes, numPlaceholders)
-	} else if numTypes < numPlaceholders {
-		return pgerror.Newf(pgcode.UndefinedParameter,
-			"could not find types for all placeholders: got %d, expected %d",
-			numTypes, numPlaceholders)
+// MaybeExtendTypes is to fill the nil types with the type hints, if exists.
+func (p *PlaceholderInfo) MaybeExtendTypes() {
+	if len(p.TypeHints) >= len(p.Types) {
+		for i, t := range p.Types {
+			if t == nil {
+				p.Types[i] = p.TypeHints[i]
+			}
+		}
 	}
-	return nil
 }
 
 // Value returns the known value of a placeholder.  Returns false in

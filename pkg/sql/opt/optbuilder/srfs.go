@@ -15,6 +15,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -56,7 +58,7 @@ func (s *srf) TypeCheck(
 }
 
 // Eval is part of the tree.TypedExpr interface.
-func (s *srf) Eval(_ tree.ExprEvaluator) (tree.Datum, error) {
+func (s *srf) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("srf must be replaced before evaluation"))
 }
 
@@ -70,8 +72,7 @@ var _ tree.TypedExpr = &srf{}
 // returns tuples of values from a,b,c picked "simultaneously". NULLs
 // are used when an iterator is "shorter" than another. For example:
 //
-//    zip([1,2,3], ['a','b']) = [(1,'a'), (2,'b'), (3, null)]
-//
+//	zip([1,2,3], ['a','b']) = [(1,'a'), (2,'b'), (3, null)]
 func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 	outScope = inScope.push()
 
@@ -84,44 +85,66 @@ func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 	inScope.context = exprKindFrom
 
 	// Build each of the provided expressions.
-	zip := make(memo.ZipExpr, len(exprs))
-	for i, expr := range exprs {
+	zip := make(memo.ZipExpr, 0, len(exprs))
+	var outCols opt.ColSet
+	for _, expr := range exprs {
 		// Output column names should exactly match the original expression, so we
 		// have to determine the output column name before we perform type
 		// checking. However, the alias may be overridden later below if the expression
 		// is a function and specifically defines a return label.
-		_, alias, err := tree.ComputeColNameInternal(b.semaCtx.SearchPath, expr)
+		_, alias, err := tree.ComputeColNameInternal(b.ctx, b.semaCtx.SearchPath, expr, b.semaCtx.FunctionResolver)
 		if err != nil {
 			panic(err)
 		}
 		texpr := inScope.resolveType(expr, types.Any)
 
-		var def *tree.FunctionDefinition
-		if funcExpr, ok := texpr.(*tree.FuncExpr); ok {
-			if def, err = funcExpr.Func.Resolve(b.semaCtx.SearchPath); err != nil {
+		var def *tree.ResolvedFunctionDefinition
+		funcExpr, ok := texpr.(*tree.FuncExpr)
+		if ok {
+			if def, err = funcExpr.Func.Resolve(
+				b.ctx, b.semaCtx.SearchPath, b.semaCtx.FunctionResolver,
+			); err != nil {
 				panic(err)
 			}
 		}
 
 		var outCol *scopeColumn
 		startCols := len(outScope.cols)
-		if def == nil || def.Class != tree.GeneratorClass || b.shouldCreateDefaultColumn(texpr) {
 
-			if def != nil && len(def.ReturnLabels) > 0 {
+		if def == nil || funcExpr.ResolvedOverload().Class != tree.GeneratorClass || b.shouldCreateDefaultColumn(texpr) {
+			if def != nil && len(funcExpr.ResolvedOverload().ReturnLabels) > 0 {
 				// Override the computed alias with the one defined in the ReturnLabels. This
 				// satisfies a Postgres quirk where some json functions use different labels
 				// when used in a from clause.
-				alias = def.ReturnLabels[0]
+				alias = funcExpr.ResolvedOverload().ReturnLabels[0]
 			}
 			outCol = outScope.addColumn(scopeColName(tree.Name(alias)), texpr)
 		}
 
 		scalar := b.buildScalar(texpr, inScope, outScope, outCol, nil)
-		cols := make(opt.ColList, len(outScope.cols)-startCols)
+		numExpectedOutputCols := len(outScope.cols) - startCols
+		cols := make(opt.ColList, 0, numExpectedOutputCols)
 		for j := startCols; j < len(outScope.cols); j++ {
-			cols[j-startCols] = outScope.cols[j].id
+			// If a newly-added outScope column has already been added in a zip
+			// expression, don't add it again.
+			if outCols.Contains(outScope.cols[j].id) {
+				continue
+			}
+			cols = append(cols, outScope.cols[j].id)
+
+			// Record that this output column has been added.
+			outCols.Add(outScope.cols[j].id)
 		}
-		zip[i] = b.factory.ConstructZipItem(scalar, cols)
+		// Only add the zip expression if it has output columns which haven't
+		// already been built.
+		if len(cols) != 0 {
+			if len(cols) != numExpectedOutputCols {
+				// Building more columns than were just added to outScope could cause
+				// problems for the execution engine. Catch this case.
+				panic(errors.AssertionFailedf("zip expression builds more columns than added to outScope"))
+			}
+			zip = append(zip, b.factory.ConstructZipItem(scalar, cols))
+		}
 	}
 
 	// Construct the zip as a ProjectSet with empty input.
@@ -140,12 +163,45 @@ func (b *Builder) buildZip(exprs tree.Exprs, inScope *scope) (outScope *scope) {
 // (SRF) such as generate_series() or unnest(). It synthesizes new columns in
 // outScope for each of the SRF's output columns.
 func (b *Builder) finishBuildGeneratorFunction(
-	f *tree.FuncExpr, fn opt.ScalarExpr, inScope, outScope *scope, outCol *scopeColumn,
+	f *tree.FuncExpr,
+	def *tree.Overload,
+	fn opt.ScalarExpr,
+	inScope, outScope *scope,
+	outCol *scopeColumn,
 ) (out opt.ScalarExpr) {
+	lastAlias := inScope.alias
+	if def.ReturnsRecordType {
+		if lastAlias == nil {
+			panic(pgerror.New(pgcode.Syntax, "a column definition list is required for functions returning \"record\""))
+		}
+	} else if lastAlias != nil {
+		// Non-record type return with a table alias that includes types is not
+		// permitted.
+		for _, c := range lastAlias.Cols {
+			if c.Type != nil {
+				panic(pgerror.Newf(pgcode.Syntax, "a column definition list is only allowed for functions returning \"record\""))
+			}
+		}
+	}
 	// Add scope columns.
 	if outCol != nil {
 		// Single-column return type.
 		b.populateSynthesizedColumn(outCol, fn)
+	} else if def.ReturnsRecordType && lastAlias != nil && len(lastAlias.Cols) > 0 {
+		// If we're building a generator function that returns a record type, like
+		// json_to_record, we need to know the alias that was assigned to the
+		// generator function - without that, we won't know the list of columns
+		// to output.
+		for _, c := range lastAlias.Cols {
+			if c.Type == nil {
+				panic(pgerror.Newf(pgcode.Syntax, "a column definition list is required for functions returning \"record\""))
+			}
+			typ, err := tree.ResolveType(b.ctx, c.Type, b.semaCtx.TypeResolver)
+			if err != nil {
+				panic(err)
+			}
+			b.synthesizeColumn(outScope, scopeColName(c.Name), typ, nil, fn)
+		}
 	} else {
 		// Multi-column return type. Use the tuple labels in the SRF's return type
 		// as column aliases.
@@ -167,7 +223,7 @@ func (b *Builder) finishBuildGeneratorFunction(
 // ProjectSet is necessary in case some of the SRFs depend on the input.
 // For example, consider this query:
 //
-//   SELECT generate_series(t.a, t.a + 1) FROM t
+//	SELECT generate_series(t.a, t.a + 1) FROM t
 //
 // In this case, the inputs to generate_series depend on table t, so during
 // execution, generate_series will be called once for each row of t.

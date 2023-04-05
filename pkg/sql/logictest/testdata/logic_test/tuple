@@ -1217,3 +1217,34 @@ SELECT (CASE WHEN false THEN (ROW(1) AS a) ELSE (ROW(2) AS b) END).a;
 
 statement error could not identify column \"b\" in tuple{int AS a}
 SELECT (CASE WHEN false THEN (ROW(1) AS a) ELSE (ROW(2) AS b) END).b;
+
+subtest end
+
+# Regression test for #79484. Verify that type-checking is smart enough
+# to handle tuples of arrays of tuples in the VALUES clause.
+subtest 79484
+
+query T
+SELECT * FROM (
+  VALUES
+    ((ARRAY[15181:::INT8], ARRAY[]:::RECORD[])),
+    (
+      (ARRAY[1534:::INT8], ARRAY[('infinity':::DATE, 'cat':::TEXT)])
+    ),
+    (NULL)
+) AS tab(col)
+----
+({15181},{})
+({1534},"{""(infinity,cat)""}")
+NULL
+
+subtest end
+
+# Regression test for incorrect handling of tree.ParenExprs during type-checking
+# (#94092).
+statement ok
+CREATE TABLE t94092 (c INT);
+INSERT INTO t94092 VALUES (1);
+
+query error expected tuple \(\) to have a length of 2
+SELECT (c, 1) != (()) FROM t94092;

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -12,7 +13,6 @@ go_library(
         "//pkg/base",
         "//pkg/jobs",
         "//pkg/jobs/jobsprotectedts",
-        "//pkg/kv",
         "//pkg/kv/kvserver/protectedts",
         "//pkg/kv/kvserver/protectedts/ptpb",
         "//pkg/roachpb",
@@ -23,10 +23,12 @@ go_library(
         "//pkg/spanconfig/spanconfigtestutils",
         "//pkg/sql",
         "//pkg/sql/catalog",
+        "//pkg/sql/catalog/dbdesc",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/descs",
         "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/distsql",
+        "//pkg/sql/isql",
         "//pkg/sql/sem/tree",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
@@ -39,3 +41,5 @@ go_library(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

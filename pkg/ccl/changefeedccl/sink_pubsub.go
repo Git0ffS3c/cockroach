@@ -18,12 +18,13 @@ import (
 	"cloud.google.com/go/pubsub"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/oauth2/google"
+	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,6 +35,8 @@ const credentialsParam = "CREDENTIALS"
 // GcpScheme to be used in testfeed and sink.go
 const GcpScheme = "gcpubsub"
 const gcpScope = "https://www.googleapis.com/auth/pubsub"
+const cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
+const globalGCPEndpoint = "pubsub.googleapis.com:443"
 
 // TODO: make numOfWorkers configurable
 const numOfWorkers = 128
@@ -49,7 +52,7 @@ type pubsubClient interface {
 	flushTopics()
 	sendMessage(content []byte, topic string, key string) error
 	sendMessageToAllTopics(content []byte) error
-	connectivityError() error
+	connectivityErrorLocked() error
 }
 
 type jsonPayload struct {
@@ -74,10 +77,9 @@ type pubsubMessage struct {
 
 type gcpPubsubClient struct {
 	client     *pubsub.Client
-	topics     map[string]*pubsub.Topic
 	ctx        context.Context
 	projectID  string
-	region     string
+	endpoint   string
 	topicNamer *TopicNamer
 	url        sinkURL
 
@@ -85,6 +87,7 @@ type gcpPubsubClient struct {
 		syncutil.Mutex
 		autocreateError error
 		publishError    error
+		topics          map[string]*pubsub.Topic
 	}
 }
 
@@ -109,10 +112,15 @@ type pubsubSink struct {
 	format changefeedbase.FormatType
 }
 
+func (p *pubsubSink) getConcreteType() sinkType {
+	return sinkTypePubsub
+}
+
 // TODO: unify gcp credentials code with gcp cloud storage credentials code
 // getGCPCredentials returns gcp credentials parsed out from url
-func getGCPCredentials(ctx context.Context, u sinkURL) (*google.Credentials, error) {
+func getGCPCredentials(ctx context.Context, u sinkURL) (option.ClientOption, error) {
 	const authParam = "AUTH"
+	const assumeRoleParam = "ASSUME_ROLE"
 	const authSpecified = "specified"
 	const authImplicit = "implicit"
 	const authDefault = "default"
@@ -121,59 +129,86 @@ func getGCPCredentials(ctx context.Context, u sinkURL) (*google.Credentials, err
 	var creds *google.Credentials
 	var err error
 	authOption := u.consumeParam(authParam)
+	assumeRoleOption := u.consumeParam(assumeRoleParam)
+	authScope := gcpScope
+	if assumeRoleOption != "" {
+		// If we need to assume a role, the credentials need to have the scope to
+		// impersonate instead.
+		authScope = cloudPlatformScope
+	}
 
 	// implemented according to https://github.com/cockroachdb/cockroach/pull/64737
 	switch authOption {
 	case authImplicit:
-		creds, err = google.FindDefaultCredentials(ctx, gcpScope)
+		creds, err = google.FindDefaultCredentials(ctx, authScope)
 		if err != nil {
 			return nil, err
 		}
-		return creds, nil
 	case authSpecified:
 		fallthrough
 	case authDefault:
 		fallthrough
 	default:
+		if u.q.Get(credentialsParam) == "" {
+			return nil, errors.New("missing credentials parameter")
+		}
 		err := u.decodeBase64(credentialsParam, &credsJSON)
 		if err != nil {
 			return nil, errors.Wrap(err, "decoding credentials json")
 		}
-		creds, err = google.CredentialsFromJSON(ctx, credsJSON, gcpScope)
+		creds, err = google.CredentialsFromJSON(ctx, credsJSON, authScope)
 		if err != nil {
-			return nil, errors.Wrap(err, "creating credentials")
+			return nil, errors.Wrap(err, "creating credentials from json")
 		}
-		return creds, nil
 	}
+
+	credsOpt := option.WithCredentials(creds)
+	if assumeRoleOption != "" {
+		assumeRole, delegateRoles := cloud.ParseRoleString(assumeRoleOption)
+		cfg := impersonate.CredentialsConfig{
+			TargetPrincipal: assumeRole,
+			Scopes:          []string{gcpScope},
+			Delegates:       delegateRoles,
+		}
+
+		ts, err := impersonate.CredentialsTokenSource(ctx, cfg, credsOpt)
+		if err != nil {
+			return nil, errors.Wrap(err, "creating impersonate credentials")
+		}
+		return option.WithTokenSource(ts), nil
+	}
+
+	return credsOpt, nil
 }
 
 // MakePubsubSink returns the corresponding pubsub sink based on the url given
 func MakePubsubSink(
 	ctx context.Context,
 	u *url.URL,
-	opts map[string]string,
-	targets []jobspb.ChangefeedTargetSpecification,
+	encodingOpts changefeedbase.EncodingOptions,
+	targets changefeedbase.Targets,
+	unordered bool,
 ) (Sink, error) {
 
 	pubsubURL := sinkURL{URL: u, q: u.Query()}
 	pubsubTopicName := pubsubURL.consumeParam(changefeedbase.SinkParamTopicName)
 
 	var formatType changefeedbase.FormatType
-	switch changefeedbase.FormatType(opts[changefeedbase.OptFormat]) {
+	switch encodingOpts.Format {
 	case changefeedbase.OptFormatJSON:
 		formatType = changefeedbase.OptFormatJSON
 	case changefeedbase.OptFormatCSV:
 		formatType = changefeedbase.OptFormatCSV
 	default:
 		return nil, errors.Errorf(`this sink is incompatible with %s=%s`,
-			changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
+			changefeedbase.OptFormat, encodingOpts.Format)
 	}
 
-	switch changefeedbase.EnvelopeType(opts[changefeedbase.OptEnvelope]) {
-	case changefeedbase.OptEnvelopeWrapped:
+	switch encodingOpts.Envelope {
+	case changefeedbase.OptEnvelopeWrapped, changefeedbase.OptEnvelopeBare:
 	default:
 		return nil, errors.Errorf(`this sink is incompatible with %s=%s`,
-			changefeedbase.OptEnvelope, opts[changefeedbase.OptEnvelope])
+			changefeedbase.OptEnvelope, encodingOpts.Envelope)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -189,9 +224,21 @@ func MakePubsubSink(
 	case GcpScheme:
 		const regionParam = "region"
 		projectID := pubsubURL.Host
+		if projectID == "" {
+			return nil, errors.New("missing project name")
+		}
 		region := pubsubURL.consumeParam(regionParam)
+		var endpoint string
 		if region == "" {
-			return nil, errors.New("region query parameter not found")
+			if unordered {
+				endpoint = globalGCPEndpoint
+			} else {
+				return nil, errors.WithHintf(errors.New("region query parameter not found"),
+					"Use of gcpubsub without specifying a region requires the WITH %s option.",
+					changefeedbase.OptUnordered)
+			}
+		} else {
+			endpoint = gcpEndpointForRegion(region)
 		}
 		tn, err := MakeTopicNamer(targets, WithSingleName(pubsubTopicName))
 		if err != nil {
@@ -201,7 +248,7 @@ func MakePubsubSink(
 			topicNamer: tn,
 			ctx:        ctx,
 			projectID:  projectID,
-			region:     gcpEndpointForRegion(region),
+			endpoint:   endpoint,
 			url:        pubsubURL,
 		}
 		p.client = g
@@ -244,7 +291,7 @@ func (p *pubsubSink) EmitRow(
 	case <-p.workerCtx.Done():
 		// check again for error in case it triggered since last check
 		// will return more verbose error instead of "context canceled"
-		return errors.CombineErrors(p.workerCtx.Err(), p.sinkError())
+		return errors.CombineErrors(p.workerCtx.Err(), p.sinkErrorLocked())
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-p.errChan:
@@ -269,7 +316,7 @@ func (p *pubsubSink) EmitResolvedTimestamp(
 // Flush blocks until all messages in the event channels are sent
 func (p *pubsubSink) Flush(ctx context.Context) error {
 	if err := p.flush(ctx); err != nil {
-		return errors.CombineErrors(p.client.connectivityError(), err)
+		return errors.CombineErrors(p.client.connectivityErrorLocked(), err)
 	}
 	return nil
 }
@@ -293,7 +340,7 @@ func (p *pubsubSink) flush(ctx context.Context) error {
 	case err := <-p.errChan:
 		return err
 	case <-p.flushDone:
-		return p.sinkError()
+		return p.sinkErrorLocked()
 	}
 
 }
@@ -323,15 +370,30 @@ func (p *pubsubSink) Topics() []string {
 	return p.topicNamer.DisplayNamesSlice()
 }
 
+func (p *gcpPubsubClient) cacheTopicLocked(name string, topic *pubsub.Topic) {
+	//TODO (zinger): Investigate whether changing topics to a sync.Map would be
+	//faster here, I think it would.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.mu.topics[name] = topic
+}
+
+func (p *gcpPubsubClient) getTopicLocked(name string) (t *pubsub.Topic, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t, ok = p.mu.topics[name]
+	return t, ok
+}
+
 func (p *gcpPubsubClient) getTopicClient(name string) (*pubsub.Topic, error) {
-	if topic, ok := p.topics[name]; ok {
+	if topic, ok := p.getTopicLocked(name); ok {
 		return topic, nil
 	}
 	topic, err := p.openTopic(name)
 	if err != nil {
 		return nil, err
 	}
-	p.topics[name] = topic
+	p.cacheTopicLocked(name, topic)
 	return topic, nil
 }
 
@@ -407,7 +469,7 @@ func (p *pubsubSink) exitWorkersWithError(err error) {
 }
 
 // sinkError checks if there is an error in the error channel
-func (p *pubsubSink) sinkError() error {
+func (p *pubsubSink) sinkErrorLocked() error {
 	select {
 	case err := <-p.errChan:
 		return err
@@ -460,15 +522,15 @@ func (p *gcpPubsubClient) init() error {
 	client, err = pubsub.NewClient(
 		p.ctx,
 		p.projectID,
-		option.WithCredentials(creds),
-		option.WithEndpoint(p.region),
+		creds,
+		option.WithEndpoint(p.endpoint),
 	)
 
 	if err != nil {
 		return errors.Wrap(err, "opening client")
 	}
 	p.client = client
-	p.topics = make(map[string]*pubsub.Topic)
+	p.mu.topics = make(map[string]*pubsub.Topic)
 
 	return nil
 
@@ -484,10 +546,10 @@ func (p *gcpPubsubClient) openTopic(topicName string) (*pubsub.Topic, error) {
 		case codes.PermissionDenied:
 			// PermissionDenied may not be fatal if the topic already exists,
 			// but record it in case it turns out not to.
-			p.recordAutocreateError(err)
+			p.recordAutocreateErrorLocked(err)
 			t = p.client.Topic(topicName)
 		default:
-			p.recordAutocreateError(err)
+			p.recordAutocreateErrorLocked(err)
 			return nil, err
 		}
 	}
@@ -517,7 +579,7 @@ func (p *gcpPubsubClient) sendMessage(m []byte, topic string, key string) error 
 	// an error is returned for the published message.
 	_, err = res.Get(p.ctx)
 	if err != nil {
-		p.recordPublishError(err)
+		p.recordPublishErrorLocked(err)
 		return err
 	}
 
@@ -554,20 +616,20 @@ func (p *gcpPubsubClient) forEachTopic(f func(name string, topicClient *pubsub.T
 	})
 }
 
-func (p *gcpPubsubClient) recordAutocreateError(e error) {
+func (p *gcpPubsubClient) recordAutocreateErrorLocked(e error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.mu.autocreateError = e
 }
 
-func (p *gcpPubsubClient) recordPublishError(e error) {
+func (p *gcpPubsubClient) recordPublishErrorLocked(e error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.mu.publishError = e
 }
 
 // connectivityError returns any errors encountered while writing to gcp.
-func (p *gcpPubsubClient) connectivityError() error {
+func (p *gcpPubsubClient) connectivityErrorLocked() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if status.Code(p.mu.publishError) == codes.NotFound && p.mu.autocreateError != nil {

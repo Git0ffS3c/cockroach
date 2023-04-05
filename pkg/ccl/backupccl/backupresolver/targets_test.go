@@ -50,9 +50,13 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 		type tbDesc = descpb.TableDescriptor
 		type typDesc = descpb.TypeDescriptor
 		ts1 := hlc.Timestamp{WallTime: 1}
-		mkTable := func(descriptor tbDesc) catalog.Descriptor {
-			descProto := tabledesc.NewBuilder(&descriptor).BuildImmutable().DescriptorProto()
-			return descbuilder.NewBuilderWithMVCCTimestamp(descProto, ts1).BuildImmutable()
+		mkTable := func(tableDescProto tbDesc) catalog.Descriptor {
+			pb := tabledesc.NewBuilder(&tableDescProto).BuildCreatedMutable().DescriptorProto()
+			mut, err := descbuilder.BuildMutable(nil /* original */, pb, ts1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return mut.ImmutableCopy()
 		}
 		mkDB := func(id descpb.ID, name string) catalog.Descriptor {
 			return dbdesc.NewInitial(id, name, username.AdminRoleName(), dbdesc.WithPublicSchemaID(keys.SystemPublicSchemaID))
@@ -171,16 +175,16 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 		expectedDBs     []string
 		err             string
 	}{
-		{"", "DATABASE system", []string{"system", "foo", "bar"}, []string{"system"}, ``},
+		{"", "DATABASE system", []string{"system", "foo", "bar", "offline"}, []string{"system"}, ``},
 		{"", "DATABASE system, noexist", nil, nil, `database "noexist" does not exist`},
-		{"", "DATABASE system, system", []string{"system", "foo", "bar"}, []string{"system"}, ``},
+		{"", "DATABASE system, system", []string{"system", "foo", "bar", "offline"}, []string{"system"}, ``},
 		{"", "DATABASE data", []string{"data", "baz"}, []string{"data"}, ``},
-		{"", "DATABASE system, data", []string{"system", "foo", "bar", "data", "baz"}, []string{"data", "system"}, ``},
+		{"", "DATABASE system, data", []string{"system", "foo", "bar", "offline", "data", "baz"}, []string{"data", "system"}, ``},
 		{"", "DATABASE system, data, noexist", nil, nil, `database "noexist" does not exist`},
-		{"system", "DATABASE system", []string{"system", "foo", "bar"}, []string{"system"}, ``},
+		{"system", "DATABASE system", []string{"system", "foo", "bar", "offline"}, []string{"system"}, ``},
 		{"system", "DATABASE system, noexist", nil, nil, `database "noexist" does not exist`},
 		{"system", "DATABASE data", []string{"data", "baz"}, []string{"data"}, ``},
-		{"system", "DATABASE system, data", []string{"system", "foo", "bar", "data", "baz"}, []string{"data", "system"}, ``},
+		{"system", "DATABASE system, data", []string{"system", "foo", "bar", "offline", "data", "baz"}, []string{"data", "system"}, ``},
 		{"system", "DATABASE system, data, noexist", nil, nil, `database "noexist" does not exist`},
 
 		{"", "TABLE foo", nil, nil, `table "foo" does not exist`},
@@ -191,7 +195,7 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 		{"", "TABLE *", nil, nil, `"\*" does not match any valid database or schema`},
 		{"", "TABLE *, system.public.foo", nil, nil, `"\*" does not match any valid database or schema`},
 		{"noexist", "TABLE *", nil, nil, `"\*" does not match any valid database or schema`},
-		{"system", "TABLE *", []string{"system", "foo", "bar"}, nil, ``},
+		{"system", "TABLE *", []string{"system", "foo", "bar", "offline"}, nil, ``},
 		{"data", "TABLE *", []string{"data", "baz"}, nil, ``},
 		{"empty", "TABLE *", []string{"empty"}, nil, ``},
 
@@ -211,11 +215,11 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 
 		{"", "TABLE noexist.*", nil, nil, `"noexist\.\*" does not match any valid database or schema`},
 		{"", "TABLE empty.*", []string{"empty"}, nil, ``},
-		{"", "TABLE system.*", []string{"system", "foo", "bar"}, nil, ``},
-		{"", "TABLE system.public.*", []string{"system", "foo", "bar"}, nil, ``},
+		{"", "TABLE system.*", []string{"system", "foo", "bar", "offline"}, nil, ``},
+		{"", "TABLE system.public.*", []string{"system", "foo", "bar", "offline"}, nil, ``},
 		{"", "TABLE system.public.*, foo, baz", nil, nil, `table "(foo|baz)" does not exist`},
 		{"system", "TABLE system.public.*, foo, baz", nil, nil, `table "baz" does not exist`},
-		{"data", "TABLE system.public.*, baz", []string{"system", "foo", "bar", "data", "baz"}, nil, ``},
+		{"data", "TABLE system.public.*, baz", []string{"system", "foo", "bar", "offline", "data", "baz"}, nil, ``},
 		{"data", "TABLE system.public.*, foo, baz", nil, nil, `table "(foo|baz)" does not exist`},
 
 		{"", "TABLE SyStEm.FoO", []string{"system", "foo"}, nil, ``},
@@ -229,7 +233,7 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 
 		{"system", `TABLE offline`, nil, nil, `table "offline" does not exist`},
 		{"", `TABLE system.offline`, []string{"system", "foo"}, nil, `table "system.public.offline" does not exist`},
-		{"system", `TABLE *`, []string{"system", "foo", "bar"}, nil, ``},
+		{"system", `TABLE *`, []string{"system", "foo", "bar", "offline"}, nil, ``},
 		// If we backup udts, then all tables and types (even unused) should be present.
 		{"", "DATABASE udts", []string{"udts", "enum1", "_enum1", "enum2", "_enum2", "enum_tbl", "enum_arr_tbl"}, []string{"udts"}, ``},
 		// Backing up enum_tbl should pull in both the enum and its array type.
@@ -249,15 +253,15 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 	searchPath := sessiondata.MakeSearchPath([]string{"public", "pg_catalog"})
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("%d/%s/%s", i, test.sessionDatabase, test.pattern), func(t *testing.T) {
-			sql := fmt.Sprintf(`GRANT ALL ON %s TO ignored`, test.pattern)
+			sql := fmt.Sprintf(`BACKUP %s TO 'ignored'`, test.pattern)
 			stmt, err := parser.ParseOne(sql)
 			if err != nil {
 				t.Fatal(err)
 			}
-			targets := stmt.AST.(*tree.Grant).Targets
+			targets := stmt.AST.(*tree.Backup).Targets
 
 			matched, err := DescriptorsMatchingTargets(context.Background(),
-				test.sessionDatabase, searchPath, descriptors, targets, hlc.Timestamp{})
+				test.sessionDatabase, searchPath, descriptors, *targets, hlc.Timestamp{})
 			if test.err != "" {
 				if !testutils.IsError(err, test.err) {
 					t.Fatalf("expected error matching '%v', but got '%v'", test.err, err)
@@ -283,7 +287,7 @@ func TestDescriptorsMatchingTargets(t *testing.T) {
 				if !reflect.DeepEqual(test.expectedDBs, matchedDBNames) {
 					t.Fatalf("expected %q got %q", test.expectedDBs, matchedDBNames)
 				}
-				for _, p := range targets.Tables {
+				for _, p := range targets.Tables.TablePatterns {
 					_, ok := matched.DescsByTablePattern[p]
 					if !ok {
 						t.Fatalf("no entry in %q for %q", matched.DescsByTablePattern, p)

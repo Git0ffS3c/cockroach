@@ -133,11 +133,11 @@ CREATE SEQUENCE ignored_options_test NO CYCLE
 statement ok
 CREATE SEQUENCE show_create_test
 
-query ITTITTTTTTTBBBB colnames
+query ITTITTTTTTTTBBBB colnames
 SELECT * FROM crdb_internal.create_statements WHERE descriptor_name = 'show_create_test'
 ----
-database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                                     state   create_nofks                                                                                         alter_statements  validate_statements  has_partitions  is_multi_region  is_virtual  is_temporary
-104          test           public       116            sequence         show_create_test  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  {}                {}                   false           false            false       false
+database_id  database_name  schema_name  descriptor_id  descriptor_type  descriptor_name   create_statement                                                                                     state   create_nofks                                                                                         alter_statements  validate_statements  create_redactable                                                                                    has_partitions  is_multi_region  is_virtual  is_temporary
+104          test           public       111            sequence         show_create_test  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  PUBLIC  CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  {}                {}                   CREATE SEQUENCE public.show_create_test MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1  false           false            false       false
 
 query TT colnames
 SHOW CREATE SEQUENCE show_create_test
@@ -932,7 +932,7 @@ user testuser
 statement error pq: user testuser does not have SELECT privilege on relation priv_test
 SELECT * FROM priv_test
 
-statement error pq: nextval\(\): user testuser does not have UPDATE privilege on relation priv_test
+statement error pq: nextval\(\): user testuser does not have UPDATE or USAGE privilege on relation priv_test
 SELECT nextval('priv_test')
 
 statement error pq: setval\(\): user testuser does not have UPDATE privilege on relation priv_test
@@ -1131,6 +1131,11 @@ CREATE TABLE ab(a INT DEFAULT nextval('owned_seq'), b INT DEFAULT nextval('owned
 statement ok
 ALTER SEQUENCE owned_seq OWNED BY ab.a;
 
+skipif config local-legacy-schema-changer
+statement error cannot drop column a because other objects depend on it
+ALTER TABLE ab DROP COLUMN a;
+
+onlyif config local-legacy-schema-changer
 statement error cannot drop table ab because other objects depend on it
 ALTER TABLE ab DROP COLUMN a;
 
@@ -1186,6 +1191,11 @@ CREATE TABLE b(b INT DEFAULT nextval('seq'));
 statement error cannot drop table a because other objects depend on it
 DROP TABLE a
 
+skipif config local-legacy-schema-changer
+statement error cannot drop column a because other objects depend on it
+ALTER TABLE a DROP COLUMN a;
+
+onlyif config local-legacy-schema-changer
 statement error cannot drop table a because other objects depend on it
 ALTER TABLE a DROP COLUMN a;
 
@@ -1950,8 +1960,8 @@ CREATE SEQUENCE public.seqas_3 AS int2 START WITH -4 INCREMENT BY -3
 query TT colnames
 SHOW CREATE SEQUENCE seqas_3
 ----
-table_name        create_statement
-seqas_3           CREATE SEQUENCE public.seqas_3 AS INT2 MINVALUE -32768 MAXVALUE -1 INCREMENT -3 START -4
+table_name  create_statement
+seqas_3     CREATE SEQUENCE public.seqas_3 AS INT2 MINVALUE -32768 MAXVALUE -1 INCREMENT -3 START -4
 
 statement ok
 CREATE SEQUENCE seqas_4 AS integer
@@ -1959,8 +1969,8 @@ CREATE SEQUENCE seqas_4 AS integer
 query TT colnames
 SHOW CREATE SEQUENCE seqas_4
 ----
-table_name        create_statement
-seqas_4           CREATE SEQUENCE public.seqas_4 AS INT8 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1
+table_name  create_statement
+seqas_4     CREATE SEQUENCE public.seqas_4 AS INT8 MINVALUE 1 MAXVALUE 9223372036854775807 INCREMENT 1 START 1
 
 statement ok
 CREATE SEQUENCE seqas_5 AS int8
@@ -1983,8 +1993,8 @@ CREATE SEQUENCE seqas_9 AS integer
 query TT colnames
 SHOW CREATE SEQUENCE seqas_9
 ----
-table_name        create_statement
-seqas_9           CREATE SEQUENCE public.seqas_9 AS INT4 MINVALUE 1 MAXVALUE 2147483647 INCREMENT 1 START 1
+table_name  create_statement
+seqas_9     CREATE SEQUENCE public.seqas_9 AS INT4 MINVALUE 1 MAXVALUE 2147483647 INCREMENT 1 START 1
 
 statement ok
 ALTER SEQUENCE seqas_9 AS smallint
@@ -1992,8 +2002,8 @@ ALTER SEQUENCE seqas_9 AS smallint
 query TT colnames
 SHOW CREATE SEQUENCE seqas_9
 ----
-table_name        create_statement
-seqas_9           CREATE SEQUENCE public.seqas_9 AS INT2 MINVALUE 1 MAXVALUE 32767 INCREMENT 1 START 1
+table_name  create_statement
+seqas_9     CREATE SEQUENCE public.seqas_9 AS INT2 MINVALUE 1 MAXVALUE 32767 INCREMENT 1 START 1
 
 statement ok
 CREATE SEQUENCE seqas_10
@@ -2074,6 +2084,10 @@ CREATE SEQUENCE seqas_error
   CACHE 1
 
 subtest sequence_in_transaction
+
+# We're using explicit transactions, so we might hit retries.
+
+skip_on_retry
 
 # create a sequence and nextval in the same transaction
 statement ok
@@ -2214,3 +2228,100 @@ SELECT lastval()
 
 statement ok
 END
+
+# Create sequence restart should work, and the RESTART value takes precedence
+# over START WITH
+statement ok
+CREATE SEQUENCE restart_seq START WITH 50 RESTART 100
+
+query I
+SELECT nextval('restart_seq')
+----
+100
+
+query I
+SELECT nextval('restart_seq')
+----
+101
+
+# If the sequence is restarted now, then it goes back to the START WITH value.
+statement ok
+ALTER SEQUENCE restart_seq RESTART
+
+query I
+SELECT nextval('restart_seq')
+----
+50
+
+# Create a sequence with restart and check that the value can be selected
+statement ok
+BEGIN
+
+statement ok
+CREATE SEQUENCE restart_txn_seq RESTART 100
+
+query I
+SELECT nextval('restart_txn_seq')
+----
+100
+
+statement ok
+END
+
+# Regression test for #74127. Assert that out-of-range sequence values are not returned.
+
+# The value value(12) is out-of-bounds
+statement ok
+CREATE SEQUENCE customer_seq_check_cache_and_bounds_1 INCREMENT  BY 3  MINVALUE 6 MAXVALUE 10
+
+query I
+SELECT nextval('customer_seq_check_cache_and_bounds_1')
+----
+6
+
+query I
+SELECT nextval('customer_seq_check_cache_and_bounds_1')
+----
+9
+
+statement error pgcode 2200H pq: nextval\(\): reached maximum value of sequence "customer_seq_check_cache_and_bounds_1" \(10\)
+SELECT nextval('customer_seq_check_cache_and_bounds_1')
+
+# Set the cache to 5
+statement ok
+CREATE SEQUENCE customer_seq_check_cache_and_bounds_2 MINVALUE -2 MAXVALUE 2 START WITH 1 CACHE 5 INCREMENT BY -2
+
+query I
+SELECT nextval('customer_seq_check_cache_and_bounds_2')
+----
+1
+
+query I
+SELECT nextval('customer_seq_check_cache_and_bounds_2')
+----
+-1
+
+statement error pgcode 2200H pq: nextval\(\): reached minimum value of sequence "customer_seq_check_cache_and_bounds_2" \(-2\)
+SELECT nextval('customer_seq_check_cache_and_bounds_2')
+
+# The value value(12) is equal with MAXVALUE(12)
+statement ok
+CREATE SEQUENCE customer_seq_check_cache_and_bounds_3 INCREMENT  BY 3  MINVALUE 6 MAXVALUE 12
+
+query I
+SELECT nextval('customer_seq_check_cache_and_bounds_3')
+----
+6
+
+query I
+SELECT nextval('customer_seq_check_cache_and_bounds_3')
+----
+9
+
+query I
+SELECT nextval('customer_seq_check_cache_and_bounds_3')
+----
+12
+
+statement error pgcode 2200H pq: nextval\(\): reached maximum value of sequence "customer_seq_check_cache_and_bounds_3" \(12\)
+SELECT nextval('customer_seq_check_cache_and_bounds_3')

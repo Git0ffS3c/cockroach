@@ -11,44 +11,36 @@
 import React from "react";
 import { assert } from "chai";
 import { mount, ReactWrapper } from "enzyme";
-import sinon from "sinon";
-import Long from "long";
 import { MemoryRouter } from "react-router-dom";
-import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { Button } from "@cockroachlabs/ui-components";
 
 import { DiagnosticsView } from "./diagnosticsView";
 import { Table } from "src/table";
 import { TestStoreProvider } from "src/test-utils";
-
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
-
-const sandbox = sinon.createSandbox();
+import { StatementDiagnosticsReport } from "../../api";
+import moment from "moment";
 
 const activateDiagnosticsRef = { current: { showModalFor: jest.fn() } };
 
 function generateDiagnosticsRequest(
-  extendObject: Partial<IStatementDiagnosticsReport> = {},
-): IStatementDiagnosticsReport {
-  const diagnosticsRequest = {
+  extendObject: Partial<StatementDiagnosticsReport> = {},
+): StatementDiagnosticsReport {
+  const requestedAt = moment.now();
+  const report: StatementDiagnosticsReport = {
+    id: "124354678574635",
     statement_fingerprint: "SELECT * FROM table",
     completed: true,
-    requested_at: {
-      seconds: Long.fromNumber(Date.now()),
-      nanos: Math.random() * 1000000,
-    },
+    requested_at: moment(requestedAt),
+    min_execution_latency: moment.duration(10),
+    expires_at: moment(requestedAt + 10),
   };
-  Object.assign(diagnosticsRequest, extendObject);
-  return diagnosticsRequest;
+  Object.assign(report, extendObject);
+  return report;
 }
 
 describe("DiagnosticsView", () => {
   let wrapper: ReactWrapper;
   const statementFingerprint = "some-id";
-
-  beforeEach(() => {
-    sandbox.reset();
-  });
 
   describe("With Empty state", () => {
     beforeEach(() => {
@@ -76,7 +68,7 @@ describe("DiagnosticsView", () => {
 
   describe("With tracing data", () => {
     beforeEach(() => {
-      const diagnosticsRequests: IStatementDiagnosticsReport[] = [
+      const diagnosticsRequests: StatementDiagnosticsReport[] = [
         generateDiagnosticsRequest(),
         generateDiagnosticsRequest(),
       ];
@@ -109,7 +101,7 @@ describe("DiagnosticsView", () => {
     });
 
     it("Activate button is hidden if diagnostics is requested and waiting query", () => {
-      const diagnosticsRequests: IStatementDiagnosticsReport[] = [
+      const diagnosticsRequests: StatementDiagnosticsReport[] = [
         generateDiagnosticsRequest({ completed: false }),
         generateDiagnosticsRequest(),
       ];
@@ -131,7 +123,7 @@ describe("DiagnosticsView", () => {
     });
 
     it("Cancel request button shows if diagnostics is requested and waiting query", () => {
-      const diagnosticsRequests: IStatementDiagnosticsReport[] = [
+      const diagnosticsRequests: StatementDiagnosticsReport[] = [
         generateDiagnosticsRequest({ completed: false }),
         generateDiagnosticsRequest(),
       ];

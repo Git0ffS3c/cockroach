@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -39,7 +41,7 @@ import (
 
 func writeTxnRecord(ctx context.Context, tc *testContext, txn *roachpb.Transaction) error {
 	key := keys.TransactionKey(txn.Key, txn.ID)
-	return storage.MVCCPutProto(ctx, tc.store.Engine(), nil, key, hlc.Timestamp{}, nil, txn)
+	return storage.MVCCPutProto(ctx, tc.store.TODOEngine(), nil, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, txn)
 }
 
 // createTxnForPushQueue creates a txn struct and writes a "fake"
@@ -50,8 +52,8 @@ func createTxnForPushQueue(ctx context.Context, tc *testContext) (*roachpb.Trans
 }
 
 type RespWithErr struct {
-	resp *roachpb.PushTxnResponse
-	pErr *roachpb.Error
+	resp *kvpb.PushTxnResponse
+	pErr *kvpb.Error
 }
 
 func checkAllGaugesZero(tc testContext) error {
@@ -102,8 +104,8 @@ func TestTxnWaitQueueEnableDisable(t *testing.T) {
 	assert.EqualValues(tc, 1, m.PusheeWaiting.Value())
 
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
@@ -185,8 +187,8 @@ func TestTxnWaitQueueCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
@@ -251,8 +253,8 @@ func TestTxnWaitQueueUpdateTxn(t *testing.T) {
 	}
 	pusher1 := newTransaction("pusher1", roachpb.Key("a"), 1, tc.Clock())
 	pusher2 := newTransaction("pusher2", roachpb.Key("a"), 1, tc.Clock())
-	req1 := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req1 := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher1,
 		PusheeTxn: txn.TxnMeta,
 	}
@@ -361,11 +363,11 @@ func TestTxnWaitQueueTxnSilentlyCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	req := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txn.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
@@ -441,8 +443,8 @@ func TestTxnWaitQueueUpdateNotPushedTxn(t *testing.T) {
 		t.Fatal(err)
 	}
 	pusher := newTransaction("pusher", roachpb.Key("a"), 1, tc.Clock())
-	req := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher,
 		PusheeTxn: txn.TxnMeta,
 	}
@@ -488,18 +490,18 @@ func TestTxnWaitQueuePusheeExpires(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	var queryTxnCount int32
 
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	clock := hlc.NewClockForTesting(manual)
 	txn := newTransaction("txn", roachpb.Key("a"), 1, clock)
 	// Move the clock forward so that when the PushTxn is sent, the txn appears
 	// expired.
-	manual.Set(txnwait.TxnExpiration(txn).WallTime)
+	manual.MustAdvanceTo(txnwait.TxnExpiration(txn).GoTime())
 
 	tc := testContext{}
 	tsc := TestStoreConfig(clock)
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			if qtReq, ok := filterArgs.Req.(*roachpb.QueryTxnRequest); ok && bytes.Equal(qtReq.Txn.Key, txn.Key) {
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			if qtReq, ok := filterArgs.Req.(*kvpb.QueryTxnRequest); ok && bytes.Equal(qtReq.Txn.Key, txn.Key) {
 				atomic.AddInt32(&queryTxnCount, 1)
 			}
 			return nil
@@ -511,8 +513,8 @@ func TestTxnWaitQueuePusheeExpires(t *testing.T) {
 
 	pusher1 := newTransaction("pusher1", roachpb.Key("a"), 1, tc.Clock())
 	pusher2 := newTransaction("pusher2", roachpb.Key("a"), 1, tc.Clock())
-	req1 := roachpb.PushTxnRequest{
-		PushType:  roachpb.PUSH_ABORT,
+	req1 := kvpb.PushTxnRequest{
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *pusher1,
 		PusheeTxn: txn.TxnMeta,
 	}
@@ -608,8 +610,8 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 				}
 				pusher.Epoch = pushEpoch
 
-				req := roachpb.PushTxnRequest{
-					PushType:  roachpb.PUSH_ABORT,
+				req := kvpb.PushTxnRequest{
+					PushType:  kvpb.PUSH_ABORT,
 					PusherTxn: *pusher,
 					PusheeTxn: txn.TxnMeta,
 				}
@@ -675,9 +677,9 @@ func TestTxnWaitQueuePusherUpdate(t *testing.T) {
 }
 
 type ReqWithRespAndErr struct {
-	req  *roachpb.PushTxnRequest
-	resp *roachpb.PushTxnResponse
-	pErr *roachpb.Error
+	req  *kvpb.PushTxnRequest
+	resp *kvpb.PushTxnResponse
+	pErr *kvpb.Error
 }
 
 // TestTxnWaitQueueDependencyCycle verifies that if txn A pushes txn B
@@ -705,27 +707,27 @@ func TestTxnWaitQueueDependencyCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reqA := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqA := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnB.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnA,
 		PusheeTxn: txnB.TxnMeta,
 	}
-	reqB := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqB := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnC.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnB,
 		PusheeTxn: txnC.TxnMeta,
 	}
-	reqC := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqC := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnA.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnC,
 		PusheeTxn: txnA.TxnMeta,
 	}
@@ -741,10 +743,10 @@ func TestTxnWaitQueueDependencyCycle(t *testing.T) {
 	m := tc.store.txnWaitMetrics
 	assert.EqualValues(tc, 0, m.DeadlocksTotal.Count())
 
-	reqs := []*roachpb.PushTxnRequest{reqA, reqB, reqC}
+	reqs := []*kvpb.PushTxnRequest{reqA, reqB, reqC}
 	retCh := make(chan ReqWithRespAndErr, len(reqs))
 	for _, req := range reqs {
-		go func(req *roachpb.PushTxnRequest) {
+		go func(req *kvpb.PushTxnRequest) {
 			resp, pErr := q.MaybeWaitForPush(ctx, req)
 			retCh <- ReqWithRespAndErr{req, resp, pErr}
 		}(req)
@@ -806,19 +808,19 @@ func TestTxnWaitQueueDependencyCycleWithPriorityInversion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reqA := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqA := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnB.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnA,
 		PusheeTxn: txnB.TxnMeta,
 	}
-	reqB := &roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	reqB := &kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txnA.Key,
 		},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		PusherTxn: *txnB,
 		PusheeTxn: updatedTxnA.TxnMeta,
 	}
@@ -832,10 +834,10 @@ func TestTxnWaitQueueDependencyCycleWithPriorityInversion(t *testing.T) {
 	m := tc.store.txnWaitMetrics
 	assert.EqualValues(tc, 0, m.DeadlocksTotal.Count())
 
-	reqs := []*roachpb.PushTxnRequest{reqA, reqB}
+	reqs := []*kvpb.PushTxnRequest{reqA, reqB}
 	retCh := make(chan ReqWithRespAndErr, len(reqs))
 	for _, req := range reqs {
-		go func(req *roachpb.PushTxnRequest) {
+		go func(req *kvpb.PushTxnRequest) {
 			resp, pErr := q.MaybeWaitForPush(ctx, req)
 			retCh <- ReqWithRespAndErr{req, resp, pErr}
 		}(req)

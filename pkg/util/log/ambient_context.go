@@ -13,6 +13,7 @@ package log
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/logtags"
 	"golang.org/x/net/trace"
@@ -23,40 +24,41 @@ import (
 // server components.
 //
 // Example:
-//   type SomeServer struct {
-//     log.AmbientContext
-//     ...
-//   }
 //
-//   ac := AmbientContext{Tracer: tracing.NewTracer()}
-//   ac.AddLogTag("n", 1)
+//	type SomeServer struct {
+//	  log.AmbientContext
+//	  ...
+//	}
 //
-//   s := &SomeServer{
-//     AmbientContext: ac
-//     ...
-//   }
+//	ac := AmbientContext{Tracer: tracing.NewTracer()}
+//	ac.AddLogTag("n", 1)
 //
-//   // on an operation with context ctx
-//   ctx = s.AnnotateCtx(ctx)
-//   ...
+//	s := &SomeServer{
+//	  AmbientContext: ac
+//	  ...
+//	}
 //
-//   // run a worker
-//   s.stopper.RunWorker(func() {
-//     ctx := s.AnnotateCtx(context.Background())
-//     ...
-//   })
+//	// on an operation with context ctx
+//	ctx = s.AnnotateCtx(ctx)
+//	...
 //
-//   // start a background operation
-//   ctx, span := s.AnnotateCtxWithSpan(context.Background(), "some-op")
-//   defer span.Finish()
-//   ...
+//	// run a worker
+//	s.stopper.RunWorker(func() {
+//	  ctx := s.AnnotateCtx(context.Background())
+//	  ...
+//	})
+//
+//	// start a background operation
+//	ctx, span := s.AnnotateCtxWithSpan(context.Background(), "some-op")
+//	defer span.Finish()
+//	...
 type AmbientContext struct {
 	// Tracer is used to open spans (see AnnotateCtxWithSpan).
 	Tracer *tracing.Tracer
 
 	// ServerIDs will be embedded into contexts that don't already have
 	// one.
-	ServerIDs ServerIdentificationPayload
+	ServerIDs serverident.ServerIdentificationPayload
 
 	// eventLog will be embedded into contexts that don't already have an event
 	// log or an open span (if not nil).
@@ -98,11 +100,11 @@ func (ac *AmbientContext) refreshCache() {
 }
 
 // AnnotateCtx annotates a given context with the information in AmbientContext:
-//  - the EventLog is embedded in the context if the context doesn't already
-//    have an event log or an open trace.
-//  - the log tags in AmbientContext are added (if ctx doesn't already have
-//  them). If the tags already exist, the values from the AmbientContext
-//  overwrite the existing values, but the order of the tags might change.
+//   - the EventLog is embedded in the context if the context doesn't already
+//     have an event log or an open trace.
+//   - the log tags in AmbientContext are added (if ctx doesn't already have
+//     them). If the tags already exist, the values from the AmbientContext
+//     overwrite the existing values, but the order of the tags might change.
 //
 // For background operations, context.Background() should be passed; however, in
 // that case it is strongly recommended to open a span if possible (using
@@ -137,11 +139,9 @@ func (ac *AmbientContext) ResetAndAnnotateCtx(ctx context.Context) context.Conte
 		if ac.eventLog != nil && tracing.SpanFromContext(ctx) == nil && eventLogFromCtx(ctx) == nil {
 			ctx = embedCtxEventLog(ctx, ac.eventLog)
 		}
-		if ac.tags != nil {
-			ctx = logtags.WithTags(ctx, ac.tags)
-		}
+		ctx = logtags.WithTags(ctx, ac.tags)
 		if ac.ServerIDs != nil {
-			ctx = context.WithValue(ctx, ServerIdentificationContextKey{}, ac.ServerIDs)
+			ctx = serverident.ContextWithServerIdentification(ctx, ac.ServerIDs)
 		}
 		return ctx
 	}
@@ -154,8 +154,8 @@ func (ac *AmbientContext) annotateCtxInternal(ctx context.Context) context.Conte
 	if ac.tags != nil {
 		ctx = logtags.AddTags(ctx, ac.tags)
 	}
-	if ac.ServerIDs != nil && ctx.Value(ServerIdentificationContextKey{}) == nil {
-		ctx = context.WithValue(ctx, ServerIdentificationContextKey{}, ac.ServerIDs)
+	if ac.ServerIDs != nil && serverident.ServerIdentificationFromContext(ctx) == nil {
+		ctx = serverident.ContextWithServerIdentification(ctx, ac.ServerIDs)
 	}
 	return ctx
 }
@@ -181,8 +181,8 @@ func (ac *AmbientContext) AnnotateCtxWithSpan(
 		if ac.tags != nil {
 			ctx = logtags.AddTags(ctx, ac.tags)
 		}
-		if ac.ServerIDs != nil && ctx.Value(ServerIdentificationContextKey{}) == nil {
-			ctx = context.WithValue(ctx, ServerIdentificationContextKey{}, ac.ServerIDs)
+		if ac.ServerIDs != nil && serverident.ServerIdentificationFromContext(ctx) == nil {
+			ctx = serverident.ContextWithServerIdentification(ctx, ac.ServerIDs)
 		}
 	}
 
@@ -217,7 +217,7 @@ func MakeTestingAmbientCtxWithNewTracer() AmbientContext {
 // MakeServerAmbientContext creates an AmbientContext for use by
 // server processes.
 func MakeServerAmbientContext(
-	tracer *tracing.Tracer, idProvider ServerIdentificationPayload,
+	tracer *tracing.Tracer, idProvider serverident.ServerIdentificationPayload,
 ) AmbientContext {
 	return AmbientContext{Tracer: tracer, ServerIDs: idProvider}
 }

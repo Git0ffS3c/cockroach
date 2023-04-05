@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -336,6 +337,31 @@ func TestEncodedLengthUvarintAscending(t *testing.T) {
 	}
 }
 
+func TestGetUvarintLen(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		v := rand.Uint64()
+		enc := EncodeUvarintAscending(nil, v)
+		exp := len(enc)
+		actual, err := GetUvarintLen(enc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actual != exp {
+			t.Fatalf("incorrect encoded length for %d: %d (expected %d)", v, actual, exp)
+		}
+		b, dec, err := DecodeUvarintAscending(enc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dec != v {
+			t.Fatalf("incorrect decoded value: %d (expected %d)", dec, v)
+		}
+		if len(b) != 0 {
+			t.Fatalf("incorrect decoded length for %d: %d (expected %d)", v, exp-len(b), exp)
+		}
+	}
+}
+
 func TestEncodeDecodeUvarintDescending(t *testing.T) {
 	testBasicEncodeDecodeUint64(EncodeUvarintDescending, DecodeUvarintDescending, true, true, true, t)
 	testCases := []testCaseUint64{
@@ -461,7 +487,7 @@ func testPeekLength(t *testing.T, encoded []byte) {
 	}
 }
 
-func TestEncodeDecodeBytes(t *testing.T) {
+func TestEncodeDecodeBytesAscending(t *testing.T) {
 	testCases := []struct {
 		value   []byte
 		encoded []byte
@@ -489,6 +515,11 @@ func TestEncodeDecodeBytes(t *testing.T) {
 					c.value, testCases[i-1].encoded, enc)
 			}
 		}
+		expSize := EncodeBytesSize(c.value)
+		if len(enc) != expSize {
+			t.Errorf("expected encoded size %d, got %d", expSize, len(enc))
+		}
+
 		remainder, dec, err := DecodeBytesAscending(enc, nil)
 		if err != nil {
 			t.Error(err)
@@ -511,6 +542,56 @@ func TestEncodeDecodeBytes(t *testing.T) {
 		}
 		if string(remainder) != "remainder" {
 			t.Errorf("unexpected remaining bytes: %v", remainder)
+		}
+	}
+}
+
+func TestEncodeNextBytesAscending_Equivalence(t *testing.T) {
+	for _, b := range [][]byte{
+		{0, 1, 'a'},
+		{0, 'a'},
+		{0, 0xff, 'a'},
+		{'a'},
+		{'b'},
+		{'b', 0},
+		{'b', 0, 0},
+		{'b', 0, 0, 'a'},
+		{'b', 0xff},
+		{'h', 'e', 'l', 'l', 'o'},
+	} {
+		next := append(b, 0x00)
+
+		gotSz := EncodeNextBytesSize(b)
+		wantSz := EncodeBytesSize(next)
+		if gotSz != wantSz {
+			t.Errorf("EncodeNextBytesSize(%q) = %d; want %d", b, gotSz, wantSz)
+		}
+		gotV := EncodeNextBytesAscending(nil, b)
+		wantV := EncodeBytesAscending(nil, next)
+		if !bytes.Equal(gotV, wantV) {
+			t.Errorf("EncodeNextBytesAscending(%q) = %q; want %q", b, gotV, wantV)
+		}
+	}
+}
+
+func TestEncodeNextBytesAscending_Equivalence_Randomized(t *testing.T) {
+	rnd, _ := randutil.NewTestRand()
+	var buf [10]byte
+	var nextBuf [10 + 1]byte
+	for i := 0; i < 1000; i++ {
+		b := buf[:randutil.RandIntInRange(rnd, 1, cap(buf))]
+		randutil.ReadTestdataBytes(rnd, b)
+		next := append(append(nextBuf[:0], b...), 0x00)
+
+		gotSz := EncodeNextBytesSize(b)
+		wantSz := EncodeBytesSize(next)
+		if gotSz != wantSz {
+			t.Errorf("EncodeNextBytesSize(%q) = %d; want %d", b, gotSz, wantSz)
+		}
+		gotV := EncodeNextBytesAscending(nil, b)
+		wantV := EncodeBytesAscending(nil, next)
+		if !bytes.Equal(gotV, wantV) {
+			t.Errorf("EncodeNextBytesAscending(%q) = %q; want %q", b, gotV, wantV)
 		}
 	}
 }
@@ -543,6 +624,11 @@ func TestEncodeDecodeBytesDescending(t *testing.T) {
 					c.value, testCases[i-1].encoded, enc)
 			}
 		}
+		expSize := EncodeBytesSize(c.value)
+		if len(enc) != expSize {
+			t.Errorf("expected encoded size %d, got %d", expSize, len(enc))
+		}
+
 		remainder, dec, err := DecodeBytesDescending(enc, nil)
 		if err != nil {
 			t.Error(err)
@@ -887,7 +973,9 @@ func TestPrettyPrintValue(t *testing.T) {
 			dirStr = "Desc"
 		}
 		t.Run(test.exp[1:]+"/"+dirStr, func(t *testing.T) {
-			got := PrettyPrintValue([]Direction{test.dir}, test.key, "/")
+			var buf redact.StringBuilder
+			PrettyPrintValue(&buf, []Direction{test.dir}, test.key, "/")
+			got := buf.String()
 			if got != test.exp {
 				t.Errorf("expected %q, got %q", test.exp, got)
 			}

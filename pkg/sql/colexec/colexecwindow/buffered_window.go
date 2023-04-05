@@ -12,7 +12,6 @@ package colexecwindow
 
 import (
 	"context"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
@@ -30,7 +29,7 @@ import (
 // window function.
 func newBufferedWindowOperator(
 	args *WindowArgs, windower bufferedWindower, outputColType *types.T, memoryLimit int64,
-) colexecop.Operator {
+) colexecop.ClosableOperator {
 	outputTypes := make([]*types.T, len(args.InputTypes), len(args.InputTypes)+1)
 	copy(outputTypes, args.InputTypes)
 	outputTypes = append(outputTypes, outputColType)
@@ -42,14 +41,15 @@ func newBufferedWindowOperator(
 	queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeIntertwinedCalls)
 	return &bufferedWindowOp{
 		windowInitFields: windowInitFields{
-			OneInputNode: colexecop.NewOneInputNode(input),
-			allocator:    args.MainAllocator,
-			memoryLimit:  memoryLimit,
-			diskQueueCfg: queueCfg,
-			fdSemaphore:  args.FdSemaphore,
-			outputTypes:  outputTypes,
-			diskAcc:      args.DiskAcc,
-			outputColIdx: args.OutputColIdx,
+			OneInputNode:    colexecop.NewOneInputNode(input),
+			allocator:       args.MainAllocator,
+			memoryLimit:     memoryLimit,
+			diskQueueCfg:    queueCfg,
+			fdSemaphore:     args.FdSemaphore,
+			outputTypes:     outputTypes,
+			diskAcc:         args.DiskAcc,
+			converterMemAcc: args.ConverterMemAcc,
+			outputColIdx:    args.OutputColIdx,
 		},
 		windower: windower,
 	}
@@ -144,13 +144,14 @@ type windowInitFields struct {
 	colexecop.OneInputNode
 	colexecop.InitHelper
 
-	allocator    *colmem.Allocator
-	memoryLimit  int64
-	diskQueueCfg colcontainer.DiskQueueCfg
-	fdSemaphore  semaphore.Semaphore
-	outputTypes  []*types.T
-	diskAcc      *mon.BoundAccount
-	outputColIdx int
+	allocator       *colmem.Allocator
+	memoryLimit     int64
+	diskQueueCfg    colcontainer.DiskQueueCfg
+	fdSemaphore     semaphore.Semaphore
+	outputTypes     []*types.T
+	diskAcc         *mon.BoundAccount
+	converterMemAcc *mon.BoundAccount
+	outputColIdx    int
 }
 
 // bufferedWindowOp extracts common fields for the various window operators
@@ -208,12 +209,13 @@ func (b *bufferedWindowOp) Init(ctx context.Context) {
 			DiskQueueCfg:       b.diskQueueCfg,
 			FDSemaphore:        b.fdSemaphore,
 			DiskAcc:            b.diskAcc,
+			ConverterMemAcc:    b.converterMemAcc,
 		},
 	)
 	b.windower.startNewPartition()
 }
 
-var _ colexecop.Operator = &bufferedWindowOp{}
+var _ colexecop.ClosableOperator = &bufferedWindowOp{}
 
 func (b *bufferedWindowOp) Next() coldata.Batch {
 	var err error
@@ -248,9 +250,8 @@ func (b *bufferedWindowOp) Next() coldata.Batch {
 			sel := batch.Selection()
 			// We don't limit the batches based on the memory footprint because
 			// we assume that the input is producing reasonably sized batches.
-			const maxBatchMemSize = math.MaxInt64
-			b.currentBatch, _ = b.allocator.ResetMaybeReallocate(
-				b.outputTypes, b.currentBatch, batch.Length(), maxBatchMemSize,
+			b.currentBatch, _ = b.allocator.ResetMaybeReallocateNoMemLimit(
+				b.outputTypes, b.currentBatch, batch.Length(),
 			)
 			b.allocator.PerformOperation(b.currentBatch.ColVecs(), func() {
 				for colIdx, vec := range batch.ColVecs() {
@@ -343,16 +344,11 @@ func (b *bufferedWindowOp) Next() coldata.Batch {
 }
 
 func (b *bufferedWindowOp) Close(ctx context.Context) error {
-	if !b.CloserHelper.Close() || b.Ctx == nil {
-		// Either Close() has already been called or Init() was never called. In
-		// both cases there is nothing to do.
+	if !b.CloserHelper.Close() {
 		return nil
 	}
-	if err := b.bufferQueue.Close(ctx); err != nil {
-		return err
-	}
 	b.windower.Close(ctx)
-	return nil
+	return b.bufferQueue.Close(ctx)
 }
 
 // partitionSeekerBase extracts common fields and methods for buffered windower

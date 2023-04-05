@@ -12,7 +12,6 @@ package testutils
 
 import (
 	"context"
-	"runtime/debug"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -32,10 +31,11 @@ const (
 	RaceSucceedsSoonDuration = DefaultSucceedsSoonDuration * 5
 )
 
-// SucceedsSoon fails the test (with t.Fatal) unless the supplied
-// function runs without error within a preset maximum duration. The
-// function is invoked immediately at first and then successively with
-// an exponential backoff starting at 1ns and ending at around 1s.
+// SucceedsSoon fails the test (with t.Fatal) unless the supplied function runs
+// without error within a preset maximum duration. The function is invoked
+// immediately at first and then successively with an exponential backoff
+// starting at 1ns and ending at DefaultSucceedsSoonDuration (or
+// RaceSucceedsSoonDuration if race is enabled).
 func SucceedsSoon(t TB, fn func() error) {
 	t.Helper()
 	SucceedsWithin(t, fn, succeedsSoonDuration())
@@ -44,7 +44,8 @@ func SucceedsSoon(t TB, fn func() error) {
 // SucceedsSoonError returns an error unless the supplied function runs without
 // error within a preset maximum duration. The function is invoked immediately
 // at first and then successively with an exponential backoff starting at 1ns
-// and ending at around 1s.
+// and ending at DefaultSucceedsSoonDuration (or RaceSucceedsSoonDuration if
+// race is enabled).
 func SucceedsSoonError(fn func() error) error {
 	return SucceedsWithinError(fn, succeedsSoonDuration())
 }
@@ -52,19 +53,18 @@ func SucceedsSoonError(fn func() error) error {
 // SucceedsWithin fails the test (with t.Fatal) unless the supplied
 // function runs without error within the given duration. The function
 // is invoked immediately at first and then successively with an
-// exponential backoff starting at 1ns and ending at around 1s.
+// exponential backoff starting at 1ns and ending at duration.
 func SucceedsWithin(t TB, fn func() error, duration time.Duration) {
 	t.Helper()
 	if err := SucceedsWithinError(fn, duration); err != nil {
-		t.Fatalf("condition failed to evaluate within %s: %s\n%s",
-			duration, err, string(debug.Stack()))
+		t.Fatalf("condition failed to evaluate within %s: %s", duration, err)
 	}
 }
 
 // SucceedsWithinError returns an error unless the supplied function
 // runs without error within the given duration. The function is
 // invoked immediately at first and then successively with an
-// exponential backoff starting at 1ns and ending at around 1s.
+// exponential backoff starting at 1ns and ending at duration.
 func SucceedsWithinError(fn func() error, duration time.Duration) error {
 	tBegin := timeutil.Now()
 	wrappedFn := func() error {

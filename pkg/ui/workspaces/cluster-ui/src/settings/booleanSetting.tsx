@@ -11,6 +11,7 @@
 import * as React from "react";
 import { CircleFilled } from "src/icon";
 import { Tooltip } from "antd";
+import "antd/lib/tooltip/style";
 import classNames from "classnames/bind";
 import styles from "./booleanSetting.module.scss";
 
@@ -22,7 +23,7 @@ export interface BooleanSettingProps {
   tooltipText: JSX.Element;
 }
 
-export function BooleanSetting(props: BooleanSettingProps) {
+export function BooleanSetting(props: BooleanSettingProps): React.ReactElement {
   const { text, enabled, tooltipText } = props;
   const label = enabled ? "enabled" : "disabled";
   const boolClass = enabled

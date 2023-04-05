@@ -11,6 +11,8 @@
 package transform
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/normalize"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -23,19 +25,19 @@ import (
 // visitors between uses.
 type ExprTransformContext struct {
 	normalizeVisitor   normalize.Visitor
-	isAggregateVisitor IsAggregateVisitor
+	isAggregateVisitor isAggregateVisitor
 }
 
 // NormalizeExpr is a wrapper around EvalContex.Expr which
 // avoids allocation of a normalizeVisitor. See var_expr.go for
 // details.
 func (t *ExprTransformContext) NormalizeExpr(
-	ctx *eval.Context, typedExpr tree.TypedExpr,
+	ctx context.Context, evalCtx *eval.Context, typedExpr tree.TypedExpr,
 ) (tree.TypedExpr, error) {
-	if ctx.SkipNormalize {
+	if evalCtx.SkipNormalize {
 		return typedExpr, nil
 	}
-	t.normalizeVisitor = normalize.MakeNormalizeVisitor(ctx)
+	t.normalizeVisitor = normalize.MakeNormalizeVisitor(ctx, evalCtx)
 	expr, _ := tree.WalkExpr(&t.normalizeVisitor, typedExpr)
 	if err := t.normalizeVisitor.Err(); err != nil {
 		return nil, err
@@ -49,13 +51,14 @@ func (t *ExprTransformContext) NormalizeExpr(
 // should collect scalar properties (see tree.ScalarProperties) and
 // then the collected properties should be tested directly.
 func (t *ExprTransformContext) AggregateInExpr(
-	expr tree.Expr, searchPath sessiondata.SearchPath,
+	ctx context.Context, expr tree.Expr, searchPath sessiondata.SearchPath,
 ) bool {
 	if expr == nil {
 		return false
 	}
 
-	t.isAggregateVisitor = IsAggregateVisitor{
+	t.isAggregateVisitor = isAggregateVisitor{
+		ctx:        ctx,
 		searchPath: searchPath,
 	}
 	tree.WalkExprConst(&t.isAggregateVisitor, expr)

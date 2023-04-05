@@ -159,6 +159,17 @@ func (tq *testQueue) MaybeAddAsync(
 	}
 }
 
+// NB: AddAsync on a testQueue is actually synchronous.
+func (tq *testQueue) AddAsync(ctx context.Context, replI replicaInQueue, prio float64) {
+	repl := replI.(*Replica)
+
+	tq.Lock()
+	defer tq.Unlock()
+	if index := tq.indexOf(repl.RangeID); index == -1 {
+		tq.ranges = append(tq.ranges, repl)
+	}
+}
+
 func (tq *testQueue) MaybeRemove(rangeID roachpb.RangeID) {
 	tq.Lock()
 	defer tq.Unlock()
@@ -207,8 +218,7 @@ func TestScannerAddToQueues(t *testing.T) {
 	// We don't want to actually consume entries from the queues during this test.
 	q1.SetDisabled(true)
 	q2.SetDisabled(true)
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q1, q2)
 	s.stopper = stop.NewStopper()
@@ -260,8 +270,7 @@ func TestScannerTiming(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			ranges := newTestRangeSet(count, t)
 			q := &testQueue{}
-			mc := hlc.NewManualClock(123)
-			clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+			clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 			s := newReplicaScanner(makeAmbCtx(), clock, duration, 0, 0, ranges)
 			s.AddQueues(q)
 			s.stopper = stop.NewStopper()
@@ -344,8 +353,7 @@ func TestScannerDisabled(t *testing.T) {
 	const count = 3
 	ranges := newTestRangeSet(count, t)
 	q := &testQueue{}
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q)
 	s.stopper = stop.NewStopper()
@@ -409,8 +417,7 @@ func TestScannerEmptyRangeSet(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ranges := newTestRangeSet(0, t)
 	q := &testQueue{}
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, time.Hour, 0, 0, ranges)
 	s.AddQueues(q)
 	s.stopper = stop.NewStopper()

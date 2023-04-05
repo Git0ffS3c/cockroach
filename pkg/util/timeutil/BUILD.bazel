@@ -1,8 +1,10 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "timeutil",
     srcs = [
+        "cpustopwatch.go",
         "manual_time.go",
         "stopwatch.go",
         "time.go",
@@ -16,6 +18,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/util/timeutil",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/util/grunning",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
     ],
@@ -33,6 +36,7 @@ go_test(
         "time_zone_util_test.go",
         "timer_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":timeutil"],
     deps = [
         "//pkg/util/leaktest",
@@ -64,3 +68,5 @@ genrule(
         "//pkg/gen:__pkg__",
     ],
 )
+
+get_x_data(name = "get_x_data")

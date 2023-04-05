@@ -21,12 +21,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -37,16 +39,20 @@ import (
 
 func TestCategory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	if expected, actual := categoryString, builtins["lower"].props.Category; expected != actual {
+	getCategory := func(name string) string {
+		props, _ := builtinsregistry.GetBuiltinProperties(name)
+		return props.Category
+	}
+	if expected, actual := builtinconstants.CategoryString, getCategory("lower"); expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
-	if expected, actual := categoryString, builtins["length"].props.Category; expected != actual {
+	if expected, actual := builtinconstants.CategoryString, getCategory("length"); expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
-	if expected, actual := categoryDateAndTime, builtins["now"].props.Category; expected != actual {
+	if expected, actual := builtinconstants.CategoryDateAndTime, getCategory("now"); expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
-	if expected, actual := categorySystemInfo, builtins["version"].props.Category; expected != actual {
+	if expected, actual := builtinconstants.CategorySystemInfo, getCategory("version"); expected != actual {
 		t.Fatalf("bad category: expected %q got %q", expected, actual)
 	}
 }
@@ -93,6 +99,9 @@ func TestMapToUniqueUnorderedID(t *testing.T) {
 func TestSerialNormalizationWithUniqueUnorderedID(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
+
+	skip.UnderRace(t, "the test is too slow and the goodness of fit test "+
+		"assumes large N")
 	params := base.TestServerArgs{}
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
@@ -109,41 +118,61 @@ CREATE TABLE t (
 )`)
 
 	numberOfRows := 10000
-	if util.RaceEnabled {
-		// We use a small number of rows because inserting rows under race is slow.
-		numberOfRows = 100
-	}
 
-	// Enforce 3 bits worth of range splits in the high order to collect range
-	// statistics after row insertions.
+	// Insert rows.
 	tdb.Exec(t, fmt.Sprintf(`
-ALTER TABLE t SPLIT AT SELECT i<<(60) FROM generate_series(1, 7) as t(i);
 INSERT INTO t(j) SELECT * FROM generate_series(1, %d);
 `, numberOfRows))
 
-	// Derive range statistics.
+	// Build an equi-width histogram over the key range. The below query will
+	// generate the key bounds for each high-order bit pattern as defined by
+	// prefixBits. For example, if this were 3, we'd get the following groups:
+	//
+	//            low         |        high
+	//  ----------------------+----------------------
+	//                      0 | 2305843009213693952
+	//    2305843009213693952 | 4611686018427387904
+	//    4611686018427387904 | 6917529027641081856
+	//    6917529027641081856 | 9223372036854775807
+	//
+	const prefixBits = 4
 	var keyCounts pq.Int64Array
-	tdb.QueryRow(t, "SELECT "+
-		"array_agg((crdb_internal.range_stats(start_key)->>'key_count')::int) AS rows "+
-		"FROM crdb_internal.ranges_no_leases WHERE table_id"+
-		"='t'::regclass;").Scan(&keyCounts)
+	tdb.QueryRow(t, `
+  WITH boundaries AS (
+                     SELECT i << (64 - $1) AS p FROM ROWS FROM (generate_series(0, (1<<($1-1)) -1)) AS t (i)
+                     UNION ALL SELECT (((1 << 62) - 1) << 1)+1 -- int63 max value
+                  ),
+       groups AS (
+                SELECT *
+                  FROM (SELECT p AS low, lead(p) OVER () AS high FROM boundaries)
+                 WHERE high IS NOT NULL
+              ),
+       counts AS (
+                  SELECT count(i) AS c
+                    FROM t, groups
+                   WHERE low <= i AND high > i
+                GROUP BY (low, high)
+              )
+SELECT array_agg(c)
+  FROM counts;`, prefixBits).Scan(&keyCounts)
 
 	t.Log("Key counts in each split range")
 	for i, keyCount := range keyCounts {
 		t.Logf("range %d: %d\n", i, keyCount)
 	}
+	require.Len(t, keyCounts, 1<<(prefixBits-1))
 
 	// To check that the distribution over ranges is not uniform, we use a
 	// chi-square goodness of fit statistic. We'll set our null hypothesis as
 	// 'each range in the distribution should have the same probability of getting
 	// a row inserted' and we'll check if we can reject the null hypothesis if
-	// chi-square is greater than the critical value we currently set as 19.5114,
+	// chi-square is greater than the critical value we currently set as 35.2585,
 	// a deliberate choice that gives us a p-value of 0.00001 according to
 	// https://www.fourmilab.ch/rpkp/experiments/analysis/chiCalc.html. If we are
 	// able to reject the null hypothesis, then the distribution is not uniform,
-	// and we raise an error.
+	// and we raise an error. This test has 7 degrees of freedom (categories - 1).
 	chiSquared := discreteUniformChiSquared(keyCounts)
-	criticalValue := 19.5114
+	criticalValue := 35.2585
 	require.Lessf(t, chiSquared, criticalValue, "chiSquared value of %f must be"+
 		" less than criticalVal %f to guarantee distribution is relatively uniform",
 		chiSquared, criticalValue)
@@ -649,5 +678,85 @@ func TestTruncateTimestamp(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.expected, result)
 		})
+	}
+}
+
+func TestPGBuiltinsCalledOnNull(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	params := base.TestServerArgs{}
+	s, db, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	testCases := []struct {
+		sql string
+	}{
+		{ // Case 1
+			sql: "SELECT pg_get_functiondef(NULL);",
+		},
+		{ // Case 2
+			sql: "SELECT pg_get_function_arguments(NULL);",
+		},
+		{ // Case 3
+			sql: "SELECT pg_get_function_result(NULL);",
+		},
+		{ // Case 4
+			sql: "SELECT pg_get_function_identity_arguments(NULL);",
+		},
+		{ // Case 5
+			sql: "SELECT pg_get_indexdef(NULL);",
+		},
+		{ // Case 6
+			sql: "SELECT pg_get_userbyid(NULL);",
+		},
+		{ // Case 7
+			sql: "SELECT pg_sequence_parameters(NULL);",
+		},
+		{ // Case 8
+			sql: "SELECT col_description(NULL, NULL);",
+		},
+		{ // Case 9
+			sql: "SELECT col_description(NULL, 0);",
+		},
+		{ // Case 10
+			sql: "SELECT col_description(0, NULL);",
+		},
+		{ // Case 11
+			sql: "SELECT obj_description(NULL);",
+		},
+		{ // Case 12
+			sql: "SELECT obj_description(NULL, NULL);",
+		},
+		{ // Case 13
+			sql: "SELECT obj_description(NULL, 'foo');",
+		},
+		{ // Case 14
+			sql: "SELECT obj_description(0, NULL);",
+		},
+		{ // Case 15
+			sql: "SELECT shobj_description(NULL, NULL);",
+		},
+		{ // Case 16
+			sql: "SELECT shobj_description(NULL, 'foo');",
+		},
+		{ // Case 17
+			sql: "SELECT shobj_description(0, NULL);",
+		},
+		{ // Case 18
+			sql: "SELECT pg_function_is_visible(NULL);",
+		},
+		{ // Case 19
+			sql: "SELECT pg_table_is_visible(NULL);",
+		},
+		{ // Case 20
+			sql: "SELECT pg_type_is_visible(NULL);",
+		},
+	}
+	for i, tc := range testCases {
+		res := tdb.QueryStr(t, tc.sql)
+		require.Equalf(t, [][]string{{"NULL"}}, res, "failed test case %d", i+1)
 	}
 }

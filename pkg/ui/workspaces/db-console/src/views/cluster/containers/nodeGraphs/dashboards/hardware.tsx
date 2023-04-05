@@ -23,22 +23,43 @@ import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 // TODO(vilterp): tooltips
 
-export default function(props: GraphDashboardProps) {
+export default function (props: GraphDashboardProps) {
   const {
     nodeIDs,
-    nodesSummary,
+    nodeDisplayNameByID,
+    storeIDsByNodeID,
     nodeSources,
     storeSources,
     tooltipSelection,
   } = props;
 
   return [
-    <LineGraph title="CPU Percent" sources={nodeSources}>
+    <LineGraph
+      title="CPU Percent"
+      sources={nodeSources}
+      tooltip={<div>CPU usage for the CRDB nodes {tooltipSelection}</div>}
+    >
       <Axis units={AxisUnits.Percentage} label="CPU">
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.cpu.combined.percent-normalized"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={[nid]}
+          />
+        ))}
+      </Axis>
+    </LineGraph>,
+
+    <LineGraph
+      title="Host CPU Percent"
+      sources={nodeSources}
+      tooltip={<div>Machine-wide CPU usage {tooltipSelection}</div>}
+    >
+      <Axis units={AxisUnits.Percentage} label="CPU">
+        {nodeIDs.map(nid => (
+          <Metric
+            name="cr.node.sys.cpu.host.combined.percent-normalized"
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
           />
         ))}
@@ -54,7 +75,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.rss"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
           />
         ))}
@@ -66,7 +87,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.host.disk.read.bytes"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
             nonNegativeRate
           />
@@ -79,7 +100,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.host.disk.write.bytes"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
             nonNegativeRate
           />
@@ -92,7 +113,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.host.disk.read.count"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
             nonNegativeRate
           />
@@ -105,7 +126,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.host.disk.write.count"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
             nonNegativeRate
           />
@@ -118,7 +139,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.host.disk.iopsinprogress"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
           />
         ))}
@@ -134,8 +155,8 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.store.capacity.available"
-            sources={storeIDsForNode(nodesSummary, nid)}
-            title={nodeDisplayName(nodesSummary, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
           />
         ))}
       </Axis>
@@ -146,7 +167,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.host.net.recv.bytes"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
             nonNegativeRate
           />
@@ -159,7 +180,7 @@ export default function(props: GraphDashboardProps) {
         {nodeIDs.map(nid => (
           <Metric
             name="cr.node.sys.host.net.send.bytes"
-            title={nodeDisplayName(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
             sources={[nid]}
             nonNegativeRate
           />

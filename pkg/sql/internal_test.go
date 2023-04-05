@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -50,7 +51,7 @@ func TestInternalExecutor(t *testing.T) {
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
 	row, err := ie.QueryRowEx(ctx, "test", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		"SELECT 1")
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +71,7 @@ func TestInternalExecutor(t *testing.T) {
 	// The following statement will succeed on the 2nd try.
 	row, err = ie.QueryRowEx(
 		ctx, "test", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		"select case nextval('test.seq') when 1 then crdb_internal.force_retry('1h') else 99 end",
 	)
 	if err != nil {
@@ -96,7 +97,7 @@ func TestInternalExecutor(t *testing.T) {
 		cnt++
 		row, err = ie.QueryRowEx(
 			ctx, "test", txn,
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			"select case nextval('test.seq') when 2 then crdb_internal.force_retry('1h') else 99 end",
 		)
 		if cnt == 1 {
@@ -149,11 +150,10 @@ func TestInternalFullTableScan(t *testing.T) {
 		"pq: query `SELECT * FROM t` contains a full table/index scan which is explicitly disallowed",
 		err.Error())
 
+	mon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
+	mon.StartNoReserved(ctx, s.(*server.TestServer).Server.PGServer().SQLServer.GetBytesMonitor())
 	ie := sql.MakeInternalExecutor(
-		ctx,
-		s.(*server.TestServer).Server.PGServer().SQLServer,
-		sql.MemoryMetrics{},
-		s.ExecutorConfig().(sql.ExecutorConfig).Settings,
+		s.(*server.TestServer).Server.PGServer().SQLServer, sql.MemoryMetrics{}, mon,
 	)
 	ie.SetSessionData(
 		&sessiondata.SessionData{
@@ -189,13 +189,11 @@ func TestInternalStmtFingerprintLimit(t *testing.T) {
 	_, err = db.Exec("SET CLUSTER SETTING sql.metrics.max_mem_stmt_fingerprints = 0;")
 	require.NoError(t, err)
 
+	mon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
+	mon.StartNoReserved(ctx, s.(*server.TestServer).Server.PGServer().SQLServer.GetBytesMonitor())
 	ie := sql.MakeInternalExecutor(
-		ctx,
-		s.(*server.TestServer).Server.PGServer().SQLServer,
-		sql.MemoryMetrics{},
-		s.ExecutorConfig().(sql.ExecutorConfig).Settings,
+		s.(*server.TestServer).Server.PGServer().SQLServer, sql.MemoryMetrics{}, mon,
 	)
-
 	_, err = ie.Exec(ctx, "stmt-exceeds-fingerprint-limit", nil, "SELECT 1")
 	require.NoError(t, err)
 }
@@ -322,11 +320,10 @@ func TestSessionBoundInternalExecutor(t *testing.T) {
 	}
 
 	expDB := "foo"
+	mon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
+	mon.StartNoReserved(ctx, s.(*server.TestServer).Server.PGServer().SQLServer.GetBytesMonitor())
 	ie := sql.MakeInternalExecutor(
-		ctx,
-		s.(*server.TestServer).Server.PGServer().SQLServer,
-		sql.MemoryMetrics{},
-		s.ExecutorConfig().(sql.ExecutorConfig).Settings,
+		s.(*server.TestServer).Server.PGServer().SQLServer, sql.MemoryMetrics{}, mon,
 	)
 	ie.SetSessionData(
 		&sessiondata.SessionData{
@@ -338,7 +335,7 @@ func TestSessionBoundInternalExecutor(t *testing.T) {
 		})
 
 	row, err := ie.QueryRowEx(ctx, "test", nil, /* txn */
-		sessiondata.InternalExecutorOverride{},
+		sessiondata.NoSessionDataOverride,
 		"show database")
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +364,7 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 	// sem will be fired every time pg_sleep(1337666) is called.
 	sem := make(chan struct{})
 	params.Knobs.SQLExecutor = &sql.ExecutorTestingKnobs{
-		BeforeExecute: func(ctx context.Context, stmt string) {
+		BeforeExecute: func(ctx context.Context, stmt string, descriptors *descs.Collection) {
 			if strings.Contains(stmt, "(1.337666") {
 				sem <- struct{}{}
 			}
@@ -378,10 +375,10 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 		s, _, _ := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(context.Background())
 
-		testInternalExecutorAppNameInitialization(t, sem,
-			catconstants.InternalAppNamePrefix+"-test-query", // app name in SHOW
-			catconstants.InternalAppNamePrefix+"-test-query", // app name in stats
-			s.InternalExecutor().(*sql.InternalExecutor))
+		testInternalExecutorAppNameInitialization(
+			t, sem, catconstants.InternalAppNamePrefix+"-test-query",
+			s.InternalExecutor().(*sql.InternalExecutor),
+		)
 	})
 
 	// We are running the second test with a new server so
@@ -390,11 +387,10 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 		s, _, _ := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(context.Background())
 
+		mon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
+		mon.StartNoReserved(context.Background(), s.(*server.TestServer).Server.PGServer().SQLServer.GetBytesMonitor())
 		ie := sql.MakeInternalExecutor(
-			context.Background(),
-			s.(*server.TestServer).Server.PGServer().SQLServer,
-			sql.MemoryMetrics{},
-			s.ExecutorConfig().(sql.ExecutorConfig).Settings,
+			s.(*server.TestServer).Server.PGServer().SQLServer, sql.MemoryMetrics{}, mon,
 		)
 		ie.SetSessionData(
 			&sessiondata.SessionData{
@@ -406,10 +402,7 @@ func TestInternalExecAppNameInitialization(t *testing.T) {
 				SequenceState: &sessiondata.SequenceState{},
 			})
 		testInternalExecutorAppNameInitialization(
-			t, sem,
-			"appname_findme", // app name in SHOW
-			catconstants.DelegatedAppNamePrefix+"appname_findme", // app name in stats
-			&ie,
+			t, sem, catconstants.DelegatedAppNamePrefix+"appname_findme", &ie,
 		)
 	})
 }
@@ -424,10 +417,7 @@ type testInternalExecutor interface {
 }
 
 func testInternalExecutorAppNameInitialization(
-	t *testing.T,
-	sem chan struct{},
-	expectedAppName, expectedAppNameInStats string,
-	ie testInternalExecutor,
+	t *testing.T, sem chan struct{}, expectedAppName string, ie testInternalExecutor,
 ) {
 	// Check that the application_name is set properly in the executor.
 	if row, err := ie.QueryRow(context.Background(), "test-query", nil,
@@ -515,8 +505,8 @@ func testInternalExecutorAppNameInitialization(
 		t.Fatal(err)
 	} else if row == nil {
 		t.Fatalf("expected 1 query, got 0")
-	} else if appName := string(*row[0].(*tree.DString)); appName != expectedAppNameInStats {
-		t.Fatalf("unexpected app name: expected %q, got %q", expectedAppNameInStats, appName)
+	} else if appName := string(*row[0].(*tree.DString)); appName != expectedAppName {
+		t.Fatalf("unexpected app name: expected %q, got %q", expectedAppName, appName)
 	}
 }
 
@@ -572,12 +562,13 @@ func TestInternalExecutorInLeafTxnDoesNotPanic(t *testing.T) {
 
 	rootTxn := kvDB.NewTxn(ctx, "root-txn")
 
-	ltis := rootTxn.GetLeafTxnInputState(ctx)
+	ltis, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	leafTxn := kv.NewLeafTxn(ctx, kvDB, roachpb.NodeID(1), ltis)
 
 	ie := s.InternalExecutor().(*sql.InternalExecutor)
-	_, err := ie.ExecEx(
-		ctx, "leaf-query", leafTxn, sessiondata.InternalExecutorOverride{User: username.RootUserName()}, "SELECT 1",
+	_, err = ie.ExecEx(
+		ctx, "leaf-query", leafTxn, sessiondata.RootUserSessionDataOverride, "SELECT 1",
 	)
 	require.NoError(t, err)
 }
@@ -624,8 +615,8 @@ func TestInternalExecutorWithUndefinedQoSOverridePanics(t *testing.T) {
 }
 
 // TODO(andrei): Test that descriptor leases are released by the
-// InternalExecutor, with and without a higher-level txn. When there is no
+// Executor, with and without a higher-level txn. When there is no
 // higher-level txn, the leases are released normally by the txn finishing. When
 // there is, they are released by the resetExtraTxnState() call in the
-// InternalExecutor. Unfortunately at the moment we don't have a great way to
+// Executor. Unfortunately at the moment we don't have a great way to
 // test lease releases.

@@ -10,6 +10,7 @@ package changefeedccl
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strconv"
 	"sync"
@@ -18,13 +19,13 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -48,6 +49,8 @@ type asyncProducerMock struct {
 	}
 }
 
+var _ sarama.AsyncProducer = (*asyncProducerMock)(nil)
+
 const unbuffered = 0
 
 func newAsyncProducerMock(bufSize int) *asyncProducerMock {
@@ -68,6 +71,68 @@ func (p *asyncProducerMock) Close() error {
 	close(p.errorsCh)
 	return nil
 }
+func (p *asyncProducerMock) IsTransactional() bool                   { panic(`unimplemented`) }
+func (p *asyncProducerMock) BeginTxn() error                         { panic(`unimplemented`) }
+func (p *asyncProducerMock) CommitTxn() error                        { panic(`unimplemented`) }
+func (p *asyncProducerMock) AbortTxn() error                         { panic(`unimplemented`) }
+func (p *asyncProducerMock) TxnStatus() sarama.ProducerTxnStatusFlag { panic(`unimplemented`) }
+func (p *asyncProducerMock) AddOffsetsToTxn(
+	_ map[string][]*sarama.PartitionOffsetMetadata, _ string,
+) error {
+	panic(`unimplemented`)
+}
+func (p *asyncProducerMock) AddMessageToTxn(_ *sarama.ConsumerMessage, _ string, _ *string) error {
+	panic(`unimplemented`)
+}
+
+type syncProducerMock struct {
+	overrideSend func(*sarama.ProducerMessage) error
+}
+
+var _ sarama.SyncProducer = (*syncProducerMock)(nil)
+
+func (p *syncProducerMock) SendMessage(
+	msg *sarama.ProducerMessage,
+) (partition int32, offset int64, err error) {
+	if p.overrideSend != nil {
+		if err := p.overrideSend(msg); err != nil {
+			return 0, 0, sarama.ProducerError{Msg: msg, Err: err}
+		}
+	}
+	return 0, 0, nil
+}
+func (p *syncProducerMock) SendMessages(msgs []*sarama.ProducerMessage) error {
+	var errs sarama.ProducerErrors = nil
+	for _, msg := range msgs {
+		_, _, err := p.SendMessage(msg)
+		if err != nil {
+			// nolint:errcmp
+			if producerErr, ok := err.(sarama.ProducerError); ok {
+				errs = append(errs, &producerErr)
+			} else {
+				return err
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return errs
+	}
+	return nil
+}
+func (p *syncProducerMock) IsTransactional() bool                   { panic(`unimplemented`) }
+func (p *syncProducerMock) BeginTxn() error                         { panic(`unimplemented`) }
+func (p *syncProducerMock) CommitTxn() error                        { panic(`unimplemented`) }
+func (p *syncProducerMock) AbortTxn() error                         { panic(`unimplemented`) }
+func (p *syncProducerMock) TxnStatus() sarama.ProducerTxnStatusFlag { panic(`unimplemented`) }
+func (p *syncProducerMock) AddOffsetsToTxn(
+	_ map[string][]*sarama.PartitionOffsetMetadata, _ string,
+) error {
+	panic(`unimplemented`)
+}
+func (p *syncProducerMock) AddMessageToTxn(_ *sarama.ConsumerMessage, _ string, _ *string) error {
+	panic(`unimplemented`)
+}
+func (p *syncProducerMock) Close() error { panic(`unimplemented`) }
 
 // consumeAndSucceed consumes input messages and sends them to successes channel.
 // Returns function that must be called to stop this consumer
@@ -147,12 +212,12 @@ func (p *asyncProducerMock) outstanding() int {
 
 func topic(name string) *tableDescriptorTopic {
 	tableDesc := tabledesc.NewBuilder(&descpb.TableDescriptor{Name: name}).BuildImmutableTable()
-	spec := jobspb.ChangefeedTargetSpecification{
+	spec := changefeedbase.Target{
 		Type:              jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY,
 		TableID:           tableDesc.GetID(),
-		StatementTimeName: name,
+		StatementTimeName: changefeedbase.StatementTimeName(name),
 	}
-	return &tableDescriptorTopic{tableDesc: tableDesc, spec: spec}
+	return &tableDescriptorTopic{Metadata: makeMetadata(tableDesc), spec: spec}
 }
 
 const noTopicPrefix = ""
@@ -203,22 +268,32 @@ func makeTestKafkaSink(
 	s = &kafkaSink{
 		ctx:      context.Background(),
 		topics:   topics,
-		producer: p,
+		kafkaCfg: &sarama.Config{},
+		metrics:  (*sliMetrics)(nil),
+		knobs: kafkaSinkKnobs{
+			OverrideAsyncProducerFromClient: func(client kafkaClient) (sarama.AsyncProducer, error) {
+				return p, nil
+			},
+			OverrideClientInit: func(config *sarama.Config) (kafkaClient, error) {
+				return nil, nil
+			},
+		},
 	}
-	s.start()
+	err = s.Dial()
+	require.NoError(t, err)
 
 	return s, func() {
 		require.NoError(t, s.Close())
 	}
 }
 
-func makeChangefeedTargets(targetNames ...string) []jobspb.ChangefeedTargetSpecification {
-	targets := make([]jobspb.ChangefeedTargetSpecification, len(targetNames))
+func makeChangefeedTargets(targetNames ...string) changefeedbase.Targets {
+	targets := changefeedbase.Targets{}
 	for i, name := range targetNames {
-		targets[i] = jobspb.ChangefeedTargetSpecification{
+		targets.Add(changefeedbase.Target{
 			TableID:           descpb.ID(i),
-			StatementTimeName: name,
-		}
+			StatementTimeName: changefeedbase.StatementTimeName(name),
+		})
 	}
 	return targets
 }
@@ -234,47 +309,36 @@ func TestKafkaSink(t *testing.T) {
 	defer cleanup()
 
 	// No inflight
-	if err := sink.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.Flush(ctx))
 
 	// Timeout
-	if err := sink.EmitRow(ctx, topic(`t`), []byte(`1`), nil, zeroTS, zeroTS, zeroAlloc); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t,
+		sink.EmitRow(ctx, topic(`t`), []byte(`1`), nil, zeroTS, zeroTS, zeroAlloc))
+
 	m1 := <-p.inputCh
 	for i := 0; i < 2; i++ {
 		timeoutCtx, cancel := context.WithTimeout(ctx, time.Millisecond)
 		defer cancel()
-		if err := sink.Flush(timeoutCtx); !testutils.IsError(
-			err, `context deadline exceeded`,
-		) {
-			t.Fatalf(`expected "context deadline exceeded" error got: %+v`, err)
-		}
+		require.True(t, errors.Is(context.DeadlineExceeded, sink.Flush(timeoutCtx)))
 	}
 	go func() { p.successesCh <- m1 }()
-	if err := sink.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.Flush(ctx))
 
 	// Check no inflight again now that we've sent something
-	if err := sink.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.Flush(ctx))
 
 	// Mixed success and error.
 	var pool testAllocPool
-	if err := sink.EmitRow(ctx, topic(`t`), []byte(`2`), nil, zeroTS, zeroTS, pool.alloc()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.EmitRow(ctx,
+		topic(`t`), []byte(`2`), nil, zeroTS, zeroTS, pool.alloc()))
 	m2 := <-p.inputCh
-	if err := sink.EmitRow(ctx, topic(`t`), []byte(`3`), nil, zeroTS, zeroTS, pool.alloc()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.EmitRow(
+		ctx, topic(`t`), []byte(`3`), nil, zeroTS, zeroTS, pool.alloc()))
+
 	m3 := <-p.inputCh
-	if err := sink.EmitRow(ctx, topic(`t`), []byte(`4`), nil, zeroTS, zeroTS, pool.alloc()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.EmitRow(
+		ctx, topic(`t`), []byte(`4`), nil, zeroTS, zeroTS, pool.alloc()))
+
 	m4 := <-p.inputCh
 	go func() { p.successesCh <- m2 }()
 	go func() {
@@ -284,19 +348,15 @@ func TestKafkaSink(t *testing.T) {
 		}
 	}()
 	go func() { p.successesCh <- m4 }()
-	if err := sink.Flush(ctx); !testutils.IsError(err, `m3`) {
-		t.Fatalf(`expected "m3" error got: %+v`, err)
-	}
+	require.Regexp(t, "m3", sink.Flush(ctx))
 
 	// Check simple success again after error
-	if err := sink.EmitRow(ctx, topic(`t`), []byte(`5`), nil, zeroTS, zeroTS, pool.alloc()); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.EmitRow(
+		ctx, topic(`t`), []byte(`5`), nil, zeroTS, zeroTS, pool.alloc()))
+
 	m5 := <-p.inputCh
 	go func() { p.successesCh <- m5 }()
-	if err := sink.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, sink.Flush(ctx))
 	// At the end, all of the resources has been released
 	require.EqualValues(t, 0, pool.used())
 }
@@ -384,8 +444,14 @@ func BenchmarkEmitRow(b *testing.B) {
 
 type testEncoder struct{}
 
-func (testEncoder) EncodeKey(context.Context, encodeRow) ([]byte, error)   { panic(`unimplemented`) }
-func (testEncoder) EncodeValue(context.Context, encodeRow) ([]byte, error) { panic(`unimplemented`) }
+func (testEncoder) EncodeKey(context.Context, cdcevent.Row) ([]byte, error) {
+	panic(`unimplemented`)
+}
+func (testEncoder) EncodeValue(
+	context.Context, eventContext, cdcevent.Row, cdcevent.Row,
+) ([]byte, error) {
+	panic(`unimplemented`)
+}
 func (testEncoder) EncodeResolvedTimestamp(
 	_ context.Context, _ string, ts hlc.Timestamp,
 ) ([]byte, error) {
@@ -399,12 +465,12 @@ func TestSQLSink(t *testing.T) {
 	overrideTopic := func(name string) *tableDescriptorTopic {
 		id, _ := strconv.ParseUint(name, 36, 64)
 		td := tabledesc.NewBuilder(&descpb.TableDescriptor{Name: name, ID: descpb.ID(id)}).BuildImmutableTable()
-		spec := jobspb.ChangefeedTargetSpecification{
+		spec := changefeedbase.Target{
 			Type:              jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY,
 			TableID:           td.GetID(),
-			StatementTimeName: name,
+			StatementTimeName: changefeedbase.StatementTimeName(name),
 		}
-		return &tableDescriptorTopic{tableDesc: td, spec: spec}
+		return &tableDescriptorTopic{Metadata: makeMetadata(td), spec: spec}
 	}
 
 	ctx := context.Background()
@@ -419,12 +485,12 @@ func TestSQLSink(t *testing.T) {
 
 	fooTopic := overrideTopic(`foo`)
 	barTopic := overrideTopic(`bar`)
-	targets := []jobspb.ChangefeedTargetSpecification{
-		fooTopic.GetTargetSpecification(),
-		barTopic.GetTargetSpecification(),
-	}
+	targets := changefeedbase.Targets{}
+	targets.Add(fooTopic.GetTargetSpecification())
+	targets.Add(barTopic.GetTargetSpecification())
+
 	const testTableName = `sink`
-	sink, err := makeSQLSink(sinkURL{URL: &pgURL}, testTableName, targets, nil)
+	sink, err := makeSQLSink(sinkURL{URL: &pgURL}, testTableName, targets, nilMetricsRecorderBuilder)
 	require.NoError(t, err)
 	require.NoError(t, sink.(*sqlSink).Dial())
 	defer func() { require.NoError(t, sink.Close()) }()
@@ -523,7 +589,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	t.Run("defaults returned if not option set", func(t *testing.T) {
-		opts := make(map[string]string)
+		opts := changefeedbase.SinkSpecificJSONConfig("")
 
 		expected := defaultSaramaConfig()
 
@@ -532,8 +598,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		require.Equal(t, expected, cfg)
 	})
 	t.Run("options overlay defaults", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"Flush": {"MaxMessages": 1000, "Frequency": "1s"}}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"MaxMessages": 1000, "Frequency": "1s"}}`)
 
 		expected := defaultSaramaConfig()
 		expected.Flush.MaxMessages = 1000
@@ -544,34 +609,31 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		require.Equal(t, expected, cfg)
 	})
 	t.Run("validate returns nil for valid flush configuration", func(t *testing.T) {
-		opts := make(map[string]string)
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 1000, "Frequency": "1s"}}`)
 
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"Flush": {"Messages": 1000, "Frequency": "1s"}}`
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
 		require.NoError(t, cfg.Validate())
 
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"Flush": {"Messages": 1}}`
+		opts = `{"Flush": {"Messages": 1}}`
 		cfg, err = getSaramaConfig(opts)
 		require.NoError(t, err)
 		require.NoError(t, cfg.Validate())
 	})
 	t.Run("validate returns error for bad flush configuration", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"Flush": {"Messages": 1000}}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 1000}}`)
 
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
 		require.Error(t, cfg.Validate())
 
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"Flush": {"Bytes": 10}}`
+		opts = `{"Flush": {"Bytes": 10}}`
 		cfg, err = getSaramaConfig(opts)
 		require.NoError(t, err)
 		require.Error(t, cfg.Validate())
 	})
 	t.Run("apply parses valid version", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"version": "0.8.2.0"}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"version": "0.8.2.0"}`)
 
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
@@ -582,8 +644,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		require.Equal(t, sarama.V0_8_2_0, saramaCfg.Version)
 	})
 	t.Run("apply parses valid version with capitalized key", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"Version": "0.8.2.0"}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Version": "0.8.2.0"}`)
 
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
@@ -594,8 +655,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		require.Equal(t, sarama.V0_8_2_0, saramaCfg.Version)
 	})
 	t.Run("apply allows for unset version", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{}`)
 
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
@@ -606,8 +666,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		require.Equal(t, sarama.KafkaVersion{}, saramaCfg.Version)
 	})
 	t.Run("apply errors if version is invalid", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"version": "invalid"}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"version": "invalid"}`)
 
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
@@ -617,8 +676,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		require.Error(t, err)
 	})
 	t.Run("apply parses RequiredAcks", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"RequiredAcks": "ALL"}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"RequiredAcks": "ALL"}`)
 
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
@@ -628,7 +686,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, sarama.WaitForAll, saramaCfg.Producer.RequiredAcks)
 
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"RequiredAcks": "-1"}`
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"RequiredAcks": "-1"}`)
 
 		cfg, err = getSaramaConfig(opts)
 		require.NoError(t, err)
@@ -640,8 +698,7 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 
 	})
 	t.Run("apply errors if RequiredAcks is invalid", func(t *testing.T) {
-		opts := make(map[string]string)
-		opts[changefeedbase.OptKafkaSinkConfig] = `{"RequiredAcks": "LocalQuorum"}`
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"RequiredAcks": "LocalQuorum"}`)
 
 		cfg, err := getSaramaConfig(opts)
 		require.NoError(t, err)
@@ -650,6 +707,21 @@ func TestSaramaConfigOptionParsing(t *testing.T) {
 		err = cfg.Apply(saramaCfg)
 		require.Error(t, err)
 
+	})
+	t.Run("compression options validation", func(t *testing.T) {
+		for option := range saramaCompressionCodecOptions {
+			opts := changefeedbase.SinkSpecificJSONConfig(fmt.Sprintf(`{"Compression": "%s"}`, option))
+			cfg, err := getSaramaConfig(opts)
+			require.NoError(t, err)
+
+			saramaCfg := &sarama.Config{}
+			err = cfg.Apply(saramaCfg)
+			require.NoError(t, err)
+		}
+
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Compression": "invalid"}`)
+		_, err := getSaramaConfig(opts)
+		require.Error(t, err)
 	})
 }
 
@@ -691,4 +763,87 @@ func TestKafkaSinkTracksMemory(t *testing.T) {
 	require.NoError(t, sink.Flush(ctx))
 	require.EqualValues(t, 0, p.outstanding())
 	require.EqualValues(t, 0, pool.used())
+}
+
+func TestSinkConfigParsing(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	t.Run("handles valid types", func(t *testing.T) {
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 1234, "Frequency": "3s", "Bytes":30}, "Retry": {"Max": 5, "Backoff": "3h"}}`)
+		batch, retry, err := getSinkConfigFromJson(opts)
+		require.NoError(t, err)
+		require.Equal(t, batch, sinkBatchConfig{
+			Bytes:     30,
+			Messages:  1234,
+			Frequency: jsonDuration(3 * time.Second),
+		})
+		require.Equal(t, retry.MaxRetries, 5)
+		require.Equal(t, retry.InitialBackoff, 3*time.Hour)
+
+		// Max accepts both values and specifically the string "inf"
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"Retry": {"Max": "inf"}}`)
+		_, retry, err = getSinkConfigFromJson(opts)
+		require.NoError(t, err)
+		require.Equal(t, retry.MaxRetries, 0)
+	})
+
+	t.Run("provides retry defaults", func(t *testing.T) {
+		defaultRetry := defaultRetryConfig()
+
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 1234, "Frequency": "3s"}}`)
+		_, retry, err := getSinkConfigFromJson(opts)
+		require.NoError(t, err)
+
+		require.Equal(t, retry.MaxRetries, defaultRetry.MaxRetries)
+		require.Equal(t, retry.InitialBackoff, defaultRetry.InitialBackoff)
+
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"Retry": {"Max": "inf"}}`)
+		_, retry, err = getSinkConfigFromJson(opts)
+		require.NoError(t, err)
+		require.Equal(t, retry.MaxRetries, 0)
+		require.Equal(t, retry.InitialBackoff, defaultRetry.InitialBackoff)
+	})
+
+	t.Run("errors on invalid configuration", func(t *testing.T) {
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": -1234, "Frequency": "3s"}}`)
+		_, _, err := getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "invalid sink config, all values must be non-negative")
+
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 1234, "Frequency": "-3s"}}`)
+		_, _, err = getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "invalid sink config, all values must be non-negative")
+
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 10}}`)
+		_, _, err = getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "invalid sink config, Flush.Frequency is not set, messages may never be sent")
+	})
+
+	t.Run("errors on invalid type", func(t *testing.T) {
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": "1234", "Frequency": "3s", "Bytes":30}}`)
+		_, _, err := getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "Flush.Messages of type int")
+
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 1234, "Frequency": "3s", "Bytes":"30"}}`)
+		_, _, err = getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "Flush.Bytes of type int")
+
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"Retry": {"Max": true}}`)
+		_, _, err = getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "Retry.Max must be either a positive int or 'inf'")
+
+		opts = changefeedbase.SinkSpecificJSONConfig(`{"Retry": {"Max": "not-inf"}}`)
+		_, _, err = getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "Retry.Max must be either a positive int or 'inf'")
+	})
+
+	t.Run("errors on malformed json", func(t *testing.T) {
+		opts := changefeedbase.SinkSpecificJSONConfig(`{"Flush": {"Messages": 1234 "Frequency": "3s"}}`)
+		_, _, err := getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "invalid character '\"'")
+
+		opts = changefeedbase.SinkSpecificJSONConfig(`string`)
+		_, _, err = getSinkConfigFromJson(opts)
+		require.ErrorContains(t, err, "invalid character 's' looking for beginning of value")
+	})
 }

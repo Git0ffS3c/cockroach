@@ -17,13 +17,12 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -70,7 +69,7 @@ func hasManuallySplitRangesInSpan(
 		if err := r.ValueProto(&desc); err != nil {
 			t.Fatal(err)
 		}
-		if !desc.GetStickyBit().IsEmpty() {
+		if !desc.StickyBit.IsEmpty() {
 			return true
 		}
 	}
@@ -96,7 +95,7 @@ func hasManuallySplitRangesOnIndex(
 		if err != nil {
 			continue
 		}
-		if indexID == descpb.IndexID(foundIndexID) && !desc.GetStickyBit().IsEmpty() {
+		if indexID == descpb.IndexID(foundIndexID) && !desc.StickyBit.IsEmpty() {
 			return true
 		}
 	}
@@ -149,7 +148,7 @@ func rangeIsManuallySplit(
 		if err := r.ValueProto(&desc); err != nil {
 			t.Fatal(err)
 		}
-		if bytes.Equal(desc.StartKey.AsRawKey(), startKey) && !desc.GetStickyBit().IsEmpty() {
+		if bytes.Equal(desc.StartKey.AsRawKey(), startKey) && !desc.StickyBit.IsEmpty() {
 			return true
 		}
 	}
@@ -157,12 +156,7 @@ func rangeIsManuallySplit(
 }
 
 // Test that manually split ranges get unsplit when dropping a
-// table/database/index or truncating a table. It verifies that the logic is
-// working on both the old (before version `UnsplitRangesInAsyncGCJobs`) and new
-// (from versiom `UnsplitRangesInAsyncGCJobs`) pathes.
-// TODO(Chengxiong): remove test for test cases with binary version
-// "clusterversion.UnsplitRangesInAsyncGCJobs - 1" and update this comment in
-// 22.2.
+// table/database/index or truncating a table.
 func TestUnsplitRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -175,9 +169,7 @@ func TestUnsplitRanges(t *testing.T) {
 	//
 	// For each testcase we execute a statement represented by the testcase's
 	// query string to either drop the table/database/index or truncate the table.
-	// The Unsplit logic is then triggered through either the new or old code
-	// path, determined by the "binaryVersion" assigned. For the new code path,
-	// ranges are not unsplit until the gc job is kicked off. So we wait until it
+	// Ranges are not unsplit until the gc job is kicked off. So we wait until it
 	// succeeds.
 	//
 	// In the end, expected results are verified based on the testcase's settings.
@@ -185,9 +177,8 @@ func TestUnsplitRanges(t *testing.T) {
 	// Then we checked if there are still split ranges start with key "splitKey"
 	// and on the table in overall.
 	type testCase struct {
-		name          string
-		query         string
-		binaryVersion clusterversion.Key
+		name  string
+		query string
 		// allKeyCntAfterGC is the expected keys count of the whole table.
 		// For example, we expect it to be 0 when dropping a table because all data
 		// should be gone, while 2*numRows is expected if only index "foo" is being
@@ -242,27 +233,8 @@ func TestUnsplitRanges(t *testing.T) {
 
 	testCases := []testCase{
 		{
-			name:                   "drop-table-unsplit-sync",
-			query:                  "DROP TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
-			allKeyCntAfterGC:       0,
-			hasSplitOnTableAfterGC: false,
-			hasSplitOnKeyAfterGC:   false,
-			gcSucceedFunc:          tableDropSucceed,
-		},
-		{
 			name:                   "drop-table-unsplit-async",
 			query:                  "DROP TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
-			allKeyCntAfterGC:       0,
-			hasSplitOnTableAfterGC: false,
-			hasSplitOnKeyAfterGC:   false,
-			gcSucceedFunc:          tableDropSucceed,
-		},
-		{
-			name:                   "drop-database-unsplit-sync",
-			query:                  "DROP DATABASE t",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
 			allKeyCntAfterGC:       0,
 			hasSplitOnTableAfterGC: false,
 			hasSplitOnKeyAfterGC:   false,
@@ -271,43 +243,22 @@ func TestUnsplitRanges(t *testing.T) {
 		{
 			name:                   "drop-database-unsplit-async",
 			query:                  "DROP DATABASE t",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
 			allKeyCntAfterGC:       0,
 			hasSplitOnTableAfterGC: false,
 			hasSplitOnKeyAfterGC:   false,
 			gcSucceedFunc:          tableDropSucceed,
 		},
 		{
-			name:                   "truncate-table-unsplit-sync",
-			query:                  "TRUNCATE TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
-			allKeyCntAfterGC:       0,
-			hasSplitOnTableAfterGC: true, // It's true since we copy split points.
-			hasSplitOnKeyAfterGC:   false,
-			gcSucceedFunc:          tableTruncateSucceed,
-		},
-		{
 			name:                   "truncate-table-unsplit-async",
 			query:                  "TRUNCATE TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
 			allKeyCntAfterGC:       0,
 			hasSplitOnTableAfterGC: true, // It's true since we copy split points.
 			hasSplitOnKeyAfterGC:   false,
 			gcSucceedFunc:          tableTruncateSucceed,
-		},
-		{
-			name:                   "drop-index-unsplit-sync",
-			query:                  "DROP INDEX t.test1@foo",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
-			allKeyCntAfterGC:       numRows * 2,
-			hasSplitOnTableAfterGC: true, // It's true since we only unsplit ranges of index foo
-			hasSplitOnKeyAfterGC:   true,
-			gcSucceedFunc:          indexDropSucceed,
 		},
 		{
 			name:                   "drop-index-unsplit-async",
 			query:                  "DROP INDEX t.test1@foo",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
 			allKeyCntAfterGC:       numRows * 2,
 			hasSplitOnTableAfterGC: true, // It's true since we only unsplit ranges of index foo
 			hasSplitOnKeyAfterGC:   true,
@@ -318,12 +269,10 @@ func TestUnsplitRanges(t *testing.T) {
 	ctx := context.Background()
 	run := func(t *testing.T, tc testCase) {
 		params, _ := tests.CreateTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: make(chan struct{}),
-			BinaryVersionOverride:          clusterversion.ByKey(tc.binaryVersion),
-		}
 		params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
+		params.Knobs.GCJob = &sql.GCJobTestingKnobs{
+			SkipWaitingForMVCCGC: true,
+		}
 
 		defer gcjob.SetSmallMaxGCIntervalForTest()()
 
@@ -343,7 +292,7 @@ func TestUnsplitRanges(t *testing.T) {
 		tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 
-		idx, err := tableDesc.FindIndexWithName("foo")
+		idx, err := catalog.MustFindIndexByName(tableDesc, "foo")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -358,11 +307,6 @@ func TestUnsplitRanges(t *testing.T) {
 		require.True(t, hasManuallySplitRangesOnIndex(ctx, t, kvDB, tableSpan, idx.GetID()))
 
 		if _, err := sqlDB.Exec(tc.query); err != nil {
-			t.Fatal(err)
-		}
-		// Push a new zone config for a few tables with TTL=0 so the data
-		// is deleted immediately.
-		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 			t.Fatal(err)
 		}
 

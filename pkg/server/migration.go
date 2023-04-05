@@ -16,6 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -26,7 +27,7 @@ import (
 )
 
 // migrationServer is an implementation of the Migration service. The RPCs here
-// are used to power the migrations infrastructure in pkg/migrations.
+// are used to power the upgrades infrastructure in pkg/upgrades.
 type migrationServer struct {
 	server *Server
 
@@ -60,7 +61,7 @@ func (m *migrationServer) ValidateTargetClusterVersion(
 	}
 
 	// TODO(irfansharif): These errors are propagated all the way back to the
-	// user during improper version upgrades. Given the migrations
+	// user during improper version upgrades. Given the upgrades
 	// infrastructure is stepping through internal versions during major cluster
 	// version upgrades, and given we don't use negative internal versions (as
 	// suggested in #33578), it currently manifests (see
@@ -110,7 +111,7 @@ func bumpClusterVersion(
 ) error {
 
 	versionSetting := st.Version
-	prevCV, err := kvserver.SynthesizeClusterVersionFromEngines(
+	prevCV, err := kvstorage.SynthesizeClusterVersionFromEngines(
 		ctx, engines, versionSetting.BinaryVersion(),
 		versionSetting.BinaryMinSupportedVersion(),
 	)
@@ -130,7 +131,7 @@ func bumpClusterVersion(
 	// Whenever the version changes, we want to persist that update to
 	// wherever the CRDB process retrieved the initial version from
 	// (typically a collection of storage.Engines).
-	if err := kvserver.WriteClusterVersionToEngines(ctx, engines, newCV); err != nil {
+	if err := kvstorage.WriteClusterVersionToEngines(ctx, engines, newCV); err != nil {
 		return err
 	}
 

@@ -227,7 +227,7 @@ func (cb *constraintsBuilder) buildSingleColumnConstraintConst(
 // buildConstraintForTupleIn handles the case where we have a tuple IN another
 // tuple, for instance:
 //
-//   (a, b, c) IN ((1, 2, 3), (4, 5, 6))
+//	(a, b, c) IN ((1, 2, 3), (4, 5, 6))
 //
 // This function is a less powerful version of makeSpansForTupleIn, since it
 // does not operate on a particular index.  The <tight> return value indicates
@@ -434,7 +434,7 @@ func (cb *constraintsBuilder) buildConstraintForTupleInequality(
 func (cb *constraintsBuilder) buildFunctionConstraints(
 	f *FunctionExpr,
 ) (_ *constraint.Set, tight bool) {
-	if f.Properties.NullableArgs {
+	if f.FunctionPrivate.Overload.CalledOnNullInput {
 		return unconstrained, false
 	}
 

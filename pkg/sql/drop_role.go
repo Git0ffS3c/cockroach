@@ -22,10 +22,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessioninit"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
@@ -72,20 +76,12 @@ func (p *planner) DropRoleNode(
 	}, nil
 }
 
-type objectType string
-
-const (
-	database         objectType = "database"
-	table            objectType = "table"
-	schema           objectType = "schema"
-	typeObject       objectType = "type"
-	defaultPrivilege objectType = "default_privilege"
-)
-
 type objectAndType struct {
-	ObjectType   objectType
-	ObjectName   string
-	ErrorMessage error
+	ObjectType         privilege.ObjectType
+	ObjectName         string
+	IsDefaultPrivilege bool
+	IsGlobalPrivilege  bool
+	ErrorMessage       error
 }
 
 func (n *DropRoleNode) startExec(params runParams) error {
@@ -135,7 +131,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 				userNames[db.GetPrivileges().Owner()] = append(
 					userNames[db.GetPrivileges().Owner()],
 					objectAndType{
-						ObjectType: database,
+						ObjectType: privilege.Database,
 						ObjectName: db.GetName(),
 					})
 			}
@@ -179,7 +175,7 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			userNames[tableDescriptor.GetPrivileges().Owner()] = append(
 				userNames[tableDescriptor.GetPrivileges().Owner()],
 				objectAndType{
-					ObjectType: table,
+					ObjectType: privilege.Table,
 					ObjectName: tn.String(),
 				})
 		}
@@ -200,15 +196,16 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		if !descriptorIsVisible(schemaDesc, true /* allowAdding */) {
 			continue
 		}
-		// TODO(arul): Ideally this should be the fully qualified name of the schema,
-		// but at the time of writing there doesn't seem to be a clean way of doing
-		// this.
 		if _, ok := userNames[schemaDesc.GetPrivileges().Owner()]; ok {
+			sn, err := getSchemaNameFromSchemaDescriptor(lCtx, schemaDesc)
+			if err != nil {
+				return err
+			}
 			userNames[schemaDesc.GetPrivileges().Owner()] = append(
 				userNames[schemaDesc.GetPrivileges().Owner()],
 				objectAndType{
-					ObjectType: schema,
-					ObjectName: schemaDesc.GetName(),
+					ObjectType: privilege.Schema,
+					ObjectName: sn.String(),
 				})
 		}
 
@@ -233,10 +230,46 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			userNames[typDesc.GetPrivileges().Owner()] = append(
 				userNames[typDesc.GetPrivileges().Owner()],
 				objectAndType{
-					ObjectType: typeObject,
+					ObjectType: privilege.Type,
 					ObjectName: tn.String(),
 				})
 		}
+	}
+	for _, fnDesc := range lCtx.fnDescs {
+		if _, ok := userNames[fnDesc.GetPrivileges().Owner()]; ok {
+			if !descriptorIsVisible(fnDesc, true /* allowAdding */) {
+				continue
+			}
+			name, err := getFunctionNameFromFunctionDescriptor(lCtx, fnDesc)
+			if err != nil {
+				return err
+			}
+			userNames[fnDesc.GetPrivileges().Owner()] = append(
+				userNames[fnDesc.GetPrivileges().Owner()],
+				objectAndType{
+					ObjectType: privilege.Function,
+					ObjectName: name.String(),
+				},
+			)
+		}
+
+		for _, u := range fnDesc.GetPrivileges().Users {
+			if _, ok := userNames[u.User()]; ok {
+				name, err := getFunctionNameFromFunctionDescriptor(lCtx, fnDesc)
+				if err != nil {
+					return err
+				}
+				if privilegeObjectFormatter.Len() > 0 {
+					privilegeObjectFormatter.WriteString(", ")
+				}
+				privilegeObjectFormatter.FormatNode(&name)
+				break
+			}
+		}
+	}
+
+	if err := addDependentPrivilegesFromSystemPrivileges(params.ctx, n.roleNames, params.p, privilegeObjectFormatter, userNames); err != nil {
+		return err
 	}
 
 	// Was there any object depending on that user?
@@ -270,20 +303,26 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			if dependentObjects[i].ObjectName != dependentObjects[j].ObjectName {
 				return dependentObjects[i].ObjectName < dependentObjects[j].ObjectName
 			}
-
+			if dependentObjects[j].ErrorMessage == nil {
+				return false
+			}
+			if dependentObjects[i].ErrorMessage == nil {
+				return true
+			}
 			return dependentObjects[i].ErrorMessage.Error() < dependentObjects[j].ErrorMessage.Error()
 		})
 		var hints []string
 		if len(dependentObjects) > 0 {
 			objectsMsg := tree.NewFmtCtx(tree.FmtSimple)
 			for _, obj := range dependentObjects {
-				switch obj.ObjectType {
-				case database, table, schema, typeObject:
-					objectsMsg.WriteString(fmt.Sprintf("\nowner of %s %s", obj.ObjectType, obj.ObjectName))
-				case defaultPrivilege:
+				if obj.IsDefaultPrivilege {
 					hasDependentDefaultPrivilege = true
 					objectsMsg.WriteString(fmt.Sprintf("\n%s", obj.ErrorMessage))
 					hints = append(hints, errors.GetAllHints(obj.ErrorMessage)...)
+				} else if obj.IsGlobalPrivilege {
+					objectsMsg.WriteString(fmt.Sprintf("\n%s", obj.ErrorMessage))
+				} else {
+					objectsMsg.WriteString(fmt.Sprintf("\nowner of %s %s", obj.ObjectType, obj.ObjectName))
 				}
 			}
 			objects := objectsMsg.CloseAndGetString()
@@ -314,10 +353,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		}
 
 		// Check if user owns any scheduled jobs.
-		numSchedulesRow, err := params.ExecCfg().InternalExecutor.QueryRow(
+		numSchedulesRow, err := params.p.InternalSQLTxn().QueryRowEx(
 			params.ctx,
 			"check-user-schedules",
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			"SELECT count(*) FROM system.scheduled_jobs WHERE owner=$1",
 			normalizedUsername,
 		)
@@ -334,10 +374,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 				normalizedUsername, numSchedules)
 		}
 
-		numUsersDeleted, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		numUsersDeleted, err := params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			`DELETE FROM system.users WHERE username=$1`,
 			normalizedUsername,
 		)
@@ -346,14 +387,15 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		}
 
 		if numUsersDeleted == 0 && !n.ifExists {
-			return errors.Errorf("role/user %s does not exist", normalizedUsername)
+			return sqlerrors.NewUndefinedUserError(normalizedUsername)
 		}
 
 		// Drop all role memberships involving the user/role.
-		rowsDeleted, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		rowsDeleted, err := params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			"drop-role-membership",
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			`DELETE FROM system.role_members WHERE "role" = $1 OR "member" = $1`,
 			normalizedUsername,
 		)
@@ -362,10 +404,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 		}
 		numRoleMembershipsDeleted += rowsDeleted
 
-		_, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		_, err = params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf(
 				`DELETE FROM %s WHERE username=$1`,
 				sessioninit.RoleOptionsTableName,
@@ -376,10 +419,11 @@ func (n *DropRoleNode) startExec(params runParams) error {
 			return err
 		}
 
-		rowsDeleted, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		rowsDeleted, err = params.p.InternalSQLTxn().ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
+			sessiondata.NodeUserSessionDataOverride,
 			fmt.Sprintf(
 				`DELETE FROM %s WHERE role_name = $1`,
 				sessioninit.DatabaseRoleSettingsTableName,
@@ -464,7 +508,7 @@ func accumulateDependentDefaultPrivileges(
 }
 
 func addDependentPrivileges(
-	object tree.AlterDefaultPrivilegesTargetObject,
+	object privilege.TargetObjectType,
 	defaultPrivs catpb.PrivilegeDescriptor,
 	role catpb.DefaultPrivilegesRole,
 	userNames map[username.SQLUsername][]objectAndType,
@@ -473,13 +517,13 @@ func addDependentPrivileges(
 ) {
 	var objectType string
 	switch object {
-	case tree.Tables:
+	case privilege.Tables:
 		objectType = "relations"
-	case tree.Sequences:
+	case privilege.Sequences:
 		objectType = "sequences"
-	case tree.Types:
+	case privilege.Types:
 		objectType = "types"
-	case tree.Schemas:
+	case privilege.Schemas:
 		objectType = "schemas"
 	}
 
@@ -509,7 +553,7 @@ func addDependentPrivileges(
 				hint := createHint(role, grantee)
 				userNames[role.Role] = append(userNames[role.Role],
 					objectAndType{
-						ObjectType: defaultPrivilege,
+						IsDefaultPrivilege: true,
 						ErrorMessage: errors.WithHint(
 							errors.Newf(
 								"owner of default privileges on new %s belonging to role %s in database %s%s",
@@ -534,9 +578,69 @@ func addDependentPrivileges(
 			}
 			userNames[grantee] = append(userNames[grantee],
 				objectAndType{
-					ObjectType:   defaultPrivilege,
-					ErrorMessage: errors.WithHint(err, hint),
+					IsDefaultPrivilege: true,
+					ErrorMessage:       errors.WithHint(err, hint),
 				})
 		}
 	}
+}
+
+func addDependentPrivilegesFromSystemPrivileges(
+	ctx context.Context,
+	usernames []username.SQLUsername,
+	p *planner,
+	privilegeObjectFormatter *tree.FmtCtx,
+	userNamesToDependentPrivileges map[username.SQLUsername][]objectAndType,
+) (retErr error) {
+	names := make([]string, len(usernames))
+	for i, username := range usernames {
+		names[i] = username.Normalized()
+	}
+	rows, err := p.QueryIteratorEx(ctx, `drop-role-get-system-privileges`, sessiondata.NodeUserSessionDataOverride,
+		`SELECT DISTINCT username, path, privileges FROM system.privileges WHERE username = ANY($1) ORDER BY 1, 2`, names)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		retErr = errors.CombineErrors(retErr, rows.Close())
+	}()
+	for {
+		ok, err := rows.Next(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		name := tree.MustBeDString(rows.Cur()[0])
+		sqlUsername := username.MakeSQLUsernameFromPreNormalizedString(string(name))
+		path := tree.MustBeDString(rows.Cur()[1])
+		privileges := tree.MustBeDArray(rows.Cur()[2])
+		obj, err := syntheticprivilege.Parse(string(path))
+		if err != nil {
+			return err
+		}
+
+		if obj.GetObjectType() == privilege.Global {
+			for _, priv := range privileges.Array {
+				userNamesToDependentPrivileges[sqlUsername] = append(
+					userNamesToDependentPrivileges[sqlUsername],
+					objectAndType{
+						IsGlobalPrivilege: true,
+						ErrorMessage: errors.Newf(
+							"%s has global %s privilege", sqlUsername, priv.String(),
+						)})
+			}
+			continue
+		}
+		if privilegeObjectFormatter.Len() > 0 {
+			privilegeObjectFormatter.WriteString(", ")
+		}
+		privilegeObjectFormatter.WriteString(string(obj.GetObjectType()))
+		if obj.GetName() != "" {
+			privilegeObjectFormatter.WriteString(" ")
+			privilegeObjectFormatter.FormatName(obj.GetName())
+		}
+	}
+	return nil
 }

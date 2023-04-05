@@ -15,7 +15,7 @@ import moment from "moment";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { SortSetting } from "../sortedtable";
 import { Filters } from "../queryFilter";
-import { TimeScale, defaultTimeScaleOptions } from "../timeScaleDropdown";
+import { TimeScale } from "../timeScaleDropdown";
 
 const history = createMemoryHistory({ initialEntries: ["/transactions"] });
 
@@ -67,6 +67,8 @@ export const filters: Filters = {
   nodes: "",
 };
 
+export const lastUpdated = moment();
+
 export const data: cockroach.server.serverpb.IStatementsResponse = {
   statements: [
     {
@@ -86,6 +88,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(557),
         nodes: [Long.fromNumber(1), Long.fromNumber(2)],
+        regions: ["gcp-us-east1"],
         first_attempt_count: Long.fromInt(557),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -165,6 +168,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(70),
         nodes: [Long.fromNumber(1), Long.fromNumber(3)],
+        regions: ["gcp-us-east1", "gcp-us-west1"],
         first_attempt_count: Long.fromInt(70),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -231,6 +235,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(1),
         nodes: [Long.fromNumber(1), Long.fromNumber(3)],
+        regions: ["gcp-us-east1", "gcp-us-west1"],
         first_attempt_count: Long.fromInt(1),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -288,6 +293,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(280),
         nodes: [Long.fromNumber(3), Long.fromNumber(4)],
+        regions: ["gcp-us-west1", "gcp-europe-west1"],
         first_attempt_count: Long.fromInt(280),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -389,6 +395,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(1),
         nodes: [Long.fromNumber(2), Long.fromNumber(4)],
+        regions: ["gcp-us-east1", "gcp-europe-west1"],
         first_attempt_count: Long.fromInt(1),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -440,6 +447,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(1),
         nodes: [Long.fromNumber(1)],
+        regions: ["gcp-us-east1"],
         first_attempt_count: Long.fromInt(1),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -480,6 +488,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(1),
         nodes: [Long.fromNumber(3), Long.fromNumber(4)],
+        regions: ["gcp-us-west1", "gcp-europe-west1"],
         first_attempt_count: Long.fromInt(1),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -531,6 +540,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(24),
         nodes: [Long.fromNumber(2), Long.fromNumber(3)],
+        regions: ["gcp-us-east1", "gcp-us-west1"],
         first_attempt_count: Long.fromInt(24),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -620,6 +630,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
       stats: {
         count: Long.fromInt(141),
         nodes: [Long.fromNumber(1), Long.fromNumber(2), Long.fromNumber(3)],
+        regions: ["gcp-us-east1", "gcp-us-west1"],
         first_attempt_count: Long.fromInt(141),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",
@@ -738,6 +749,7 @@ export const data: cockroach.server.serverpb.IStatementsResponse = {
           Long.fromNumber(3),
           Long.fromNumber(4),
         ],
+        regions: ["gcp-us-east1", "gcp-us-west1", "gcp-europe-west1"],
         first_attempt_count: Long.fromInt(1),
         max_retries: Long.fromInt(0),
         legacy_last_err: "",

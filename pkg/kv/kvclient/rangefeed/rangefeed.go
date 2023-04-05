@@ -20,8 +20,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -52,8 +55,8 @@ type DB interface {
 		ctx context.Context,
 		spans []roachpb.Span,
 		startFrom hlc.Timestamp,
-		withDiff bool,
-		eventC chan<- *roachpb.RangeFeedEvent,
+		eventC chan<- kvcoord.RangeFeedMessage,
+		opts ...kvcoord.RangeFeedOption,
 	) error
 
 	// Scan encapsulates scanning a key span at a given point in time. The method
@@ -81,10 +84,16 @@ type TestingKnobs struct {
 
 	// OnRangefeedRestart is called when a rangefeed restarts.
 	OnRangefeedRestart func()
+
+	// IgnoreOnDeleteRangeError will ignore any errors where a DeleteRange event
+	// is emitted without an OnDeleteRange handler. This can be used e.g. with
+	// StoreTestingKnobs.GlobalMVCCRangeTombstone, to prevent the global tombstone
+	// causing rangefeed errors for consumers who don't expect it.
+	IgnoreOnDeleteRangeError bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
-func (t TestingKnobs) ModuleTestingKnobs() {}
+func (*TestingKnobs) ModuleTestingKnobs() {}
 
 var _ base.ModuleTestingKnobs = (*TestingKnobs)(nil)
 
@@ -110,10 +119,17 @@ func newFactory(stopper *stop.Stopper, client DB, knobs *TestingKnobs) *Factory 
 // RangeFeed constructs a new rangefeed and runs it in an async task.
 //
 // The rangefeed can be stopped via Close(); otherwise, it will stop when the
-// server shuts down.
+// server shuts down. The only error which can be returned will indicate that
+// the server is being shut down.
 //
-// The only error which can be returned will indicate that the server is being
-// shut down.
+// Rangefeeds do not support inline (unversioned) values, and may omit them or
+// error on them. Similarly, rangefeeds will error if MVCC history is mutated
+// via e.g. ClearRange. Do not use rangefeeds across such key spans.
+//
+// NB: for the rangefeed itself, initialTimestamp is exclusive, i.e. the first
+// possible event emitted by the server (including the catchup scan) is at
+// initialTimestamp.Next(). This follows from the gRPC API semantics. However,
+// the initial scan (if any) is run at initialTimestamp.
 func (f *Factory) RangeFeed(
 	ctx context.Context,
 	name string,
@@ -149,7 +165,7 @@ func (f *Factory) New(
 }
 
 // OnValue is called for each rangefeed value.
-type OnValue func(ctx context.Context, value *roachpb.RangeFeedValue)
+type OnValue func(ctx context.Context, value *kvpb.RangeFeedValue)
 
 // RangeFeed represents a running RangeFeed.
 type RangeFeed struct {
@@ -251,6 +267,8 @@ func (f *RangeFeed) Close() {
 // will be reset.
 const resetThreshold = 30 * time.Second
 
+var useMuxRangeFeed = util.ConstantWithMetamorphicTestBool("use-mux-rangefeed", false)
+
 // run will run the RangeFeed until the context is canceled or if the client
 // indicates that an initial scan error is non-recoverable.
 func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
@@ -271,7 +289,18 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 
 	// TODO(ajwerner): Consider adding event buffering. Doing so would require
 	// draining when the rangefeed fails.
-	eventCh := make(chan *roachpb.RangeFeedEvent)
+	eventCh := make(chan kvcoord.RangeFeedMessage)
+
+	var rangefeedOpts []kvcoord.RangeFeedOption
+	if f.scanConfig.overSystemTable {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithSystemTablePriority())
+	}
+	if useMuxRangeFeed {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithMuxRangeFeed())
+	}
+	if f.withDiff {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithDiff())
+	}
 
 	for i := 0; r.Next(); i++ {
 		ts := frontier.Frontier()
@@ -282,15 +311,15 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 		start := timeutil.Now()
 
 		rangeFeedTask := func(ctx context.Context) error {
-			return f.client.RangeFeed(ctx, f.spans, ts, f.withDiff, eventCh)
+			return f.client.RangeFeed(ctx, f.spans, ts, eventCh, rangefeedOpts...)
 		}
 		processEventsTask := func(ctx context.Context) error {
 			return f.processEvents(ctx, frontier, eventCh)
 		}
 
 		err := ctxgroup.GoAndWait(ctx, rangeFeedTask, processEventsTask)
-		if errors.HasType(err, &roachpb.BatchTimestampBeforeGCError{}) ||
-			errors.HasType(err, &roachpb.MVCCHistoryMutationError{}) {
+		if errors.HasType(err, &kvpb.BatchTimestampBeforeGCError{}) ||
+			errors.HasType(err, &kvpb.MVCCHistoryMutationError{}) {
 			if errCallback := f.onUnrecoverableError; errCallback != nil {
 				errCallback(ctx, err)
 			}
@@ -325,7 +354,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 
 // processEvents processes events sent by the rangefeed on the eventCh.
 func (f *RangeFeed) processEvents(
-	ctx context.Context, frontier *span.Frontier, eventCh <-chan *roachpb.RangeFeedEvent,
+	ctx context.Context, frontier *span.Frontier, eventCh <-chan kvcoord.RangeFeedMessage,
 ) error {
 	for {
 		select {
@@ -349,7 +378,16 @@ func (f *RangeFeed) processEvents(
 					return errors.AssertionFailedf(
 						"received unexpected rangefeed SST event with no OnSSTable handler")
 				}
-				f.onSSTable(ctx, ev.SST)
+				f.onSSTable(ctx, ev.SST, ev.RegisteredSpan)
+			case ev.DeleteRange != nil:
+				if f.onDeleteRange == nil {
+					if f.knobs != nil && f.knobs.IgnoreOnDeleteRangeError {
+						continue
+					}
+					return errors.AssertionFailedf(
+						"received unexpected rangefeed DeleteRange event with no OnDeleteRange handler: %s", ev)
+				}
+				f.onDeleteRange(ctx, ev.DeleteRange)
 			case ev.Error != nil:
 				// Intentionally do nothing, we'll get an error returned from the
 				// call to RangeFeed.

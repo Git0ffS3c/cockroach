@@ -38,12 +38,19 @@ func TestBackupTenantImportingTable(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, 1,
+		base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				// Test is designed to run with explicit tenants. No need to
+				// implicitly create a tenant.
+				DefaultTestTenant: base.TestTenantDisabled,
+			},
+		})
 	defer tc.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
 
 	tSrv, tSQL := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
-		TenantID:     roachpb.MakeTenantID(10),
+		TenantID:     roachpb.MustMakeTenantID(10),
 		TestingKnobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 	})
 	defer tSQL.Close()
@@ -73,15 +80,14 @@ func TestBackupTenantImportingTable(t *testing.T) {
 	}
 	// Destroy the tenant, then restore it.
 	tSrv.Stopper().Stop(ctx)
-	if _, err := sqlDB.DB.ExecContext(ctx, "SELECT crdb_internal.destroy_tenant(10, true)"); err != nil {
+	if _, err := sqlDB.DB.ExecContext(ctx, "DROP TENANT [10] IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.DB.ExecContext(ctx, "RESTORE TENANT 10 FROM $1", dst); err != nil {
 		t.Fatal(err)
 	}
-	tSrv, tSQL = serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
-		TenantID:     roachpb.MakeTenantID(10),
-		Existing:     true,
+	_, tSQL = serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
+		TenantID:     roachpb.MustMakeTenantID(10),
 		TestingKnobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 	})
 	defer tSQL.Close()
@@ -92,14 +98,14 @@ func TestBackupTenantImportingTable(t *testing.T) {
 	if _, err := tSQL.Exec(`DELETE FROM system.lease`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tSQL.Exec(`CANCEL JOB $1`, jobID); err != nil {
-		t.Fatal(err)
-	}
-	tSrv.JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
 	testutils.SucceedsSoon(t, func() error {
+		if _, err := tSQL.Exec(`CANCEL JOB $1`, jobID); err != nil {
+			return err
+		}
+
 		var status string
 		if err := tSQL.QueryRow(`SELECT status FROM [show jobs] WHERE job_id = $1`, jobID).Scan(&status); err != nil {
-			t.Fatal(err)
+			return err
 		}
 		if status == string(jobs.StatusCanceled) {
 			return nil
@@ -130,7 +136,7 @@ func TestTenantBackupMultiRegionDatabases(t *testing.T) {
 	defer cleanup()
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
-	tenID := roachpb.MakeTenantID(10)
+	tenID := roachpb.MustMakeTenantID(10)
 	_, tSQL := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
 		TenantID:     tenID,
 		TestingKnobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},

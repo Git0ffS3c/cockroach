@@ -13,8 +13,11 @@ import { statisticsClasses } from "../transactionsPage/transactionsPageClasses";
 import { ISortedTablePagination } from "../sortedtable";
 import { Button } from "src/button";
 import { ResultsPerPageLabel } from "src/pagination";
+import classNames from "classnames/bind";
+import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
 
 const { statistic, countTitle } = statisticsClasses;
+const timeScaleStylesCx = classNames.bind(timeScaleStyles);
 
 interface TableStatistics {
   pagination: ISortedTablePagination;
@@ -23,6 +26,7 @@ interface TableStatistics {
   activeFilters: number;
   search?: string;
   onClearFilters?: () => void;
+  period?: string;
 }
 
 // TableStatistics shows statistics about the results being
@@ -32,27 +36,48 @@ interface TableStatistics {
 // This component has also a clear filter option.
 export const TableStatistics: React.FC<TableStatistics> = ({
   pagination,
-  totalCount,
+  totalCount = 0,
   search,
   arrayItemName,
   onClearFilters,
   activeFilters,
+  period,
 }) => {
+  const periodLabel = (
+    <>
+      &nbsp;&nbsp;&nbsp;| &nbsp;
+      <p className={timeScaleStylesCx("time-label")}>
+        Showing aggregated stats from{" "}
+        <span className={timeScaleStylesCx("bold")}>{period}</span>
+      </p>
+    </>
+  );
+
   const resultsPerPageLabel = (
-    <ResultsPerPageLabel
-      pagination={{ ...pagination, total: totalCount }}
-      pageName={arrayItemName}
-      search={search}
-    />
+    <>
+      <ResultsPerPageLabel
+        pagination={{ ...pagination, total: totalCount }}
+        pageName={arrayItemName}
+        search={search}
+      />
+      {period && periodLabel}
+    </>
+  );
+
+  const clearBtn = (
+    <>
+      | &nbsp;
+      <Button onClick={() => onClearFilters()} type="flat" size="small">
+        Clear filters
+      </Button>
+    </>
   );
 
   const resultsCountAndClear = (
     <>
       {totalCount} {totalCount === 1 ? "result" : "results"}
-      &nbsp;&nbsp;&nbsp;| &nbsp;
-      <Button onClick={() => onClearFilters()} type="flat" size="small">
-        clear filter
-      </Button>
+      {period && periodLabel}
+      &nbsp;&nbsp;&nbsp;{onClearFilters && clearBtn}
     </>
   );
 

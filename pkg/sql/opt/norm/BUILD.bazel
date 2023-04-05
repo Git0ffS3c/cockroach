@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -31,6 +32,7 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/opt/norm",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
@@ -42,6 +44,7 @@ go_library(
         "//pkg/sql/privilege",
         "//pkg/sql/rowenc/keyside",
         "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/builtins/builtinsregistry",
         "//pkg/sql/sem/cast",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
@@ -53,10 +56,12 @@ go_library(
         "//pkg/util/buildutil",
         "//pkg/util/encoding",
         "//pkg/util/errorutil",
+        "//pkg/util/intsets",
         "//pkg/util/json",
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
+        "@com_github_lib_pq//oid",
     ],
 )
 
@@ -69,6 +74,7 @@ go_test(
         "general_funcs_test.go",
         "norm_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]) + [
         "//c-deps:libgeos",
         "//pkg/sql/opt/testutils/opttester:testfixtures",
@@ -85,7 +91,7 @@ go_test(
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "@com_github_cockroachdb_datadriven//:datadriven",
@@ -118,3 +124,5 @@ genrule(
         "//pkg/gen:__pkg__",
     ],
 )
+
+get_x_data(name = "get_x_data")

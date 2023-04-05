@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,7 +15,8 @@ go_library(
         "//pkg/acceptance/cluster",
         "//pkg/base",
         "//pkg/build/bazel",
-        "//pkg/security/securitytest",  #keep
+        "//pkg/security/securityassets",  # keep
+        "//pkg/security/securitytest",  # keep
         "//pkg/security/username",
         "//pkg/server",  # keep
         "//pkg/testutils",
@@ -40,6 +42,8 @@ go_test(
         "debug_remote_test.go",
         "main_test.go",
     ],
+    # Note: we overide bazel timeout to 1800s using test_timeout.
+    args = ["-test.timeout=1795s"],
     data = glob([
         "testdata/**",
         "compose/**",
@@ -58,3 +62,5 @@ go_test(
         "//pkg/util/log",
     ],
 )
+
+get_x_data(name = "get_x_data")

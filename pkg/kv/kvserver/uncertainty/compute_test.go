@@ -13,6 +13,7 @@ package uncertainty
 import (
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -82,7 +83,7 @@ func TestComputeInterval(t *testing.T) {
 			tsFromServerClock: &now,
 			lease: func() kvserverpb.LeaseStatus {
 				leaseClone := lease
-				leaseClone.Lease.Start = hlc.ClockTimestamp{WallTime: 18}
+				leaseClone.MinValidObservedTimestamp = hlc.ClockTimestamp{WallTime: 18}
 				return leaseClone
 			}(),
 			exp: Interval{
@@ -96,7 +97,7 @@ func TestComputeInterval(t *testing.T) {
 			tsFromServerClock: &now,
 			lease: func() kvserverpb.LeaseStatus {
 				leaseClone := lease
-				leaseClone.Lease.Start = hlc.ClockTimestamp{WallTime: 32}
+				leaseClone.MinValidObservedTimestamp = hlc.ClockTimestamp{WallTime: 32}
 				return leaseClone
 			}(),
 			exp: Interval{
@@ -138,7 +139,7 @@ func TestComputeInterval(t *testing.T) {
 			txn:  txn,
 			lease: func() kvserverpb.LeaseStatus {
 				leaseClone := lease
-				leaseClone.Lease.Start = hlc.ClockTimestamp{WallTime: 18}
+				leaseClone.MinValidObservedTimestamp = hlc.ClockTimestamp{WallTime: 18}
 				return leaseClone
 			}(),
 			exp: Interval{
@@ -151,7 +152,7 @@ func TestComputeInterval(t *testing.T) {
 			txn:  txn,
 			lease: func() kvserverpb.LeaseStatus {
 				leaseClone := lease
-				leaseClone.Lease.Start = hlc.ClockTimestamp{WallTime: 22}
+				leaseClone.MinValidObservedTimestamp = hlc.ClockTimestamp{WallTime: 22}
 				return leaseClone
 			}(),
 			exp: Interval{
@@ -162,7 +163,7 @@ func TestComputeInterval(t *testing.T) {
 	}
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
-			var h roachpb.Header
+			var h kvpb.Header
 			h.Txn = test.txn
 			h.TimestampFromServerClock = test.tsFromServerClock
 			require.Equal(t, test.exp, ComputeInterval(&h, test.lease, maxOffset))

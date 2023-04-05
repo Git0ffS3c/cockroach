@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"net/http"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -25,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -44,13 +44,13 @@ type authenticationV2Server struct {
 // newAuthenticationV2Server creates a new authenticationV2Server for the given
 // outer Server, and base path.
 func newAuthenticationV2Server(
-	ctx context.Context, s *Server, basePath string,
+	ctx context.Context, s *SQLServer, cfg *base.Config, basePath string,
 ) *authenticationV2Server {
 	simpleMux := http.NewServeMux()
 
 	authServer := &authenticationV2Server{
-		sqlServer:  s.sqlServer,
-		authServer: newAuthenticationServer(s.cfg.Config, s.sqlServer),
+		sqlServer:  s,
+		authServer: newAuthenticationServer(cfg, s),
 		mux:        simpleMux,
 		ctx:        ctx,
 		basePath:   basePath,
@@ -106,43 +106,45 @@ type loginResponse struct {
 
 // swagger:operation POST /login/ login
 //
-// API Login
+// # API Login
 //
 // Creates an API session for use with API endpoints that require
 // authentication.
 //
 // ---
 // parameters:
-// - name: credentials
-//   schema:
+//   - name: credentials
+//     schema:
 //     type: object
 //     properties:
-//       username:
-//         type: string
-//       password:
-//         type: string
+//     username:
+//     type: string
+//     password:
+//     type: string
 //     required:
-//       - username
-//       - password
-//   in: body
-//   description: Credentials for login
-//   required: true
+//   - username
+//   - password
+//     in: body
+//     description: Credentials for login
+//     required: true
+//
 // produces:
 // - application/json
 // - text/plain
 // consumes:
 // - application/x-www-form-urlencoded
 // responses:
-//   "200":
-//     description: Login response.
-//     schema:
-//       "$ref": "#/definitions/loginResponse"
-//   "400":
-//     description: Bad request, if required parameters absent.
-//     type: string
-//   "401":
-//     description: Unauthorized, if credentials don't match.
-//     type: string
+//
+//	"200":
+//	  description: Login response.
+//	  schema:
+//	    "$ref": "#/definitions/loginResponse"
+//	"400":
+//	  description: Bad request, if required parameters absent.
+//	  type: string
+//	"401":
+//	  description: Unauthorized, if credentials don't match.
+//	  type: string
 func (a *authenticationV2Server) login(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -195,7 +197,7 @@ type logoutResponse struct {
 
 // swagger:operation POST /logout/ logout
 //
-// API Logout
+// # API Logout
 //
 // Logs out on a previously-created API session.
 //
@@ -206,14 +208,15 @@ type logoutResponse struct {
 // security:
 // - api_session: []
 // responses:
-//   "200":
-//     description: Logout response.
-//     schema:
-//       "$ref": "#/definitions/logoutResponse"
-//   "400":
-//     description: Bad request, if API session not present in headers, or
-//       invalid session.
-//     type: string
+//
+//	"200":
+//	  description: Logout response.
+//	  schema:
+//	    "$ref": "#/definitions/logoutResponse"
+//	"400":
+//	  description: Bad request, if API session not present in headers, or
+//	    invalid session.
+//	  type: string
 func (a *authenticationV2Server) logout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -239,7 +242,7 @@ func (a *authenticationV2Server) logout(w http.ResponseWriter, r *http.Request) 
 		a.ctx,
 		"revoke-auth-session",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+		sessiondata.RootUserSessionDataOverride,
 		`UPDATE system.web_sessions SET "revokedAt" = now() WHERE id = $1`,
 		sessionCookie.ID,
 	); err != nil {
@@ -266,70 +269,94 @@ func (a *authenticationV2Server) ServeHTTP(w http.ResponseWriter, r *http.Reques
 // and the request isn't routed through to the inner handler. On success, the
 // username is set on the request context for use in the inner handler.
 type authenticationV2Mux struct {
-	s     *authenticationV2Server
-	inner http.Handler
+	s              *authenticationV2Server
+	inner          http.Handler
+	allowAnonymous bool
 }
 
 func newAuthenticationV2Mux(s *authenticationV2Server, inner http.Handler) *authenticationV2Mux {
 	return &authenticationV2Mux{
-		s:     s,
-		inner: inner,
+		s:              s,
+		inner:          inner,
+		allowAnonymous: s.sqlServer.cfg.Insecure,
 	}
 }
 
-// getSession decodes the cookie from the request, looks up the corresponding session, and
-// returns the logged in user name. If there's an error, it returns an error value and
-// also sends the error over http using w.
+// apiV2UseCookieBasedAuth is a magic value of the auth header that
+// tells us to look for the session in the cookie. This can be used by
+// frontend code to maintain cookie-based auth while interacting with
+// the API.
+const apiV2UseCookieBasedAuth = "cookie"
+
+// getSession decodes the cookie from the request, looks up the corresponding
+// session, and returns the logged-in username. The session can be looked up
+// either from a session cookie as used in the non-v2 API server, or via the
+// session header. In order for us to use the cookie as the session source, the
+// header `"X-Cockroach-API-Session"` must be set to `"cookie"` (This is to
+// guard against CSRF attacks in the browser since it forces the caller to use
+// javascript to set the header). If there's an error, it returns an error value
+// and also sends the error over http using w.
 func (a *authenticationV2Mux) getSession(
 	w http.ResponseWriter, req *http.Request,
-) (string, *serverpb.SessionCookie, error) {
-	// Validate the returned cookie.
+) (string, *serverpb.SessionCookie, int, error) {
+	ctx := req.Context()
+	// Validate the returned session header or cookie.
 	rawSession := req.Header.Get(apiV2AuthHeader)
 	if len(rawSession) == 0 {
 		err := errors.New("invalid session header")
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return "", nil, err
-	}
-	sessionCookie := &serverpb.SessionCookie{}
-	decoded, err := base64.StdEncoding.DecodeString(rawSession)
-	if err != nil {
-		err := errors.New("invalid session header")
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return "", nil, err
-	}
-	if err := protoutil.Unmarshal(decoded, sessionCookie); err != nil {
-		err := errors.New("invalid session header")
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return "", nil, err
+		return "", nil, http.StatusUnauthorized, err
 	}
 
-	valid, username, err := a.s.authServer.verifySession(req.Context(), sessionCookie)
+	cookie := &serverpb.SessionCookie{}
+	var err error
+	if rawSession == apiV2UseCookieBasedAuth {
+		st := a.s.sqlServer.cfg.Settings
+		cookie, err = findAndDecodeSessionCookie(req.Context(), st, req.Cookies())
+	} else {
+		decoded, err := base64.StdEncoding.DecodeString(rawSession)
+		if err != nil {
+			log.Warningf(ctx, "attempted to decode session but failed: %v", err)
+			return "", nil, http.StatusBadRequest, err
+		}
+		err = protoutil.Unmarshal(decoded, cookie)
+		if err != nil {
+			log.Warningf(ctx, "attempted to unmarshal session but failed: %v", err)
+		}
+	}
+	if err != nil {
+		err := errors.New("invalid session header")
+		return "", nil, http.StatusBadRequest, err
+	}
+	valid, username, err := a.s.authServer.verifySession(req.Context(), cookie)
 	if err != nil {
 		apiV2InternalError(req.Context(), err, w)
-		return "", nil, err
+		return "", nil, http.StatusInternalServerError, err
 	}
 	if !valid {
 		err := errors.New("the provided authentication session could not be validated")
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-		return "", nil, err
+		return "", nil, http.StatusUnauthorized, err
 	}
 
-	return username, sessionCookie, nil
+	return username, cookie, http.StatusOK, nil
 }
 
 func (a *authenticationV2Mux) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	username, cookie, err := a.getSession(w, req)
-	if err == nil {
-		// Valid session found. Set the username in the request context, so
-		// child http.Handlers can access it.
-		ctx := req.Context()
-		ctx = context.WithValue(ctx, webSessionUserKey{}, username)
-		ctx = context.WithValue(ctx, webSessionIDKey{}, cookie.ID)
-		req = req.WithContext(ctx)
-	} else {
+	u, cookie, errStatus, err := a.getSession(w, req)
+	if err != nil && !a.allowAnonymous {
 		// getSession writes an error to w if err != nil.
+		http.Error(w, err.Error(), errStatus)
 		return
 	}
+	if a.allowAnonymous {
+		u = username.RootUser
+	}
+	// Valid session found, or insecure. Set the username in the request context,
+	// so child http.Handlers can access it.
+	var sessionID int64
+	if cookie != nil {
+		sessionID = cookie.ID
+	}
+	req = req.WithContext(contextWithHTTPAuthInfo(req.Context(), u, sessionID))
 	a.inner.ServeHTTP(w, req)
 }
 
@@ -413,8 +440,7 @@ func (r *roleAuthorizationMux) hasRoleOption(
 func (r *roleAuthorizationMux) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// The username is set in authenticationV2Mux, and must correspond with a
 	// logged-in user.
-	username := username.MakeSQLUsernameFromPreNormalizedString(
-		req.Context().Value(webSessionUserKey{}).(string))
+	username := userFromHTTPAuthInfoContext(req.Context())
 	if role, err := r.getRoleForUser(req.Context(), username); err != nil || role < r.role {
 		if err != nil {
 			apiV2InternalError(req.Context(), err, w)
@@ -434,10 +460,4 @@ func (r *roleAuthorizationMux) ServeHTTP(w http.ResponseWriter, req *http.Reques
 		}
 	}
 	r.inner.ServeHTTP(w, req)
-}
-
-// apiToOutgoingGatewayCtx converts an HTTP API (v1 or v2) context, to one that
-// can issue outgoing RPC requests under the same logged-in user.
-func apiToOutgoingGatewayCtx(ctx context.Context, r *http.Request) context.Context {
-	return metadata.NewOutgoingContext(ctx, forwardAuthenticationMetadata(ctx, r))
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -54,10 +55,10 @@ var validTableDesc = &descpb.Descriptor{
 				ID:                  1,
 				Unique:              true,
 				KeyColumnNames:      []string{"col"},
-				KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{1},
 				Version:             descpb.LatestIndexDescriptorVersion,
-				EncodingType:        descpb.PrimaryIndexEncoding,
+				EncodingType:        catenumpb.PrimaryIndexEncoding,
 				ConstraintID:        1,
 			},
 			NextIndexID: 2,
@@ -70,46 +71,64 @@ var validTableDesc = &descpb.Descriptor{
 }
 
 func toBytes(t *testing.T, desc *descpb.Descriptor) []byte {
-	table, database, typ, schema := descpb.FromDescriptor(desc)
+	table, database, typ, schema, function := descpb.GetDescriptors(desc)
 	if table != nil {
 		parentSchemaID := table.GetUnexposedParentSchemaID()
 		if parentSchemaID == descpb.InvalidID {
 			parentSchemaID = keys.PublicSchemaID
 		}
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&table.Privileges,
 			table.GetParentID(),
 			parentSchemaID,
 			privilege.Table,
 			table.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 		if table.FormatVersion == 0 {
 			table.FormatVersion = descpb.InterleavedFormatVersion
 		}
 	} else if database != nil {
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&database.Privileges,
 			descpb.InvalidID,
 			descpb.InvalidID,
 			privilege.Database,
 			database.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 	} else if typ != nil {
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&typ.Privileges,
 			typ.GetParentID(),
 			typ.GetParentSchemaID(),
 			privilege.Type,
 			typ.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
 	} else if schema != nil {
-		catprivilege.MaybeFixPrivileges(
+		if _, err := catprivilege.MaybeFixPrivileges(
 			&schema.Privileges,
 			schema.GetParentID(),
 			descpb.InvalidID,
 			privilege.Schema,
 			schema.GetName(),
-		)
+		); err != nil {
+			panic(err)
+		}
+	} else if function != nil {
+		if _, err := catprivilege.MaybeFixPrivileges(
+			&function.Privileges,
+			function.GetParentID(),
+			descpb.InvalidID,
+			privilege.Function,
+			function.GetName(),
+		); err != nil {
+			panic(err)
+		}
 	}
 	res, err := protoutil.Marshal(desc)
 	require.NoError(t, err)
@@ -128,7 +147,7 @@ func TestExamineDescriptors(t *testing.T) {
 
 	droppedValidTableDesc := protoutil.Clone(validTableDesc).(*descpb.Descriptor)
 	{
-		tbl, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(droppedValidTableDesc, hlc.Timestamp{WallTime: 1})
+		tbl, _, _, _, _ := descpb.GetDescriptors(droppedValidTableDesc)
 		tbl.State = descpb.DescriptorState_DROP
 	}
 
@@ -138,7 +157,7 @@ func TestExamineDescriptors(t *testing.T) {
 	// the privileges returned from the SystemAllowedPrivileges map in privilege.go.
 	validTableDescWithParentSchema := protoutil.Clone(validTableDesc).(*descpb.Descriptor)
 	{
-		tbl, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(validTableDescWithParentSchema, hlc.Timestamp{WallTime: 1})
+		tbl, _, _, _, _ := descpb.GetDescriptors(validTableDescWithParentSchema)
 		tbl.UnexposedParentSchemaID = 53
 	}
 
@@ -170,7 +189,7 @@ func TestExamineDescriptors(t *testing.T) {
 			},
 			expected: `Examining 1 descriptors and 0 namespace entries...
   ParentID   0, ParentSchemaID 29: relation "" (2): different id in descriptor table: 1
-  ParentID   0, ParentSchemaID 29: relation "" (2): empty table name
+  ParentID   0, ParentSchemaID 29: relation "" (2): empty relation name
   ParentID   0, ParentSchemaID 29: relation "" (2): invalid parent ID 0
   ParentID   0, ParentSchemaID 29: relation "" (2): table must contain at least 1 column
 `,
@@ -235,7 +254,7 @@ func TestExamineDescriptors(t *testing.T) {
 			},
 			expected: `Examining 2 descriptors and 2 namespace entries...
   ParentID  52, ParentSchemaID 29: relation "t" (51): expected matching namespace entry, found none
-  ParentID   0, ParentSchemaID 29: namespace entry "t" (51): no matching name info found in non-dropped relation "t"
+  ParentID   0, ParentSchemaID 29: namespace entry "t" (51): mismatched name "t" in relation descriptor
 `,
 		},
 		{ // 8
@@ -364,7 +383,7 @@ func TestExamineDescriptors(t *testing.T) {
 				{NameInfo: descpb.NameInfo{Name: "causes_error"}, ID: 2},
 			},
 			expected: `Examining 0 descriptors and 4 namespace entries...
-  ParentID   0, ParentSchemaID  0: namespace entry "causes_error" (2): descriptor not found
+  ParentID   0, ParentSchemaID  0: namespace entry "causes_error" (2): referenced descriptor not found
 `,
 		},
 		{ // 14
@@ -372,7 +391,7 @@ func TestExamineDescriptors(t *testing.T) {
 				{NameInfo: descpb.NameInfo{Name: "null"}, ID: int64(descpb.InvalidID)},
 			},
 			expected: `Examining 0 descriptors and 1 namespace entries...
-  ParentID   0, ParentSchemaID  0: namespace entry "null" (0): invalid descriptor ID
+  ParentID   0, ParentSchemaID  0: namespace entry "null" (0): invalid namespace entry
 `,
 		},
 		{ // 15
@@ -393,49 +412,6 @@ func TestExamineDescriptors(t *testing.T) {
 			expected: "Examining 2 descriptors and 2 namespace entries...\n",
 		},
 		{ // 16
-			valid: true,
-			descTable: doctor.DescriptorTable{
-				{
-					ID: 1,
-					DescBytes: toBytes(t, &descpb.Descriptor{Union: &descpb.Descriptor_Database{
-						Database: &descpb.DatabaseDescriptor{
-							ID:            1,
-							Name:          "db",
-							DrainingNames: []descpb.NameInfo{{Name: "db1"}, {Name: "db2"}},
-						},
-					}}),
-				},
-			},
-			namespaceTable: doctor.NamespaceTable{
-				{NameInfo: descpb.NameInfo{Name: "db"}, ID: 1},
-				{NameInfo: descpb.NameInfo{Name: "db1"}, ID: 1},
-				{NameInfo: descpb.NameInfo{Name: "db2"}, ID: 1},
-			},
-			expected: "Examining 1 descriptors and 3 namespace entries...\n",
-		},
-		{ // 17
-			descTable: doctor.DescriptorTable{
-				{
-					ID: 1,
-					DescBytes: toBytes(t, &descpb.Descriptor{Union: &descpb.Descriptor_Database{
-						Database: &descpb.DatabaseDescriptor{
-							ID:            1,
-							Name:          "db",
-							DrainingNames: []descpb.NameInfo{{Name: "db1"}, {Name: "db2"}, {Name: "db3"}},
-						},
-					}}),
-				},
-			},
-			namespaceTable: doctor.NamespaceTable{
-				{NameInfo: descpb.NameInfo{Name: "db"}, ID: 1},
-				{NameInfo: descpb.NameInfo{Name: "db1"}, ID: 1},
-				{NameInfo: descpb.NameInfo{Name: "db2"}, ID: 1},
-			},
-			expected: `Examining 1 descriptors and 3 namespace entries...
-  ParentID   0, ParentSchemaID  0: database "db" (1): expected matching namespace entry for draining name (0, 0, db3), found none
-`,
-		},
-		{ // 18
 			descTable: doctor.DescriptorTable{
 				{ID: 51, DescBytes: toBytes(t, droppedValidTableDesc)},
 				{
@@ -450,14 +426,14 @@ func TestExamineDescriptors(t *testing.T) {
 				{NameInfo: descpb.NameInfo{Name: "db"}, ID: 52},
 			},
 			expected: `Examining 2 descriptors and 2 namespace entries...
-  ParentID  52, ParentSchemaID 29: namespace entry "t" (51): no matching name info in draining names of dropped relation
+  ParentID  52, ParentSchemaID 29: namespace entry "t" (51): descriptor is being dropped
 `,
 		},
-		{ // 19
+		{ // 17
 			descTable: doctor.DescriptorTable{
 				{ID: 51, DescBytes: toBytes(t, func() *descpb.Descriptor {
 					desc := protoutil.Clone(validTableDesc).(*descpb.Descriptor)
-					tbl, _, _, _ := descpb.FromDescriptor(desc)
+					tbl, _, _, _, _ := descpb.GetDescriptors(desc)
 					tbl.PrimaryIndex.Disabled = true
 					return desc
 				}())},
@@ -476,7 +452,7 @@ func TestExamineDescriptors(t *testing.T) {
   ParentID  52, ParentSchemaID 29: relation "t" (51): unimplemented: primary key dropped without subsequent addition of new primary key in same transaction
 `,
 		},
-		{ // 20
+		{ // 18
 
 			// The data for these descriptors was generated by running the following
 			// SQL in 19.1. Then upgrading the cluster to 20.1.8. Running a backup
@@ -514,11 +490,11 @@ func TestExamineDescriptors(t *testing.T) {
   ParentID  57, ParentSchemaID 29: relation "c" (60): missing fk back reference "fk_i_ref_b" to "c" from "a"
 `,
 		},
-		{ // 21
+		{ // 19
 			descTable: doctor.DescriptorTable{
 				{ID: 51, DescBytes: toBytes(t, func() *descpb.Descriptor {
 					desc := protoutil.Clone(validTableDesc).(*descpb.Descriptor)
-					tbl, _, _, _ := descpb.FromDescriptor(desc)
+					tbl, _, _, _, _ := descpb.GetDescriptors(desc)
 					tbl.MutationJobs = []descpb.TableDescriptor_MutationJob{{MutationID: 1, JobID: 123}}
 					return desc
 				}())},
@@ -541,6 +517,7 @@ func TestExamineDescriptors(t *testing.T) {
 				},
 			},
 			expected: `Examining 2 descriptors and 2 namespace entries...
+  ParentID  52, ParentSchemaID 29: relation "t" (51): unknown mutation ID 1 associated with job ID 123
   ParentID  52, ParentSchemaID 29: relation "t" (51): mutation job 123 has terminal status (canceled)
 `,
 		},
@@ -548,12 +525,16 @@ func TestExamineDescriptors(t *testing.T) {
 
 	for i, test := range tests {
 		var buf bytes.Buffer
+		for j := range test.descTable {
+			test.descTable[j].ModTime = hlc.MaxTimestamp
+		}
 		valid, err := doctor.ExamineDescriptors(
 			context.Background(),
 			clusterversion.TestingClusterVersion,
 			test.descTable,
 			test.namespaceTable,
 			test.jobsTable,
+			true,
 			false,
 			&buf)
 		msg := fmt.Sprintf("Test %d failed!", i+1)
@@ -605,9 +586,9 @@ func TestExamineJobs(t *testing.T) {
 					Progress: &jobspb.Progress{Details: jobspb.WrapProgressDetails(
 						jobspb.SchemaChangeGCProgress{
 							Tables: []jobspb.SchemaChangeGCProgress_TableProgress{
-								{ID: 1, Status: jobspb.SchemaChangeGCProgress_DELETED},
-								{ID: 2, Status: jobspb.SchemaChangeGCProgress_DELETING},
-								{ID: 3, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_GC},
+								{ID: 1, Status: jobspb.SchemaChangeGCProgress_CLEARED},
+								{ID: 2, Status: jobspb.SchemaChangeGCProgress_CLEARING},
+								{ID: 3, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_CLEAR},
 							},
 						})},
 					Status: jobs.StatusRunning,
@@ -618,8 +599,8 @@ func TestExamineJobs(t *testing.T) {
 					Progress: &jobspb.Progress{Details: jobspb.WrapProgressDetails(
 						jobspb.SchemaChangeGCProgress{
 							Tables: []jobspb.SchemaChangeGCProgress_TableProgress{
-								{ID: 1, Status: jobspb.SchemaChangeGCProgress_DELETED},
-								{ID: 3, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_GC},
+								{ID: 1, Status: jobspb.SchemaChangeGCProgress_CLEARED},
+								{ID: 3, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_CLEAR},
 							},
 						})},
 					Status: jobs.StatusPauseRequested,
@@ -630,11 +611,11 @@ func TestExamineJobs(t *testing.T) {
 					Progress: &jobspb.Progress{Details: jobspb.WrapProgressDetails(
 						jobspb.SchemaChangeGCProgress{
 							Tables: []jobspb.SchemaChangeGCProgress_TableProgress{
-								{ID: 1, Status: jobspb.SchemaChangeGCProgress_DELETED},
-								{ID: 3, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_GC},
+								{ID: 1, Status: jobspb.SchemaChangeGCProgress_CLEARED},
+								{ID: 3, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_CLEAR},
 							},
 							Indexes: []jobspb.SchemaChangeGCProgress_IndexProgress{
-								{IndexID: 10, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_GC},
+								{IndexID: 10, Status: jobspb.SchemaChangeGCProgress_WAITING_FOR_CLEAR},
 							},
 						})},
 					Status: jobs.StatusPaused,

@@ -12,7 +12,6 @@ package codeowners
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,11 +29,14 @@ func TestMatch(t *testing.T) {
 /b/ @cockroachdb/team-b-noreview
 /a/b* @cockroachdb/team-b @cockroachdb/team-a
 **/c/ @cockroachdb/team-c
+#!/q/ @cockroachdb/team-q
+/qq/ @cockroachdb/team-q #! @cockroachdb/team-b-noreview
 `
 	teams := map[team.Alias]team.Team{
 		"cockroachdb/team-a": {},
 		"cockroachdb/team-b": {},
 		"cockroachdb/team-c": {},
+		"cockroachdb/team-q": {},
 	}
 
 	codeOwners, err := LoadCodeOwners(strings.NewReader(owners), teams)
@@ -50,6 +52,8 @@ func TestMatch(t *testing.T) {
 		{"a/bob", []team.Team{teams["cockroachdb/team-b"], teams["cockroachdb/team-a"]}},
 		{"no/owner/", nil},
 		{"hmm/what/about/c/file", []team.Team{teams["cockroachdb/team-c"]}},
+		{"q/foo.txt", []team.Team{teams["cockroachdb/team-q"]}},
+		{"qq/foo.txt", []team.Team{teams["cockroachdb/team-q"], teams["cockroachdb/team-b"]}},
 	}
 
 	for _, tc := range testCases {
@@ -99,7 +103,7 @@ func TestLintEverythingIsOwned(t *testing.T) {
 		}
 		require.NoError(t, os.MkdirAll(filepath.Join(d, "pkg", mkd), 0755))
 		if mkf != "" {
-			require.NoError(t, ioutil.WriteFile(filepath.Join(d, "pkg", mkd, mkf), []byte("foo"), 0644))
+			require.NoError(t, os.WriteFile(filepath.Join(d, "pkg", mkd, mkf), []byte("foo"), 0644))
 		}
 	}
 	co, err := LoadCodeOwners(strings.NewReader("# nothing!"), nil /* no teams! */)

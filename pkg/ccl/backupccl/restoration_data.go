@@ -37,6 +37,9 @@ type restorationData interface {
 	getTenantRekeys() []execinfrapb.TenantRekey
 	getPKIDs() map[uint64]bool
 
+	// isValidateOnly returns ture iff only validation should occur
+	isValidateOnly() bool
+
 	// addTenant extends the set of data needed to restore to include a new tenant.
 	addTenant(fromID, toID roachpb.TenantID)
 
@@ -63,10 +66,13 @@ func (*mainRestorationData) isMainBundle() bool { return true }
 type restorationDataBase struct {
 	// spans is the spans included in this bundle.
 	spans []roachpb.Span
+
 	// rekeys maps old table IDs to their new table descriptor.
 	tableRekeys []execinfrapb.TableRekey
+
 	// tenantRekeys maps tenants being restored to their new ID.
 	tenantRekeys []execinfrapb.TenantRekey
+
 	// pkIDs stores the ID of the primary keys for all of the tables that we're
 	// restoring for RowCount calculation.
 	pkIDs map[uint64]bool
@@ -74,6 +80,9 @@ type restorationDataBase struct {
 	// systemTables store the system tables that need to be restored for cluster
 	// backups. Should be nil otherwise.
 	systemTables []catalog.TableDescriptor
+
+	// validateOnly indicates this data should only get read from external storage, not written
+	validateOnly bool
 }
 
 // restorationDataBase implements restorationData.
@@ -117,6 +126,10 @@ func (b *restorationDataBase) addTenant(fromTenantID, toTenantID roachpb.TenantI
 // isEmpty implements restorationData.
 func (b *restorationDataBase) isEmpty() bool {
 	return len(b.spans) == 0
+}
+
+func (b *restorationDataBase) isValidateOnly() bool {
+	return b.validateOnly
 }
 
 // isMainBundle implements restorationData.

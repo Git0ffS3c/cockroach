@@ -24,17 +24,24 @@ import (
 
 	"github.com/alessio/shellescape"
 	bazelutil "github.com/cockroachdb/cockroach/pkg/build/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/spf13/cobra"
 )
 
 const (
 	crossFlag       = "cross"
 	nogoDisableFlag = "--//build/toolchains:nogo_disable_flag"
+	geosTarget      = "//c-deps:libgeos"
+	devTarget       = "//pkg/cmd/dev:dev"
 )
 
 type buildTarget struct {
+	// fullName is the full qualified name of the Bazel build target,
+	// like //pkg/cmd/cockroach:cockroach.
 	fullName string
-	kind     string
+	// kind is either the "kind" of the Bazel rule (like go_library), or the
+	// string "geos" in case fullName is //c-deps:libgeos.
+	kind string
 }
 
 // makeBuildCmd constructs the subcommand used to build the specified binaries.
@@ -66,35 +73,42 @@ func makeBuildCmd(runE func(cmd *cobra.Command, args []string) error) *cobra.Com
 
 // buildTargetMapping maintains shorthands that map 1:1 with bazel targets.
 var buildTargetMapping = map[string]string{
-	"bazel-remote":     bazelRemoteTarget,
-	"buildifier":       "@com_github_bazelbuild_buildtools//buildifier:buildifier",
-	"buildozer":        "@com_github_bazelbuild_buildtools//buildozer:buildozer",
-	"cockroach":        "//pkg/cmd/cockroach:cockroach",
-	"cockroach-sql":    "//pkg/cmd/cockroach-sql:cockroach-sql",
-	"cockroach-oss":    "//pkg/cmd/cockroach-oss:cockroach-oss",
-	"cockroach-short":  "//pkg/cmd/cockroach-short:cockroach-short",
-	"crlfmt":           "@com_github_cockroachdb_crlfmt//:crlfmt",
-	"dev":              "//pkg/cmd/dev:dev",
-	"docgen":           "//pkg/cmd/docgen:docgen",
-	"docs-issue-gen":   "//pkg/cmd/docs-issue-generation:docs-issue-generation",
-	"execgen":          "//pkg/sql/colexec/execgen/cmd/execgen:execgen",
-	"gofmt":            "@com_github_cockroachdb_gostdlib//cmd/gofmt:gofmt",
-	"goimports":        "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports:goimports",
-	"label-merged-pr":  "//pkg/cmd/label-merged-pr:label-merged-pr",
-	"optgen":           "//pkg/sql/opt/optgen/cmd/optgen:optgen",
-	"optfmt":           "//pkg/sql/opt/optgen/cmd/optfmt:optfmt",
-	"oss":              "//pkg/cmd/cockroach-oss:cockroach-oss",
-	"langgen":          "//pkg/sql/opt/optgen/cmd/langgen:langgen",
-	"reduce":           "//pkg/cmd/reduce:reduce",
-	"roachprod":        "//pkg/cmd/roachprod:roachprod",
-	"roachprod-stress": "//pkg/cmd/roachprod-stress:roachprod-stress",
-	"roachtest":        "//pkg/cmd/roachtest:roachtest",
-	"short":            "//pkg/cmd/cockroach-short:cockroach-short",
-	"staticcheck":      "@co_honnef_go_tools//cmd/staticcheck:staticcheck",
-	"stress":           stressTarget,
-	"swagger":          "@com_github_go_swagger_go_swagger//cmd/swagger:swagger",
-	"tests":            "//pkg:all_tests",
-	"workload":         "//pkg/cmd/workload:workload",
+	"bazel-remote":         bazelRemoteTarget,
+	"buildifier":           "@com_github_bazelbuild_buildtools//buildifier:buildifier",
+	"buildozer":            "@com_github_bazelbuild_buildtools//buildozer:buildozer",
+	"cockroach":            "//pkg/cmd/cockroach:cockroach",
+	"cockroach-sql":        "//pkg/cmd/cockroach-sql:cockroach-sql",
+	"cockroach-oss":        "//pkg/cmd/cockroach-oss:cockroach-oss",
+	"cockroach-short":      "//pkg/cmd/cockroach-short:cockroach-short",
+	"crlfmt":               "@com_github_cockroachdb_crlfmt//:crlfmt",
+	"dev":                  devTarget,
+	"docgen":               "//pkg/cmd/docgen:docgen",
+	"docs-issue-gen":       "//pkg/cmd/docs-issue-generation:docs-issue-generation",
+	"execgen":              "//pkg/sql/colexec/execgen/cmd/execgen:execgen",
+	"gofmt":                "@com_github_cockroachdb_gostdlib//cmd/gofmt:gofmt",
+	"goimports":            "@com_github_cockroachdb_gostdlib//x/tools/cmd/goimports:goimports",
+	"label-merged-pr":      "//pkg/cmd/label-merged-pr:label-merged-pr",
+	"geos":                 geosTarget,
+	"langgen":              "//pkg/sql/opt/optgen/cmd/langgen:langgen",
+	"libgeos":              geosTarget,
+	"obsservice":           "//pkg/obsservice/cmd/obsservice:obsservice",
+	"optgen":               "//pkg/sql/opt/optgen/cmd/optgen:optgen",
+	"optfmt":               "//pkg/sql/opt/optgen/cmd/optfmt:optfmt",
+	"oss":                  "//pkg/cmd/cockroach-oss:cockroach-oss",
+	"reduce":               "//pkg/cmd/reduce:reduce",
+	"roachprod":            "//pkg/cmd/roachprod:roachprod",
+	"roachprod-stress":     "//pkg/cmd/roachprod-stress:roachprod-stress",
+	"roachprod-microbench": "//pkg/cmd/roachprod-microbench:roachprod-microbench",
+	"roachtest":            "//pkg/cmd/roachtest:roachtest",
+	"short":                "//pkg/cmd/cockroach-short:cockroach-short",
+	"smith":                "//pkg/cmd/smith:smith",
+	"smithcmp":             "//pkg/cmd/smithcmp:smithcmp",
+	"smithtest":            "//pkg/cmd/smithtest:smithtest",
+	"staticcheck":          "@co_honnef_go_tools//cmd/staticcheck:staticcheck",
+	"stress":               stressTarget,
+	"swagger":              "@com_github_go_swagger_go_swagger//cmd/swagger:swagger",
+	"tests":                "//pkg:all_tests",
+	"workload":             "//pkg/cmd/workload:workload",
 }
 
 // allBuildTargets is a sorted list of all the available build targets.
@@ -108,6 +122,26 @@ var allBuildTargets = func() []string {
 }()
 
 func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
+	var tmpDir string
+	if !buildutil.CrdbTestBuild {
+		// tmpDir will contain the build event binary file if produced.
+		var err error
+		tmpDir, err = os.MkdirTemp("", "")
+		if err != nil {
+			return err
+		}
+	}
+	defer func() {
+		if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
+			// Retry.
+			if err := sendBepDataToBeaverHubIfNeeded(filepath.Join(tmpDir, bepFileBasename)); err != nil {
+				log.Printf("Internal Error: Sending BEP file to beaver hub failed - %v", err)
+			}
+		}
+		if !buildutil.CrdbTestBuild {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
 	targets, additionalBazelArgs := splitArgsAtDash(cmd, commandLine)
 	ctx := cmd.Context()
 	cross := mustGetFlagString(cmd, crossFlag)
@@ -136,18 +170,14 @@ func (d *dev) build(cmd *cobra.Command, commandLine []string) error {
 	args = append(args, additionalBazelArgs...)
 
 	if cross == "" {
-		// run "yarn --check-files" before any bazel target that includes UI to ensure that node_modules dir is consistent
-		// see related issue: https://github.com/cockroachdb/cockroach/issues/70867
-		for _, arg := range args {
-			if arg == "--config=with_ui" {
-				logCommand("bazel", "run", "@nodejs//:yarn", "--", "--check-files", "--cwd", "pkg/ui", "--offline")
-				if err := d.exec.CommandContextInheritingStdStreams(ctx, "bazel", "run", "@nodejs//:yarn", "--", "--check-files", "--cwd", "pkg/ui", "--offline"); err != nil {
-					return err
-				}
-				break
-			}
-		}
+		// Do not log --build_event_binary_file=... because it is not relevant to the actual call
+		// from the user perspective.
 		logCommand("bazel", args...)
+		if buildutil.CrdbTestBuild {
+			args = append(args, "--build_event_binary_file=/tmp/path")
+		} else {
+			args = append(args, fmt.Sprintf("--build_event_binary_file=%s", filepath.Join(tmpDir, bepFileBasename)))
+		}
 		if err := d.exec.CommandContextInheritingStdStreams(ctx, "bazel", args...); err != nil {
 			return err
 		}
@@ -174,24 +204,25 @@ func (d *dev) crossBuild(
 	script.WriteString(fmt.Sprintf("bazel %s\n", shellescape.QuoteCommand(bazelArgs)))
 	for _, arg := range bazelArgs {
 		if arg == "--config=with_ui" {
-			script.WriteString("bazel run @nodejs//:yarn -- --check-files --cwd pkg/ui --offline\n")
+			script.WriteString("bazel run @yarn//:yarn -- --check-files --cwd pkg/ui --offline\n")
 			break
 		}
 	}
 	var bazelBinSet bool
 	script.WriteString("set +x\n")
 	for _, target := range targets {
-		if target.kind == "cmake" {
-			if !bazelBinSet {
-				script.WriteString(fmt.Sprintf("BAZELBIN=$(bazel info bazel-bin %s)\n", shellescape.QuoteCommand(configArgs)))
-				bazelBinSet = true
+		if target.kind == "geos" {
+			// Cross-build will never force-build geos.
+			script.WriteString(fmt.Sprintf("EXECROOT=$(bazel info execution_root %s)\n", shellescape.QuoteCommand(configArgs)))
+			libDir := "lib"
+			if strings.Contains(crossConfig, "windows") {
+				libDir = "bin"
 			}
-			targetComponents := strings.Split(target.fullName, ":")
-			pkgname := strings.TrimPrefix(targetComponents[0], "//")
-			dirname := targetComponents[1]
-			script.WriteString(fmt.Sprintf("cp -R $BAZELBIN/%s/%s /artifacts/%s\n", pkgname, dirname, dirname))
-			script.WriteString(fmt.Sprintf("chmod a+w -R /artifacts/%s\n", dirname))
-			script.WriteString(fmt.Sprintf("echo \"Successfully built target %s at artifacts/%s\"\n", target.fullName, dirname))
+			script.WriteString(fmt.Sprintf("for LIB in `ls $EXECROOT/external/archived_cdep_libgeos_%s/%s`; do\n", strings.TrimPrefix(crossConfig, "cross"), libDir))
+			script.WriteString(fmt.Sprintf("cp $EXECROOT/external/archived_cdep_libgeos_%s/%s/$LIB /artifacts\n", strings.TrimPrefix(crossConfig, "cross"), libDir))
+			script.WriteString("chmod a+w -R /artifacts/$LIB\n")
+			script.WriteString(fmt.Sprintf("echo \"Successfully built target %s at artifacts/$LIB\"\n", target.fullName))
+			script.WriteString("done")
 			continue
 		}
 		if target.kind == "go_binary" || target.kind == "go_test" {
@@ -235,8 +266,48 @@ func (d *dev) stageArtifacts(ctx context.Context, targets []buildTarget) error {
 	}
 
 	for _, target := range targets {
-		if target.kind != "go_binary" {
+		if target.kind != "go_binary" && target.kind != "geos" {
 			// Skip staging for these.
+			continue
+		}
+		if target.kind == "geos" {
+			if err := d.os.MkdirAll(path.Join(workspace, "lib")); err != nil {
+				return err
+			}
+			// Libraries are unusual in that they end up in lib/ rather than bin/.
+			archived, err := d.getArchivedCdepString(bazelBin)
+			if err != nil {
+				return err
+			}
+			var geosDir string
+			if archived != "" {
+				execRoot, err := d.getExecutionRoot(ctx)
+				if err != nil {
+					return err
+				}
+				geosDir = filepath.Join(execRoot, "external", "archived_cdep_libgeos_"+archived)
+			} else {
+				geosDir = filepath.Join(bazelBin, "c-deps", "libgeos_foreign")
+			}
+			libDir := "lib"
+			var ext string
+			if runtime.GOOS == "windows" {
+				ext = "dll"
+				// Shared libraries end up in the "bin" dir on Windows.
+				libDir = "bin"
+			} else if runtime.GOOS == "darwin" {
+				ext = "dylib"
+			} else {
+				ext = "so"
+			}
+			for _, whichLib := range []string{"libgeos.", "libgeos_c."} {
+				baseName := whichLib + ext
+				dst := filepath.Join(workspace, "lib", baseName)
+				if err := d.os.CopyFile(filepath.Join(geosDir, libDir, baseName), dst); err != nil {
+					return err
+				}
+				successfullyBuilt(workspace, "library", target.fullName, dst)
+			}
 			continue
 		}
 		binaryPath := filepath.Join(bazelBin, bazelutil.OutputOfBinaryRule(target.fullName, runtime.GOOS == "windows"))
@@ -278,11 +349,7 @@ func (d *dev) stageArtifacts(ctx context.Context, targets []buildTarget) error {
 			if err := d.os.CopyFile(binaryPath, copyPath); err != nil {
 				return err
 			}
-			rel, err := filepath.Rel(workspace, copyPath)
-			if err != nil {
-				rel = copyPath
-			}
-			log.Printf("Successfully built binary for target %s at %s", target.fullName, rel)
+			successfullyBuilt(workspace, "binary", target.fullName, copyPath)
 		}
 	}
 
@@ -337,6 +404,14 @@ func (d *dev) getBasicBuildArgs(
 				fullTargetName := fields[len(fields)-1]
 				typ := fields[0]
 				args = append(args, fullTargetName)
+				if fullTargetName == geosTarget {
+					// We need to build test_force_build_cdeps.txt so we can
+					// check where the geos libraries will end up when built.
+					args = append(args, "//build/bazelutil:test_force_build_cdeps")
+					// Note the "kind" is explicitly set to "geos" in this case.
+					buildTargets = append(buildTargets, buildTarget{fullName: geosTarget, kind: "geos"})
+					continue
+				}
 				buildTargets = append(buildTargets, buildTarget{fullName: fullTargetName, kind: typ})
 				if typ == "go_test" || typ == "go_transition_test" || typ == "test_suite" {
 					shouldBuildWithTestConfig = true
@@ -357,17 +432,22 @@ func (d *dev) getBasicBuildArgs(
 		if aliased == "//pkg:all_tests" {
 			buildTargets = append(buildTargets, buildTarget{fullName: aliased, kind: "test_suite"})
 			shouldBuildWithTestConfig = true
+		} else if aliased == "//c-deps:libgeos" {
+			args = append(args, "//build/bazelutil:test_force_build_cdeps")
+			buildTargets = append(buildTargets, buildTarget{fullName: aliased, kind: "geos"})
 		} else {
 			buildTargets = append(buildTargets, buildTarget{fullName: aliased, kind: "go_binary"})
 		}
-		if strings.HasPrefix(aliased, "//") {
+		if strings.HasPrefix(aliased, "//") && aliased != devTarget {
 			canDisableNogo = false
 		}
 	}
 
 	// Add --config=with_ui iff we're building a target that needs it.
 	for _, target := range buildTargets {
-		if target.fullName == buildTargetMapping["cockroach"] || target.fullName == buildTargetMapping["cockroach-oss"] {
+		if target.fullName == buildTargetMapping["cockroach"] ||
+			target.fullName == buildTargetMapping["cockroach-oss"] ||
+			target.fullName == buildTargetMapping["obsservice"] {
 			args = append(args, "--config=with_ui")
 			break
 		}
@@ -390,4 +470,12 @@ func getConfigArgs(args []string) (ret []string) {
 		}
 	}
 	return
+}
+
+func successfullyBuilt(workspace, what, target, path string) {
+	rel, err := filepath.Rel(workspace, path)
+	if err != nil {
+		rel = path
+	}
+	log.Printf("Successfully built %s for target %s at %s", what, target, rel)
 }

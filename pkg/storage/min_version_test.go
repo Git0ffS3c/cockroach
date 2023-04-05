@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/pebble"
@@ -35,13 +36,14 @@ func TestMinVersion(t *testing.T) {
 	dir := "/foo"
 	require.NoError(t, mem.MkdirAll(dir, os.ModeDir))
 
-	// Expect zero value version when min version file doesn't exist.
-	v, err := getMinVersion(mem, dir)
+	// Expect !ok min version file doesn't exist.
+	v, ok, err := getMinVersion(mem, dir)
 	require.NoError(t, err)
 	require.Equal(t, roachpb.Version{}, v)
+	require.False(t, ok)
 
 	// Expect min version to not be at least any target version.
-	ok, err := MinVersionIsAtLeastTargetVersion(mem, dir, version1)
+	ok, err = MinVersionIsAtLeastTargetVersion(mem, dir, version1)
 	require.NoError(t, err)
 	require.False(t, ok)
 	ok, err = MinVersionIsAtLeastTargetVersion(mem, dir, version2)
@@ -52,8 +54,9 @@ func TestMinVersion(t *testing.T) {
 	require.NoError(t, writeMinVersionFile(mem, dir, version1))
 
 	// Expect min version to be version1.
-	v, err = getMinVersion(mem, dir)
+	v, ok, err = getMinVersion(mem, dir)
 	require.NoError(t, err)
+	require.True(t, ok)
 	require.True(t, version1.Equal(v))
 
 	// Expect min version to be at least version1 but not version2.
@@ -76,14 +79,16 @@ func TestMinVersion(t *testing.T) {
 	require.True(t, ok)
 
 	// Expect min version to be version2.
-	v, err = getMinVersion(mem, dir)
+	v, ok, err = getMinVersion(mem, dir)
 	require.NoError(t, err)
+	require.True(t, ok)
 	require.True(t, version2.Equal(v))
 
 	// Expect no-op when trying to update min version to a lower version.
 	require.NoError(t, writeMinVersionFile(mem, dir, version1))
-	v, err = getMinVersion(mem, dir)
+	v, ok, err = getMinVersion(mem, dir)
 	require.NoError(t, err)
+	require.True(t, ok)
 	require.True(t, version2.Equal(v))
 }
 
@@ -91,34 +96,18 @@ func TestSetMinVersion(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	p, err := Open(context.Background(), InMemory(), CacheSize(0))
+	st := cluster.MakeClusterSettings()
+	p, err := Open(context.Background(), InMemory(), cluster.MakeClusterSettings(), CacheSize(0))
 	require.NoError(t, err)
 	defer p.Close()
-	require.Equal(t, pebble.FormatMostCompatible, p.db.FormatMajorVersion())
+	require.Equal(t, pebble.FormatPrePebblev1Marked, p.db.FormatMajorVersion())
 
-	// The earliest supported Cockroach version advances the pebble version.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.V21_2))
-	require.NoError(t, err)
-	require.Equal(t, pebble.FormatSetWithDelete, p.db.FormatMajorVersion())
-
-	// Setting the same min version twice is okay.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.V21_2))
-	require.NoError(t, err)
-	require.Equal(t, pebble.FormatSetWithDelete, p.db.FormatMajorVersion())
-
-	// Advancing the store cluster version to another cluster version
-	// that does not advance the Pebble format major version should
-	// leave the format major version unchanged.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.ValidateGrantOption))
-	require.NoError(t, err)
-	require.Equal(t, pebble.FormatSetWithDelete, p.db.FormatMajorVersion())
-
-	// Advancing the store cluster version to PebbleFormatBlockPropertyCollector
+	ValueBlocksEnabled.Override(context.Background(), &st.SV, true)
+	// Advancing the store cluster version to one that supports value blocks
 	// should also advance the store's format major version.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.PebbleFormatBlockPropertyCollector))
+	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.V23_1EnablePebbleFormatSSTableValueBlocks))
 	require.NoError(t, err)
-	require.Equal(t, pebble.FormatBlockPropertyCollector, p.db.FormatMajorVersion())
-
+	require.Equal(t, pebble.FormatSSTableValueBlocks, p.db.FormatMajorVersion())
 }
 
 func TestMinVersion_IsNotEncrypted(t *testing.T) {
@@ -132,32 +121,23 @@ func TestMinVersion_IsNotEncrypted(t *testing.T) {
 	defer func() { NewEncryptedEnvFunc = oldNewEncryptedEnvFunc }()
 	NewEncryptedEnvFunc = fauxNewEncryptedEnvFunc
 
+	st := cluster.MakeClusterSettings()
 	fs := vfs.NewMem()
 	p, err := Open(
 		context.Background(),
 		Location{dir: "", fs: fs},
+		st,
 		EncryptionAtRest(nil))
 	require.NoError(t, err)
 	defer p.Close()
-
-	v1 := roachpb.Version{Major: 21, Minor: 1, Patch: 0, Internal: 122}
-	v2 := roachpb.Version{Major: 21, Minor: 1, Patch: 0, Internal: 126}
-
-	ok, err := p.MinVersionIsAtLeastTargetVersion(v1)
-	require.NoError(t, err)
-	require.False(t, ok)
-
-	require.NoError(t, p.SetMinVersion(v2))
-
-	ok, err = p.MinVersionIsAtLeastTargetVersion(v1)
-	require.NoError(t, err)
-	require.True(t, ok)
+	require.NoError(t, p.SetMinVersion(st.Version.BinaryVersion()))
 
 	// Reading the file directly through the unencrypted MemFS should
 	// succeed and yield the correct version.
-	v, err := getMinVersion(fs, "")
+	v, ok, err := getMinVersion(fs, "")
 	require.NoError(t, err)
-	require.Equal(t, v2, v)
+	require.True(t, ok)
+	require.Equal(t, st.Version.BinaryVersion(), v)
 }
 
 func fauxNewEncryptedEnvFunc(

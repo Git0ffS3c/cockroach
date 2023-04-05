@@ -13,17 +13,18 @@ package kv
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // MockTransactionalSender allows a function to be used as a TxnSender.
 type MockTransactionalSender struct {
 	senderFunc func(
-		context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-	) (*roachpb.BatchResponse, *roachpb.Error)
+		context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+	) (*kvpb.BatchResponse, *kvpb.Error)
 	txn roachpb.Transaction
 }
 
@@ -31,8 +32,8 @@ type MockTransactionalSender struct {
 // The passed in txn is cloned.
 func NewMockTransactionalSender(
 	f func(
-		context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-	) (*roachpb.BatchResponse, *roachpb.Error),
+		context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+	) (*kvpb.BatchResponse, *kvpb.Error),
 	txn *roachpb.Transaction,
 ) *MockTransactionalSender {
 	return &MockTransactionalSender{senderFunc: f, txn: *txn}
@@ -40,21 +41,21 @@ func NewMockTransactionalSender(
 
 // Send is part of the TxnSender interface.
 func (m *MockTransactionalSender) Send(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	return m.senderFunc(ctx, &m.txn, ba)
 }
 
 // GetLeafTxnInputState is part of the TxnSender interface.
 func (m *MockTransactionalSender) GetLeafTxnInputState(
-	context.Context, TxnStatusOpt,
+	context.Context,
 ) (*roachpb.LeafTxnInputState, error) {
 	panic("unimplemented")
 }
 
 // GetLeafTxnFinalState is part of the TxnSender interface.
 func (m *MockTransactionalSender) GetLeafTxnFinalState(
-	context.Context, TxnStatusOpt,
+	context.Context,
 ) (*roachpb.LeafTxnFinalState, error) {
 	panic("unimplemented")
 }
@@ -62,13 +63,8 @@ func (m *MockTransactionalSender) GetLeafTxnFinalState(
 // UpdateRootWithLeafFinalState is part of the TxnSender interface.
 func (m *MockTransactionalSender) UpdateRootWithLeafFinalState(
 	context.Context, *roachpb.LeafTxnFinalState,
-) {
+) error {
 	panic("unimplemented")
-}
-
-// AnchorOnSystemConfigRange is part of the TxnSender interface.
-func (m *MockTransactionalSender) AnchorOnSystemConfigRange() error {
-	return errors.New("unimplemented")
 }
 
 // TxnStatus is part of the TxnSender interface.
@@ -175,8 +171,8 @@ func (m *MockTransactionalSender) Active() bool {
 
 // UpdateStateOnRemoteRetryableErr is part of the TxnSender interface.
 func (m *MockTransactionalSender) UpdateStateOnRemoteRetryableErr(
-	ctx context.Context, pErr *roachpb.Error,
-) *roachpb.Error {
+	ctx context.Context, pErr *kvpb.Error,
+) *kvpb.Error {
 	panic("unimplemented")
 }
 
@@ -184,8 +180,10 @@ func (m *MockTransactionalSender) UpdateStateOnRemoteRetryableErr(
 func (m *MockTransactionalSender) DisablePipelining() error { return nil }
 
 // PrepareRetryableError is part of the client.TxnSender interface.
-func (m *MockTransactionalSender) PrepareRetryableError(ctx context.Context, msg string) error {
-	return roachpb.NewTransactionRetryWithProtoRefreshError(msg, m.txn.ID, *m.txn.Clone())
+func (m *MockTransactionalSender) PrepareRetryableError(
+	ctx context.Context, msg redact.RedactableString,
+) error {
+	return kvpb.NewTransactionRetryWithProtoRefreshError(msg, m.txn.ID, *m.txn.Clone())
 }
 
 // Step is part of the TxnSender interface.
@@ -195,6 +193,9 @@ func (m *MockTransactionalSender) Step(_ context.Context) error {
 	// and that requires a non-panicky Step().
 	return nil
 }
+
+// GetReadSeqNum is part of the TxnSender interface.
+func (m *MockTransactionalSender) GetReadSeqNum() enginepb.TxnSeq { return 0 }
 
 // SetReadSeqNum is part of the TxnSender interface.
 func (m *MockTransactionalSender) SetReadSeqNum(_ enginepb.TxnSeq) error { return nil }
@@ -223,7 +224,7 @@ func (m *MockTransactionalSender) DeferCommitWait(ctx context.Context) func(cont
 // GetTxnRetryableErr is part of the TxnSender interface.
 func (m *MockTransactionalSender) GetTxnRetryableErr(
 	ctx context.Context,
-) *roachpb.TransactionRetryWithProtoRefreshError {
+) *kvpb.TransactionRetryWithProtoRefreshError {
 	return nil
 }
 
@@ -231,10 +232,20 @@ func (m *MockTransactionalSender) GetTxnRetryableErr(
 func (m *MockTransactionalSender) ClearTxnRetryableErr(ctx context.Context) {
 }
 
+// HasPerformedReads is part of TxnSenderFactory.
+func (m *MockTransactionalSender) HasPerformedReads() bool {
+	panic("unimplemented")
+}
+
+// HasPerformedWrites is part of TxnSenderFactory.
+func (m *MockTransactionalSender) HasPerformedWrites() bool {
+	panic("unimplemented")
+}
+
 // MockTxnSenderFactory is a TxnSenderFactory producing MockTxnSenders.
 type MockTxnSenderFactory struct {
-	senderFunc func(context.Context, *roachpb.Transaction, roachpb.BatchRequest) (
-		*roachpb.BatchResponse, *roachpb.Error)
+	senderFunc func(context.Context, *roachpb.Transaction, *kvpb.BatchRequest) (
+		*kvpb.BatchResponse, *kvpb.Error)
 	nonTxnSenderFunc Sender
 }
 
@@ -245,8 +256,8 @@ var _ TxnSenderFactory = MockTxnSenderFactory{}
 // function is responsible for putting the txn inside the batch, if needed.
 func MakeMockTxnSenderFactory(
 	senderFunc func(
-		context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-	) (*roachpb.BatchResponse, *roachpb.Error),
+		context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+	) (*kvpb.BatchResponse, *kvpb.Error),
 ) MockTxnSenderFactory {
 	return MockTxnSenderFactory{
 		senderFunc: senderFunc,
@@ -258,8 +269,8 @@ func MakeMockTxnSenderFactory(
 // requests.
 func MakeMockTxnSenderFactoryWithNonTxnSender(
 	senderFunc func(
-		context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-	) (*roachpb.BatchResponse, *roachpb.Error),
+		context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+	) (*kvpb.BatchResponse, *kvpb.Error),
 	nonTxnSenderFunc SenderFunc,
 ) MockTxnSenderFactory {
 	return MockTxnSenderFactory{

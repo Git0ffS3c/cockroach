@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"go/build"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/url"
@@ -38,7 +37,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -272,11 +270,14 @@ func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*N
 		Insecure: true,
 	}
 	rpcCtx := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID: roachpb.SystemTenantID,
-		Config:   baseCtx,
-		Clock:    hlc.NewClock(hlc.UnixNano, 0),
-		Stopper:  c.stopper,
-		Settings: cluster.MakeTestingClusterSettings(),
+		TenantID:        roachpb.SystemTenantID,
+		Config:          baseCtx,
+		Clock:           &timeutil.DefaultTimeSource{},
+		ToleratedOffset: 0,
+		Stopper:         c.stopper,
+		Settings:        cluster.MakeTestingClusterSettings(),
+
+		ClientOnly: true,
 	})
 
 	n := &Node{
@@ -481,7 +482,7 @@ func (n *Node) Alive() bool {
 }
 
 // StatusClient returns a StatusClient set up to talk to this node.
-func (n *Node) StatusClient() serverpb.StatusClient {
+func (n *Node) StatusClient(ctx context.Context) serverpb.StatusClient {
 	n.Lock()
 	existingClient := n.statusClient
 	n.Unlock()
@@ -490,7 +491,7 @@ func (n *Node) StatusClient() serverpb.StatusClient {
 		return existingClient
 	}
 
-	conn, _, err := n.rpcCtx.GRPCDialRaw(n.RPCAddr())
+	conn, err := n.rpcCtx.GRPCUnvalidatedDial(n.RPCAddr()).Connect(ctx)
 	if err != nil {
 		log.Fatalf(context.Background(), "failed to initialize status client: %s", err)
 	}
@@ -664,7 +665,7 @@ func (n *Node) httpAddrFile() string {
 }
 
 func readFileOrEmpty(f string) string {
-	c, err := ioutil.ReadFile(f)
+	c, err := os.ReadFile(f)
 	if err != nil {
 		if !oserror.IsNotExist(err) {
 			panic(err)
@@ -710,7 +711,7 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 			return nil
 		}
 
-		urlBytes, err := ioutil.ReadFile(n.listeningURLFile())
+		urlBytes, err := os.ReadFile(n.listeningURLFile())
 		if err != nil {
 			log.Infof(ctx, "%v", err)
 			continue

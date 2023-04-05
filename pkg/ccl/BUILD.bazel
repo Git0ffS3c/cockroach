@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -6,11 +7,13 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/base",
         "//pkg/ccl/backupccl",
         "//pkg/ccl/buildccl",
         "//pkg/ccl/changefeedccl",
         "//pkg/ccl/cliccl",
         "//pkg/ccl/gssapiccl",
+        "//pkg/ccl/jwtauthccl",
         "//pkg/ccl/kvccl",
         "//pkg/ccl/multiregionccl",
         "//pkg/ccl/multitenantccl",
@@ -22,5 +25,8 @@ go_library(
         "//pkg/ccl/streamingccl/streamproducer",
         "//pkg/ccl/utilccl",
         "//pkg/ccl/workloadccl",
+        "//pkg/server",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -11,6 +12,7 @@ go_library(
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/dbdesc",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/funcdesc",
         "//pkg/sql/catalog/schemadesc",
         "//pkg/sql/catalog/schemaexpr",
         "//pkg/sql/catalog/tabledesc",
@@ -28,3 +30,5 @@ go_library(
         "@com_github_lib_pq//oid",
     ],
 )
+
+get_x_data(name = "get_x_data")

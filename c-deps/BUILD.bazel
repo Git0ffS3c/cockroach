@@ -21,7 +21,7 @@ configure_make(
         "@io_bazel_rules_go//go/platform:darwin_amd64": ["--host=x86_64-apple-darwin21.2"],
         "@io_bazel_rules_go//go/platform:darwin_arm64": [
             "--host=aarch64-apple-darwin21.2",
-            "--with-lg-page=16",
+            "--with-lg-page=14",
         ],
         "@io_bazel_rules_go//go/platform:linux_amd64": ["--host=x86_64-unknown-linux-gnu"],
         "@io_bazel_rules_go//go/platform:linux_arm64": ["--host=aarch64-unknown-linux-gnu"],
@@ -41,8 +41,14 @@ configure_make(
         "//conditions:default": [],
     }),
     env = select({
-        "//build/toolchains:dev": {"AR": ""},
-        "//conditions:default": {},
+        "//build/toolchains:dev": {
+            "AR": "",
+            # NOTE: we disable MADV_FREE; see https://github.com/cockroachdb/cockroach/issues/83790
+            "je_cv_madv_free": "no",
+        },
+        "//conditions:default": {
+            "je_cv_madv_free": "no",
+        },
     }),
     lib_source = "@jemalloc//:all",
     out_static_libs = select({
@@ -212,6 +218,7 @@ configure_make(
     ] + select({
         "@io_bazel_rules_go//go/platform:linux_amd64": ["--host=x86_64-unknown-linux-gnu"],
         "@io_bazel_rules_go//go/platform:linux_arm64": ["--host=aarch64-unknown-linux-gnu"],
+        "@io_bazel_rules_go//go/platform:linux_s390x": ["--host=s390x-unknown-linux-gnu"],
         "//conditions:default": [],
     }),
     copts = select({

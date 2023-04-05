@@ -19,7 +19,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -27,10 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -38,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 )
@@ -61,11 +63,12 @@ import (
 // Similar to exec-sql, but also traces the input statement and analyzes the
 // trace. Currently, the trace analysis only works for "simple" queries which
 // perform a single kv operation. The trace is analyzed for the following:
-// 	 - served locally: prints true iff the query was routed to the local
-//   replica.
+//   - served locally: prints true iff the query was routed to the local
+//     replica.
 //   - served via follower read: prints true iff the query was served using a
-//   follower read. This is omitted completely if the query was not served
-//   locally.
+//     follower read. This is omitted completely if the query was not served
+//     locally.
+//
 // This is because it the replica the query is routed to may or may not be the
 // leaseholder.
 //
@@ -111,16 +114,20 @@ func TestMultiRegionDataDriven(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	skip.UnderRace(t, "flaky test")
-
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		ds := datadrivenTestState{}
 		defer ds.cleanup(ctx)
 		var mu syncutil.Mutex
 		var traceStmt string
-		var recCh chan tracing.Recording
+		var recCh chan tracingpb.Recording
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
+			case "skip":
+				var issue int
+				d.ScanArgs(t, "issue-num", &issue)
+				skip.WithIssue(t, issue)
+				return ""
 			case "sleep-for-follower-read":
 				time.Sleep(time.Second)
 			case "new-cluster":
@@ -135,7 +142,7 @@ func TestMultiRegionDataDriven(t *testing.T) {
 				}
 				serverArgs := make(map[int]base.TestServerArgs)
 				localityNames := strings.Split(localities, ",")
-				recCh = make(chan tracing.Recording, 1)
+				recCh = make(chan tracingpb.Recording, 1)
 				for i, localityName := range localityNames {
 					localityCfg := roachpb.Locality{
 						Tiers: []roachpb.Tier{
@@ -145,9 +152,15 @@ func TestMultiRegionDataDriven(t *testing.T) {
 					}
 					serverArgs[i] = base.TestServerArgs{
 						Locality: localityCfg,
+						// We need to disable the default test tenant here
+						// because it appears as though operations like
+						// "wait-for-zone-config-changes" only work correctly
+						// when called from the system tenant. More
+						// investigation is required (tracked with #76378).
+						DefaultTestTenant: base.TestTenantDisabled,
 						Knobs: base.TestingKnobs{
 							SQLExecutor: &sql.ExecutorTestingKnobs{
-								WithStatementTrace: func(trace tracing.Recording, stmt string) {
+								WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
 									mu.Lock()
 									defer mu.Unlock()
 									if stmt == traceStmt {
@@ -186,6 +199,12 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 			case "cleanup-cluster":
 				ds.cleanup(ctx)
 
+			case "stop-server":
+				mustHaveArgOrFatal(t, d, serverIdx)
+				var idx int
+				d.ScanArgs(t, serverIdx, &idx)
+				ds.tc.StopServer(idx)
+
 			case "exec-sql":
 				mustHaveArgOrFatal(t, d, serverIdx)
 				var err error
@@ -203,6 +222,7 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 
 			case "trace-sql":
 				mustHaveArgOrFatal(t, d, serverIdx)
+				var rec tracingpb.Recording
 				queryFunc := func() (localRead bool, followerRead bool, err error) {
 					var idx int
 					d.ScanArgs(t, serverIdx, &idx)
@@ -225,7 +245,7 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 					if err != nil {
 						return false, false, err
 					}
-					rec := <-recCh
+					rec = <-recCh
 					localRead, followerRead, err = checkReadServedLocallyInSimpleRecording(rec)
 					if err != nil {
 						return false, false, err
@@ -243,6 +263,9 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 				if localRead {
 					output.WriteString(
 						fmt.Sprintf("served via follower read: %s\n", strconv.FormatBool(followerRead)))
+				}
+				if d.Expected != output.String() {
+					return errors.AssertionFailedf("not a match, trace:\n%s\n", rec).Error()
 				}
 				return output.String()
 
@@ -289,7 +312,7 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 				// There's a lot going on here and things can fail at various steps, for
 				// completely legitimate reasons, which is why this thing needs to be
 				// wrapped in a succeeds soon.
-				if err := testutils.SucceedsSoonError(func() error {
+				if err := testutils.SucceedsWithinError(func() error {
 					desc, err := ds.tc.LookupRange(lookupKey)
 					if err != nil {
 						return err
@@ -315,8 +338,9 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 						return errors.New(`could not find replica`)
 					}
 					for _, queueName := range []string{"split", "replicate", "raftsnapshot"} {
-						_, processErr, err := store.ManuallyEnqueue(ctx, queueName, repl,
-							true /* skipShouldQueue */)
+						_, processErr, err := store.Enqueue(
+							ctx, queueName, repl, true /* skipShouldQueue */, false, /* async */
+						)
 						if processErr != nil {
 							return processErr
 						}
@@ -325,8 +349,8 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 						}
 					}
 
-					// If the user specified a leaseholder, transfer range lease to the
-					// leaseholder.
+					// If the user specified a leaseholder, transfer range's lease to the
+					// that node.
 					if expectedPlacement.hasLeaseholderInfo() {
 						expectedLeaseIdx := expectedPlacement.getLeaseholder()
 						actualLeaseIdx := actualPlacement.getLeaseholder()
@@ -357,7 +381,17 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 							)
 						}
 					}
-
+					// Now that this range has gone through a bunch of changes, we lookup
+					// the range and its leaseholder again to ensure we're comparing the
+					// most up-to-date range state with the supplied expectation.
+					desc, err = ds.tc.LookupRange(lookupKey)
+					if err != nil {
+						return err
+					}
+					actualPlacement, err = parseReplicasFromRange(t, ds.tc, desc)
+					if err != nil {
+						return err
+					}
 					err = actualPlacement.satisfiesExpectedPlacement(expectedPlacement)
 					if err != nil {
 						return err
@@ -381,7 +415,7 @@ SET CLUSTER SETTING kv.closed_timestamp.propagation_slack = '0.5s'
 					}
 
 					return nil
-				}); err != nil {
+				}, 2*time.Minute); err != nil {
 					return err.Error()
 				}
 
@@ -475,7 +509,7 @@ func nodeIdToIdx(t *testing.T, tc serverutils.TestClusterInterface, id roachpb.N
 // message. An error is returned if more than one (or no) "dist sender send"
 // messages are found in the recording.
 func checkReadServedLocallyInSimpleRecording(
-	rec tracing.Recording,
+	rec tracingpb.Recording,
 ) (servedLocally bool, servedUsingFollowerReads bool, err error) {
 	foundDistSenderSend := false
 	for _, sp := range rec {
@@ -566,6 +600,7 @@ func parseReplicasFromInput(
 }
 
 // parseReplicasFromInput constructs a replicaPlacement from a range descriptor.
+// It also ensures all replicas have the same view of who the leaseholder is.
 func parseReplicasFromRange(
 	t *testing.T, tc serverutils.TestClusterInterface, desc roachpb.RangeDescriptor,
 ) (*replicaPlacement, error) {
@@ -577,6 +612,28 @@ func parseReplicasFromRange(
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get leaseholder")
 	}
+	// This test performs lease transfers at various points and expects the
+	// range's leaseholder to conform to what was specified in the test. However,
+	// whenever the lease is transferred using methods on TestCluster, only the
+	// outgoing leaseholder is guaranteed to have applied the lease. Given the
+	// tracing assumptions these tests make, it's worth ensuring all replicas have
+	// applied the lease, as it makes reasoning about these tests much easier.
+	// To that effect, we loop through all replicas on the supplied descriptor and
+	// ensure that is indeed the case.
+	for _, repl := range desc.Replicas().VoterAndNonVoterDescriptors() {
+		t := tc.Target(nodeIdToIdx(t, tc, repl.NodeID))
+		lh, err := tc.FindRangeLeaseHolder(desc, &t)
+		if err != nil {
+			return nil, err
+		}
+		if lh.NodeID != leaseHolder.NodeID && lh.StoreID != leaseHolder.StoreID {
+			return nil, errors.Newf(
+				"all replicas do not have the same view of the lease; found %s and %s",
+				lh, leaseHolder,
+			)
+		}
+	}
+
 	leaseHolderIdx := nodeIdToIdx(t, tc, leaseHolder.NodeID)
 	replicaMap[leaseHolderIdx] = replicaTypeLeaseholder
 	ret.leaseholder = leaseHolderIdx
@@ -648,6 +705,12 @@ func (r *replicaPlacement) satisfiesExpectedPlacement(expected *replicaPlacement
 		}
 	}
 
+	if expected.hasLeaseholderInfo() && expected.getLeaseholder() != r.getLeaseholder() {
+		return errors.Newf(
+			"expected %s to be the leaseholder, but %s was instead",
+			expected.getLeaseholder(), r.getLeaseholder(),
+		)
+	}
 	return nil
 }
 
@@ -737,10 +800,8 @@ func lookupTable(ec *sql.ExecutorConfig, database, table string) (catalog.TableD
 	err = sql.DescsTxn(
 		context.Background(),
 		ec,
-		func(ctx context.Context, txn *kv.Txn, col *descs.Collection) error {
-			_, desc, err := col.GetImmutableTableByName(ctx, txn, tbName, tree.ObjectLookupFlags{
-				DesiredObjectKind: tree.TableObject,
-			})
+		func(ctx context.Context, txn isql.Txn, col *descs.Collection) error {
+			_, desc, err := descs.PrefixAndTable(ctx, col.ByNameWithLeased(txn.KV()).MaybeGet(), tbName)
 			if err != nil {
 				return err
 			}

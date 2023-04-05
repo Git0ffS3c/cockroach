@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -39,11 +38,9 @@ type loggerOption interface {
 	apply(*Config)
 }
 
-type logPrefix string
+type LogPrefix string
 
-var _ logPrefix // silence unused lint
-
-func (p logPrefix) apply(cfg *Config) {
+func (p LogPrefix) apply(cfg *Config) {
 	cfg.Prefix = string(p)
 }
 
@@ -51,14 +48,14 @@ type quietStdoutOption struct {
 }
 
 func (quietStdoutOption) apply(cfg *Config) {
-	cfg.Stdout = ioutil.Discard
+	cfg.Stdout = io.Discard
 }
 
 type quietStderrOption struct {
 }
 
 func (quietStderrOption) apply(cfg *Config) {
-	cfg.Stderr = ioutil.Discard
+	cfg.Stderr = io.Discard
 }
 
 // QuietStdout is a logger option that suppresses Stdout.
@@ -102,7 +99,7 @@ type Logger struct {
 // If path is empty, logs will go to stdout/Stderr.
 func (cfg *Config) NewLogger(path string) (*Logger, error) {
 	if path == "" {
-		// Log to os.Stdout/Stderr is no other options are passed in.
+		// Log to os.Stdout/Stderr if no other options are passed in.
 		stdout := cfg.Stdout
 		if stdout == nil {
 			stdout = os.Stdout

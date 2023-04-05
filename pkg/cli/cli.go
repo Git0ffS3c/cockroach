@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -34,10 +35,12 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/workload/bulkingest" // registers workloads
 	workloadcli "github.com/cockroachdb/cockroach/pkg/workload/cli"
 	_ "github.com/cockroachdb/cockroach/pkg/workload/examples"  // registers workloads
+	_ "github.com/cockroachdb/cockroach/pkg/workload/insights"  // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/kv"        // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/movr"      // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpcc"      // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/tpch"      // registers workloads
+	_ "github.com/cockroachdb/cockroach/pkg/workload/ttlbench"  // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/ttllogger" // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/ycsb"      // registers workloads
 	"github.com/cockroachdb/errors"
@@ -75,6 +78,8 @@ func Main() {
 		// by the sub-command.
 		errCode = getExitCode(err)
 	}
+	// Finally, gracefully shutdown logging facilities.
+	cliCtx.logShutdownFn()
 
 	exit.WithCode(errCode)
 }
@@ -96,7 +101,7 @@ func doMain(cmd *cobra.Command, cmdName string) error {
 		// This must occur before the parameters are parsed by cobra, so
 		// that the command-line flags can override the defaults in
 		// environment variables.
-		if err := processEnvVarDefaults(cmd); err != nil {
+		if err := cliflagcfg.ProcessEnvVarDefaults(cmd); err != nil {
 			return err
 		}
 
@@ -244,7 +249,6 @@ func init() {
 		connectCmd,
 		initCmd,
 		certCmd,
-		quitCmd,
 
 		sqlShellCmd,
 		stmtDiagCmd,

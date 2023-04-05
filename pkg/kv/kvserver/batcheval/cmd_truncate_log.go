@@ -14,8 +14,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -26,13 +26,13 @@ import (
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.TruncateLog, declareKeysTruncateLog, TruncateLog)
+	RegisterReadWriteCommand(kvpb.TruncateLog, declareKeysTruncateLog, TruncateLog)
 }
 
 func declareKeysTruncateLog(
 	rs ImmutableRangeState,
-	_ *roachpb.Header,
-	_ roachpb.Request,
+	_ *kvpb.Header,
+	_ kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
@@ -44,9 +44,9 @@ func declareKeysTruncateLog(
 // has already been truncated has no effect. If this range is not the one
 // specified within the request body, the request will also be ignored.
 func TruncateLog(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.TruncateLogRequest)
+	args := cArgs.Args.(*kvpb.TruncateLogRequest)
 
 	// After a merge, it's possible that this request was sent to the wrong
 	// range based on the start key. This will cancel the request if this is not
@@ -58,10 +58,6 @@ func TruncateLog(
 		return result.Result{}, nil
 	}
 
-	firstIndex, err := cArgs.EvalCtx.GetFirstIndex()
-	if err != nil {
-		return result.Result{}, errors.Wrap(err, "getting first index")
-	}
 	// Have we already truncated this log? If so, just return without an error.
 	// Note that there may in principle be followers whose Raft log is longer
 	// than this node's, but to issue a truncation we also need the *term* for
@@ -70,6 +66,7 @@ func TruncateLog(
 	//
 	// TODO(tbg): think about synthesizing a valid term. Can we use the next
 	// existing entry's term?
+	firstIndex := cArgs.EvalCtx.GetFirstIndex()
 	if firstIndex >= args.Index {
 		if log.V(3) {
 			log.Infof(ctx, "attempting to truncate previously truncated raft log. FirstIndex:%d, TruncateFrom:%d",
@@ -120,10 +117,8 @@ func TruncateLog(
 	// Note that any sideloaded payloads that may be removed by this truncation
 	// are not tracked in the raft log delta. The delta will be adjusted below
 	// raft.
-	iter := readWriter.NewMVCCIterator(storage.MVCCKeyIterKind, storage.IterOptions{UpperBound: end})
-	defer iter.Close()
 	// We can pass zero as nowNanos because we're only interested in SysBytes.
-	ms, err := iter.ComputeStats(start, end, 0 /* nowNanos */)
+	ms, err := storage.ComputeStats(readWriter, start, end, 0 /* nowNanos */)
 	if err != nil {
 		return result.Result{}, errors.Wrap(err, "while computing stats of Raft log freed by truncation")
 	}
@@ -139,9 +134,6 @@ func TruncateLog(
 		TruncatedState: tState,
 	}
 	pd.Replicated.RaftLogDelta = ms.SysBytes
-	if cArgs.EvalCtx.ClusterSettings().Version.ActiveVersionOrEmpty(ctx).IsActive(
-		clusterversion.LooselyCoupledRaftLogTruncation) {
-		pd.Replicated.RaftExpectedFirstIndex = firstIndex
-	}
+	pd.Replicated.RaftExpectedFirstIndex = firstIndex
 	return pd, nil
 }

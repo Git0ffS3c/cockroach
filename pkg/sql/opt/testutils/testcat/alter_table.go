@@ -26,9 +26,8 @@ import (
 // AlterTable is a partial implementation of the ALTER TABLE statement.
 //
 // Supported commands:
-//  - INJECT STATISTICS: imports table statistics from a JSON object.
-//  - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
-//
+//   - INJECT STATISTICS: imports table statistics from a JSON object.
+//   - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
 func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	tn := stmt.Table.ToTableName()
 	// Update the table name to include catalog and schema if not provided.
@@ -60,13 +59,11 @@ func injectTableStats(tt *Table, statsExpr tree.Expr) {
 	ctx := context.Background()
 	semaCtx := tree.MakeSemaContext()
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	typedExpr, err := tree.TypeCheckAndRequire(
-		ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS",
-	)
+	typedExpr, err := tree.TypeCheckAndRequire(ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS")
 	if err != nil {
 		panic(err)
 	}
-	val, err := eval.Expr(&evalCtx, typedExpr)
+	val, err := eval.Expr(ctx, &evalCtx, typedExpr)
 	if err != nil {
 		panic(err)
 	}
@@ -81,7 +78,7 @@ func injectTableStats(tt *Table, statsExpr tree.Expr) {
 	}
 	tt.Stats = make([]*TableStat, len(stats))
 	for i := range stats {
-		tt.Stats[i] = &TableStat{js: stats[i], tt: tt}
+		tt.Stats[i] = &TableStat{js: stats[i], tt: tt, evalCtx: &evalCtx}
 	}
 	// Call ColumnOrdinal on all possible columns to assert that
 	// the column names are valid.

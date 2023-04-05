@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -36,7 +37,7 @@ func TestEvaluateBatch(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ts := hlc.Timestamp{WallTime: 1}
-	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, ts, 0, 0)
+	txn := roachpb.MakeTransaction("test", roachpb.Key("a"), 0, 0, ts, 0, 0)
 
 	tcs := []testCase{
 		//
@@ -623,6 +624,22 @@ func TestEvaluateBatch(t *testing.T) {
 			},
 		},
 		{
+			// A batch limited to resolve only up to 2 keys should respect that
+			// limit. The limit is saturated by the first request in the batch.
+			name: "ranged intent resolution with MaxSpanRequestKeys=2",
+			setup: func(t *testing.T, d *data) {
+				writeABCDEFIntents(t, d, &txn)
+				d.ba.Add(resolveIntentRangeArgsString("a", "d", txn.TxnMeta, roachpb.COMMITTED))
+				d.ba.Add(resolveIntentRangeArgsString("e", "f", txn.TxnMeta, roachpb.COMMITTED))
+				d.ba.Add(resolveIntentRangeArgsString("h", "j", txn.TxnMeta, roachpb.COMMITTED))
+				d.ba.MaxSpanRequestKeys = 2
+			},
+			check: func(t *testing.T, r resp) {
+				verifyNumKeys(t, r, 2, 0, 0)
+				verifyResumeSpans(t, r, "b\x00-d", "e-f", "h-j")
+			},
+		},
+		{
 			// A batch limited to resolve only up to 3 keys should respect that
 			// limit. The limit is saturated by the first request in the batch.
 			name: "ranged intent resolution with MaxSpanRequestKeys=3",
@@ -635,7 +652,7 @@ func TestEvaluateBatch(t *testing.T) {
 			},
 			check: func(t *testing.T, r resp) {
 				verifyNumKeys(t, r, 3, 0, 0)
-				verifyResumeSpans(t, r, "c\x00-d", "e-f", "h-j")
+				verifyResumeSpans(t, r, "", "e-f", "h-j")
 			},
 		},
 	}
@@ -658,6 +675,10 @@ func TestEvaluateBatch(t *testing.T) {
 
 			var r resp
 			r.d = d
+			evalPath := readWrite
+			if d.readOnly {
+				evalPath = readOnlyDefault
+			}
 			r.br, r.res, r.pErr = evaluateBatch(
 				ctx,
 				d.idKey,
@@ -665,8 +686,10 @@ func TestEvaluateBatch(t *testing.T) {
 				d.MockEvalCtx.EvalContext(),
 				&d.ms,
 				&d.ba,
+				nil,
+				nil,
 				uncertainty.Interval{},
-				d.readOnly,
+				evalPath,
 			)
 
 			tc.check(t, r)
@@ -676,7 +699,7 @@ func TestEvaluateBatch(t *testing.T) {
 
 type data struct {
 	batcheval.MockEvalCtx
-	ba       roachpb.BatchRequest
+	ba       kvpb.BatchRequest
 	idKey    kvserverbase.CmdIDKey
 	eng      storage.Engine
 	ms       enginepb.MVCCStats
@@ -685,9 +708,9 @@ type data struct {
 
 type resp struct {
 	d    *data
-	br   *roachpb.BatchResponse
+	br   *kvpb.BatchResponse
 	res  result.Result
-	pErr *roachpb.Error
+	pErr *kvpb.Error
 }
 
 type testCase struct {
@@ -711,7 +734,7 @@ func writeABCDEFIntents(t *testing.T, d *data, txn *roachpb.Transaction) {
 func writeABCDEFWith(t *testing.T, eng storage.Engine, ts hlc.Timestamp, txn *roachpb.Transaction) {
 	for _, k := range []string{"a", "b", "c", "d", "e", "f"} {
 		require.NoError(t, storage.MVCCPut(
-			context.Background(), eng, nil /* ms */, roachpb.Key(k), ts,
+			context.Background(), eng, nil /* ms */, roachpb.Key(k), ts, hlc.ClockTimestamp{},
 			roachpb.MakeValueFromString("value-"+k), txn))
 	}
 }
@@ -725,11 +748,11 @@ func verifyScanResult(t *testing.T, r resp, keysPerResp ...[]string) {
 		scan := r.br.Responses[i].GetInner()
 		var rows []roachpb.KeyValue
 		switch req := scan.(type) {
-		case *roachpb.ScanResponse:
+		case *kvpb.ScanResponse:
 			rows = req.Rows
-		case *roachpb.ReverseScanResponse:
+		case *kvpb.ReverseScanResponse:
 			rows = req.Rows
-		case *roachpb.GetResponse:
+		case *kvpb.GetResponse:
 			if req.Value != nil {
 				rows = []roachpb.KeyValue{{
 					Key:   r.d.ba.Requests[i].GetGet().Key,

@@ -16,7 +16,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
@@ -24,8 +23,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/backfiller"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -43,6 +43,74 @@ func NewIndexBackfillerMergePlanner(execCfg *ExecutorConfig) *IndexBackfillerMer
 	return &IndexBackfillerMergePlanner{execCfg: execCfg}
 }
 
+// MergeIndexes is part of the scexec.Merger interface.
+func (im *IndexBackfillerMergePlanner) MergeIndexes(
+	ctx context.Context,
+	progress scexec.MergeProgress,
+	tracker scexec.BackfillerProgressWriter,
+	descriptor catalog.TableDescriptor,
+) error {
+	spansToDo := make([][]roachpb.Span, len(progress.SourceIndexIDs))
+	if len(progress.CompletedSpans) != len(progress.SourceIndexIDs) {
+		return errors.AssertionFailedf("invalid MergeProgress, CompletedSpans should " +
+			"be parallel to SourceIndexIDs")
+	}
+	var hasToDo bool
+	for i, sourceID := range progress.SourceIndexIDs {
+		sourceIndexSpan := descriptor.IndexSpan(im.execCfg.Codec, sourceID)
+		var g roachpb.SpanGroup
+		g.Add(sourceIndexSpan)
+		g.Sub(progress.CompletedSpans[i]...)
+		spansToDo[i] = g.Slice()
+		if len(spansToDo) > 0 {
+			hasToDo = true
+		}
+	}
+	if !hasToDo { // already done
+		return nil
+	}
+	completed := struct {
+		syncutil.Mutex
+		g []roachpb.SpanGroup
+	}{
+		g: make([]roachpb.SpanGroup, len(progress.SourceIndexIDs)),
+	}
+	addCompleted := func(idxs []int32, spans []roachpb.Span) (ret [][]roachpb.Span) {
+		completed.Lock()
+		defer completed.Unlock()
+		for i, idx := range idxs {
+			completed.g[idx].Add(spans[i])
+		}
+		for _, g := range completed.g {
+			ret = append(ret, g.Slice())
+		}
+		return ret
+	}
+	updateFunc := func(ctx context.Context, meta *execinfrapb.ProducerMetadata) error {
+		if meta.BulkProcessorProgress == nil {
+			return nil
+		}
+		progress.CompletedSpans = addCompleted(
+			meta.BulkProcessorProgress.CompletedSpanIdx,
+			meta.BulkProcessorProgress.CompletedSpans,
+		)
+		return tracker.SetMergeProgress(ctx, progress)
+	}
+	run, err := im.plan(
+		ctx,
+		descriptor,
+		spansToDo,
+		progress.DestIndexIDs,
+		progress.SourceIndexIDs,
+		updateFunc,
+		getMergeTimestamp(im.execCfg.Clock),
+	)
+	if err != nil {
+		return err
+	}
+	return run(ctx)
+}
+
 func (im *IndexBackfillerMergePlanner) plan(
 	ctx context.Context,
 	tableDesc catalog.TableDescriptor,
@@ -56,10 +124,11 @@ func (im *IndexBackfillerMergePlanner) plan(
 	var planCtx *PlanningCtx
 
 	if err := DescsTxn(ctx, im.execCfg, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
-		evalCtx = createSchemaChangeEvalCtx(ctx, im.execCfg, txn.ReadTimestamp(), descriptors)
-		planCtx = im.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn,
+		sd := NewFakeSessionData(im.execCfg.SV(), "plan-index-backfill-merge")
+		evalCtx = createSchemaChangeEvalCtx(ctx, im.execCfg, sd, txn.KV().ReadTimestamp(), descriptors)
+		planCtx = im.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn.KV(),
 			DistributionTypeSystemTenantOnly)
 
 		spec, err := initIndexBackfillMergerSpec(*tableDesc.TableDesc(), addedIndexes, temporaryIndexes, mergeTimestamp)
@@ -82,8 +151,6 @@ func (im *IndexBackfillerMergePlanner) plan(
 			nil, /* txn - the flow does not run wholly in a txn */
 			im.execCfg.Clock,
 			evalCtx.Tracing,
-			im.execCfg.ContentionRegistry,
-			nil, /* testingPushCallback */
 		)
 		defer recv.Release()
 		evalCtxCopy := evalCtx
@@ -93,7 +160,7 @@ func (im *IndexBackfillerMergePlanner) plan(
 			nil, /* txn - the processors manage their own transactions */
 			p, recv, &evalCtxCopy,
 			nil, /* finishedSetupFn */
-		)()
+		)
 		return cbw.Err()
 	}, nil
 }
@@ -164,7 +231,7 @@ type IndexMergeTracker struct {
 	fractionScaler *multiStageFractionScaler
 }
 
-var _ scexec.BackfillProgressFlusher = (*IndexMergeTracker)(nil)
+var _ scexec.BackfillerProgressFlusher = (*IndexMergeTracker)(nil)
 
 type rangeCounter func(ctx context.Context, spans []roachpb.Span) (int, error)
 
@@ -191,13 +258,17 @@ func (imt *IndexMergeTracker) FlushCheckpoint(ctx context.Context) error {
 	imt.jobMu.Lock()
 	defer imt.jobMu.Unlock()
 
-	imt.mu.Lock()
-	if imt.mu.progress.TodoSpans == nil {
-		imt.mu.Unlock()
+	progress := func() *MergeProgress {
+		imt.mu.Lock()
+		defer imt.mu.Unlock()
+		if imt.mu.progress.TodoSpans == nil {
+			return nil
+		}
+		return imt.mu.progress.Copy()
+	}()
+	if progress == nil {
 		return nil
 	}
-	progress := imt.mu.progress.Copy()
-	imt.mu.Unlock()
 
 	details, ok := imt.jobMu.job.Details().(jobspb.SchemaChangeDetails)
 	if !ok {
@@ -208,15 +279,17 @@ func (imt *IndexMergeTracker) FlushCheckpoint(ctx context.Context) error {
 		details.ResumeSpanList[progress.MutationIdx[idx]].ResumeSpans = progress.TodoSpans[idx]
 	}
 
-	return imt.jobMu.job.SetDetails(ctx, nil, details)
+	return imt.jobMu.job.NoTxn().SetDetails(ctx, details)
 }
 
 // FlushFractionCompleted writes out the fraction completed based on the number of total
 // ranges completed.
 func (imt *IndexMergeTracker) FlushFractionCompleted(ctx context.Context) error {
-	imt.mu.Lock()
-	spans := imt.mu.progress.FlatSpans()
-	imt.mu.Unlock()
+	spans := func() []roachpb.Span {
+		imt.mu.Lock()
+		defer imt.mu.Unlock()
+		return imt.mu.progress.FlatSpans()
+	}()
 
 	rangeCount, err := imt.rangeCounter(ctx, spans)
 	if err != nil {
@@ -233,8 +306,9 @@ func (imt *IndexMergeTracker) FlushFractionCompleted(ctx context.Context) error 
 
 		imt.jobMu.Lock()
 		defer imt.jobMu.Unlock()
-		if err := imt.jobMu.job.FractionProgressed(ctx, nil,
-			jobs.FractionUpdater(frac)); err != nil {
+		if err := imt.jobMu.job.NoTxn().FractionProgressed(
+			ctx, jobs.FractionUpdater(frac),
+		); err != nil {
 			return jobs.SimplifyInvalidStatusError(err)
 		}
 	}
@@ -263,7 +337,7 @@ func (imt *IndexMergeTracker) UpdateMergeProgress(
 }
 
 func newPeriodicProgressFlusher(settings *cluster.Settings) scexec.PeriodicProgressFlusher {
-	return scdeps.NewPeriodicProgressFlusher(
+	return backfiller.NewPeriodicProgressFlusher(
 		func() time.Duration {
 			return backfill.IndexBackfillCheckpointInterval.Get(&settings.SV)
 		},

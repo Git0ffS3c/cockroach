@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -36,15 +37,21 @@ func TestDropTableLowersSpanCount(t *testing.T) {
 	defer gcjob.SetSmallMaxGCIntervalForTest()()
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantProbabilistic,
+	}})
 
 	defer tc.Stopper().Stop(ctx)
 	ts := tc.Server(0)
 
-	tenantID := roachpb.MakeTenantID(10)
+	tenantID := roachpb.MustMakeTenantID(10)
 	tenant, err := ts.StartTenant(ctx, base.TestTenantArgs{
-		TenantID:     tenantID,
-		TestingKnobs: base.TestingKnobs{},
+		TenantID: tenantID,
+		TestingKnobs: base.TestingKnobs{
+			GCJob: &sql.GCJobTestingKnobs{
+				SkipWaitingForMVCCGC: true,
+			},
+		},
 	})
 	require.NoError(t, err)
 

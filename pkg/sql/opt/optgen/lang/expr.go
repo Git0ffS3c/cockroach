@@ -16,6 +16,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // VisitFunc is called by the Visit method of an expression for each child of
@@ -180,9 +183,9 @@ func (e RuleSetExpr) Sort(less func(left, right *RuleExpr) bool) {
 // construct several different operators; which it constructs is not known until
 // runtime. For example:
 //
-//   (Select $input:(Left | InnerJoin $left:* $right:* $on))
-//   =>
-//   ((OpName $input) $left $right $on)
+//	(Select $input:(Left | InnerJoin $left:* $right:* $on))
+//	=>
+//	((OpName $input) $left $right $on)
 //
 // The replace pattern uses a constructor function that dynamically constructs
 // either a Left or InnerJoin operator.
@@ -260,7 +263,7 @@ func formatExpr(e Expr, buf *bytes.Buffer, level int) {
 		return
 	}
 
-	opName := strings.Title(e.Op().String())
+	opName := cases.Title(language.English, cases.NoLower).String(e.Op().String())
 	opName = opName[:len(opName)-2]
 	src := e.Source()
 

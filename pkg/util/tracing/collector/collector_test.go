@@ -12,14 +12,20 @@ package collector_test
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -54,7 +60,9 @@ func newTestStructured(i string) *testStructuredImpl {
 // Trace for t1:
 // -------------
 // root													<-- traceID1
-// 		root.child								<-- traceID1
+//
+//	root.child								<-- traceID1
+//
 // root2.child.remotechild 			<-- traceID2
 // root2.child.remotechild2 		<-- traceID2
 //
@@ -63,10 +71,11 @@ func newTestStructured(i string) *testStructuredImpl {
 // root.child.remotechild				<-- traceID1
 // root.child.remotechilddone		<-- traceID1
 // root2												<-- traceID2
-// 		root2.child								<-- traceID2
+//
+//	root2.child								<-- traceID2
 func setupTraces(t1, t2 *tracing.Tracer) (tracingpb.TraceID, tracingpb.TraceID, func()) {
 	// Start a root span on "node 1".
-	root := t1.StartSpan("root", tracing.WithRecording(tracing.RecordingVerbose))
+	root := t1.StartSpan("root", tracing.WithRecording(tracingpb.RecordingVerbose))
 	root.RecordStructured(newTestStructured("root"))
 
 	time.Sleep(10 * time.Millisecond)
@@ -86,10 +95,10 @@ func setupTraces(t1, t2 *tracing.Tracer) (tracingpb.TraceID, tracingpb.TraceID, 
 
 	// Start another remote child span on "node 2" that we finish.
 	childRemoteChildFinished := t2.StartSpan("root.child.remotechilddone", tracing.WithRemoteParentFromSpanMeta(child.Meta()))
-	child.ImportRemoteSpans(childRemoteChildFinished.FinishAndGetRecording(tracing.RecordingVerbose))
+	child.ImportRemoteRecording(childRemoteChildFinished.FinishAndGetRecording(tracingpb.RecordingVerbose))
 
 	// Start a root span on "node 2".
-	root2 := t2.StartSpan("root2", tracing.WithRecording(tracing.RecordingVerbose))
+	root2 := t2.StartSpan("root2", tracing.WithRecording(tracingpb.RecordingVerbose))
 	root2.RecordStructured(newTestStructured("root2"))
 
 	// Start a child span on "node 2".
@@ -122,17 +131,24 @@ func TestTracingCollectorGetSpanRecordings(t *testing.T) {
 	remoteTracer := tc.Server(1).TracerI().(*tracing.Tracer)
 
 	traceCollector := collector.New(
-		tc.Server(0).NodeDialer().(*nodedialer.Dialer),
-		tc.Server(0).NodeLiveness().(*liveness.NodeLiveness), localTracer)
+		localTracer,
+		func(ctx context.Context) ([]roachpb.NodeID, error) {
+			nodeIDs := make([]roachpb.NodeID, len(tc.Servers))
+			for i := range tc.Servers {
+				nodeIDs[i] = tc.Server(i).NodeID()
+			}
+			return nodeIDs, nil
+		},
+		tc.Server(0).NodeDialer().(*nodedialer.Dialer))
 	localTraceID, remoteTraceID, cleanup := setupTraces(localTracer, remoteTracer)
 	defer cleanup()
 
-	getSpansFromAllNodes := func(traceID tracingpb.TraceID) map[roachpb.NodeID][]tracing.Recording {
-		res := make(map[roachpb.NodeID][]tracing.Recording)
+	getSpansFromAllNodes := func(traceID tracingpb.TraceID) map[roachpb.NodeID][]tracingpb.Recording {
+		res := make(map[roachpb.NodeID][]tracingpb.Recording)
 
 		var iter *collector.Iterator
 		var err error
-		for iter, err = traceCollector.StartIter(ctx, traceID); err == nil && iter.Valid(); iter.Next() {
+		for iter, err = traceCollector.StartIter(ctx, traceID); err == nil && iter.Valid(); iter.Next(ctx) {
 			nodeID, recording := iter.Value()
 			res[nodeID] = append(res[nodeID], recording)
 		}
@@ -187,5 +203,108 @@ func TestTracingCollectorGetSpanRecordings(t *testing.T) {
 					span: root2.child
 						tags: _unfinished=1 _verbose=1
 	`))
+	})
+}
+
+// Test that crdb_internal.cluster_inflight_traces works, both in tenants and in
+// mixed nodes.
+func TestClusterInflightTraces(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ccl.TestingEnableEnterprise() // We'll create tenants.
+	defer ccl.TestingDisableEnterprise()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	args := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// We'll create our own tenants, to ensure they exist as opposed to them
+			// being created randomly.
+			DefaultTestTenant: base.TestTenantDisabled,
+		},
+	}
+
+	testutils.RunTrueAndFalse(t, "tenant", func(t *testing.T, tenant bool) {
+		tc := testcluster.StartTestCluster(t, 2 /* nodes */, args)
+		defer tc.Stopper().Stop(ctx)
+
+		type testCase struct {
+			servers []serverutils.TestTenantInterface
+			// otherServers, if set, represents the servers corresponding to other
+			// tenants (or to the system tenant) than the ones being tested.
+			otherServers []serverutils.TestTenantInterface
+		}
+		var testCases []testCase
+		if tenant {
+			tenantID := roachpb.MustMakeTenantID(10)
+			tenants := make([]serverutils.TestTenantInterface, len(tc.Servers))
+			for i := range tc.Servers {
+				tenant, err := tc.Servers[i].StartTenant(ctx, base.TestTenantArgs{TenantID: tenantID})
+				require.NoError(t, err)
+				tenants[i] = tenant
+			}
+			testCases = []testCase{
+				{
+					servers:      tenants,
+					otherServers: []serverutils.TestTenantInterface{tc.Servers[0], tc.Servers[1]},
+				},
+				{
+					servers:      []serverutils.TestTenantInterface{tc.Servers[0], tc.Servers[1]},
+					otherServers: tenants,
+				},
+			}
+		} else {
+			testCases = []testCase{{
+				servers: []serverutils.TestTenantInterface{tc.Servers[0], tc.Servers[1]},
+			}}
+		}
+
+		for _, tc := range testCases {
+			// Setup the traces we're going to look for.
+			localTraceID, _, cleanup := setupTraces(tc.servers[0].Tracer(), tc.servers[1].Tracer())
+			defer cleanup()
+
+			// Create some other spans on tc.otherServers, that we don't expect to
+			// find.
+			const otherServerSpanName = "other-server-span"
+			for _, s := range tc.otherServers {
+				sp := s.Tracer().StartSpan(otherServerSpanName)
+				defer sp.Finish()
+			}
+
+			// We're going to query the cluster_inflight_traces through every node.
+			for _, s := range tc.servers {
+				pgURL, cleanupPGUrl := sqlutils.PGUrl(t, s.SQLAddr(), "Tenant", url.User(username.RootUser))
+				defer cleanupPGUrl()
+				db, err := gosql.Open("postgres", pgURL.String())
+				defer func() {
+					require.NoError(t, db.Close())
+				}()
+				require.NoError(t, err)
+
+				rows, err := db.Query(
+					"SELECT node_id, trace_str FROM crdb_internal.cluster_inflight_traces "+
+						"WHERE trace_id=$1 ORDER BY node_id",
+					localTraceID)
+				require.NoError(t, err)
+
+				expSpans := map[int][]string{
+					1: {"root", "root.child", "root.child.remotechilddone"},
+					2: {"root.child.remotechild"},
+				}
+				for rows.Next() {
+					var nodeID int
+					var trace string
+					require.NoError(t, rows.Scan(&nodeID, &trace))
+					exp, ok := expSpans[nodeID]
+					require.True(t, ok)
+					delete(expSpans, nodeID) // Consume this entry; we'll check that they were all consumed.
+					for _, span := range exp {
+						require.Contains(t, trace, "=== operation:"+span)
+					}
+					require.NotContains(t, trace, "=== operation:"+otherServerSpanName)
+				}
+				require.Len(t, expSpans, 0)
+			}
+		}
 	})
 }

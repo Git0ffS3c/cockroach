@@ -34,18 +34,20 @@ func TestGetProjectionConstOperator(t *testing.T) {
 	constVal := 31.37
 	constArg := tree.NewDFloat(tree.DFloat(constVal))
 	outputIdx := 5
+	calledOnNullInput := false
 	op, err := GetProjectionRConstOperator(
 		nil /* allocator */, inputTypes, types.Float, types.Float, binOp, input, colIdx,
-		constArg, outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil, /* cmpExpr */
+		constArg, outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil /* cmpExpr */, calledOnNullInput,
 	)
 	if err != nil {
 		t.Error(err)
 	}
 	expected := &projMultFloat64Float64ConstOp{
 		projConstOpBase: projConstOpBase{
-			OneInputHelper: colexecop.MakeOneInputHelper(op.(*projMultFloat64Float64ConstOp).Input),
-			colIdx:         colIdx,
-			outputIdx:      outputIdx,
+			OneInputHelper:    colexecop.MakeOneInputHelper(op.(*projMultFloat64Float64ConstOp).Input),
+			colIdx:            colIdx,
+			outputIdx:         outputIdx,
+			calledOnNullInput: calledOnNullInput,
 		},
 		constArg: constVal,
 	}
@@ -65,18 +67,20 @@ func TestGetProjectionConstMixedTypeOperator(t *testing.T) {
 	constVal := int16(31)
 	constArg := tree.NewDInt(tree.DInt(constVal))
 	outputIdx := 5
+	calledOnNullInput := false
 	op, err := GetProjectionRConstOperator(
 		nil /* allocator */, inputTypes, types.Int2, types.Int, cmpOp, input, colIdx,
-		constArg, outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil, /* cmpExpr */
+		constArg, outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil /* cmpExpr */, calledOnNullInput,
 	)
 	if err != nil {
 		t.Error(err)
 	}
 	expected := &projGEInt64Int16ConstOp{
 		projConstOpBase: projConstOpBase{
-			OneInputHelper: colexecop.MakeOneInputHelper(op.(*projGEInt64Int16ConstOp).Input),
-			colIdx:         colIdx,
-			outputIdx:      outputIdx,
+			OneInputHelper:    colexecop.MakeOneInputHelper(op.(*projGEInt64Int16ConstOp).Input),
+			colIdx:            colIdx,
+			outputIdx:         outputIdx,
+			calledOnNullInput: calledOnNullInput,
 		},
 		constArg: constVal,
 	}

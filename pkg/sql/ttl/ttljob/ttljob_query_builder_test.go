@@ -14,7 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/stretchr/testify/require"
@@ -25,8 +27,7 @@ func TestSelectQueryBuilder(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	mockTime := time.Date(2000, 1, 1, 13, 30, 45, 0, time.UTC)
-	mockTimestampTZ, err := tree.MakeDTimestampTZ(mockTime, time.Microsecond)
-	require.NoError(t, err)
+	mockDuration := -10 * time.Second
 
 	type iteration struct {
 		expectedQuery string
@@ -45,16 +46,20 @@ func TestSelectQueryBuilder(t *testing.T) {
 				mockTime,
 				[]string{"col1", "col2"},
 				"relation_name",
-				tree.Datums{tree.NewDInt(100), tree.NewDInt(5)},
-				tree.Datums{tree.NewDInt(200), tree.NewDInt(15)},
-				*mockTimestampTZ,
+				spanToProcess{
+					startPK: tree.Datums{tree.NewDInt(100), tree.NewDInt(5)},
+					endPK:   tree.Datums{tree.NewDInt(200), tree.NewDInt(15)},
+				},
+				mockDuration,
 				2,
+				colinfo.TTLDefaultExpirationColumnName,
 			),
 			iterations: []iteration{
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) >= ($4, $5) AND (col1, col2) < ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) >= ($4, $5) AND (col1, col2) < ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -69,8 +74,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -85,8 +91,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -105,16 +112,17 @@ LIMIT 2`,
 				mockTime,
 				[]string{"col1", "col2"},
 				"table_name",
-				nil,
-				nil,
-				*mockTimestampTZ,
+				spanToProcess{},
+				mockDuration,
 				2,
+				colinfo.TTLDefaultExpirationColumnName,
 			),
 			iterations: []iteration{
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
 WHERE crdb_internal_expiration <= $1
+
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -127,8 +135,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -142,8 +151,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -161,16 +171,20 @@ LIMIT 2`,
 				mockTime,
 				[]string{"col1", "col2"},
 				"table_name",
-				tree.Datums{tree.NewDInt(100)},
-				tree.Datums{tree.NewDInt(181)},
-				*mockTimestampTZ,
+				spanToProcess{
+					startPK: tree.Datums{tree.NewDInt(100)},
+					endPK:   tree.Datums{tree.NewDInt(181)},
+				},
+				mockDuration,
 				2,
+				colinfo.TTLDefaultExpirationColumnName,
 			),
 			iterations: []iteration{
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1) >= ($3) AND (col1) < ($2)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1) >= ($3) AND (col1) < ($2)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -185,8 +199,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($3, $4) AND (col1) < ($2)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($3, $4) AND (col1) < ($2)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -201,8 +216,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($3, $4) AND (col1) < ($2)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($3, $4) AND (col1) < ($2)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -221,16 +237,19 @@ LIMIT 2`,
 				mockTime,
 				[]string{"col1", "col2"},
 				"table_name",
-				nil,
-				tree.Datums{tree.NewDInt(200), tree.NewDInt(15)},
-				*mockTimestampTZ,
+				spanToProcess{
+					endPK: tree.Datums{tree.NewDInt(200), tree.NewDInt(15)},
+				},
+				mockDuration,
 				2,
+				colinfo.TTLDefaultExpirationColumnName,
 			),
 			iterations: []iteration{
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) < ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+ AND (col1, col2) < ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -244,8 +263,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -260,8 +280,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($4, $5) AND (col1, col2) < ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -280,16 +301,19 @@ LIMIT 2`,
 				mockTime,
 				[]string{"col1", "col2"},
 				"table_name",
-				tree.Datums{tree.NewDInt(100), tree.NewDInt(5)},
-				nil,
-				*mockTimestampTZ,
+				spanToProcess{
+					startPK: tree.Datums{tree.NewDInt(100), tree.NewDInt(5)},
+				},
+				mockDuration,
 				2,
+				colinfo.TTLDefaultExpirationColumnName,
 			),
 			iterations: []iteration{
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) >= ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) >= ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -303,8 +327,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -318,8 +343,9 @@ LIMIT 2`,
 				},
 				{
 					expectedQuery: `SELECT col1, col2 FROM [1 AS tbl_name]
-AS OF SYSTEM TIME '2000-01-01 13:30:45+00:00'
-WHERE crdb_internal_expiration <= $1 AND (col1, col2) > ($2, $3)
+AS OF SYSTEM TIME INTERVAL '-10 seconds'
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) > ($2, $3)
 ORDER BY col1, col2
 LIMIT 2`,
 					expectedArgs: []interface{}{
@@ -366,14 +392,16 @@ func TestDeleteQueryBuilder(t *testing.T) {
 	}{
 		{
 			desc: "single delete less than batch size",
-			b:    makeDeleteQueryBuilder(1, mockTime, []string{"col1", "col2"}, "table_name", 3),
+			b:    makeDeleteQueryBuilder(1, mockTime, []string{"col1", "col2"}, "table_name", 3, colinfo.TTLDefaultExpirationColumnName),
 			iterations: []iteration{
 				{
 					rows: []tree.Datums{
 						{tree.NewDInt(10), tree.NewDInt(15)},
 						{tree.NewDInt(12), tree.NewDInt(16)},
 					},
-					expectedQuery: `DELETE FROM [1 AS tbl_name] WHERE crdb_internal_expiration <= $1 AND (col1, col2) IN (($2, $3), ($4, $5))`,
+					expectedQuery: `DELETE FROM [1 AS tbl_name]
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) IN (($2, $3), ($4, $5))`,
 					expectedArgs: []interface{}{
 						mockTime,
 						tree.NewDInt(10), tree.NewDInt(15),
@@ -384,7 +412,7 @@ func TestDeleteQueryBuilder(t *testing.T) {
 		},
 		{
 			desc: "multiple deletes",
-			b:    makeDeleteQueryBuilder(1, mockTime, []string{"col1", "col2"}, "table_name", 3),
+			b:    makeDeleteQueryBuilder(1, mockTime, []string{"col1", "col2"}, "table_name", 3, colinfo.TTLDefaultExpirationColumnName),
 			iterations: []iteration{
 				{
 					rows: []tree.Datums{
@@ -392,7 +420,9 @@ func TestDeleteQueryBuilder(t *testing.T) {
 						{tree.NewDInt(12), tree.NewDInt(16)},
 						{tree.NewDInt(12), tree.NewDInt(18)},
 					},
-					expectedQuery: `DELETE FROM [1 AS tbl_name] WHERE crdb_internal_expiration <= $1 AND (col1, col2) IN (($2, $3), ($4, $5), ($6, $7))`,
+					expectedQuery: `DELETE FROM [1 AS tbl_name]
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) IN (($2, $3), ($4, $5), ($6, $7))`,
 					expectedArgs: []interface{}{
 						mockTime,
 						tree.NewDInt(10), tree.NewDInt(15),
@@ -406,7 +436,9 @@ func TestDeleteQueryBuilder(t *testing.T) {
 						{tree.NewDInt(112), tree.NewDInt(116)},
 						{tree.NewDInt(112), tree.NewDInt(118)},
 					},
-					expectedQuery: `DELETE FROM [1 AS tbl_name] WHERE crdb_internal_expiration <= $1 AND (col1, col2) IN (($2, $3), ($4, $5), ($6, $7))`,
+					expectedQuery: `DELETE FROM [1 AS tbl_name]
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) IN (($2, $3), ($4, $5), ($6, $7))`,
 					expectedArgs: []interface{}{
 						mockTime,
 						tree.NewDInt(110), tree.NewDInt(115),
@@ -418,7 +450,9 @@ func TestDeleteQueryBuilder(t *testing.T) {
 					rows: []tree.Datums{
 						{tree.NewDInt(1210), tree.NewDInt(1215)},
 					},
-					expectedQuery: `DELETE FROM [1 AS tbl_name] WHERE crdb_internal_expiration <= $1 AND (col1, col2) IN (($2, $3))`,
+					expectedQuery: `DELETE FROM [1 AS tbl_name]
+WHERE crdb_internal_expiration <= $1
+AND (col1, col2) IN (($2, $3))`,
 					expectedArgs: []interface{}{
 						mockTime,
 						tree.NewDInt(1210), tree.NewDInt(1215),
@@ -448,14 +482,14 @@ func TestMakeColumnNamesSQL(t *testing.T) {
 		expected string
 	}{
 		{[]string{"a"}, "a"},
-		{[]string{"index"}, `"index"`},
+		{[]string{"index"}, `index`},
 		{[]string{"a", "b"}, "a, b"},
-		{[]string{"escape-me", "index", "c"}, `"escape-me", "index", c`},
+		{[]string{"escape-me", "index", "c"}, `"escape-me", index, c`},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.expected, func(t *testing.T) {
-			require.Equal(t, tc.expected, makeColumnNamesSQL(tc.cols))
+			require.Equal(t, tc.expected, ttlbase.MakeColumnNamesSQL(tc.cols))
 		})
 	}
 }

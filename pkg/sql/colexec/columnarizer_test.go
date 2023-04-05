@@ -49,9 +49,10 @@ func TestColumnarizerResetsInternalBatch(t *testing.T) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 	c.Init(ctx)
 	foundRows := 0
 	for {
@@ -80,6 +81,7 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	for _, tc := range []struct {
@@ -98,7 +100,7 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 			const errMsg = "artificial error"
 			rb := distsqlutils.NewRowBuffer([]*types.T{types.Int}, nil /* rows */, distsqlutils.RowBufferArgs{})
 			rb.Push(nil, &execinfrapb.ProducerMetadata{Err: errors.New(errMsg)})
-			c := NewBufferingColumnarizer(testAllocator, flowCtx, 0 /* processorID */, rb)
+			c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0 /* processorID */, rb)
 
 			c.Init(ctx)
 
@@ -139,11 +141,12 @@ func BenchmarkColumnarize(b *testing.B) {
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	b.SetBytes(int64(nRows * nCols * int(memsize.Int64)))
 
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 	c.Init(ctx)
 	for i := 0; i < b.N; i++ {
 		foundRows := 0

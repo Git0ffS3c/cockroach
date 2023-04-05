@@ -45,7 +45,8 @@ type Column struct {
 
 // Ordinal returns the position of the column in its table. The following always
 // holds:
-//   tab.Column(i).Ordinal() == i
+//
+//	tab.Column(i).Ordinal() == i
 func (c *Column) Ordinal() int {
 	return c.ordinal
 }
@@ -346,6 +347,7 @@ func (c *Column) InitVirtualComputed(
 	ordinal int,
 	stableID StableID,
 	name tree.Name,
+	kind ColumnKind,
 	datumType *types.T,
 	nullable bool,
 	visibility ColumnVisibility,
@@ -357,7 +359,7 @@ func (c *Column) InitVirtualComputed(
 		ordinal:                     ordinal,
 		stableID:                    stableID,
 		name:                        name,
-		kind:                        Ordinary,
+		kind:                        kind,
 		datumType:                   datumType,
 		nullable:                    nullable,
 		visibility:                  visibility,

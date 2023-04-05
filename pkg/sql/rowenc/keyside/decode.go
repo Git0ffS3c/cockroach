@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -117,13 +118,13 @@ func Decode(
 		d, err := a.NewDCollatedString(r, valType.Locale())
 		return d, rkey, err
 	case types.JsonFamily:
-		// Don't attempt to decode the JSON value. Instead, just return the
-		// remaining bytes of the key.
-		jsonLen, err := encoding.PeekLength(key)
+		var json json.JSON
+		json, rkey, err = decodeJSONKey(key, dir)
 		if err != nil {
 			return nil, nil, err
 		}
-		return tree.DNull, key[jsonLen:], nil
+		d := a.NewDJSON(tree.DJSON{JSON: json})
+		return d, rkey, err
 	case types.BytesFamily:
 		var r []byte
 		if dir == encoding.Ascending {
@@ -245,13 +246,18 @@ func Decode(
 		_, err := ipAddr.FromBuffer(r)
 		return a.NewDIPAddr(tree.DIPAddr{IPAddr: ipAddr}), rkey, err
 	case types.OidFamily:
+		// TODO: This possibly should use DecodeUint32 (with corresponding changes
+		// to encoding) to ensure that the value fits in a DOid without any loss of
+		// precision. In practice, this may not matter, since everything at
+		// execution time uses a uint32 for OIDs. The extra safety may not be worth
+		// the loss of variable length encoding.
 		var i int64
 		if dir == encoding.Ascending {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
 		} else {
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
-		return a.NewDOid(tree.MakeDOid(tree.DInt(i), valType)), rkey, err
+		return a.NewDOid(tree.MakeDOid(oid.Oid(i), valType)), rkey, err
 	case types.EnumFamily:
 		var r []byte
 		if dir == encoding.Ascending {

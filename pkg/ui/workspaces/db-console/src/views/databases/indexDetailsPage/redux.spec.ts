@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import assert from "assert";
 import { createMemoryHistory } from "history";
 import Long from "long";
 import { RouteComponentProps } from "react-router-dom";
@@ -17,6 +16,7 @@ import {
   IndexDetailPageActions,
   IndexDetailsPageData,
   util,
+  TimeScale,
 } from "@cockroachlabs/cluster-ui";
 
 import { AdminUIState, createAdminUIStore } from "src/redux/state";
@@ -59,6 +59,14 @@ function fakeRouteComponentProps(
   };
 }
 
+const timeScale: TimeScale = {
+  key: "Past 10 Minutes",
+  windowSize: moment.duration(10, "minutes"),
+  windowValid: moment.duration(10, "seconds"),
+  sampleSize: moment.duration(10, "seconds"),
+  fixedWindowEnd: false,
+};
+
 class TestDriver {
   private readonly actions: IndexDetailPageActions;
   private readonly properties: () => IndexDetailsPageData;
@@ -93,19 +101,21 @@ class TestDriver {
   ) {
     // Assert moments are equal if not in pre-loading state.
     if (compareTimestamps) {
-      assert(
+      expect(
         this.properties().details.lastRead.isSame(expected.details.lastRead),
-      );
-      assert(
+      ).toBe(true);
+      expect(
         this.properties().details.lastReset.isSame(expected.details.lastReset),
-      );
+      ).toBe(true);
     }
     // Assert objects without moments are equal.
     delete this.properties().details.lastRead;
     delete expected.details.lastRead;
     delete this.properties().details.lastReset;
     delete expected.details.lastReset;
-    assert.deepStrictEqual(this.properties(), expected);
+    delete this.properties().timeScale;
+    delete expected.timeScale;
+    expect(this.properties()).toEqual(expected);
   }
 
   async refreshIndexStats() {
@@ -113,10 +123,10 @@ class TestDriver {
   }
 }
 
-describe("Index Details Page", function() {
+describe("Index Details Page", function () {
   let driver: TestDriver;
 
-  beforeEach(function() {
+  beforeEach(function () {
     driver = new TestDriver(
       createAdminUIStore(createMemoryHistory()),
       "DATABASE",
@@ -125,16 +135,21 @@ describe("Index Details Page", function() {
     );
   });
 
-  afterEach(function() {
+  afterEach(function () {
     fakeApi.restore();
   });
 
-  it("starts in a pre-loading state", function() {
+  it("starts in a pre-loading state", function () {
     driver.assertProperties(
       {
         databaseName: "DATABASE",
         tableName: "TABLE",
         indexName: "INDEX",
+        isTenant: false,
+        nodeRegions: {},
+        hasAdminRole: undefined,
+        hasViewActivityRedactedRole: undefined,
+        timeScale: timeScale,
         details: {
           loading: false,
           loaded: false,
@@ -143,13 +158,16 @@ describe("Index Details Page", function() {
           lastRead: moment(),
           lastReset: moment(),
           indexRecommendations: [],
+          tableID: undefined,
+          indexID: undefined,
         },
+        breadcrumbItems: null,
       },
       false,
     );
   });
 
-  it("loads index stats", async function() {
+  it("loads index stats", async function () {
     fakeApi.stubIndexStats("DATABASE", "TABLE", {
       statistics: [
         {
@@ -182,9 +200,16 @@ describe("Index Details Page", function() {
       databaseName: "DATABASE",
       tableName: "TABLE",
       indexName: "INDEX",
+      isTenant: false,
+      nodeRegions: {},
+      timeScale: timeScale,
+      hasAdminRole: undefined,
+      hasViewActivityRedactedRole: undefined,
       details: {
         loading: false,
         loaded: true,
+        tableID: "15",
+        indexID: "2",
         createStatement:
           "CREATE INDEX jobs_created_by_type_created_by_id_idx ON system.public.jobs USING btree (created_by_type ASC, created_by_id ASC) STORING (status)",
         totalReads: 2,
@@ -196,6 +221,7 @@ describe("Index Details Page", function() {
         ),
         indexRecommendations: [],
       },
+      breadcrumbItems: null,
     });
   });
 });

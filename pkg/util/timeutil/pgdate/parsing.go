@@ -82,20 +82,29 @@ var (
 	TimeNegativeInfinity = timeutil.Unix(-210866803200, 0)
 )
 
+type ParseHelper struct {
+	fe fieldExtract
+}
+
 // ParseDate converts a string into Date.
 //
 // Any specified timezone is inconsequential. Examples:
-//  - "now": parses to the local date (in the current timezone)
-//  - "2020-06-26 01:09:15.511971": parses to '2020-06-26'
-//  - "2020-06-26 01:09:15.511971-05": parses to '2020-06-26'
+//   - "now": parses to the local date (in the current timezone)
+//   - "2020-06-26 01:09:15.511971": parses to '2020-06-26'
+//   - "2020-06-26 01:09:15.511971-05": parses to '2020-06-26'
 //
 // The dependsOnContext return value indicates if we had to consult the given
 // `now` value (either for the time or the local timezone).
 //
+// Memory allocations can be avoided by passing ParseHelper which can be re-used
+// across calls for batch parsing purposes, otherwise it can be nil.
 func ParseDate(
-	now time.Time, dateStyle DateStyle, s string,
+	now time.Time, dateStyle DateStyle, s string, h *ParseHelper,
 ) (_ Date, dependsOnContext bool, _ error) {
-	fe := fieldExtract{
+	if h == nil {
+		h = &ParseHelper{}
+	}
+	h.fe = fieldExtract{
 		currentTime: now,
 		dateStyle:   dateStyle,
 		required:    dateRequiredFields,
@@ -105,42 +114,48 @@ func ParseDate(
 		wanted: dateTimeFields,
 	}
 
-	if err := fe.Extract(s); err != nil {
+	if err := h.fe.Extract(s); err != nil {
 		return Date{}, false, parseError(err, "date", s)
 	}
-	date, err := fe.MakeDate()
-	return date, fe.currentTimeUsed, err
+	date, err := h.fe.MakeDate()
+	return date, h.fe.currentTimeUsed, err
 }
 
 // ParseTime converts a string into a time value on the epoch day.
 //
 // The dependsOnContext return value indicates if we had to consult the given
 // `now` value (either for the time or the local timezone).
+//
+// Memory allocations can be avoided by passing ParseHelper which can be re-used
+// across calls for batch parsing purposes, otherwise it can be nil.
 func ParseTime(
-	now time.Time, dateStyle DateStyle, s string,
+	now time.Time, dateStyle DateStyle, s string, h *ParseHelper,
 ) (_ time.Time, dependsOnContext bool, _ error) {
-	fe := fieldExtract{
+	if h == nil {
+		h = &ParseHelper{}
+	}
+	h.fe = fieldExtract{
 		currentTime: now,
 		required:    timeRequiredFields,
 		wanted:      timeFields,
 	}
 
-	if err := fe.Extract(s); err != nil {
+	if err := h.fe.Extract(s); err != nil {
 		// It's possible that the user has given us a complete
 		// timestamp string; let's try again, accepting more fields.
-		fe = fieldExtract{
+		h.fe = fieldExtract{
 			currentTime: now,
 			dateStyle:   dateStyle,
 			required:    timeRequiredFields,
 			wanted:      dateTimeFields,
 		}
 
-		if err := fe.Extract(s); err != nil {
+		if err := h.fe.Extract(s); err != nil {
 			return TimeEpoch, false, parseError(err, "time", s)
 		}
 	}
-	res := fe.MakeTime()
-	return res, fe.currentTimeUsed, nil
+	res := h.fe.MakeTime()
+	return res, h.fe.currentTimeUsed, nil
 }
 
 // ParseTimeWithoutTimezone converts a string into a time value on the epoch
@@ -148,8 +163,8 @@ func ParseTime(
 // location.
 //
 // Any specified timezone is inconsequential. Examples:
-//  - "now": parses to the local time of day (in the current timezone)
-//  - "01:09:15.511971" and "01:09:15.511971-05" parse to the same result
+//   - "now": parses to the local time of day (in the current timezone)
+//   - "01:09:15.511971" and "01:09:15.511971-05" parse to the same result
 //
 // The dependsOnContext return value indicates if we had to consult the given
 // `now` value (either for the time or the local timezone).
@@ -210,7 +225,7 @@ func ParseTimestamp(
 // For example, all these inputs return 2020-06-26 01:02:03 +0000 UTC:
 //   - '2020-06-26 01:02:03';
 //   - '2020-06-26 01:02:03+04';
-//   - 'now', if the local local time (in the current timezone) is
+//   - 'now', if the local time (in the current timezone) is
 //     2020-06-26 01:02:03. Note that this does not represent the same time
 //     instant, but the one that "reads" the same in UTC.
 //

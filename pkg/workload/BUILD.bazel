@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -7,6 +8,7 @@ go_library(
         "csv.go",
         "driver.go",
         "pgx_helpers.go",
+        "random.go",
         "round_robin.go",
         "sql_runner.go",
         "stats.go",
@@ -21,6 +23,7 @@ go_library(
         "//pkg/util/bufalloc",
         "//pkg/util/encoding/csv",
         "//pkg/util/log",
+        "//pkg/util/randutil",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/workload/histogram",
@@ -45,10 +48,11 @@ go_test(
         "stats_test.go",
         "workload_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":workload"],
     deps = [
         "//pkg/col/coldata",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/types",
@@ -66,3 +70,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

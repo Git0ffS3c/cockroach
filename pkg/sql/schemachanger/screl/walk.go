@@ -42,6 +42,19 @@ func WalkExpressions(e scpb.Element, f func(t *catpb.Expression) error) error {
 	})
 }
 
+// WalkColumnIDs calls f for every catid.ColumnID field in e.
+func WalkColumnIDs(e scpb.Element, f func(id *catid.ColumnID) error) error {
+	return walk(reflect.TypeOf((*catid.ColumnID)(nil)), e, func(i interface{}) error {
+		return f(i.(*catid.ColumnID))
+	})
+}
+
+func WalkConstraintIDs(e scpb.Element, f func(id *catid.ConstraintID) error) error {
+	return walk(reflect.TypeOf((*catid.ConstraintID)(nil)), e, func(i interface{}) error {
+		return f(i.(*catid.ConstraintID))
+	})
+}
+
 // walk will use reflection to find all values which are either scalars
 // types or pointers types and pass them to f as pointers. The
 // expectation is that the input is a pointer to some structure so that
@@ -60,9 +73,7 @@ func walk(wantType reflect.Type, toWalk interface{}, f func(interface{}) error) 
 		default:
 			err = errors.AssertionFailedf("failed to do walk: %v", r)
 		}
-		if iterutil.Done(err) {
-			err = nil
-		}
+		err = iterutil.Map(err)
 	}()
 
 	visit := func(v reflect.Value) {

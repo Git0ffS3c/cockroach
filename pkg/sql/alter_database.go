@@ -14,8 +14,9 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -36,8 +37,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
+	yaml "gopkg.in/yaml.v2"
 )
 
 type alterDatabaseOwnerNode struct {
@@ -57,8 +61,7 @@ func (p *planner) AlterDatabaseOwner(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: true})
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -143,9 +146,7 @@ func (p *planner) AlterDatabaseAddRegion(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -218,11 +219,7 @@ func (n *alterDatabaseAddRegionNode) startExec(params runParams) error {
 	}
 
 	// Get the type descriptor for the multi-region enum.
-	typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(
-		params.ctx,
-		params.p.txn,
-		n.desc.RegionConfig.RegionEnumID,
-	)
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, n.desc.RegionConfig.RegionEnumID)
 	if err != nil {
 		return err
 	}
@@ -309,8 +306,7 @@ func (p *planner) AlterDatabaseDropRegion(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: true})
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +350,23 @@ func (p *planner) AlterDatabaseDropRegion(
 		return nil, err
 	}
 
+	// Ensure the secondary region is not being dropped
+	if dbDesc.RegionConfig.SecondaryRegion == catpb.RegionName(n.Region) {
+		return nil, errors.WithHintf(
+			pgerror.Newf(
+				pgcode.InvalidDatabaseDefinition,
+				"cannot drop region %q",
+				dbDesc.RegionConfig.SecondaryRegion,
+			),
+			"You must designate another region as the secondary region using "+
+				"ALTER DATABASE %s SECONDARY REGION <region name> or remove the secondary region "+
+				"using ALTER DATABASE %s DROP SECONDARY REGION in order to drop region %q",
+			dbDesc.GetName(),
+			dbDesc.GetName(),
+			n.Region,
+		)
+	}
+
 	removingPrimaryRegion := false
 	var toDrop []*typedesc.Mutable
 
@@ -364,19 +377,26 @@ func (p *planner) AlterDatabaseDropRegion(
 		if err != nil {
 			return nil, err
 		}
-		typeDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeID)
+		typeDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeID)
 		if err != nil {
 			return nil, err
+		}
+		regionEnumDesc := typeDesc.AsRegionEnumTypeDescriptor()
+		if regionEnumDesc == nil {
+			return nil, errors.AssertionFailedf(
+				"expected region enum type, not %s for type %q (%d)",
+				typeDesc.GetKind(), typeDesc.GetName(), typeDesc.GetID())
 		}
 
 		// Ensure that there's only 1 region on the multi-region enum (the primary
 		// region) as this can only be dropped once all other regions have been
 		// dropped. This check must account for regions that are transitioning,
 		// as transitions aren't guaranteed to succeed.
-		regions, err := typeDesc.RegionNamesIncludingTransitioning()
-		if err != nil {
-			return nil, err
-		}
+		var regions catpb.RegionNames
+		_ = regionEnumDesc.ForEachRegion(func(name catpb.RegionName, _ descpb.TypeDescriptor_EnumMember_Direction) error {
+			regions = append(regions, name)
+			return nil
+		})
 		if len(regions) != 1 {
 			return nil, errors.WithHintf(
 				pgerror.Newf(
@@ -399,11 +419,14 @@ func (p *planner) AlterDatabaseDropRegion(
 			)
 		}
 
+		// If this is the system database, we can only drop a rtegion if it is
+		// not a part of any of
+
 		// When the last region is removed from the database, we also clean up
 		// detritus multi-region type descriptor. This includes both the
 		// type descriptor and its array counterpart.
 		toDrop = append(toDrop, typeDesc)
-		arrayTypeDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeDesc.ArrayTypeID)
+		arrayTypeDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeDesc.ArrayTypeID)
 		if err != nil {
 			return nil, err
 		}
@@ -450,9 +473,39 @@ func (p *planner) AlterDatabaseDropRegion(
 // - or be an owner of the table.
 // - or have the CREATE privilege on the table.
 // privilege on the table descriptor.
+//
+// For the system database, the conditions are more stringent. The user must
+// be the node user, and this must be a secondary tenant.
 func (p *planner) checkPrivilegesForMultiRegionOp(
 	ctx context.Context, desc catalog.Descriptor,
 ) error {
+
+	// Ensure that only secondary tenants may have their system database
+	// set up for multi-region operations. Even then, ensure that only the
+	// node user may configure the system database.
+	//
+	// Operations to configure the system database will be sent as tasks using
+	// the autoconfig infrastucture.
+	//
+	// TODO(ajwerner): Adopt the auto-config infrastructure for configuring
+	// multi-region primitives in the system database. For now, we also allow
+	// root to perform the various operations to enable testing.
+	if desc.GetID() == keys.SystemDatabaseID {
+		if p.execCfg.Codec.ForSystemTenant() {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"modifying the regions of system database is not supported",
+			)
+		}
+		if u := p.SessionData().User(); !u.IsNodeUser() && !u.IsRootUser() {
+			return pgerror.Newf(
+				pgcode.InsufficientPrivilege,
+				"user %s may not modify the system database",
+				u,
+			)
+		}
+	}
+
 	hasAdminRole, err := p.HasAdminRole(ctx)
 	if err != nil {
 		return err
@@ -461,10 +514,13 @@ func (p *planner) checkPrivilegesForMultiRegionOp(
 		// TODO(arul): It's worth noting CREATE isn't a thing on tables in postgres,
 		// so this will require some changes when (if) we move our privilege system
 		// to be more in line with postgres.
-		err := p.CheckPrivilege(ctx, desc, privilege.CREATE)
+		hasPriv, err := p.HasPrivilege(ctx, desc, privilege.CREATE, p.User())
+		if err != nil {
+			return err
+		}
 		// Wrap an insufficient privileges error a bit better to reflect the lack
 		// of ownership as well.
-		if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
+		if !hasPriv {
 			return pgerror.Newf(pgcode.InsufficientPrivilege,
 				"user %s must be owner of %s or have %s privilege on %s %s",
 				p.SessionData().User(),
@@ -474,7 +530,6 @@ func (p *planner) checkPrivilegesForMultiRegionOp(
 				desc.GetName(),
 			)
 		}
-		return err
 	}
 	return nil
 }
@@ -528,8 +583,10 @@ func removeLocalityConfigFromAllTablesInDB(
 			case *catpb.LocalityConfig_Global_:
 				if err := ApplyZoneConfigForMultiRegionTable(
 					ctx,
-					p.txn,
+					p.Txn(),
 					p.ExecCfg(),
+					p.extendedEvalCtx.Tracing.KVTracingEnabled(),
+					p.Descriptors(),
 					multiregion.RegionConfig{}, // pass dummy config as it is not used.
 					tbDesc,
 					applyZoneConfigForMultiRegionTableOptionRemoveGlobalZoneConfig,
@@ -570,11 +627,7 @@ func (n *alterDatabaseDropRegionNode) startExec(params runParams) error {
 	if n.n == nil {
 		return nil
 	}
-	typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(
-		params.ctx,
-		params.p.txn,
-		n.desc.RegionConfig.RegionEnumID,
-	)
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, n.desc.RegionConfig.RegionEnumID)
 	if err != nil {
 		return err
 	}
@@ -598,8 +651,10 @@ func (n *alterDatabaseDropRegionNode) startExec(params runParams) error {
 		if err := discardMultiRegionFieldsForDatabaseZoneConfig(
 			params.ctx,
 			n.desc.ID,
-			params.p.txn,
+			params.p.Txn(),
 			params.p.execCfg,
+			params.p.Descriptors(),
+			params.extendedEvalCtx.Tracing.KVTracingEnabled(),
 		); err != nil {
 			return err
 		}
@@ -669,9 +724,7 @@ func (p *planner) AlterDatabasePrimaryRegion(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -714,11 +767,19 @@ func (n *alterDatabasePrimaryRegionNode) switchPrimaryRegion(params runParams) e
 		)
 	}
 
+	if prevRegionConfig.HasSecondaryRegion() && catpb.RegionName(n.n.PrimaryRegion) == prevRegionConfig.SecondaryRegion() {
+		return errors.WithHintf(
+			pgerror.Newf(pgcode.InvalidDatabaseDefinition,
+				"region %s is currently the secondary region",
+				n.n.PrimaryRegion.String(),
+			),
+			"you must drop the secondary region using ALTER DATABASE %s DROP SECONDARY REGION",
+			n.n.Name.String(),
+		)
+	}
+
 	// Get the type descriptor for the multi-region enum.
-	typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(
-		params.ctx,
-		params.p.txn,
-		n.desc.RegionConfig.RegionEnumID)
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, n.desc.RegionConfig.RegionEnumID)
 	if err != nil {
 		return err
 	}
@@ -754,8 +815,10 @@ func (n *alterDatabasePrimaryRegionNode) switchPrimaryRegion(params runParams) e
 		params.ctx,
 		n.desc.ID,
 		updatedRegionConfig,
-		params.p.txn,
+		params.p.Txn(),
 		params.p.execCfg,
+		params.p.Descriptors(),
+		params.extendedEvalCtx.Tracing.KVTracingEnabled(),
 	); err != nil {
 		return err
 	}
@@ -874,7 +937,7 @@ func addDefaultLocalityConfigToAllTables(
 func checkCanConvertTableToMultiRegion(
 	dbDesc catalog.DatabaseDescriptor, tableDesc catalog.TableDescriptor,
 ) error {
-	if tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns() > 0 {
+	if tableDesc.GetPrimaryIndex().PartitioningColumnCount() > 0 {
 		return errors.WithDetailf(
 			pgerror.Newf(
 				pgcode.ObjectNotInPrerequisiteState,
@@ -886,7 +949,7 @@ func checkCanConvertTableToMultiRegion(
 		)
 	}
 	for _, idx := range tableDesc.AllIndexes() {
-		if idx.GetPartitioning().NumColumns() > 0 {
+		if idx.PartitioningColumnCount() > 0 {
 			return errors.WithDetailf(
 				pgerror.Newf(
 					pgcode.ObjectNotInPrerequisiteState,
@@ -913,6 +976,7 @@ func (n *alterDatabasePrimaryRegionNode) setInitialPrimaryRegion(params runParam
 		n.n.PrimaryRegion,
 		[]tree.Name{n.n.PrimaryRegion},
 		tree.DataPlacementUnspecified,
+		tree.SecondaryRegionNotSpecifiedName,
 	)
 	if err != nil {
 		return err
@@ -965,18 +1029,18 @@ func (n *alterDatabasePrimaryRegionNode) setInitialPrimaryRegion(params runParam
 		}
 		return err
 	}
+
+	// If this is the system database, we need to do some additional magic to
+	// reconfigure the various tables and set the correct localities.
+	if n.desc.GetID() == keys.SystemDatabaseID {
+		if err := params.p.optimizeSystemDatabase(params.ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (n *alterDatabasePrimaryRegionNode) startExec(params runParams) error {
-	// Block adding a primary region to the system database. This ensures that the system
-	// database can never be made into a multi-region database.
-	if n.desc.GetID() == keys.SystemDatabaseID {
-		return pgerror.Newf(
-			pgcode.FeatureNotSupported,
-			"adding a primary region to the system database is not supported",
-		)
-	}
 
 	// There are two paths to consider here: either this is the first setting of
 	// the primary region, OR we're updating the primary region. In the case where
@@ -1042,9 +1106,7 @@ func (p *planner) AlterDatabaseSurvivalGoal(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -1127,8 +1189,10 @@ func (n *alterDatabaseSurvivalGoalNode) startExec(params runParams) error {
 		params.ctx,
 		n.desc.ID,
 		regionConfig,
-		params.p.txn,
+		params.p.Txn(),
 		params.p.execCfg,
+		params.p.Descriptors(),
+		params.extendedEvalCtx.Tracing.KVTracingEnabled(),
 	); err != nil {
 		return err
 	}
@@ -1174,7 +1238,7 @@ func (p *planner) AlterDatabasePlacement(
 
 	if !p.EvalContext().SessionData().PlacementEnabled {
 		return nil, errors.WithHint(pgerror.New(
-			pgcode.FeatureNotSupported,
+			pgcode.ExperimentalFeature,
 			"ALTER DATABASE PLACEMENT requires that the session setting "+
 				"enable_multiregion_placement_policy is enabled",
 		),
@@ -1183,9 +1247,7 @@ func (p *planner) AlterDatabasePlacement(
 		)
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.Name),
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.Name))
 	if err != nil {
 		return nil, err
 	}
@@ -1256,8 +1318,10 @@ func (n *alterDatabasePlacementNode) startExec(params runParams) error {
 		params.ctx,
 		n.desc.ID,
 		regionConfig,
-		params.p.txn,
+		params.p.Txn(),
 		params.p.execCfg,
+		params.p.Descriptors(),
+		params.extendedEvalCtx.Tracing.KVTracingEnabled(),
 	); err != nil {
 		return err
 	}
@@ -1303,9 +1367,6 @@ type alterDatabaseAddSuperRegion struct {
 func (p *planner) AlterDatabaseAddSuperRegion(
 	ctx context.Context, n *tree.AlterDatabaseAddSuperRegion,
 ) (planNode, error) {
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SuperRegions) {
-		return nil, errors.Newf("super regions are not supported until upgrade to version %s is finalized", clusterversion.SuperRegions.String())
-	}
 	if err := p.isSuperRegionEnabled(); err != nil {
 		return nil, err
 	}
@@ -1318,9 +1379,7 @@ func (p *planner) AlterDatabaseAddSuperRegion(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.DatabaseName),
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.DatabaseName))
 	if err != nil {
 		return nil, err
 	}
@@ -1345,15 +1404,31 @@ func (n *alterDatabaseAddSuperRegion) startExec(params runParams) error {
 		)
 	}
 
-	typeID, err := n.desc.MultiRegionEnumID()
-	if err != nil {
-		return err
-	}
-	typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(params.ctx, params.p.txn, typeID)
+	// Check if the primary and secondary regions are members of this super region.
+	regionConfig, err := SynthesizeRegionConfig(
+		params.ctx, params.p.txn, n.desc.ID, params.p.Descriptors(),
+	)
 	if err != nil {
 		return err
 	}
 
+	if regionConfig.HasSecondaryRegion() {
+		primaryRegion := regionConfig.PrimaryRegionString()
+		regions := nameToRegionName(n.n.Regions)
+		err := validateSecondaryRegion(catpb.RegionName(primaryRegion), regionConfig.SecondaryRegion(), regions)
+		if err != nil {
+			return err
+		}
+	}
+
+	typeID, err := n.desc.MultiRegionEnumID()
+	if err != nil {
+		return err
+	}
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, typeID)
+	if err != nil {
+		return err
+	}
 	return params.p.addSuperRegion(params.ctx, n.desc, typeDesc, n.n.Regions, n.n.SuperRegionName, tree.AsStringWithFQNames(n.n, params.Ann()))
 }
 
@@ -1386,10 +1461,6 @@ type alterDatabaseDropSuperRegion struct {
 func (p *planner) AlterDatabaseDropSuperRegion(
 	ctx context.Context, n *tree.AlterDatabaseDropSuperRegion,
 ) (planNode, error) {
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SuperRegions) {
-		return nil, errors.Newf("super regions are not supported until upgrade to version %s is finalized", clusterversion.SuperRegions.String())
-	}
-
 	if err := p.isSuperRegionEnabled(); err != nil {
 		return nil, err
 	}
@@ -1402,9 +1473,7 @@ func (p *planner) AlterDatabaseDropSuperRegion(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.DatabaseName),
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.DatabaseName))
 	if err != nil {
 		return nil, err
 	}
@@ -1433,7 +1502,7 @@ func (n *alterDatabaseDropSuperRegion) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
-	typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(params.ctx, params.p.txn, typeID)
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, typeID)
 	if err != nil {
 		return err
 	}
@@ -1483,7 +1552,7 @@ func (p *planner) isSuperRegionEnabled() error {
 			pgerror.WithCandidateCode(
 				errors.WithHint(errors.New("super regions are only supported experimentally"),
 					"You can enable super regions by running `SET enable_super_regions = 'on'`."),
-				pgcode.FeatureNotSupported),
+				pgcode.ExperimentalFeature),
 			"sql.schema.super_regions_disabled",
 		)
 	}
@@ -1498,7 +1567,7 @@ func (p *planner) getSuperRegionsForDatabase(
 	if err != nil {
 		return nil, err
 	}
-	typeDesc, err := p.Descriptors().GetMutableTypeVersionByID(ctx, p.txn, typeID)
+	typeDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1518,9 +1587,6 @@ func (n *alterDatabaseAlterSuperRegion) Close(context.Context)        {}
 func (p *planner) AlterDatabaseAlterSuperRegion(
 	ctx context.Context, n *tree.AlterDatabaseAlterSuperRegion,
 ) (planNode, error) {
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.SuperRegions) {
-		return nil, errors.Newf("super regions are not supported until upgrade to version %s is finalized", clusterversion.SuperRegions.String())
-	}
 	if err := p.isSuperRegionEnabled(); err != nil {
 		return nil, err
 	}
@@ -1533,9 +1599,7 @@ func (p *planner) AlterDatabaseAlterSuperRegion(
 		return nil, err
 	}
 
-	dbDesc, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, string(n.DatabaseName),
-		tree.DatabaseLookupFlags{Required: true},
-	)
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.DatabaseName))
 	if err != nil {
 		return nil, err
 	}
@@ -1564,9 +1628,25 @@ func (n *alterDatabaseAlterSuperRegion) startExec(params runParams) error {
 	if err != nil {
 		return err
 	}
-	typeDesc, err := params.p.Descriptors().GetMutableTypeVersionByID(params.ctx, params.p.txn, typeID)
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, typeID)
 	if err != nil {
 		return err
+	}
+
+	// Check that the secondary region isn't being dropped from this super region.
+	regionConfig, err := SynthesizeRegionConfig(
+		params.ctx, params.p.txn, n.desc.ID, params.p.Descriptors(),
+	)
+	if err != nil {
+		return err
+	}
+
+	if regionConfig.HasSecondaryRegion() {
+		regions := nameToRegionName(n.n.Regions)
+		err = validateSecondaryRegion(regionConfig.PrimaryRegion(), typeDesc.RegionConfig.SecondaryRegion, regions)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Remove the old super region.
@@ -1590,11 +1670,17 @@ func (p *planner) addSuperRegion(
 	superRegionName tree.Name,
 	op string,
 ) error {
-
-	regionNames, err := typeDesc.RegionNames()
-	if err != nil {
-		return err
+	regionsDesc := typeDesc.AsRegionEnumTypeDescriptor()
+	if regionsDesc == nil {
+		return errors.AssertionFailedf("expected region enum type, not %s for type %q (%d)",
+			typeDesc.GetKind(), typeDesc.GetName(), typeDesc.GetID())
 	}
+
+	var regionNames catpb.RegionNames
+	_ = regionsDesc.ForEachPublicRegion(func(name catpb.RegionName) error {
+		regionNames = append(regionNames, name)
+		return nil
+	})
 
 	regionsInDatabase := make(map[catpb.RegionName]struct{})
 	for _, regionName := range regionNames {
@@ -1626,16 +1712,18 @@ func (p *planner) addSuperRegion(
 
 	// Ensure that the super region name is not already used and that
 	// the super regions don't overlap.
-	for _, superRegion := range typeDesc.RegionConfig.SuperRegions {
-		if superRegion.SuperRegionName == string(superRegionName) {
-			return errors.Newf("super region %s already exists", superRegion.SuperRegionName)
+	if err := regionsDesc.ForEachSuperRegion(func(superRegion string) error {
+		if superRegion == string(superRegionName) {
+			return errors.Newf("super region %s already exists", superRegion)
 		}
-
-		for _, region := range superRegion.Regions {
+		return regionsDesc.ForEachRegionInSuperRegion(superRegion, func(region catpb.RegionName) error {
 			if _, found := regionSet[region]; found {
-				return errors.Newf("region %s is already part of super region %s", region, superRegion.SuperRegionName)
+				return errors.Newf("region %s is already part of super region %s", region, superRegion)
 			}
-		}
+			return nil
+		})
+	}); err != nil {
+		return err
 	}
 
 	addSuperRegion(typeDesc.RegionConfig, descpb.SuperRegion{
@@ -1653,3 +1741,554 @@ func (p *planner) addSuperRegion(
 		desc,
 	)
 }
+
+type alterDatabaseSecondaryRegion struct {
+	n    *tree.AlterDatabaseSecondaryRegion
+	desc *dbdesc.Mutable
+}
+
+func (p *planner) AlterDatabaseSecondaryRegion(
+	ctx context.Context, n *tree.AlterDatabaseSecondaryRegion,
+) (planNode, error) {
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.DatabaseName))
+	if err != nil {
+		return nil, err
+	}
+	if err := p.checkPrivilegesForMultiRegionOp(ctx, dbDesc); err != nil {
+		return nil, err
+	}
+
+	return &alterDatabaseSecondaryRegion{n: n, desc: dbDesc}, nil
+}
+
+func (n *alterDatabaseSecondaryRegion) startExec(params runParams) error {
+	if !n.desc.IsMultiRegion() {
+		return errors.WithHintf(
+			pgerror.New(pgcode.InvalidDatabaseDefinition,
+				"database must be multi-region to support a secondary region",
+			),
+			"you must first add a primary region to the database using "+
+				"ALTER DATABASE %s PRIMARY REGION <region_name>",
+			n.n.DatabaseName.String(),
+		)
+	}
+
+	// Verify that the secondary region is part of the region list.
+	prevRegionConfig, err := SynthesizeRegionConfig(params.ctx, params.p.txn, n.desc.ID, params.p.Descriptors())
+	if err != nil {
+		return err
+	}
+
+	// If we're setting the secondary region to the current secondary region,
+	// there is nothing to be done.
+	if prevRegionConfig.SecondaryRegion() == catpb.RegionName(n.n.SecondaryRegion) {
+		return nil
+	}
+
+	if !prevRegionConfig.Regions().Contains(catpb.RegionName(n.n.SecondaryRegion)) {
+		return errors.WithHintf(
+			pgerror.Newf(pgcode.InvalidDatabaseDefinition,
+				"region %s has not been added to the database",
+				n.n.SecondaryRegion.String(),
+			),
+			"you must add the region to the database before setting it as secondary region, using "+
+				"ALTER DATABASE %s ADD REGION %s",
+			n.n.DatabaseName.String(),
+			n.n.SecondaryRegion.String(),
+		)
+	}
+
+	// The secondary region cannot be the current primary region.
+	if prevRegionConfig.PrimaryRegion() == catpb.RegionName(n.n.SecondaryRegion) {
+		return pgerror.New(pgcode.InvalidDatabaseDefinition,
+			"the secondary region cannot be the same as the current primary region",
+		)
+	}
+
+	regions, ok := prevRegionConfig.GetSuperRegionRegionsForRegion(prevRegionConfig.PrimaryRegion())
+	if !ok && prevRegionConfig.IsMemberOfExplicitSuperRegion(catpb.RegionName(n.n.SecondaryRegion)) {
+		return pgerror.New(pgcode.InvalidDatabaseDefinition,
+			"the secondary region can not be in a super region, unless the primary is also "+
+				"within a super region",
+		)
+	}
+	err = validateSecondaryRegion(prevRegionConfig.PrimaryRegion(), catpb.RegionName(n.n.SecondaryRegion), regions)
+	if err != nil {
+		return err
+	}
+
+	// Get the type descriptor for the multi-region enum.
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, n.desc.RegionConfig.RegionEnumID)
+	if err != nil {
+		return err
+	}
+
+	// To update the secondary region we need to modify the database descriptor,
+	// update the multi-region enum, and write a new zone configuration.
+	n.desc.RegionConfig.SecondaryRegion = catpb.RegionName(n.n.SecondaryRegion)
+	if err := params.p.writeNonDropDatabaseChange(
+		params.ctx,
+		n.desc,
+		tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
+		return err
+	}
+
+	// Update the secondary region in the type descriptor, and write it back out.
+	typeDesc.RegionConfig.SecondaryRegion = catpb.RegionName(n.n.SecondaryRegion)
+	if err := params.p.writeTypeDesc(params.ctx, typeDesc); err != nil {
+		return err
+	}
+
+	updatedRegionConfig, err := SynthesizeRegionConfig(
+		params.ctx, params.p.txn, n.desc.ID, params.p.Descriptors(),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Update the database's zone configuration.
+	if err := ApplyZoneConfigFromDatabaseRegionConfig(
+		params.ctx,
+		n.desc.ID,
+		updatedRegionConfig,
+		params.p.Txn(),
+		params.p.execCfg,
+		params.p.Descriptors(),
+		params.extendedEvalCtx.Tracing.KVTracingEnabled(),
+	); err != nil {
+		return err
+	}
+
+	// Update all regional and regional by row tables.
+	return params.p.refreshZoneConfigsForTables(
+		params.ctx,
+		n.desc,
+	)
+}
+
+func (n *alterDatabaseSecondaryRegion) Next(runParams) (bool, error) { return false, nil }
+func (n *alterDatabaseSecondaryRegion) Values() tree.Datums          { return tree.Datums{} }
+func (n *alterDatabaseSecondaryRegion) Close(context.Context)        {}
+
+type alterDatabaseDropSecondaryRegion struct {
+	n    *tree.AlterDatabaseDropSecondaryRegion
+	desc *dbdesc.Mutable
+}
+
+func (p *planner) AlterDatabaseDropSecondaryRegion(
+	ctx context.Context, n *tree.AlterDatabaseDropSecondaryRegion,
+) (planNode, error) {
+
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.DatabaseName))
+	if err != nil {
+		return nil, err
+	}
+
+	return &alterDatabaseDropSecondaryRegion{n: n, desc: dbDesc}, nil
+
+}
+
+func (n *alterDatabaseDropSecondaryRegion) startExec(params runParams) error {
+	if !n.desc.IsMultiRegion() {
+		return errors.WithHintf(
+			pgerror.New(pgcode.InvalidDatabaseDefinition,
+				"database must be multi-region to support a secondary region",
+			),
+			"you must first add a primary region to the database using "+
+				"ALTER DATABASE %s PRIMARY REGION <region_name>",
+			n.n.DatabaseName.String(),
+		)
+	}
+
+	if n.desc.RegionConfig.SecondaryRegion == "" {
+		if n.n.IfExists {
+			params.p.BufferClientNotice(
+				params.ctx,
+				pgnotice.Newf("No secondary region is defined on the database; skipping"),
+			)
+			return nil
+		}
+		return pgerror.Newf(pgcode.UndefinedParameter,
+			"database %s doesn't have a secondary region defined", n.desc.GetName(),
+		)
+	}
+
+	typeID, err := n.desc.MultiRegionEnumID()
+	if err != nil {
+		return err
+	}
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, typeID)
+	if err != nil {
+		return err
+	}
+
+	n.desc.RegionConfig.SecondaryRegion = ""
+	if err := params.p.writeNonDropDatabaseChange(
+		params.ctx,
+		n.desc,
+		tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
+		return err
+	}
+
+	// Update the secondary region in the type descriptor, and write it back out.
+	typeDesc.RegionConfig.SecondaryRegion = ""
+	if err := params.p.writeTypeDesc(params.ctx, typeDesc); err != nil {
+		return err
+	}
+
+	updatedRegionConfig, err := SynthesizeRegionConfig(
+		params.ctx, params.p.txn, n.desc.ID, params.p.Descriptors(),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Update the database's zone configuration.
+	if err := ApplyZoneConfigFromDatabaseRegionConfig(
+		params.ctx,
+		n.desc.ID,
+		updatedRegionConfig,
+		params.p.Txn(),
+		params.p.execCfg,
+		params.p.Descriptors(),
+		params.extendedEvalCtx.Tracing.KVTracingEnabled(),
+	); err != nil {
+		return err
+	}
+
+	// Update all regional and regional by row tables.
+	if err := params.p.refreshZoneConfigsForTables(
+		params.ctx,
+		n.desc,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateSecondaryRegion ensures the primary region and the secondary region
+// are both inside or both outside a super region. The primary region and secondary
+// region should also be within the same super region.
+func validateSecondaryRegion(
+	primaryRegion catpb.RegionName, secondaryRegion catpb.RegionName, regions catpb.RegionNames,
+) error {
+
+	secondaryInCurrSuper, primaryInCurrSuper := false, false
+	for _, region := range regions {
+		if region == secondaryRegion {
+			secondaryInCurrSuper = true
+		}
+		if region == primaryRegion {
+			primaryInCurrSuper = true
+		}
+	}
+
+	if primaryInCurrSuper == secondaryInCurrSuper {
+		return nil
+	}
+
+	return pgerror.New(pgcode.InvalidDatabaseDefinition,
+		"the secondary region must be in the same super region as the current primary region",
+	)
+}
+
+// nameToRegionName returns a slice of region names.
+func nameToRegionName(regions tree.NameList) []catpb.RegionName {
+	regionList := make([]catpb.RegionName, len(regions))
+	for i, region := range regions {
+		regionList[i] = catpb.RegionName(region)
+	}
+
+	return regionList
+}
+
+func (n *alterDatabaseDropSecondaryRegion) Next(runParams) (bool, error) { return false, nil }
+func (n *alterDatabaseDropSecondaryRegion) Values() tree.Datums          { return tree.Datums{} }
+func (n *alterDatabaseDropSecondaryRegion) Close(context.Context)        {}
+
+type alterDatabaseSetZoneConfigExtensionNode struct {
+	n          *tree.AlterDatabaseSetZoneConfigExtension
+	desc       *dbdesc.Mutable
+	yamlConfig tree.TypedExpr
+	options    map[tree.Name]optionValue
+}
+
+// AlterDatabaseSetZoneConfigExtension transforms a
+// tree.AlterDatabaseSetZoneConfigExtension into a plan node.
+func (p *planner) AlterDatabaseSetZoneConfigExtension(
+	ctx context.Context, n *tree.AlterDatabaseSetZoneConfigExtension,
+) (planNode, error) {
+
+	if err := checkSchemaChangeEnabled(
+		ctx,
+		p.ExecCfg(),
+		"ALTER DATABASE",
+	); err != nil {
+		return nil, err
+	}
+
+	dbDesc, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(n.DatabaseName))
+	if err != nil {
+		return nil, err
+	}
+
+	if err := p.checkPrivilegesForMultiRegionOp(ctx, dbDesc); err != nil {
+		return nil, err
+	}
+
+	yamlConfig, err := p.getUpdatedZoneConfigYamlConfig(ctx, n.YAMLConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	options, err := p.getUpdatedZoneConfigOptions(ctx, n.Options, "database")
+	if err != nil {
+		return nil, err
+	}
+
+	if n.SetDefault {
+		return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+			"unsupported zone config parameter: SET DEFAULT")
+	}
+
+	return &alterDatabaseSetZoneConfigExtensionNode{
+		n:          n,
+		desc:       dbDesc,
+		yamlConfig: yamlConfig,
+		options:    options,
+	}, nil
+}
+
+func (n *alterDatabaseSetZoneConfigExtensionNode) startExec(params runParams) error {
+	// Verify that the database is a multi-region database.
+	if !n.desc.IsMultiRegion() {
+		return errors.WithHintf(
+			pgerror.New(pgcode.InvalidName,
+				"database must have associated regions before a zone config extension can be set",
+			),
+			"you must first add a primary region to the database using "+
+				"ALTER DATABASE %s PRIMARY REGION <region_name>",
+			n.n.DatabaseName.String(),
+		)
+	}
+
+	yamlConfig, deleteZone, err := evaluateYAMLConfig(n.yamlConfig, params)
+	if err != nil {
+		return err
+	}
+
+	// There's no need to inherit zone options from parents for zone config
+	// extension, because it's not allowed to give a nil value for a zone
+	// config when setting the extension.
+	optionsStr, _, setters, err := evaluateZoneOptions(n.options, params)
+	if err != nil {
+		return err
+	}
+
+	// Get the type descriptor for the multi-region enum.
+	typeID, err := n.desc.MultiRegionEnumID()
+	if err != nil {
+		return err
+	}
+	typeDesc, err := params.p.Descriptors().MutableByID(params.p.txn).Type(params.ctx, typeID)
+	if err != nil {
+		return err
+	}
+	regionsDesc := typeDesc.AsRegionEnumTypeDescriptor()
+	if regionsDesc == nil {
+		return errors.AssertionFailedf("expected region enum type, not %s for type %q (%d)",
+			typeDesc.GetKind(), typeDesc.GetName(), typeDesc.GetID())
+	}
+
+	// Verify that the region is present in the database, if necessary.
+	if n.n.LocalityLevel == tree.LocalityLevelTable && n.n.RegionName != "" {
+		var found bool
+		_ = regionsDesc.ForEachPublicRegion(func(name catpb.RegionName) error {
+			if name == catpb.RegionName(n.n.RegionName) {
+				found = true
+				return iterutil.StopIteration()
+			}
+			return nil
+		})
+		if !found {
+			return pgerror.Newf(
+				pgcode.UndefinedObject,
+				"region %q has not been added to the database",
+				n.n.RegionName,
+			)
+		}
+	}
+
+	if deleteZone {
+		switch n.n.LocalityLevel {
+		case tree.LocalityLevelGlobal:
+			typeDesc.RegionConfig.ZoneConfigExtensions.Global = nil
+		case tree.LocalityLevelTable:
+			if n.n.RegionName != "" {
+				delete(typeDesc.RegionConfig.ZoneConfigExtensions.RegionalIn, catpb.RegionName(n.n.RegionName))
+			} else {
+				typeDesc.RegionConfig.ZoneConfigExtensions.Regional = nil
+			}
+		default:
+			return errors.AssertionFailedf("unexpected locality level %v", n.n.LocalityLevel)
+		}
+	} else {
+		// Validate the user input.
+		if len(yamlConfig) == 0 || yamlConfig[len(yamlConfig)-1] != '\n' {
+			// YAML values must always end with a newline character. If there is none,
+			// for UX convenience add one.
+			yamlConfig += "\n"
+		}
+
+		// Load settings from YAML. If there was no YAML (e.g. because the
+		// query specified CONFIGURE ZONE USING), the YAML string will be
+		// empty, in which case the unmarshaling will be a no-op. This is
+		// innocuous.
+		newZone := zonepb.NewZoneConfig()
+		if err := yaml.UnmarshalStrict([]byte(yamlConfig), newZone); err != nil {
+			return pgerror.Wrap(err, pgcode.CheckViolation, "could not parse zone config")
+		}
+
+		// Load settings from var = val assignments. If there were no such
+		// settings, (e.g. because the query specified CONFIGURE ZONE = or
+		// USING DEFAULT), the setter slice will be empty and this will be
+		// a no-op. This is innocuous.
+		for _, setter := range setters {
+			// A setter may fail with an error-via-panic. Catch those.
+			if err := func() (err error) {
+				defer func() {
+					if p := recover(); p != nil {
+						if errP, ok := p.(error); ok {
+							// Catch and return the error.
+							err = errP
+						} else {
+							// Nothing we know about, let it continue as a panic.
+							panic(p)
+						}
+					}
+				}()
+
+				setter(newZone)
+				return nil
+			}(); err != nil {
+				return err
+			}
+		}
+
+		// Validate that there are no conflicts in the zone setup.
+		if err := validateNoRepeatKeysInZone(newZone); err != nil {
+			return err
+		}
+
+		if err := validateZoneAttrsAndLocalities(params.ctx, params.p.ExecCfg(), newZone); err != nil {
+			return err
+		}
+
+		switch n.n.LocalityLevel {
+		case tree.LocalityLevelGlobal:
+			typeDesc.RegionConfig.ZoneConfigExtensions.Global = newZone
+		case tree.LocalityLevelTable:
+			if n.n.RegionName != "" {
+				if typeDesc.RegionConfig.ZoneConfigExtensions.RegionalIn == nil {
+					typeDesc.RegionConfig.ZoneConfigExtensions.RegionalIn = make(map[catpb.RegionName]zonepb.ZoneConfig)
+				}
+				typeDesc.RegionConfig.ZoneConfigExtensions.RegionalIn[catpb.RegionName(n.n.RegionName)] = *newZone
+			} else {
+				typeDesc.RegionConfig.ZoneConfigExtensions.Regional = newZone
+			}
+		default:
+			return errors.AssertionFailedf("unexpected locality level %v", n.n.LocalityLevel)
+		}
+	}
+
+	if err := params.p.writeTypeSchemaChange(
+		params.ctx, typeDesc, tree.AsStringWithFQNames(n.n, params.Ann()),
+	); err != nil {
+		return err
+	}
+
+	updatedRegionConfig, err := SynthesizeRegionConfig(params.ctx, params.p.txn, n.desc.ID, params.p.Descriptors())
+	if err != nil {
+		return err
+	}
+
+	// We need to validate that the zone config extension won't violate the original
+	// region config before we truly write the update. Since the zone config
+	// extension can affect the final zone config of the database AND
+	// tables in it, we now follow these steps:
+	// 1. Generate and validate the newly created zone config for the database.
+	// 2. For each table under this database, validate the newly derived zone
+	// config. After the validation passed for all tables, we are now sure that the
+	// new zone config is sound and update the zone config for each table.
+	// 3. Update the zone config for the database.
+
+	// Validate if the zone config extension is compatible with the database.
+	dbZoneConfig, err := generateAndValidateZoneConfigForMultiRegionDatabase(
+		params.ctx, params.ExecCfg(), updatedRegionConfig,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Validate and update all tables' zone configurations.
+	if err := params.p.refreshZoneConfigsForTablesWithValidation(
+		params.ctx,
+		n.desc,
+	); err != nil {
+		return err
+	}
+
+	// Apply the zone config extension to the database.
+	if err := applyZoneConfigForMultiRegionDatabase(
+		params.ctx,
+		n.desc.ID,
+		dbZoneConfig,
+		params.p.Txn(),
+		params.p.execCfg,
+		params.p.Descriptors(),
+		params.extendedEvalCtx.Tracing.KVTracingEnabled(),
+	); err != nil {
+		return err
+	}
+
+	// Record that the change has occurred for auditing.
+	eventDetails := eventpb.CommonZoneConfigDetails{
+		Target:  tree.AsStringWithFQNames(n.n, params.Ann()),
+		Config:  strings.TrimSpace(yamlConfig),
+		Options: optionsStr,
+	}
+	var info logpb.EventPayload
+	if deleteZone {
+		info = &eventpb.RemoveZoneConfig{CommonZoneConfigDetails: eventDetails}
+	} else {
+		info = &eventpb.AlterDatabaseSetZoneConfigExtension{CommonZoneConfigDetails: eventDetails}
+	}
+	if err := params.p.logEvent(params.ctx, n.desc.ID, info); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (n *alterDatabaseSetZoneConfigExtensionNode) Next(runParams) (bool, error) { return false, nil }
+func (n *alterDatabaseSetZoneConfigExtensionNode) Values() tree.Datums          { return tree.Datums{} }
+func (n *alterDatabaseSetZoneConfigExtensionNode) Close(context.Context)        {}

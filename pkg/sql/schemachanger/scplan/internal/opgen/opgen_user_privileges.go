@@ -20,19 +20,23 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.UserPrivileges) scop.Op {
-					return notImplemented(this)
+				emit(func(this *scpb.UserPrivileges) *scop.UpdateUserPrivileges {
+					return &scop.UpdateUserPrivileges{
+						Privileges: *this,
+					}
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
 				// TODO(postamar): remove revertibility constraint when possible
 				revertible(false),
-				emit(func(this *scpb.UserPrivileges) scop.Op {
-					return notImplemented(this)
+				emit(func(this *scpb.UserPrivileges) *scop.RemoveUserPrivileges {
+					return &scop.RemoveUserPrivileges{
+						DescriptorID: this.DescriptorID,
+						User:         this.UserName,
+					}
 				}),
 			),
 		),

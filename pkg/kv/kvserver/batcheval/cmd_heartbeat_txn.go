@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -24,13 +25,13 @@ import (
 )
 
 func init() {
-	RegisterReadWriteCommand(roachpb.HeartbeatTxn, declareKeysHeartbeatTransaction, HeartbeatTxn)
+	RegisterReadWriteCommand(kvpb.HeartbeatTxn, declareKeysHeartbeatTransaction, HeartbeatTxn)
 }
 
 func declareKeysHeartbeatTransaction(
 	rs ImmutableRangeState,
-	header *roachpb.Header,
-	req roachpb.Request,
+	header *kvpb.Header,
+	req kvpb.Request,
 	latchSpans, _ *spanset.SpanSet,
 	_ time.Duration,
 ) {
@@ -41,11 +42,11 @@ func declareKeysHeartbeatTransaction(
 // timestamp after receiving transaction heartbeat messages from
 // coordinator. Returns the updated transaction.
 func HeartbeatTxn(
-	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.HeartbeatTxnRequest)
+	args := cArgs.Args.(*kvpb.HeartbeatTxnRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.HeartbeatTxnResponse)
+	reply := resp.(*kvpb.HeartbeatTxnResponse)
 
 	if err := VerifyTransaction(h, args, roachpb.PENDING, roachpb.STAGING); err != nil {
 		return result.Result{}, err
@@ -73,13 +74,24 @@ func HeartbeatTxn(
 		}
 	}
 
+	// If the transaction is pending, take the opportunity to determine the
+	// minimum timestamp that it will be allowed to commit at to account for any
+	// transaction pushes. This can help inform the transaction coordinator of
+	// pushes earlier than commit time, but is entirely best-effort.
+	//
+	// NOTE: we cannot do this if the transaction record is STAGING because it may
+	// already be implicitly committed.
+	if txn.Status == roachpb.PENDING {
+		BumpToMinTxnCommitTS(ctx, cArgs.EvalCtx, &txn)
+	}
+
 	if !txn.Status.IsFinalized() {
 		// NOTE: this only updates the LastHeartbeat. It doesn't update any other
 		// field from h.Txn, even if it could. Whether that's a good thing or not
 		// is up for debate.
 		txn.LastHeartbeat.Forward(args.Now)
 		txnRecord := txn.AsRecord()
-		if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, nil, &txnRecord); err != nil {
+		if err := storage.MVCCPutProto(ctx, readWriter, cArgs.Stats, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &txnRecord); err != nil {
 			return result.Result{}, err
 		}
 	}

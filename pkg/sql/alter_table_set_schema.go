@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 )
 
@@ -80,7 +81,7 @@ func (p *planner) AlterTableSetSchema(
 	// If so, then we disallow renaming, otherwise we allow it.
 	for _, dependent := range tableDesc.DependedOnBy {
 		if !dependent.ByID {
-			return nil, p.dependentViewError(
+			return nil, p.dependentError(
 				ctx, string(tableDesc.DescriptorType()), tableDesc.Name,
 				tableDesc.ParentID, dependent.ID, "set schema on",
 			)
@@ -96,7 +97,10 @@ func (p *planner) AlterTableSetSchema(
 }
 
 func (n *alterTableSetSchemaNode) startExec(params runParams) error {
-	telemetry.Inc(n.n.TelemetryCounter())
+	telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra(
+		tree.GetTableType(n.n.IsSequence, n.n.IsView, n.n.IsMaterialized),
+		n.n.TelemetryName(),
+	))
 	ctx := params.ctx
 	p := params.p
 	tableDesc := n.tableDesc
@@ -120,7 +124,7 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 		return nil
 	}
 
-	objectID, err := p.Descriptors().Direct().LookupObjectID(
+	objectID, err := p.Descriptors().LookupObjectID(
 		ctx, p.txn, tableDesc.GetParentID(), desiredSchemaID, tableDesc.GetName(),
 	)
 	if err == nil && objectID != descpb.InvalidID {
@@ -134,7 +138,9 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 	tableDesc.SetParentSchemaID(desiredSchemaID)
 
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, tableDesc); err != nil {
+		return err
+	}
 
 	if err := p.writeSchemaChange(
 		ctx, tableDesc, descpb.InvalidMutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
@@ -154,11 +160,9 @@ func (n *alterTableSetSchemaNode) startExec(params runParams) error {
 	return p.logEvent(ctx,
 		desiredSchemaID,
 		&eventpb.SetSchema{
-			CommonEventDetails:    eventpb.CommonEventDetails{},
-			CommonSQLEventDetails: eventpb.CommonSQLEventDetails{},
-			DescriptorName:        oldName.FQString(),
-			NewDescriptorName:     newName.FQString(),
-			DescriptorType:        kind,
+			DescriptorName:    oldName.FQString(),
+			NewDescriptorName: newName.FQString(),
+			DescriptorType:    kind,
 		},
 	)
 }

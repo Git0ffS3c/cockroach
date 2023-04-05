@@ -22,13 +22,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -111,14 +112,8 @@ func getSQLStatsCompactionSchedule(t *testing.T, helper *testHelper) *jobs.Sched
 	helper.sqlDB.
 		QueryRow(t, `SELECT schedule_id FROM system.scheduled_jobs WHERE schedule_name = 'sql-stats-compaction'`).
 		Scan(&jobID)
-	sj, err :=
-		jobs.LoadScheduledJob(
-			context.Background(),
-			helper.env,
-			jobID,
-			helper.server.InternalExecutor().(sqlutil.InternalExecutor),
-			nil, /* txn */
-		)
+	schedules := jobs.ScheduledJobDB(helper.server.InternalDB().(isql.DB))
+	sj, err := schedules.Load(context.Background(), helper.env, jobID)
 	require.NoError(t, err)
 	require.NotNil(t, sj)
 	return sj
@@ -177,9 +172,10 @@ func TestScheduledSQLStatsCompaction(t *testing.T) {
 func TestSQLStatsScheduleOperations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderStressRace(t, "test is too slow to run under race")
 
 	ctx := context.Background()
-	helper, helperCleanup := newTestHelper(t, nil /* sqlStatsKnobs */)
+	helper, helperCleanup := newTestHelper(t, &sqlstats.TestingKnobs{JobMonitorUpdateCheckInterval: time.Second})
 	defer helperCleanup()
 
 	schedID := getSQLStatsCompactionSchedule(t, helper).ScheduleID()
@@ -225,11 +221,17 @@ func TestSQLStatsScheduleOperations(t *testing.T) {
 				require.Equal(t, expr, sj.ScheduleExpr())
 				return nil
 			})
+
 			require.True(t, errors.Is(
 				errors.Unwrap(err), persistedsqlstats.ErrScheduleIntervalTooLong),
 				"expected ErrScheduleIntervalTooLong, but found %+v", err)
 
 			helper.sqlDB.Exec(t, "RESET CLUSTER SETTING sql.stats.cleanup.recurrence")
+			helper.sqlDB.CheckQueryResultsRetry(t,
+				`SHOW CLUSTER SETTING sql.stats.cleanup.recurrence`,
+				[][]string{{"@hourly"}},
+			)
+
 			helper.sqlDB.CheckQueryResultsRetry(t,
 				fmt.Sprintf(`
 SELECT schedule_expr

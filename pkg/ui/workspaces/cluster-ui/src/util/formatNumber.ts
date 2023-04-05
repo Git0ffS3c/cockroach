@@ -11,13 +11,13 @@
 import { isNumber } from "lodash";
 
 function numberToString(n: number) {
-  return n.toString();
+  return n?.toString() || "";
 }
 
 export function formatNumberForDisplay(
   value: number,
   format: (n: number) => string = numberToString,
-) {
+): string {
   if (!isNumber(value)) {
     return "-";
   }

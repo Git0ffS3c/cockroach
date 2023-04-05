@@ -97,7 +97,7 @@ type StmtBuf struct {
 		cond *sync.Cond
 
 		// data contains the elements of the buffer.
-		data ring.Buffer // []Command
+		data ring.Buffer[Command]
 
 		// startPos indicates the index of the first command currently in data
 		// relative to the start of the connection.
@@ -140,6 +140,15 @@ type ExecStmt struct {
 	// LastInBatch indicates if this command contains the last query in a
 	// simple protocol Query message that contains a batch of 1 or more queries.
 	LastInBatch bool
+	// LastInBatchBeforeShowCommitTimestamp indicates that this command contains
+	// the second-to-last query in a simple protocol Query message that contains
+	// a batch of 2 or more queries and the last query is SHOW COMMIT TIMESTAMP.
+	// Detecting this case allows us to treat this command as the LastInBatch
+	// such that the SHOW COMMIT TIMESTAMP statement can return the timestamp of
+	// the transaction which applied to all the other statements in the batch.
+	// Note that SHOW COMMIT TIMESTAMP is not permitted in any other position in
+	// such a multi-statement implicit transaction.
+	LastInBatchBeforeShowCommitTimestamp bool
 }
 
 // command implements the Command interface.
@@ -218,7 +227,7 @@ var _ Command = PrepareStmt{}
 // DescribeStmt is the Command for producing info about a prepared statement or
 // portal.
 type DescribeStmt struct {
-	Name string
+	Name tree.Name
 	Type pgwirebase.PrepareType
 }
 
@@ -321,13 +330,21 @@ var _ Command = Flush{}
 
 // CopyIn is the command for execution of the Copy-in pgwire subprotocol.
 type CopyIn struct {
-	Stmt *tree.CopyFrom
+	ParsedStmt parser.Statement
+	Stmt       *tree.CopyFrom
 	// Conn is the network connection. Execution of the CopyFrom statement takes
 	// control of the connection.
 	Conn pgwirebase.Conn
 	// CopyDone is decremented once execution finishes, signaling that control of
 	// the connection is being handed back to the network routine.
 	CopyDone *sync.WaitGroup
+	// TimeReceived is the time at which the message was received
+	// from the client. Used to compute the service latency.
+	TimeReceived time.Time
+	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
+	// stats reporting.
+	ParseStart time.Time
+	ParseEnd   time.Time
 }
 
 // command implements the Command interface.
@@ -342,6 +359,32 @@ func (c CopyIn) String() string {
 }
 
 var _ Command = CopyIn{}
+
+// CopyOut is the command for execution of the Copy-out pgwire subprotocol.
+type CopyOut struct {
+	ParsedStmt parser.Statement
+	Stmt       *tree.CopyTo
+	// TimeReceived is the time at which the message was received
+	// from the client. Used to compute the service latency.
+	TimeReceived time.Time
+	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
+	// stats reporting.
+	ParseStart time.Time
+	ParseEnd   time.Time
+}
+
+// command implements the Command interface.
+func (CopyOut) command() string { return "copy" }
+
+func (c CopyOut) String() string {
+	s := "(empty)"
+	if c.Stmt != nil {
+		s = c.Stmt.String()
+	}
+	return fmt.Sprintf("CopyOut: %s", s)
+}
+
+var _ Command = CopyOut{}
 
 // DrainRequest represents a notice that the server is draining and command
 // processing should stop soon.
@@ -397,9 +440,9 @@ func (buf *StmtBuf) Init() {
 // Close() is idempotent.
 func (buf *StmtBuf) Close() {
 	buf.mu.Lock()
+	defer buf.mu.Unlock()
 	buf.mu.closed = true
 	buf.mu.cond.Signal()
-	buf.mu.Unlock()
 }
 
 // Push adds a Command to the end of the buffer. If a CurCmd() call was blocked
@@ -442,7 +485,7 @@ func (buf *StmtBuf) CurCmd() (Command, CmdPos, error) {
 		}
 		len := buf.mu.data.Len()
 		if cmdIdx < len {
-			return buf.mu.data.Get(cmdIdx).(Command), curPos, nil
+			return buf.mu.data.Get(cmdIdx), curPos, nil
 		}
 		if cmdIdx != len {
 			return nil, 0, errors.AssertionFailedf(
@@ -498,9 +541,9 @@ func (buf *StmtBuf) Ltrim(ctx context.Context, pos CmdPos) {
 // yet. The previous CmdPos is returned.
 func (buf *StmtBuf) AdvanceOne() CmdPos {
 	buf.mu.Lock()
+	defer buf.mu.Unlock()
 	prev := buf.mu.curPos
 	buf.mu.curPos++
-	buf.mu.Unlock()
 	return prev
 }
 
@@ -516,18 +559,21 @@ func (buf *StmtBuf) AdvanceOne() CmdPos {
 // It is an error to start seeking when the cursor is positioned on an empty
 // slot.
 func (buf *StmtBuf) seekToNextBatch() error {
-	buf.mu.Lock()
-	curPos := buf.mu.curPos
-	cmdIdx, err := buf.translatePosLocked(curPos)
-	if err != nil {
-		buf.mu.Unlock()
+	if err := func() error {
+		buf.mu.Lock()
+		defer buf.mu.Unlock()
+		curPos := buf.mu.curPos
+		cmdIdx, err := buf.translatePosLocked(curPos)
+		if err != nil {
+			return err
+		}
+		if cmdIdx == buf.mu.data.Len() {
+			return errors.AssertionFailedf("invalid seek start point")
+		}
+		return nil
+	}(); err != nil {
 		return err
 	}
-	if cmdIdx == buf.mu.data.Len() {
-		buf.mu.Unlock()
-		return errors.AssertionFailedf("invalid seek start point")
-	}
-	buf.mu.Unlock()
 
 	var foundSync bool
 	for !foundSync {
@@ -536,18 +582,21 @@ func (buf *StmtBuf) seekToNextBatch() error {
 		if err != nil {
 			return err
 		}
-		buf.mu.Lock()
-		cmdIdx, err := buf.translatePosLocked(pos)
-		if err != nil {
-			buf.mu.Unlock()
+		if err := func() error {
+			buf.mu.Lock()
+			defer buf.mu.Unlock()
+			cmdIdx, err := buf.translatePosLocked(pos)
+			if err != nil {
+				return err
+			}
+
+			if _, ok := buf.mu.data.Get(cmdIdx).(Sync); ok {
+				foundSync = true
+			}
+			return nil
+		}(); err != nil {
 			return err
 		}
-
-		if _, ok := buf.mu.data.Get(cmdIdx).(Sync); ok {
-			foundSync = true
-		}
-
-		buf.mu.Unlock()
 	}
 	return nil
 }
@@ -608,6 +657,7 @@ type ClientComm interface {
 		limit int,
 		portalName string,
 		implicitTxn bool,
+		portalPausability PortalPausablity,
 	) CommandResult
 	// CreatePrepareResult creates a result for a PrepareStmt command.
 	CreatePrepareResult(pos CmdPos) ParseResult
@@ -627,7 +677,9 @@ type ClientComm interface {
 	// CreateEmptyQueryResult creates a result for an empty-string query.
 	CreateEmptyQueryResult(pos CmdPos) EmptyQueryResult
 	// CreateCopyInResult creates a result for a Copy-in command.
-	CreateCopyInResult(pos CmdPos) CopyInResult
+	CreateCopyInResult(cmd CopyIn, pos CmdPos) CopyInResult
+	// CreateCopyOutResult creates a result for a Copy-out command.
+	CreateCopyOutResult(cmd CopyOut, pos CmdPos) CopyOutResult
 	// CreateDrainResult creates a result for a Drain command.
 	CreateDrainResult(pos CmdPos) DrainResult
 
@@ -752,6 +804,10 @@ type RestrictedCommandResult interface {
 	// to this CommandResult, will be flushed immediately to the client.
 	// This is currently used for sinkless changefeeds.
 	DisableBuffering()
+
+	// GetBulkJobId returns the id of the job for the query, if the query is
+	// IMPORT, BACKUP or RESTORE.
+	GetBulkJobId() uint64
 }
 
 // DescribeResult represents the result of a Describe command (for either
@@ -818,9 +874,29 @@ type EmptyQueryResult interface {
 }
 
 // CopyInResult represents the result of a CopyIn command. Closing this result
-// produces no output for the client.
+// sends a CommandComplete message to the client.
 type CopyInResult interface {
 	ResultBase
+
+	// SetRowsAffected sets the number of rows affected by the COPY.
+	SetRowsAffected(ctx context.Context, n int)
+}
+
+// CopyOutResult represents the result of a CopyOut command. Closing this result
+// sends a CommandComplete message to the client.
+type CopyOutResult interface {
+	ResultBase
+
+	// SendCopyOut sends the copy out response to the client.
+	SendCopyOut(
+		ctx context.Context, cols colinfo.ResultColumns, format pgwirebase.FormatCode,
+	) error
+
+	// SendCopyData adds a COPY data row to the result.
+	SendCopyData(ctx context.Context, copyData []byte, isHeader bool) error
+
+	// SendCopyDone sends the copy done response to the client.
+	SendCopyDone(ctx context.Context) error
 }
 
 // ClientLock is an interface returned by ClientComm.lockCommunication(). It
@@ -912,12 +988,12 @@ func (r *streamingCommandResult) SetColumns(ctx context.Context, cols colinfo.Re
 
 // BufferParamStatusUpdate is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) BufferParamStatusUpdate(key string, val string) {
-	panic("unimplemented")
+	// Unimplemented: the internal executor does not support status updated.
 }
 
 // BufferNotice is part of the RestrictedCommandResult interface.
 func (r *streamingCommandResult) BufferNotice(notice pgnotice.Notice) {
-	panic("unimplemented")
+	// Unimplemented: the internal executor does not support notices.
 }
 
 // ResetStmtType is part of the RestrictedCommandResult interface.
@@ -958,6 +1034,11 @@ func (r *streamingCommandResult) SetError(err error) {
 	// is present) since we might replace the error with another one later which
 	// is allowed by the interface. An example of this is queryDone() closure
 	// in execStmtInOpenState().
+}
+
+// GetEntryFromExtraInfo is part of the sql.RestrictedCommandResult interface.
+func (r *streamingCommandResult) GetBulkJobId() uint64 {
+	return 0
 }
 
 // Err is part of the RestrictedCommandResult interface.
@@ -1008,3 +1089,36 @@ func (r *streamingCommandResult) SetPortalOutput(
 	context.Context, colinfo.ResultColumns, []pgwirebase.FormatCode,
 ) {
 }
+
+// SetRowsAffected is part of the sql.CopyInResult interface.
+func (r *streamingCommandResult) SetRowsAffected(ctx context.Context, rows int) {
+	r.rowsAffected = rows
+}
+
+// SendCopyOut is part of the sql.CopyOutResult interface.
+func (r *streamingCommandResult) SendCopyOut(
+	ctx context.Context, cols colinfo.ResultColumns, format pgwirebase.FormatCode,
+) error {
+	return errors.AssertionFailedf("streamingCommandResult does not implement SendCopyOut")
+}
+
+// SendCopyData is part of the sql.CopyOutResult interface.
+func (r *streamingCommandResult) SendCopyData(
+	ctx context.Context, copyData []byte, isHeader bool,
+) error {
+	return errors.AssertionFailedf("streamingCommandResult does not implement SendCopyData")
+}
+
+// SendCopyDone is part of the pgwirebase.Conn interface.
+func (r *streamingCommandResult) SendCopyDone(ctx context.Context) error {
+	return errors.AssertionFailedf("streamingCommandResult does not implement SendCopyDone")
+}
+
+// BulkJobInfoKey are for keys stored in pgwire.commandResult.bulkJobInfo.
+type BulkJobInfoKey string
+
+const (
+	// BulkJobIdColName is the key for the job id for bulk jobs.
+	BulkJobIdColName BulkJobInfoKey = "BulkJobId"
+	NumRows          BulkJobInfoKey = "NumRows"
+)

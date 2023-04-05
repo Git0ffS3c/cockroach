@@ -10,7 +10,7 @@ package statusccl
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -59,7 +59,7 @@ func TestTenantGRPCServices(t *testing.T) {
 	t.Logf("subtests starting")
 
 	t.Run("gRPC is running", func(t *testing.T) {
-		grpcAddr := tenant.SQLAddr()
+		grpcAddr := tenant.RPCAddr()
 		rpcCtx := tenant.RPCContext()
 
 		nodeID := roachpb.NodeID(tenant.SQLInstanceID())
@@ -81,7 +81,7 @@ func TestTenantGRPCServices(t *testing.T) {
 		resp, err := httpClient.Get(tenant.AdminURL() + "/_status/statements")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "transactions")
 	})
@@ -92,7 +92,6 @@ func TestTenantGRPCServices(t *testing.T) {
 
 	tenant2, connTenant2 := serverutils.StartTenant(t, server, base.TestTenantArgs{
 		TenantID:     tenantID,
-		Existing:     true,
 		TestingKnobs: testingKnobs,
 	})
 	defer connTenant2.Close()
@@ -101,14 +100,14 @@ func TestTenantGRPCServices(t *testing.T) {
 		resp, err := httpClient.Get(tenant2.AdminURL() + "/_status/statements")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "CREATE TABLE test")
 		require.Contains(t, string(body), "INSERT INTO test VALUES")
 	})
 
 	tenant3, connTenant3 := serverutils.StartTenant(t, server, base.TestTenantArgs{
-		TenantID:     roachpb.MakeTenantID(11),
+		TenantID:     roachpb.MustMakeTenantID(11),
 		TestingKnobs: testingKnobs,
 	})
 	defer connTenant3.Close()
@@ -121,14 +120,14 @@ func TestTenantGRPCServices(t *testing.T) {
 		resp, err := httpClient3.Get(tenant3.AdminURL() + "/_status/statements")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.NotContains(t, string(body), "CREATE TABLE test")
 		require.NotContains(t, string(body), "INSERT INTO test VALUES")
 	})
 
 	t.Run("fanout of statements endpoint between tenants", func(t *testing.T) {
-		grpcAddr := tenant.SQLAddr()
+		grpcAddr := tenant.RPCAddr()
 		rpcCtx := tenant2.RPCContext()
 
 		nodeID := roachpb.NodeID(tenant.SQLInstanceID())

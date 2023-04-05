@@ -3,7 +3,12 @@
 workspace(
     name = "com_github_cockroachdb_cockroach",
     managed_directories = {
-        "@npm": ["pkg/ui/node_modules"],
+        "@npm_eslint_plugin_crdb": ["pkg/ui/workspaces/eslint-plugin-crdb/node_modules"],
+        "@npm_protos": ["pkg/ui/workspaces/db-console/src/js/node_modules"],
+        "@npm_cluster_ui": ["pkg/ui/workspaces/cluster_ui/node_modules"],
+        "@npm_db_console": ["pkg/ui/workspaces/db-console/node_modules"],
+        "@npm_e2e_tests": ["pkg/ui/workspaces/e2e-tests/node_modules"],
+        "@npm_mirror_npm": ["pkg/cmd/mirror/npm/node_modules"],
     },
 )
 
@@ -13,33 +18,41 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # Load go bazel tools. This gives us access to the go bazel SDK/toolchains.
 http_archive(
     name = "io_bazel_rules_go",
-    sha256 = "8a993815a6a7cfe47e46238383f0e36a80b9ce0ac482f855c7288a31565b5661",
-    strip_prefix = "cockroachdb-rules_go-58cb947",
+    sha256 = "f02f82e74033ea42cf81da4319b9f8e0d4c5fa49346537267bba84053dc68ceb",
+    strip_prefix = "cockroachdb-rules_go-993120e",
     urls = [
-        # cockroachdb/rules_go as of 58cb94707783f529462d4c6d3c698933a1022942
-        # (upstream release-0.29 plus a few patches).
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.27.0-56-g58cb947.tar.gz",
+        # cockroachdb/rules_go as of 993120ee175025d8556a4dd8bec330e6c4b9ac13
+        # (upstream release-0.37 plus a few patches).
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_go-v0.27.0-240-g993120e.tar.gz",
     ],
 )
 
 # Like the above, but for nodeJS.
 http_archive(
     name = "build_bazel_rules_nodejs",
-    sha256 = "cfc289523cf1594598215901154a6c2515e8bf3671fd708264a6f6aefe02bf39",
-    urls = [
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/rules_nodejs-4.4.6.tar.gz",
-    ],
+    sha256 = "7f3f747db3f924547b9ffdf86da6c604335ad95e09d4e5a69fdcfdb505099421",
+    strip_prefix = "cockroachdb-rules_nodejs-59a92cc",
+    # As of 59a92ccbcd2f5c40cf2368bbb9f7b102491f537b, crl-5.5.0 in our
+    # rules_nodejs fork.
+    urls = ["https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_nodejs-5.5.0-1-g59a92cc.tar.gz"],
+)
+
+# The rules_nodejs "core" module. We use the same source archive as the non-core
+# module above, because otherwise it'll pull from upstream.
+http_archive(
+    name = "rules_nodejs",
+    sha256 = "7f3f747db3f924547b9ffdf86da6c604335ad95e09d4e5a69fdcfdb505099421",
+    strip_prefix = "cockroachdb-rules_nodejs-59a92cc",
+    urls = ["https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-rules_nodejs-5.5.0-1-g59a92cc.tar.gz"],
 )
 
 # Load gazelle. This lets us auto-generate BUILD.bazel files throughout the
 # repo.
 http_archive(
     name = "bazel_gazelle",
-    sha256 = "9fba095e4bebd8c6748154ca53c365862af47fa1651f7c0d25459e6ca5bb208f",
-    strip_prefix = "bazelbuild-bazel-gazelle-3ea1d64",
+    sha256 = "5982e5463f171da99e3bdaeff8c0f48283a7a5f396ec5282910b9e8a49c0dd7e",
     urls = [
-        # v0.24.0
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/bazelbuild-bazel-gazelle-v0.24.0-0-g3ea1d64.tar.gz",
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/bazel-gazelle-v0.25.0.tar.gz",
     ],
 )
 
@@ -91,12 +104,14 @@ http_archive(
 
 http_archive(
     name = "bazel_skylib",
-    sha256 = "1c531376ac7e5a180e0237938a2536de0c54d93f5c278634818e0efc952dd56c",
+    sha256 = "4ede85dfaa97c5662c3fb2042a7ac322d5f029fdc7a6b9daa9423b746e8e8fc0",
+    strip_prefix = "bazelbuild-bazel-skylib-6a17363",
     urls = [
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/bazel-skylib-1.0.3.tar.gz",
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/bazelbuild-bazel-skylib-1.3.0-0-g6a17363.tar.gz",
     ],
 )
 
+# org_golang_x_sys handled in DEPS.bzl.
 # org_golang_x_tools handled in DEPS.bzl.
 # org_golang_x_xerrors handled in DEPS.bzl.
 
@@ -127,13 +142,18 @@ http_archive(
         "@io_bazel_rules_go//third_party:go_googleapis-gazelle.patch",
         "@com_github_cockroachdb_cockroach//build/patches:go_googleapis.patch",
     ],
-    sha256 = "a85c6a00e9cf0f004992ebea1d10688e3beea9f8e1a5a04ee53f367e72ee85af",
-    strip_prefix = "googleapis-409e134ffaacc243052b08e6fb8e2d458014ed37",
-    # master, as of 2021-10-06
+    sha256 = "ba694861340e792fd31cb77274eacaf6e4ca8bda97707898f41d8bebfd8a4984",
+    strip_prefix = "googleapis-83c3605afb5a39952bf0a0809875d41cf2a558ca",
+    # master, as of 2022-12-05
+    # NB: You may have to update this when bumping rules_go. Bumping to the same
+    # version in rules_go (go/private/repositories.bzl) is probably what you
+    # want to do.
     urls = [
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/409e134ffaacc243052b08e6fb8e2d458014ed37.zip",
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/googleapis-83c3605afb5a39952bf0a0809875d41cf2a558ca.zip",
     ],
 )
+
+# com_github_golang_mock handled in DEPS.bzl.
 
 # Load the go dependencies and invoke them.
 load(
@@ -150,22 +170,15 @@ load(
 go_download_sdk(
     name = "go_sdk",
     sdks = {
-        "darwin_amd64": ("go1.17.6.darwin-amd64.tar.gz", "874bc6f95e07697380069a394a21e05576a18d60f4ba178646e1ebed8f8b1f89"),
-        "darwin_arm64": ("go1.17.6.darwin-arm64.tar.gz", "dc54f3f4099e2be9e9c33bf926a7dc3ad64f34717142f7abcaff9ae44bc03d0c"),
-        "freebsd_386": ("go1.17.6.freebsd-386.tar.gz", "d5fbe0292fc0ae734041d54a5614712fa50337c76927df7bc749c27a543ed6a2"),
-        "freebsd_amd64": ("go1.17.6.freebsd-amd64.tar.gz", "2b759b0eb1fc25bc1da5612ac13f60c4bf4cd6f3c7e4f3fe3476f454d08de318"),
-        "linux_386": ("go1.17.6.linux-386.tar.gz", "06c50fb0d44bb03dd4ea8795f9448379c5825d2765307b51f66905084c3ba541"),
-        "linux_amd64": ("go1.17.6.linux-amd64.tar.gz", "231654bbf2dab3d86c1619ce799e77b03d96f9b50770297c8f4dff8836fc8ca2"),
-        "linux_arm64": ("go1.17.6.linux-arm64.tar.gz", "82c1a033cce9bc1b47073fd6285233133040f0378439f3c4659fe77cc534622a"),
-        "linux_armv6l": ("go1.17.6.linux-armv6l.tar.gz", "9ac723e6b41cb7c3651099a09332a8a778b69aa63a5e6baaa47caf0d818e2d6d"),
-        "linux_ppc64le": ("go1.17.6.linux-ppc64le.tar.gz", "adc35c920b8c0253d4dd001f8979e0db4c6111a60cd5e0785a8bee95dba1fcaa"),
-        "linux_s390x": ("go1.17.6.linux-s390x.tar.gz", "ccb2d4509db846be7055d1105b28154e72cd43162c4ef79c38a936a3e6f26e1d"),
-        "windows_386": ("go1.17.6.windows-386.zip", "3809c4e40482ff047200c8b1e22a43a2c9c79b53ef540668d2b00f7228f093aa"),
-        "windows_amd64": ("go1.17.6.windows-amd64.zip", "5bf8f87aec7edfc08e6bc845f1c30dba6de32b863f89ae46553ff4bbcc1d4954"),
-        "windows_arm64": ("go1.17.6.windows-arm64.zip", "c794af7c7fe32207df2c30a39cad1cca2e382c82a4e9493499fc2feab5967ca0"),
+        "darwin_amd64": ("go1.19.4.darwin-amd64.tar.gz", "e88ffbbfe3adc94c4a2cf50f24e698a4c262cd99d98ea7d02d289726106d61e7"),
+        "darwin_arm64": ("go1.19.4.darwin-arm64.tar.gz", "1408a938fef3d17163d585db6bc2b769835c801302e3efc05ffabe021c05f0e9"),
+        "freebsd_amd64": ("go1.19.4.freebsd-amd64.tar.gz", "84489ebb63f1757b79574d7345c647bd40bc6414cecb868c93e24476c2d2b9b6"),
+        "linux_amd64": ("go1.19.4.linux-amd64.tar.gz", "565b0c97ea85539951daf203be166aef1e96e4e1bf38498a9ef5443298d83b7a"),
+        "linux_arm64": ("go1.19.4.linux-arm64.tar.gz", "6bb5752483c0d145b91199e5cc1352960d926850e75864dea16282337b0d92fe"),
+        "windows_amd64": ("go1.19.4.windows-amd64.tar.gz", "0f37edf2a6663db33c8f67ee36e21a7eb391fbf35d494299f6a81a59e294f4a0"),
     },
-    urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/{}"],
-    version = "1.17.6",
+    urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/20230214-214430/{}"],
+    version = "1.19.4",
 )
 
 # To point to a local SDK path, use the following instead. We'll call the
@@ -195,8 +208,17 @@ go_register_toolchains(nogo = "@com_github_cockroachdb_cockroach//:crdb_nogo")
 # begin rules_nodejs dependencies #
 ###################################
 
+# Install rules_nodejs dependencies
+
+# bazel_skylib handled above.
+# rules_nodejs handled above.
+load("@build_bazel_rules_nodejs//:repositories.bzl", "build_bazel_rules_nodejs_dependencies")
+
+build_bazel_rules_nodejs_dependencies()
+
 # Configure nodeJS.
 load("@build_bazel_rules_nodejs//:index.bzl", "node_repositories", "yarn_install")
+load("@build_bazel_rules_nodejs//nodejs:yarn_repositories.bzl", "yarn_repositories")
 
 node_repositories(
     node_repositories = {
@@ -210,8 +232,11 @@ node_repositories(
         "https://storage.googleapis.com/public-bazel-artifacts/js/node/v{version}/{filename}",
     ],
     node_version = "16.13.0",
-    package_json = ["//pkg/ui:package.json"],
-    yarn_repositories = {
+)
+
+yarn_repositories(
+    name = "yarn",
+    yarn_releases = {
         "1.22.11": ("yarn-v1.22.11.tar.gz", "yarn-v1.22.11", "2c320de14a6014f62d29c34fec78fdbb0bc71c9ccba48ed0668de452c1f5fe6c"),
     },
     yarn_urls = [
@@ -220,20 +245,90 @@ node_repositories(
     yarn_version = "1.22.11",
 )
 
-# install external dependencies for pkg/ui package
 yarn_install(
-    name = "npm",
+    name = "npm_mirror_npm",
     args = [
-        "--ignore-optional",
-        "--offline",
+        "--pure-lockfile",
     ],
-    package_json = "//pkg/ui:package.json",
+    package_json = "//pkg/cmd/mirror/npm:package.json",
     strict_visibility = False,
-    yarn_lock = "//pkg/ui:yarn.lock",
-    links = {
-      "@cockroachlabs/crdb-protobuf-client": "//pkg/ui/workspaces/db-console/src/js:crdb-protobuf-client",
-      "@cockroachlabs/cluster-ui": "//pkg/ui/workspaces/cluster-ui:cluster-ui",
+    symlink_node_modules = True,
+    yarn_lock = "//pkg/cmd/mirror/npm:yarn.lock",
+)
+
+# Install external dependencies for NPM packages in pkg/ui/ as separate bazel
+# repositories, to avoid version conflicts between those packages.
+# Unfortunately Bazel's rules_nodejs does not support yarn workspaces, so
+# packages have isolated dependencies and must be installed as isolated
+# Bazel repositories.
+yarn_install(
+    name = "npm_eslint_plugin_crdb",
+    args = [
+        "--pure-lockfile",
+        "--ignore-optional",
+    ],
+    package_json = "//pkg/ui/workspaces/eslint-plugin-crdb:package.json",
+    strict_visibility = False,
+    symlink_node_modules = True,
+    yarn_lock = "//pkg/ui/workspaces/eslint-plugin-crdb:yarn.lock",
+)
+
+yarn_install(
+    name = "npm_e2e_tests",
+    args = [
+        "--pure-lockfile",
+    ],
+    environment = {
+        # Don't automatically install the native Cypress binary, since not all
+        # platforms that build CRDB have Cypress binaries to install:
+        # https://docs.cypress.io/guides/getting-started/installing-cypress#System-requirements
+        #
+        # The native binary will be installed by `./dev ui e2e` just-in-time.
+        # While unsupported platforms will still encounter errors at that
+        # point, UI end-to-end tests aren't part of the core build or test
+        # flows and are intended for regression testing by CRDB developers.
+        "CYPRESS_INSTALL_BINARY": "0",
     },
+    package_json = "//pkg/ui/workspaces/e2e-tests:package.json",
+    strict_visibility = False,
+    symlink_node_modules = True,
+    yarn_lock = "//pkg/ui/workspaces/e2e-tests:yarn.lock",
+)
+
+yarn_install(
+    name = "npm_protos",
+    args = [
+        "--pure-lockfile",
+        "--ignore-optional",
+    ],
+    package_json = "//pkg/ui/workspaces/db-console/src/js:package.json",
+    package_path = "/",
+    strict_visibility = False,
+    yarn_lock = "//pkg/ui/workspaces/db-console/src/js:yarn.lock",
+)
+
+yarn_install(
+    name = "npm_db_console",
+    args = [
+        "--pure-lockfile",
+        "--ignore-optional",
+    ],
+    package_json = "//pkg/ui/workspaces/db-console:package.json",
+    strict_visibility = False,
+    symlink_node_modules = True,
+    yarn_lock = "//pkg/ui/workspaces/db-console:yarn.lock",
+)
+
+yarn_install(
+    name = "npm_cluster_ui",
+    args = [
+        "--pure-lockfile",
+        "--ignore-optional",
+    ],
+    package_json = "//pkg/ui/workspaces/cluster-ui:package.json",
+    strict_visibility = False,
+    symlink_node_modules = True,
+    yarn_lock = "//pkg/ui/workspaces/cluster-ui:yarn.lock",
 )
 
 #################################
@@ -254,6 +349,7 @@ load(
 # Ref: https://github.com/bazelbuild/bazel-gazelle/blob/master/deps.bzl
 
 # bazel_skylib handled above.
+# co_honnef_go_tools handled in DEPS.bzl.
 
 # keep
 go_repository(
@@ -270,29 +366,57 @@ go_repository(
 
 # keep
 go_repository(
-    name = "com_github_bmatcuk_doublestar",
-    importpath = "github.com/bmatcuk/doublestar",
-    sha256 = "50b02a6a30e186ba189c037901719248667b595b3131a4f6b29aebe3c874e83b",
-    strip_prefix = "doublestar",
+    name = "com_github_bmatcuk_doublestar_v4",
+    importpath = "github.com/bmatcuk/doublestar/v4",
+    sha256 = "d11c3b3a45574f89d6a6b2f50e53feea50df60407b35f36193bf5815d32c79d1",
+    strip_prefix = "bmatcuk-doublestar-f7a8118",
     urls = [
-        "https://storage.googleapis.com/public-bazel-artifacts/gomod/github.com/bmatcuk/doublestar/v1.2.2/doublestar-1.2.2.tar.gz",
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/bmatcuk-doublestar-v4.0.1-0-gf7a8118.tar.gz",
     ],
 )
 
 # com_github_burntsushi_toml handled in DEPS.bzl.
+# com_github_census_instrumentation_opencensus_proto handled in DEPS.bzl.
+# com_github_chzyer_logex handled in DEPS.bzl.
+# com_github_chzyer_readline handled in DEPS.bzl.
+# com_github_chzyer_test handled in DEPS.bzl.
+# com_github_client9_misspell handled in DEPS.bzl.
 # com_github_davecgh_go_spew handled in DEPS.bzl.
+# com_github_envoyproxy_go_control_plane handled in DEPS.bzl.
+# com_github_envoyproxy_protoc_gen_validate handled in DEPS.bzl.
 # com_github_fsnotify_fsnotify handled in DEPS.bzl.
+# com_github_golang_glog handled in DEPS.bzl.
+# com_github_golang_mock handled in DEPS.bzl.
+# com_github_golang_protobuf handled in DEPS.bzl.
 # com_github_google_go_cmp handled in DEPS.bzl.
-# com_github_kr_pretty handled in DEPS.bzl.
-# com_github_kr_pty handled in DEPS.bzl.
-# com_github_kr_text handled in DEPS.bzl.
 # com_github_pelletier_go_toml handled in DEPS.bzl.
 # com_github_pmezard_go_difflib handled in DEPS.bzl.
+# com_github_prometheus_client_model handled in DEPS.bzl.
+# com_github_yuin_goldmark handled in DEPS.bzl.
+# com_google_cloud_go handled in DEPS.bzl.
 # in_gopkg_check_v1 handled in DEPS.bzl.
 # in_gopkg_yaml_v2 handled in DEPS.bzl.
+
+# keep
+go_repository(
+    name = "net_starlark_go",
+    importpath = "go.starlark.net",
+    sha256 = "a35c6468e0e0921833a63290161ff903295eaaf5915200bbce272cbc8dfd1c1c",
+    strip_prefix = "google-starlark-go-e043a3d",
+    urls = [
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/google-starlark-go-e043a3d.tar.gz",
+    ],
+)
+
+# org_golang_google_genproto handled in DEPS.bzl.
+# org_golang_google_grpc handled in DEPS.bzl.
+# org_golang_google_protobuf handled in DEPS.bzl.
 # org_golang_x_crypto handled in DEPS.bzl.
+# org_golang_x_exp handled in DEPS.bzl.
+# org_golang_x_lint handled in DEPS.bzl.
 # org_golang_x_mod handled in DEPS.bzl.
 # org_golang_x_net handled in DEPS.bzl.
+# org_golang_x_oauth2 handled in DEPS.bzl.
 # org_golang_x_sync handled in DEPS.bzl.
 # org_golang_x_sys handled in DEPS.bzl.
 # org_golang_x_text handled in DEPS.bzl.
@@ -316,10 +440,11 @@ gazelle_dependencies()
 #      https://github.com/protocolbuffers/protobuf/blob/main/protobuf_deps.bzl
 http_archive(
     name = "com_google_protobuf",
-    sha256 = "071ccf561d127d5702910340cf038cb869aa239683544e1cca68a78ea865099e",
-    strip_prefix = "protobuf-e809d75ecb5770fdc531081eef306b3e672bcdd2",
+    sha256 = "6d4e7fe1cbd958dee69ce9becbf8892d567f082b6782d3973a118d0aa00807a8",
+    strip_prefix = "cockroachdb-protobuf-3f5d91f",
     urls = [
-        "https://storage.googleapis.com/public-bazel-artifacts/bazel/protobuf-e809d75ecb5770fdc531081eef306b3e672bcdd2.tar.gz",
+        # Code as of 3f5d91f2e169d890164d3401b8f4a9453fff5538 (crl-release-3.9, 3.9.2 plus a few patches).
+        "https://storage.googleapis.com/public-bazel-artifacts/bazel/cockroachdb-protobuf-3f5d91f.tar.gz",
     ],
 )
 
@@ -421,29 +546,33 @@ rules_foreign_cc_dependencies(
 ################################
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
 http_archive(
     name = "rules_pkg",
+    sha256 = "8a298e832762eda1830597d64fe7db58178aa84cd5926d76d5b744d6558941c2",
     urls = [
         "https://storage.googleapis.com/public-bazel-artifacts/bazel/rules_pkg-0.7.0.tar.gz",
     ],
-    sha256 = "8a298e832762eda1830597d64fe7db58178aa84cd5926d76d5b744d6558941c2",
 )
 # Ref: https://github.com/bazelbuild/rules_pkg/blob/main/pkg/deps.bzl
 
 # bazel_skylib handled above.
 http_archive(
     name = "rules_python",
-    urls = ["https://storage.googleapis.com/public-bazel-artifacts/bazel/rules_python-0.1.0.tar.gz"],
     sha256 = "b6d46438523a3ec0f3cead544190ee13223a52f6a6765a29eae7b7cc24cc83a0",
+    urls = ["https://storage.googleapis.com/public-bazel-artifacts/bazel/rules_python-0.1.0.tar.gz"],
 )
+
 http_archive(
     name = "rules_license",
+    sha256 = "4865059254da674e3d18ab242e21c17f7e3e8c6b1f1421fffa4c5070f82e98b5",
     urls = [
         "https://storage.googleapis.com/public-bazel-artifacts/bazel/rules_license-0.0.1.tar.gz",
     ],
-    sha256 = "4865059254da674e3d18ab242e21c17f7e3e8c6b1f1421fffa4c5070f82e98b5",
 )
+
 load("@rules_pkg//pkg:deps.bzl", "rules_pkg_dependencies")
+
 rules_pkg_dependencies()
 
 ##############################
@@ -468,7 +597,7 @@ register_toolchains(
     "//build/toolchains:cross_arm64_windows_toolchain",
     "//build/toolchains:cross_arm64_macos_toolchain",
     "//build/toolchains:cross_arm64_macos_arm_toolchain",
-    "//build/toolchains:dev_darwin_x86_64_toolchain",
+    "//build/toolchains:node_freebsd_toolchain",
 )
 
 http_archive(
@@ -505,4 +634,22 @@ http_archive(
 )
 
 load("//build/bazelutil:repositories.bzl", "distdir_repositories")
+
 distdir_repositories()
+
+# This is used only by rules_nodejs to find the local version of node.
+new_local_repository(
+    name = "nodejs_freebsd_amd64",
+    build_file_content = """exports_files[("bin/node")]""",
+    path = "/usr/local",
+)
+
+# Download and register the FIPS enabled Go toolchain at the end to avoid toolchain conflicts for gazelle.
+go_download_sdk(
+    name = "go_sdk_fips",
+    sdks = {
+        "linux_amd64": ("go1.19.5fips.linux-amd64.tar.gz", "b143b3c384d70700f3ad171dcf9fa1a4b434efa0012c4b1d4ebfb6a0cb7a50b6"),
+    },
+    urls = ["https://storage.googleapis.com/public-bazel-artifacts/go-fips/20230207-040328/{}"],
+    version = "1.19.5fips",
+)

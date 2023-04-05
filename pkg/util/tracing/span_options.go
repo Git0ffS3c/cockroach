@@ -75,12 +75,19 @@ type spanOptions struct {
 	ForceRealSpan                 bool                   // see WithForceRealSpan
 	SpanKind                      oteltrace.SpanKind     // see WithSpanKind
 	Sterile                       bool                   // see WithSterile
+	EventListeners                []EventListener        // see WithEventListeners
 
 	// recordingTypeExplicit is set if the WithRecording() option was used. In
 	// that case, spanOptions.recordingType() returns recordingTypeOpt below. If
-	// not set, recordingType() looks at the parent.
+	// not set, recordingType() looks at the parent, subject to
+	// minRecordingTypeOpt.
 	recordingTypeExplicit bool
-	recordingTypeOpt      RecordingType
+	recordingTypeOpt      tracingpb.RecordingType
+	// minRecordingTypeOpt, if set, indicates the "minimum" recording type of
+	// this span (if it doesn't contradict recordingTypeOpt). If the parent has
+	// a more "verbose" recording type, than that type is used by
+	// recordingType().
+	minRecordingTypeOpt tracingpb.RecordingType
 }
 
 func (opts *spanOptions) parentTraceID() tracingpb.TraceID {
@@ -101,16 +108,19 @@ func (opts *spanOptions) parentSpanID() tracingpb.SpanID {
 	return 0
 }
 
-func (opts *spanOptions) recordingType() RecordingType {
+func (opts *spanOptions) recordingType() tracingpb.RecordingType {
 	if opts.recordingTypeExplicit {
 		return opts.recordingTypeOpt
 	}
 
-	recordingType := RecordingOff
+	var recordingType tracingpb.RecordingType
 	if !opts.Parent.empty() && !opts.Parent.IsNoop() {
 		recordingType = opts.Parent.i.crdb.recordingType()
 	} else if !opts.RemoteParent.Empty() {
 		recordingType = opts.RemoteParent.recordingType
+	}
+	if recordingType < opts.minRecordingTypeOpt {
+		recordingType = opts.minRecordingTypeOpt
 	}
 	return recordingType
 }
@@ -118,7 +128,7 @@ func (opts *spanOptions) recordingType() RecordingType {
 // otelContext returns information about the OpenTelemetry parent span. If there
 // is a local parent with an otel Span, that Span is returned. If there is a
 // RemoteParent,  a SpanContext is returned. If there's no OpenTelemetry parent,
-// both return values will be empty.
+// both return values will be Empty.
 func (opts *spanOptions) otelContext() (oteltrace.Span, oteltrace.SpanContext) {
 	if !opts.Parent.empty() && opts.Parent.i.otelSpan != nil {
 		return opts.Parent.i.otelSpan, oteltrace.SpanContext{}
@@ -156,12 +166,12 @@ type parentOption spanRef
 // WithParent will be a no-op (i.e. the span resulting from
 // applying this option will be a root span, just as if this option hadn't been
 // specified) in the following cases:
-// - if `sp` is nil
-// - if `sp` is a no-op span
-// - if `sp` is a sterile span (i.e. a span explicitly marked as not wanting
-//   children). Note that the singleton Tracer.noop span is marked as sterile,
-//   which makes this condition mostly encompass the previous one, however in
-//   theory there could be no-op spans other than the singleton one.
+//   - if `sp` is nil
+//   - if `sp` is a no-op span
+//   - if `sp` is a sterile span (i.e. a span explicitly marked as not wanting
+//     children). Note that the singleton Tracer.noop span is marked as sterile,
+//     which makes this condition mostly encompass the previous one, however in
+//     theory there could be no-op spans other than the singleton one.
 //
 // The child inherits the parent's log tags. The data collected in the
 // child trace will be retrieved automatically when the parent's data is
@@ -202,17 +212,20 @@ func WithParent(sp *Span) SpanOption {
 	// below.
 	_ = sp.detectUseAfterFinish()
 
-	// Sterile spans don't get children. Noop spans also don't, but that case is
-	// handled in StartSpan, not here, because we want to assert that the parent's
-	// Tracer is the same as the child's. In contrast, in the IsSterile() case, it
-	// is allowed for the "child" to be created with a different Tracer than the
-	// parent.
-	if sp.IsSterile() {
-		return (parentOption)(spanRef{})
+	// Noop spans and sterile spans don't get children; a span constructed with
+	// WithParent(sterile-or-noop-span) will be a root span. We could return a
+	// zero parentOption here, but instead we return a parentOption referencing
+	// the tracer's noopSpan. This is so that, when constructing the "child" span
+	// using the returned option we can assert that the Tracer used to construct
+	// the child is the same as sp's Tracer.
+	if sp.IsNoop() || sp.IsSterile() {
+		return parentOption{
+			Span: sp.Tracer().noopSpan,
+		}
 	}
 
 	ref, _ /* ok */ := tryMakeSpanRef(sp)
-	// Note that ref will be empty if tryMakeSpanRef() failed. In that case, the
+	// Note that ref will be Empty if tryMakeSpanRef() failed. In that case, the
 	// resulting span will not have a parent.
 	return (parentOption)(ref)
 }
@@ -231,18 +244,19 @@ type remoteParent SpanMeta
 // For the purposes of trace recordings, there's no mechanism ensuring that the
 // child's recording will be passed to the parent span. When that's desired, it
 // has to be done manually by calling Span.GetRecording() and propagating the
-// result to the parent by calling Span.ImportRemoteSpans().
+// result to the parent by calling Span.ImportRemoteRecording().
 //
 // The canonical use case for this is around RPC boundaries, where a server
 // handling a request wants to create a child span descending from a parent on a
 // remote machine.
 //
-// node 1                     (network)          node 2
+// node 1                         (network)          node 2
 // --------------------------------------------------------------------------
-// Span.Meta()               ----------> sp2 := Tracer.StartSpan(
-//                                       		WithRemoteParentFromSpanMeta(.))
-//                                       doSomething(sp2)
-// Span.ImportRemoteSpans(.) <---------- sp2.FinishAndGetRecording()
+// Span.Meta()                   ----------> sp2 := Tracer.StartSpan(WithRemoteParentFromSpanMeta(.))
+//
+//	doSomething(sp2)
+//
+// Span.ImportRemoteRecording(.) <---------- sp2.FinishAndGetRecording()
 //
 // By default, the child span is derived using a ChildOf relationship, which
 // corresponds to the expectation that the parent span will usually wait for the
@@ -263,6 +277,27 @@ func WithRemoteParentFromSpanMeta(parent SpanMeta) SpanOption {
 func (p remoteParent) apply(opts spanOptions) spanOptions {
 	opts.RemoteParent = (SpanMeta)(p)
 	return opts
+}
+
+type remoteParentFromLocalSpanOption spanRef
+
+func (r remoteParentFromLocalSpanOption) apply(opts spanOptions) spanOptions {
+	opts.RemoteParent = r.Meta()
+	sr := spanRef(r)
+	sr.release()
+	return opts
+}
+
+// WithRemoteParentFromLocalSpan is equivalent to
+// WithRemoteParentFromSpanMeta(sp.Meta()), but doesn't allocate. The span will
+// be created with parent info, but without being linked into the parent. This
+// is useful when the child needs to be created with a different Tracer than the
+// parent - e.g. when a tenant is calling into the local KV server.
+func WithRemoteParentFromLocalSpan(sp *Span) SpanOption {
+	ref, _ /* ok */ := tryMakeSpanRef(sp)
+	// Note that ref will be Empty if tryMakeSpanRef() failed. In that case, the
+	// resulting span will not have a parent.
+	return remoteParentFromLocalSpanOption(ref)
 }
 
 type remoteParentFromTraceInfoOpt tracingpb.TraceInfo
@@ -369,22 +404,22 @@ func (forceRealSpanOption) apply(opts spanOptions) spanOptions {
 }
 
 type recordingSpanOption struct {
-	recType RecordingType
+	recType tracingpb.RecordingType
 }
 
-var structuredRecordingSingleton = SpanOption(recordingSpanOption{recType: RecordingStructured})
-var verboseRecordingSingleton = SpanOption(recordingSpanOption{recType: RecordingVerbose})
+var structuredRecordingSingleton = SpanOption(recordingSpanOption{recType: tracingpb.RecordingStructured})
+var verboseRecordingSingleton = SpanOption(recordingSpanOption{recType: tracingpb.RecordingVerbose})
 
 // WithRecording configures the span to record in the given mode.
 //
 // The recording mode can be changed later with SetVerbose().
-func WithRecording(recType RecordingType) SpanOption {
+func WithRecording(recType tracingpb.RecordingType) SpanOption {
 	switch recType {
-	case RecordingStructured:
+	case tracingpb.RecordingStructured:
 		return structuredRecordingSingleton
-	case RecordingVerbose:
+	case tracingpb.RecordingVerbose:
 		return verboseRecordingSingleton
-	case RecordingOff:
+	case tracingpb.RecordingOff:
 		panic("invalid recording option: RecordingOff")
 	default:
 		recCpy := recType // copy excaping to the heap
@@ -438,4 +473,37 @@ func WithSterile() SpanOption {
 func (w withSterileOption) apply(opts spanOptions) spanOptions {
 	opts.Sterile = true
 	return opts
+}
+
+type eventListenersOption []EventListener
+
+var _ SpanOption = eventListenersOption{}
+
+func (ev eventListenersOption) apply(opts spanOptions) spanOptions {
+	// Applying an EventListener span option implies the span has at least
+	// `RecordingStructured` recording type.
+	opts.minRecordingTypeOpt = tracingpb.RecordingStructured
+	eventListeners := ([]EventListener)(ev)
+	opts.EventListeners = eventListeners
+	return opts
+}
+
+// WithEventListeners registers eventListeners to the span. The listeners are
+// notified of Structured events recorded by the span and its children. Once the
+// span is finished, the listeners are not notified of events any more even from
+// surviving child spans.
+//
+// The listeners will also be notified of StructuredEvents recorded on remote
+// spans, when the remote recording is imported by the span or one of its
+// children. Note, the listeners will be notified of StructuredEvents in the
+// imported remote recording out of order.
+//
+// WithEventListeners implies a `RecordingStructured` recording type for the
+// span. If the recording type has been explicitly set to `RecordingVerbose` via
+// the `WithRecording(...) option, that will be respected instead.
+//
+// The caller should not mutate `eventListeners` after calling
+// WithEventListeners.
+func WithEventListeners(eventListeners ...EventListener) SpanOption {
+	return (eventListenersOption)(eventListeners)
 }

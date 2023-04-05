@@ -12,6 +12,7 @@ package roachpb
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math"
 	"math/rand"
 	"reflect"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
@@ -38,7 +40,7 @@ import (
 	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 func makeClockTS(walltime int64, logical int32) hlc.ClockTimestamp {
@@ -218,6 +220,27 @@ func TestNextKey(t *testing.T) {
 		if !c.key.Next().Equal(c.next) {
 			t.Fatalf("%d: unexpected next key for %q: %s", i, c.key, c.key.Next())
 		}
+	}
+}
+
+func TestPrevish(t *testing.T) {
+	const length = 4
+	testcases := []struct {
+		key    Key
+		expect Key
+	}{
+		{nil, nil},
+		{[]byte{}, []byte{}},
+		{[]byte{0x00}, []byte{}},
+		{[]byte{0x01, 0x00}, []byte{0x01}},
+		{[]byte{0x01}, []byte{0x00, 0xff, 0xff, 0xff}},
+		{[]byte{0x01, 0x01}, []byte{0x01, 0x00, 0xff, 0xff}},
+		{[]byte{0xff, 0xff, 0xff, 0xff}, []byte{0xff, 0xff, 0xff, 0xfe}},
+	}
+	for _, tc := range testcases {
+		t.Run(hex.EncodeToString(tc.key), func(t *testing.T) {
+			require.Equal(t, tc.expect, tc.key.Prevish(length))
+		})
 	}
 }
 
@@ -415,7 +438,7 @@ func TestSetGetChecked(t *testing.T) {
 
 func TestTransactionBumpEpoch(t *testing.T) {
 	origNow := makeTS(10, 1)
-	txn := MakeTransaction("test", Key("a"), 1, origNow, 0, 99)
+	txn := MakeTransaction("test", Key("a"), isolation.Serializable, 1, origNow, 0, 99)
 	// Advance the txn timestamp.
 	txn.WriteTimestamp = txn.WriteTimestamp.Add(10, 2)
 	txn.BumpEpoch()
@@ -482,8 +505,9 @@ func TestFastPathObservedTimestamp(t *testing.T) {
 
 var nonZeroTxn = Transaction{
 	TxnMeta: enginepb.TxnMeta{
-		Key:               Key("foo"),
 		ID:                uuid.MakeV4(),
+		Key:               Key("foo"),
+		IsoLevel:          isolation.Snapshot,
 		Epoch:             2,
 		WriteTimestamp:    makeSynTS(20, 21),
 		MinTimestamp:      makeSynTS(10, 11),
@@ -752,14 +776,14 @@ func TestTransactionRefresh(t *testing.T) {
 // with the former and contains a subset of its protos.
 //
 // Assertions:
-// 1. Transaction->TransactionRecord->Transaction is lossless for the fields
-//    in TransactionRecord. It drops all other fields.
-// 2. TransactionRecord->Transaction->TransactionRecord is lossless.
-//    Fields not in TransactionRecord are set as zero values.
-// 3. Transaction messages can be decoded as TransactionRecord messages.
-//    Fields not in TransactionRecord are dropped.
-// 4. TransactionRecord messages can be decoded as Transaction messages.
-//    Fields not in TransactionRecord are decoded as zero values.
+//  1. Transaction->TransactionRecord->Transaction is lossless for the fields
+//     in TransactionRecord. It drops all other fields.
+//  2. TransactionRecord->Transaction->TransactionRecord is lossless.
+//     Fields not in TransactionRecord are set as zero values.
+//  3. Transaction messages can be decoded as TransactionRecord messages.
+//     Fields not in TransactionRecord are dropped.
+//  4. TransactionRecord messages can be decoded as Transaction messages.
+//     Fields not in TransactionRecord are decoded as zero values.
 func TestTransactionRecordRoundtrips(t *testing.T) {
 	// Verify that converting from a Transaction to a TransactionRecord
 	// strips out fields but is lossless for the desired fields.
@@ -973,8 +997,8 @@ func TestLeaseEquivalence(t *testing.T) {
 	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.ToTimestamp().Clone()}
 
 	r1Voter, r1Learner := r1, r1
-	r1Voter.Type = ReplicaTypeVoterFull()
-	r1Learner.Type = ReplicaTypeLearner()
+	r1Voter.Type = VOTER_FULL
+	r1Learner.Type = LEARNER
 	epoch1Voter := Lease{Replica: r1Voter, Start: ts1, Epoch: 1}
 	epoch1Learner := Lease{Replica: r1Learner, Start: ts1, Epoch: 1}
 
@@ -1229,6 +1253,13 @@ func TestSpanCombine(t *testing.T) {
 // or key range is contained within the span.
 func TestSpanContains(t *testing.T) {
 	s := Span{Key: []byte("a"), EndKey: []byte("b")}
+	sp := func(start, end string) Span {
+		res := Span{Key: Key(start)}
+		if end != "" {
+			res.EndKey = Key(end)
+		}
+		return res
+	}
 
 	testData := []struct {
 		start, end string
@@ -1295,8 +1326,8 @@ func TestSpanSplitOnKey(t *testing.T) {
 		// Simple split.
 		{
 			[]byte("bb"),
-			sp("b", "bb"),
-			sp("bb", "c"),
+			Span{Key: Key("b"), EndKey: Key("bb")},
+			Span{Key: Key("bb"), EndKey: Key("c")},
 		},
 	}
 	for testIdx, test := range testData {
@@ -1460,7 +1491,7 @@ func TestRSpanIntersect(t *testing.T) {
 		desc.StartKey = test.startKey
 		desc.EndKey = test.endKey
 
-		actual, err := rs.Intersect(&desc)
+		actual, err := rs.Intersect(desc.RSpan())
 		if err != nil {
 			t.Error(err)
 			continue
@@ -1482,7 +1513,7 @@ func TestRSpanIntersect(t *testing.T) {
 		desc := RangeDescriptor{}
 		desc.StartKey = test.startKey
 		desc.EndKey = test.endKey
-		if _, err := rs.Intersect(&desc); err == nil {
+		if _, err := rs.Intersect(desc.RSpan()); err == nil {
 			t.Errorf("%d: unexpected success", i)
 		}
 	}
@@ -1793,14 +1824,10 @@ func TestUpdateObservedTimestamps(t *testing.T) {
 func TestChangeReplicasTrigger_String(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	vi := VOTER_INCOMING
-	vo := VOTER_OUTGOING
-	vd := VOTER_DEMOTING_LEARNER
-	l := LEARNER
-	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: &vi}
-	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: &vo}
-	learner := ReplicaDescriptor{NodeID: 7, StoreID: 8, ReplicaID: 9, Type: &l}
-	repl3 := ReplicaDescriptor{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: &vd}
+	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: VOTER_INCOMING}
+	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: VOTER_OUTGOING}
+	learner := ReplicaDescriptor{NodeID: 7, StoreID: 8, ReplicaID: 9, Type: LEARNER}
+	repl3 := ReplicaDescriptor{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: VOTER_DEMOTING_LEARNER}
 	crt := ChangeReplicasTrigger{
 		InternalAddedReplicas:   []ReplicaDescriptor{repl1},
 		InternalRemovedReplicas: []ReplicaDescriptor{repl2, repl3},
@@ -1827,7 +1854,7 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 
 	crt.InternalRemovedReplicas = nil
 	crt.InternalAddedReplicas = nil
-	repl1.Type = ReplicaTypeVoterFull()
+	repl1.Type = VOTER_FULL
 	crt.Desc.SetReplicas(MakeReplicaSet([]ReplicaDescriptor{repl1, learner}))
 	act = crt.String()
 	require.Empty(t, crt.Added())
@@ -1858,7 +1885,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			typ := alt[i].(ReplicaType)
 			id := alt[i+1].(int)
 			rDescs = append(rDescs, ReplicaDescriptor{
-				Type:      &typ,
+				Type:      typ,
 				NodeID:    NodeID(3 * id),
 				StoreID:   StoreID(2 * id),
 				ReplicaID: ReplicaID(id),
@@ -2052,7 +2079,7 @@ func TestTxnLocksAsLockUpdates(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ts := hlc.Timestamp{WallTime: 1}
-	txn := MakeTransaction("hello", Key("k"), 0, ts, 0, 99)
+	txn := MakeTransaction("hello", Key("k"), isolation.Serializable, 0, ts, 0, 99)
 
 	txn.Status = COMMITTED
 	txn.IgnoredSeqNums = []enginepb.IgnoredSeqNumRange{{Start: 0, End: 0}}

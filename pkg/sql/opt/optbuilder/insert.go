@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -37,7 +37,7 @@ const duplicateUpsertErrText = "UPSERT or INSERT...ON CONFLICT command cannot af
 // cannot be inserted due to a conflict, the "excluded" data source contains
 // that row, so that its columns can be referenced in the conflict clause:
 //
-//   INSERT INTO ab VALUES (1, 2) ON CONFLICT (a) DO UPDATE b=excluded.b+1
+//	INSERT INTO ab VALUES (1, 2) ON CONFLICT (a) DO UPDATE b=excluded.b+1
 //
 // It is located in the special crdb_internal schema so that it never overlaps
 // with user data sources.
@@ -55,45 +55,45 @@ func init() {
 // begin, an input expression is constructed which outputs these columns to
 // insert into the target table:
 //
-//   1. Columns explicitly specified by the user in SELECT or VALUES expression.
+//  1. Columns explicitly specified by the user in SELECT or VALUES expression.
 //
-//   2. Columns not specified by the user, but having a default value declared
-//      in schema (or being nullable).
+//  2. Columns not specified by the user, but having a default value declared
+//     in schema (or being nullable).
 //
-//   3. Computed columns.
+//  3. Computed columns.
 //
-//   4. Mutation columns which are being added or dropped by an online schema
-//      change.
+//  4. Mutation columns which are being added or dropped by an online schema
+//     change.
 //
 // buildInsert starts by constructing the input expression, and then wraps it
 // with Project operators which add default, computed, and mutation columns. The
 // final input expression will project values for all columns in the target
 // table. For example, if this is the schema and INSERT statement:
 //
-//   CREATE TABLE abcd (
-//     a INT PRIMARY KEY,
-//     b INT,
-//     c INT DEFAULT(10),
-//     d INT AS (b+c) STORED
-//   )
-//   INSERT INTO abcd (a) VALUES (1)
+//	CREATE TABLE abcd (
+//	  a INT PRIMARY KEY,
+//	  b INT,
+//	  c INT DEFAULT(10),
+//	  d INT AS (b+c) STORED
+//	)
+//	INSERT INTO abcd (a) VALUES (1)
 //
 // Then an input expression equivalent to this would be built:
 //
-//   SELECT ins_a, ins_b, ins_c, ins_b + ins_c AS ins_d
-//   FROM (VALUES (1, NULL, 10)) AS t(ins_a, ins_b, ins_c)
+//	SELECT ins_a, ins_b, ins_c, ins_b + ins_c AS ins_d
+//	FROM (VALUES (1, NULL, 10)) AS t(ins_a, ins_b, ins_c)
 //
 // If an ON CONFLICT clause is present (or if it was an UPSERT statement), then
 // additional columns are added to the input expression:
 //
-//   1. Columns containing existing values fetched from the target table and
-//      used to detect conflicts and to formulate the key/value update commands.
+//  1. Columns containing existing values fetched from the target table and
+//     used to detect conflicts and to formulate the key/value update commands.
 //
-//   2. Columns containing updated values to set when a conflict is detected, as
-//      specified by the user.
+//  2. Columns containing updated values to set when a conflict is detected, as
+//     specified by the user.
 //
-//   3. Computed columns which will be updated when a conflict is detected and
-//      that are dependent on one or more updated columns.
+//  3. Computed columns which will be updated when a conflict is detected and
+//     that are dependent on one or more updated columns.
 //
 // A LEFT OUTER JOIN associates each row to insert with the corresponding
 // existing row (#1 above). If the row does not exist, then the existing columns
@@ -129,26 +129,26 @@ func init() {
 // Putting it all together, if this is the schema and INSERT..ON CONFLICT
 // statement:
 //
-//   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
-//   INSERT INTO abc VALUES (1, 2), (1, 3) ON CONFLICT (a) DO UPDATE SET b=10
+//	CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
+//	INSERT INTO abc VALUES (1, 2), (1, 3) ON CONFLICT (a) DO UPDATE SET b=10
 //
 // Then an input expression roughly equivalent to this would be built (note that
 // the DISTINCT ON is really the UpsertDistinctOn operator, which behaves a bit
 // differently than the DistinctOn operator):
 //
-//   SELECT
-//     fetch_a,
-//     fetch_b,
-//     fetch_c,
-//     CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
-//     CASE WHEN fetch_a IS NULL ins_b ELSE 10 END AS ups_b,
-//     CASE WHEN fetch_a IS NULL ins_c ELSE fetch_c END AS ups_c,
-//   FROM (
-//     SELECT DISTINCT ON (ins_a) *
-//     FROM (VALUES (1, 2, NULL), (1, 3, NULL)) AS ins(ins_a, ins_b, ins_c)
-//   )
-//   LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
-//   ON ins_a = fetch_a
+//	SELECT
+//	  fetch_a,
+//	  fetch_b,
+//	  fetch_c,
+//	  CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
+//	  CASE WHEN fetch_a IS NULL ins_b ELSE 10 END AS ups_b,
+//	  CASE WHEN fetch_a IS NULL ins_c ELSE fetch_c END AS ups_c,
+//	FROM (
+//	  SELECT DISTINCT ON (ins_a) *
+//	  FROM (VALUES (1, 2, NULL), (1, 3, NULL)) AS ins(ins_a, ins_b, ins_c)
+//	)
+//	LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
+//	ON ins_a = fetch_a
 //
 // Here, the fetch_a column has been designated as the canary column, since it
 // is NOT NULL in the schema. It is used as the CASE condition to decide between
@@ -163,16 +163,16 @@ func init() {
 // input has no duplicates, and an ANTI JOIN to check whether a conflict exists.
 // For example:
 //
-//   CREATE TABLE ab (a INT PRIMARY KEY, b INT)
-//   INSERT INTO ab (a, b) VALUES (1, 2), (1, 3) ON CONFLICT DO NOTHING
+//	CREATE TABLE ab (a INT PRIMARY KEY, b INT)
+//	INSERT INTO ab (a, b) VALUES (1, 2), (1, 3) ON CONFLICT DO NOTHING
 //
 // Then an input expression roughly equivalent to this would be built:
 //
-//   SELECT x, y
-//   FROM (SELECT DISTINCT ON (x) * FROM (VALUES (1, 2), (1, 3))) AS input(x, y)
-//   WHERE NOT EXISTS(
-//     SELECT ab.a WHERE input.x = ab.a
-//   )
+//	SELECT x, y
+//	FROM (SELECT DISTINCT ON (x) * FROM (VALUES (1, 2), (1, 3))) AS input(x, y)
+//	WHERE NOT EXISTS(
+//	  SELECT ab.a WHERE input.x = ab.a
+//	)
 //
 // Note that an ordered input to the INSERT does not provide any guarantee about
 // the order in which mutations are applied, or the order of any returned rows
@@ -242,7 +242,7 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		mb.addTargetNamedColsForInsert(ins.Columns)
 	} else {
 		values := mb.extractValuesInput(ins.Rows)
-		if values != nil {
+		if values != nil && len(values.Rows) > 0 {
 			// Target columns are implicitly targeted by VALUES expression in the
 			// same order they appear in the target table schema.
 			mb.addTargetTableColsForInsert(len(values.Rows[0]))
@@ -281,9 +281,9 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 	// See mutationBuilder.buildCheckInputScan.
 	mb.insertExpr = mb.outScope.expr
 
-	var returning tree.ReturningExprs
+	var returning *tree.ReturningExprs
 	if resultsNeeded(ins.Returning) {
-		returning = *ins.Returning.(*tree.ReturningExprs)
+		returning = ins.Returning.(*tree.ReturningExprs)
 	}
 
 	switch {
@@ -348,13 +348,13 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 // fetch existing rows, and then the KV Put operation can be used to blindly
 // insert a new record or overwrite an existing record. This is possible when:
 //
-//   1. There are no secondary indexes. Existing values are needed to delete
-//      secondary index rows when the update causes them to move.
-//   2. There are no implicit partitioning columns in the primary index.
-//   3. All non-key columns (including mutation columns) have insert and update
-//      values specified for them.
-//   4. Each update value is the same as the corresponding insert value.
-//   5. There are no inbound foreign keys containing non-key columns.
+//  1. There are no secondary indexes. Existing values are needed to delete
+//     secondary index rows when the update causes them to move.
+//  2. There are no implicit partitioning columns in the primary index.
+//  3. All non-key columns (including mutation columns) have insert and update
+//     values specified for them.
+//  4. Each update value is the same as the corresponding insert value.
+//  5. There are no inbound foreign keys containing non-key columns.
 //
 // TODO(andyk): The fast path is currently only enabled when the UPSERT alias
 // is explicitly selected by the user. It's possible to fast path some queries
@@ -461,14 +461,14 @@ func (mb *mutationBuilder) checkPrimaryKeyForInsert() {
 // Alternatively, all columns can be unspecified. If neither condition is true,
 // checkForeignKeys raises an error. Here is an example:
 //
-//   CREATE TABLE orders (
-//     id INT,
-//     cust_id INT,
-//     state STRING,
-//     FOREIGN KEY (cust_id, state) REFERENCES customers (id, state) MATCH FULL
-//   )
+//	CREATE TABLE orders (
+//	  id INT,
+//	  cust_id INT,
+//	  state STRING,
+//	  FOREIGN KEY (cust_id, state) REFERENCES customers (id, state) MATCH FULL
+//	)
 //
-//   INSERT INTO orders (cust_id) VALUES (1)
+//	INSERT INTO orders (cust_id) VALUES (1)
 //
 // This INSERT statement would trigger a static error, because only cust_id is
 // specified in the INSERT statement. Either the state column must be specified
@@ -528,7 +528,7 @@ func (mb *mutationBuilder) checkForeignKeysForInsert() {
 // used when the target columns are not explicitly specified in the INSERT
 // statement:
 //
-//   INSERT INTO t VALUES (1, 2, 3)
+//	INSERT INTO t VALUES (1, 2, 3)
 //
 // In this example, the first three columns of table t would be added as target
 // columns.
@@ -669,7 +669,7 @@ func (mb *mutationBuilder) addSynthesizedColsForInsert() {
 
 // buildInsert constructs an Insert operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildInsert(returning tree.ReturningExprs) {
+func (mb *mutationBuilder) buildInsert(returning *tree.ReturningExprs) {
 	// Disambiguate names so that references in any expressions, such as a
 	// check constraint, refer to the correct columns.
 	mb.disambiguateColumns()
@@ -707,14 +707,14 @@ func (mb *mutationBuilder) buildInputForDoNothing(inScope *scope, onConflict *tr
 	mb.outScope.ordering = nil
 
 	// Create an anti-join for each arbiter.
-	mb.arbiters.ForEach(func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int) {
+	mb.arbiters.ForEach(func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int) {
 		mb.buildAntiJoinForDoNothingArbiter(inScope, conflictOrds, pred)
 	})
 
 	// Create an UpsertDistinctOn for each arbiter. This must happen after all
 	// conflicting rows are removed with the anti-joins created above, to avoid
 	// removing valid rows (see #59125).
-	mb.arbiters.ForEach(func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int) {
+	mb.arbiters.ForEach(func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int) {
 		// If the arbiter has a partial predicate, project a new column that
 		// allows the UpsertDistinctOn to only de-duplicate insert rows that
 		// satisfy the predicate. See projectPartialArbiterDistinctColumn for
@@ -760,7 +760,7 @@ func (mb *mutationBuilder) buildInputForUpsert(
 
 	// Create an UpsertDistinctOn and a left-join for the single arbiter.
 	var canaryCol *scopeColumn
-	mb.arbiters.ForEach(func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int) {
+	mb.arbiters.ForEach(func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int) {
 		// If the arbiter has a partial predicate, project a new column that
 		// allows the UpsertDistinctOn to only de-duplicate insert rows that
 		// satisfy the predicate. See projectPartialArbiterDistinctColumn for
@@ -824,11 +824,11 @@ func (mb *mutationBuilder) buildInputForUpsert(
 // setUpsertCols sets the list of columns to be updated in case of conflict.
 // There are two cases to handle:
 //
-//   1. Target columns are explicitly specified:
-//        UPSERT INTO abc (col1, col2, ...) <input-expr>
+//  1. Target columns are explicitly specified:
+//     UPSERT INTO abc (col1, col2, ...) <input-expr>
 //
-//   2. Target columns are implicitly derived:
-//        UPSERT INTO abc <input-expr>
+//  2. Target columns are implicitly derived:
+//     UPSERT INTO abc <input-expr>
 //
 // In case #1, only the columns that were specified by the user will be updated.
 // In case #2, all non-mutation columns in the table will be updated.
@@ -837,9 +837,9 @@ func (mb *mutationBuilder) buildInputForUpsert(
 // updated. This can have an impact in unusual cases where equal SQL values have
 // different representations. For example:
 //
-//   CREATE TABLE abc (a DECIMAL PRIMARY KEY, b DECIMAL)
-//   INSERT INTO abc VALUES (1, 2.0)
-//   UPSERT INTO abc VALUES (1.0, 2)
+//	CREATE TABLE abc (a DECIMAL PRIMARY KEY, b DECIMAL)
+//	INSERT INTO abc VALUES (1, 2.0)
+//	UPSERT INTO abc VALUES (1.0, 2)
 //
 // The UPSERT statement will update the value of column "b" from 2 => 2.0, but
 // will not modify column "a".
@@ -874,7 +874,7 @@ func (mb *mutationBuilder) setUpsertCols(insertCols tree.NameList) {
 
 // buildUpsert constructs an Upsert operator, possibly wrapped by a Project
 // operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
+func (mb *mutationBuilder) buildUpsert(returning *tree.ReturningExprs) {
 	// Merge input insert and update columns using CASE expressions.
 	mb.projectUpsertColumns()
 
@@ -919,16 +919,16 @@ func (mb *mutationBuilder) buildUpsert(returning tree.ReturningExprs) {
 // inserted into the target table, or else used to update an existing row,
 // depending on whether the canary column is null. For example:
 //
-//   UPSERT INTO ab VALUES (ins_a, ins_b) ON CONFLICT (a) DO UPDATE SET b=upd_b
+//	UPSERT INTO ab VALUES (ins_a, ins_b) ON CONFLICT (a) DO UPDATE SET b=upd_b
 //
 // will cause the columns to be projected:
 //
-//   SELECT
-//     fetch_a,
-//     fetch_b,
-//     CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
-//     CASE WHEN fetch_b IS NULL ins_b ELSE upd_b END AS ups_b,
-//   FROM (SELECT ins_a, ins_b, upd_b, fetch_a, fetch_b FROM ...)
+//	SELECT
+//	  fetch_a,
+//	  fetch_b,
+//	  CASE WHEN fetch_a IS NULL ins_a ELSE fetch_a END AS ups_a,
+//	  CASE WHEN fetch_b IS NULL ins_b ELSE upd_b END AS ups_b,
+//	FROM (SELECT ins_a, ins_b, upd_b, fetch_a, fetch_b FROM ...)
 //
 // For each column, a CASE expression is created that toggles between the insert
 // and update values depending on whether the canary column is null. These

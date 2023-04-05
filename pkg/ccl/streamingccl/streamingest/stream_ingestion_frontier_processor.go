@@ -12,20 +12,20 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamclient"
-	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,10 +36,11 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-// PartitionProgressFrequency controls the frequency of partition progress checkopints.
-var PartitionProgressFrequency = settings.RegisterDurationSetting(
+// JobCheckpointFrequency controls the frequency of frontier checkpoints into
+// the jobs table.
+var JobCheckpointFrequency = settings.RegisterDurationSetting(
 	settings.TenantWritable,
-	"streaming.partition_progress_frequency",
+	"stream_replication.job_checkpoint_frequency",
 	"controls the frequency with which partitions update their progress; if 0, disabled.",
 	10*time.Second,
 	settings.NonNegativeDuration,
@@ -64,9 +65,16 @@ type streamIngestionFrontier struct {
 	// span set.
 	frontier *span.Frontier
 
+	// metrics are monitoring all running ingestion jobs.
+	metrics *Metrics
+
 	// heartbeatSender sends heartbeats to the source cluster to keep the replication
 	// stream alive.
 	heartbeatSender *heartbeatSender
+
+	// persistedHighWater stores the highwater mark of progress that is persisted
+	// in the job record.
+	persistedHighWater hlc.Timestamp
 
 	lastPartitionUpdate time.Time
 	partitionProgress   map[string]jobspb.StreamIngestionProgress_PartitionProgress
@@ -80,40 +88,58 @@ func init() {
 }
 
 func newStreamIngestionFrontierProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.StreamIngestionFrontierSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
-	frontier, err := span.MakeFrontier(spec.TrackedSpans...)
+	frontier, err := span.MakeFrontierAt(spec.HighWaterAtStart, spec.TrackedSpans...)
 	if err != nil {
 		return nil, err
 	}
-	heartbeatSender, err := newHeartbeatSender(flowCtx, spec)
+	for _, resolvedSpan := range spec.Checkpoint.ResolvedSpans {
+		if _, err := frontier.Forward(resolvedSpan.Span, resolvedSpan.Timestamp); err != nil {
+			return nil, err
+		}
+	}
+
+	heartbeatSender, err := newHeartbeatSender(ctx, flowCtx, spec)
 	if err != nil {
 		return nil, err
+	}
+	partitionProgress := make(map[string]jobspb.StreamIngestionProgress_PartitionProgress)
+	for srcPartitionID, destSQLInstanceID := range spec.SubscribingSQLInstances {
+		partitionProgress[srcPartitionID] = jobspb.StreamIngestionProgress_PartitionProgress{
+			DestSQLInstanceID: base.SQLInstanceID(destSQLInstanceID),
+		}
 	}
 	sf := &streamIngestionFrontier{
-		flowCtx:           flowCtx,
-		spec:              spec,
-		input:             input,
-		highWaterAtStart:  spec.HighWaterAtStart,
-		frontier:          frontier,
-		partitionProgress: make(map[string]jobspb.StreamIngestionProgress_PartitionProgress),
-		heartbeatSender:   heartbeatSender,
+		flowCtx:            flowCtx,
+		spec:               spec,
+		input:              input,
+		highWaterAtStart:   spec.HighWaterAtStart,
+		frontier:           frontier,
+		partitionProgress:  partitionProgress,
+		metrics:            flowCtx.Cfg.JobRegistry.MetricsStruct().StreamIngest.(*Metrics),
+		heartbeatSender:    heartbeatSender,
+		persistedHighWater: spec.HighWaterAtStart,
 	}
 	if err := sf.Init(
+		ctx,
 		sf,
 		post,
 		input.OutputTypes(),
 		flowCtx,
 		processorID,
-		output,
 		nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{sf.input},
+			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
+				sf.close()
+				return nil
+			},
 		},
 	); err != nil {
 		return nil, err
@@ -129,45 +155,50 @@ func (sf *streamIngestionFrontier) MustBeStreaming() bool {
 type heartbeatSender struct {
 	lastSent        time.Time
 	client          streamclient.Client
-	streamID        streaming.StreamID
+	streamID        streampb.StreamID
 	frontierUpdates chan hlc.Timestamp
 	frontier        hlc.Timestamp
 	flowCtx         *execinfra.FlowCtx
 	// cg runs the heartbeatSender thread.
 	cg ctxgroup.Group
-	// Send signal to stopChan to stop heartbeat sender.
-	stopChan chan struct{}
+	// cancel stops heartbeat sender.
+	cancel func()
 	// heartbeatSender closes this channel when it stops.
 	stoppedChan chan struct{}
 }
 
 func newHeartbeatSender(
-	flowCtx *execinfra.FlowCtx, spec execinfrapb.StreamIngestionFrontierSpec,
+	ctx context.Context, flowCtx *execinfra.FlowCtx, spec execinfrapb.StreamIngestionFrontierSpec,
 ) (*heartbeatSender, error) {
-	streamClient, err := streamclient.NewStreamClient(streamingccl.StreamAddress(spec.StreamAddress))
+	streamClient, err := streamclient.GetFirstActiveClient(ctx, spec.StreamAddresses)
 	if err != nil {
 		return nil, err
 	}
 	return &heartbeatSender{
 		client:          streamClient,
-		streamID:        streaming.StreamID(spec.StreamID),
+		streamID:        streampb.StreamID(spec.StreamID),
 		flowCtx:         flowCtx,
 		frontierUpdates: make(chan hlc.Timestamp),
-		stopChan:        make(chan struct{}),
+		cancel:          func() {},
 		stoppedChan:     make(chan struct{}),
 	}, nil
 }
 
-func (h *heartbeatSender) maybeHeartbeat(ctx context.Context, frontier hlc.Timestamp) error {
+func (h *heartbeatSender) maybeHeartbeat(
+	ctx context.Context, frontier hlc.Timestamp,
+) (bool, streampb.StreamReplicationStatus, error) {
 	heartbeatFrequency := streamingccl.StreamReplicationConsumerHeartbeatFrequency.Get(&h.flowCtx.EvalCtx.Settings.SV)
 	if h.lastSent.Add(heartbeatFrequency).After(timeutil.Now()) {
-		return nil
+		return false, streampb.StreamReplicationStatus{}, nil
 	}
 	h.lastSent = timeutil.Now()
-	return h.client.Heartbeat(ctx, h.streamID, frontier)
+	s, err := h.client.Heartbeat(ctx, h.streamID, frontier)
+	return true, s, err
 }
 
 func (h *heartbeatSender) startHeartbeatLoop(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	h.cancel = cancel
 	h.cg = ctxgroup.WithContext(ctx)
 	h.cg.GoCtx(func(ctx context.Context) error {
 		sendHeartbeats := func() error {
@@ -177,60 +208,64 @@ func (h *heartbeatSender) startHeartbeatLoop(ctx context.Context) {
 			timer := time.NewTimer(streamingccl.StreamReplicationConsumerHeartbeatFrequency.
 				Get(&h.flowCtx.EvalCtx.Settings.SV))
 			defer timer.Stop()
-			unknownStatusErr := log.Every(1 * time.Minute)
+			unknownStreamStatusRetryErr := log.Every(1 * time.Minute)
 			for {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case <-h.stopChan:
-					return nil
 				case <-timer.C:
 					timer.Reset(streamingccl.StreamReplicationConsumerHeartbeatFrequency.
 						Get(&h.flowCtx.EvalCtx.Settings.SV))
 				case frontier := <-h.frontierUpdates:
 					h.frontier.Forward(frontier)
 				}
-				err := h.maybeHeartbeat(ctx, h.frontier)
-				if err == nil {
+				sent, streamStatus, err := h.maybeHeartbeat(ctx, h.frontier)
+				// TODO(casper): add unit tests to test different kinds of client errors.
+				if err != nil {
+					return err
+				}
+
+				if !sent || streamStatus.StreamStatus == streampb.StreamReplicationStatus_STREAM_ACTIVE {
 					continue
 				}
 
-				var se streamingccl.StreamStatusErr
-				if !errors.As(err, &se) {
-					return errors.Wrap(err, "unknown stream status error")
-				}
-
-				if se.StreamStatus == streampb.StreamReplicationStatus_UNKNOWN_STREAM_STATUS_RETRY {
-					if unknownStatusErr.ShouldLog() {
-						log.Warningf(ctx, "replication stream %d has unknown status error", se.StreamID)
+				if streamStatus.StreamStatus == streampb.StreamReplicationStatus_UNKNOWN_STREAM_STATUS_RETRY {
+					if unknownStreamStatusRetryErr.ShouldLog() {
+						log.Warningf(ctx, "replication stream %d has unknown stream status error and will retry later", h.streamID)
 					}
 					continue
 				}
 				// The replication stream is either paused or inactive.
-				return err
+				return streamingccl.NewStreamStatusErr(h.streamID, streamStatus.StreamStatus)
 			}
 		}
-		err := errors.CombineErrors(sendHeartbeats(), h.client.Close())
+		err := errors.CombineErrors(sendHeartbeats(), h.client.Close(ctx))
 		close(h.stoppedChan)
 		return err
 	})
 }
 
 // Stop the heartbeat loop and returns any error at time of heartbeatSender's exit.
-// Should be called at most once.
+// Can be called multiple times.
 func (h *heartbeatSender) stop() error {
-	close(h.stopChan) // Panic if closed multiple times
-	return h.cg.Wait()
+	h.cancel()
+	return h.wait()
 }
 
 // Wait for heartbeatSender to be stopped and returns any error.
-func (h *heartbeatSender) err() error {
-	return h.cg.Wait()
+func (h *heartbeatSender) wait() error {
+	err := h.cg.Wait()
+	// We expect to see context cancelled when shutting down.
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 // Start is part of the RowSource interface.
 func (sf *streamIngestionFrontier) Start(ctx context.Context) {
 	ctx = sf.StartInternal(ctx, streamIngestionFrontierProcName)
+	sf.metrics.RunningCount.Inc(1)
 	sf.input.Start(ctx)
 	sf.heartbeatSender.startHeartbeatLoop(ctx)
 }
@@ -253,57 +288,73 @@ func (sf *streamIngestionFrontier) Next() (
 			break
 		}
 
-		if err := sf.maybeUpdatePartitionProgress(); err != nil {
-			// Updating the partition progress isn't a fatal error.
-			log.Errorf(sf.Ctx, "failed to update partition progress: %+v", err)
-		}
-
-		var frontierChanged bool
 		var err error
-		if frontierChanged, err = sf.noteResolvedTimestamps(row[0]); err != nil {
+		if _, err = sf.noteResolvedTimestamps(row[0]); err != nil {
 			sf.MoveToDraining(err)
 			break
 		}
 
+		if err := sf.maybeUpdatePartitionProgress(); err != nil {
+			// Updating the partition progress isn't a fatal error.
+			log.Errorf(sf.Ctx(), "failed to update partition progress: %+v", err)
+		}
+
 		// Send back a row to the job so that it can update the progress.
-		newResolvedTS := sf.frontier.Frontier()
 		select {
-		case <-sf.Ctx.Done():
-			sf.MoveToDraining(sf.Ctx.Err())
+		case <-sf.Ctx().Done():
+			sf.MoveToDraining(sf.Ctx().Err())
 			return nil, sf.DrainHelper()
-		// Send the frontier update in the heartbeat to the source cluster.
-		case sf.heartbeatSender.frontierUpdates <- newResolvedTS:
-			if !frontierChanged {
-				break
-			}
-			progressBytes, err := protoutil.Marshal(&newResolvedTS)
-			if err != nil {
-				sf.MoveToDraining(err)
-				break
-			}
-			pushRow := rowenc.EncDatumRow{
-				rowenc.DatumToEncDatum(types.Bytes, tree.NewDBytes(tree.DBytes(progressBytes))),
-			}
-			if outRow := sf.ProcessRowHelper(pushRow); outRow != nil {
-				return outRow, nil
-			}
+			// Send the latest persisted highwater in the heartbeat to the source cluster
+			// as even with retries we will never request an earlier row than it, and
+			// the source cluster is free to clean up earlier data.
+		case sf.heartbeatSender.frontierUpdates <- sf.persistedHighWater:
 			// If heartbeatSender has error, it means remote has error, we want to
 			// stop the processor.
 		case <-sf.heartbeatSender.stoppedChan:
-			sf.MoveToDraining(sf.heartbeatSender.err())
+			err := sf.heartbeatSender.wait()
+			if err != nil {
+				log.Errorf(sf.Ctx(), "heartbeat sender exited with error: %s", err)
+			}
+			sf.MoveToDraining(err)
 			return nil, sf.DrainHelper()
 		}
 	}
 	return nil, sf.DrainHelper()
 }
 
+func (sf *streamIngestionFrontier) close() {
+	if err := sf.heartbeatSender.stop(); err != nil {
+		log.Errorf(sf.Ctx(), "heartbeat sender exited with error: %s", err)
+	}
+	if sf.InternalClose() {
+		sf.metrics.RunningCount.Dec(1)
+	}
+}
+
 // ConsumerClosed is part of the RowSource interface.
 func (sf *streamIngestionFrontier) ConsumerClosed() {
-	if sf.InternalClose() {
-		if err := sf.heartbeatSender.stop(); err != nil {
-			log.Errorf(sf.Ctx, "heartbeatSender exited with error: %s", err.Error())
-		}
+	sf.close()
+}
+
+// decodeResolvedSpans decodes an encoded datum of jobspb.ResolvedSpans into a
+// jobspb.ResolvedSpans object.
+func decodeResolvedSpans(
+	alloc *tree.DatumAlloc, resolvedSpanDatums rowenc.EncDatum,
+) (*jobspb.ResolvedSpans, error) {
+	if err := resolvedSpanDatums.EnsureDecoded(streamIngestionResultTypes[0], alloc); err != nil {
+		return nil, err
 	}
+	raw, ok := resolvedSpanDatums.Datum.(*tree.DBytes)
+	if !ok {
+		return nil, errors.AssertionFailedf(`unexpected datum type %T: %s`,
+			resolvedSpanDatums.Datum, resolvedSpanDatums.Datum)
+	}
+	var resolvedSpans jobspb.ResolvedSpans
+	if err := protoutil.Unmarshal([]byte(*raw), &resolvedSpans); err != nil {
+		return nil, errors.NewAssertionErrorWithWrappedErrf(err,
+			`unmarshalling resolved timestamp: %x`, raw)
+	}
+	return &resolvedSpans, nil
 }
 
 // noteResolvedTimestamps processes a batch of resolved timestamp events, and
@@ -312,20 +363,10 @@ func (sf *streamIngestionFrontier) noteResolvedTimestamps(
 	resolvedSpanDatums rowenc.EncDatum,
 ) (bool, error) {
 	var frontierChanged bool
-	if err := resolvedSpanDatums.EnsureDecoded(streamIngestionResultTypes[0], &sf.alloc); err != nil {
-		return frontierChanged, err
+	resolvedSpans, err := decodeResolvedSpans(&sf.alloc, resolvedSpanDatums)
+	if err != nil {
+		return false, err
 	}
-	raw, ok := resolvedSpanDatums.Datum.(*tree.DBytes)
-	if !ok {
-		return frontierChanged, errors.AssertionFailedf(`unexpected datum type %T: %s`,
-			resolvedSpanDatums.Datum, resolvedSpanDatums.Datum)
-	}
-	var resolvedSpans jobspb.ResolvedSpans
-	if err := protoutil.Unmarshal([]byte(*raw), &resolvedSpans); err != nil {
-		return frontierChanged, errors.NewAssertionErrorWithWrappedErrf(err,
-			`unmarshalling resolved timestamp: %x`, raw)
-	}
-
 	for _, resolved := range resolvedSpans.ResolvedSpans {
 		// Inserting a timestamp less than the one the ingestion flow started at could
 		// potentially regress the job progress. This is not expected and thus we
@@ -336,11 +377,11 @@ func (sf *streamIngestionFrontier) noteResolvedTimestamps(
 				redact.Safe(resolved.Timestamp), redact.Safe(sf.highWaterAtStart))
 		}
 
-		if changed, err := sf.frontier.Forward(resolved.Span, resolved.Timestamp); err == nil {
-			frontierChanged = frontierChanged || changed
-		} else {
+		changed, err := sf.frontier.Forward(resolved.Span, resolved.Timestamp)
+		if err != nil {
 			return false, err
 		}
+		frontierChanged = frontierChanged || changed
 	}
 
 	return frontierChanged, nil
@@ -349,46 +390,85 @@ func (sf *streamIngestionFrontier) noteResolvedTimestamps(
 // maybeUpdatePartitionProgress polls the frontier and updates the job progress with
 // partition-specific information to track the status of each partition.
 func (sf *streamIngestionFrontier) maybeUpdatePartitionProgress() error {
-	ctx := sf.Ctx
-	updateFreq := PartitionProgressFrequency.Get(&sf.flowCtx.Cfg.Settings.SV)
+	ctx := sf.Ctx()
+	updateFreq := JobCheckpointFrequency.Get(&sf.flowCtx.Cfg.Settings.SV)
 	if updateFreq == 0 || timeutil.Since(sf.lastPartitionUpdate) < updateFreq {
 		return nil
 	}
+	f := sf.frontier
 	registry := sf.flowCtx.Cfg.JobRegistry
 	jobID := jobspb.JobID(sf.spec.JobID)
-	f := sf.frontier
-	allSpans := roachpb.Span{
-		Key:    keys.MinKey,
-		EndKey: keys.MaxKey,
-	}
-	partitionFrontiers := sf.partitionProgress
-	job, err := registry.LoadJob(ctx, jobID)
-	if err != nil {
-		return err
-	}
 
-	f.SpanEntries(allSpans, func(span roachpb.Span, timestamp hlc.Timestamp) (done span.OpResult) {
-		partitionKey := span.Key
-		partition := string(partitionKey)
-		if curFrontier, ok := partitionFrontiers[partition]; !ok {
-			partitionFrontiers[partition] = jobspb.StreamIngestionProgress_PartitionProgress{
-				IngestedTimestamp: timestamp,
-			}
-		} else if curFrontier.IngestedTimestamp.Less(timestamp) {
-			curFrontier.IngestedTimestamp = timestamp
-		}
-		return true
+	frontierResolvedSpans := make([]jobspb.ResolvedSpan, 0)
+	f.Entries(func(sp roachpb.Span, ts hlc.Timestamp) (done span.OpResult) {
+		frontierResolvedSpans = append(frontierResolvedSpans, jobspb.ResolvedSpan{Span: sp, Timestamp: ts})
+		return span.ContinueMatch
 	})
 
+	highWatermark := f.Frontier()
+	partitionProgress := sf.partitionProgress
+
 	sf.lastPartitionUpdate = timeutil.Now()
-	// TODO(pbardea): Only update partitions that have changed.
-	return job.FractionProgressed(ctx, nil, /* txn */
-		func(ctx context.Context, details jobspb.ProgressDetails) float32 {
-			prog := details.(*jobspb.Progress_StreamIngest).StreamIngest
-			prog.PartitionProgress = partitionFrontiers
-			// "FractionProgressed" isn't relevant on jobs that are streaming in
-			// changes.
-			return 0.0
-		},
-	)
+
+	if err := registry.UpdateJobWithTxn(ctx, jobID, nil, false, func(
+		txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater,
+	) error {
+		if err := md.CheckRunningOrReverting(); err != nil {
+			return err
+		}
+
+		progress := md.Progress
+		// Keep the recorded highwater empty until some advancement has been made
+		if sf.highWaterAtStart.Less(highWatermark) {
+			progress.Progress = &jobspb.Progress_HighWater{
+				HighWater: &highWatermark,
+			}
+		}
+
+		streamProgress := progress.Details.(*jobspb.Progress_StreamIngest).StreamIngest
+		streamProgress.PartitionProgress = partitionProgress
+		streamProgress.Checkpoint.ResolvedSpans = frontierResolvedSpans
+
+		ju.UpdateProgress(progress)
+
+		// Reset RunStats.NumRuns to 1 since the stream ingestion has returned to
+		// a steady state. By resetting NumRuns,we avoid future job system level
+		// retries from having a large backoff because of past failures.
+		if md.RunStats != nil && md.RunStats.NumRuns > 1 {
+			ju.UpdateRunStats(1, md.RunStats.LastRun)
+		}
+
+		// Update the protected timestamp record protecting the destination tenant's
+		// keyspan if the highWatermark has moved forward since the last time we
+		// recorded progress. This makes older revisions of replicated values with a
+		// timestamp less than highWatermark - ReplicationTTLSeconds, eligible for
+		// garbage collection.
+		replicationDetails := md.Payload.GetStreamIngestion()
+		if replicationDetails.ProtectedTimestampRecordID == nil {
+			return errors.AssertionFailedf("expected replication job to have a protected timestamp " +
+				"record over the destination tenant's keyspan")
+		}
+		ptp := sf.flowCtx.Cfg.ProtectedTimestampProvider.WithTxn(txn)
+		record, err := ptp.GetRecord(ctx, *replicationDetails.ProtectedTimestampRecordID)
+		if err != nil {
+			return err
+		}
+		newProtectAbove := highWatermark.Add(
+			-int64(replicationDetails.ReplicationTTLSeconds)*time.Second.Nanoseconds(), 0)
+		if record.Timestamp.Less(newProtectAbove) {
+			return ptp.UpdateTimestamp(ctx, *replicationDetails.ProtectedTimestampRecordID, newProtectAbove)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	sf.metrics.JobProgressUpdates.Inc(1)
+	sf.persistedHighWater = f.Frontier()
+	sf.metrics.FrontierCheckpointSpanCount.Update(int64(len(frontierResolvedSpans)))
+	if !sf.persistedHighWater.IsEmpty() {
+		// Only update the frontier lag if the high water mark has been updated,
+		// implying the initial scan has completed.
+		sf.metrics.FrontierLagNanos.Update(timeutil.Since(sf.persistedHighWater.GoTime()).Nanoseconds())
+	}
+	return nil
 }

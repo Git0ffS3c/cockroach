@@ -201,9 +201,9 @@ func TestInboxTimeout(t *testing.T) {
 // These goroutines race against each other and the
 // desired state is that everything is cleaned up at the end. Examples of
 // scenarios that are tested by this test include but are not limited to:
-//  - DrainMeta called before Next and before a stream arrives.
-//  - DrainMeta called with an active stream.
-//  - A forceful cancellation of Next but no call to DrainMeta.
+//   - DrainMeta called before Next and before a stream arrives.
+//   - DrainMeta called with an active stream.
+//   - A forceful cancellation of Next but no call to DrainMeta.
 func TestInboxShutdown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -219,7 +219,8 @@ func TestInboxShutdown(t *testing.T) {
 		nextSleep          = time.Millisecond * time.Duration(rng.Intn(10))
 		runWithStreamSleep = time.Millisecond * time.Duration(rng.Intn(10))
 		typs               = []*types.T{types.Int}
-		batch              = coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0 /* length */, rng.Float64())
+		args               = coldatatestutils.RandomVecArgs{Rand: rng, NullProbability: rng.Float64()}
+		batch              = coldatatestutils.RandomBatch(testAllocator, args, typs, coldata.BatchSize(), 0 /* length */)
 	)
 
 	// drainMetaScenario specifies when DrainMeta should be called in the Next
@@ -256,6 +257,10 @@ func TestInboxShutdown(t *testing.T) {
 				drainScenario = drainMetaNotCalled
 			}
 			for _, runRunWithStreamGoroutine := range []bool{false, true} {
+				// copy loop variables so they can be safelyreferenced in Go routines
+				cancel, runNextGoroutine, runRunWithStreamGoroutine :=
+					cancel, runNextGoroutine, runRunWithStreamGoroutine
+
 				if runNextGoroutine == false && runRunWithStreamGoroutine == true {
 					// This is sort of like a remote node connecting to the inbox, but the
 					// inbox will never be spawned. This is dealt with by another part of
@@ -274,7 +279,7 @@ func TestInboxShutdown(t *testing.T) {
 					defer inboxMemAccount.Close(inboxCtx)
 					inbox, err := NewInbox(colmem.NewAllocator(inboxCtx, &inboxMemAccount, coldata.StandardColumnFactory), typs, execinfrapb.StreamID(0))
 					require.NoError(t, err)
-					c, err := colserde.NewArrowBatchConverter(typs)
+					c, err := colserde.NewArrowBatchConverter(typs, colserde.BatchToArrowOnly, testMemAcc)
 					require.NoError(t, err)
 					r, err := colserde.NewRecordBatchSerializer(typs)
 					require.NoError(t, err)
@@ -304,7 +309,8 @@ func TestInboxShutdown(t *testing.T) {
 									wg.Add(1)
 									go func() {
 										defer wg.Done()
-										arrowData, err := c.BatchToArrow(batch)
+										defer c.Release(context.Background())
+										arrowData, err := c.BatchToArrow(context.Background(), batch)
 										if err != nil {
 											errCh <- err
 											return

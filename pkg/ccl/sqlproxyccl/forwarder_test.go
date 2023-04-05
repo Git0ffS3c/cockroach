@@ -44,6 +44,12 @@ func TestForward(t *testing.T) {
 		err := f.run(p1, p2)
 		require.NoError(t, err)
 
+		func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			require.True(t, f.mu.isInitialized)
+		}()
+
 		// Close the connection right away to simulate processor error.
 		p1.Close()
 
@@ -77,6 +83,11 @@ func TestForward(t *testing.T) {
 		require.NoError(t, err)
 		require.Nil(t, f.ctx.Err())
 		require.False(t, f.IsIdle())
+		func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			require.True(t, f.mu.isInitialized)
+		}()
 
 		f.mu.Lock()
 		requestProc := f.mu.request
@@ -217,6 +228,11 @@ func TestForward(t *testing.T) {
 		require.NoError(t, err)
 		require.Nil(t, f.ctx.Err())
 		require.False(t, f.IsIdle())
+		func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			require.True(t, f.mu.isInitialized)
+		}()
 
 		f.mu.Lock()
 		responseProc := f.mu.response
@@ -436,10 +452,15 @@ func TestWrapClientToServerError(t *testing.T) {
 		{errors.Mark(errors.New("foo"), context.Canceled), nil},
 		{errors.Wrap(context.DeadlineExceeded, "foo"), nil},
 		// Forwarding errors.
-		{errors.New("foo"), newErrorf(
+		{errors.New("foo"), withCode(errors.New(
+			"unexpected error copying from client to target server: foo"),
 			codeClientDisconnected,
-			"copying from client to target server: foo",
 		)},
+		{errors.Mark(errors.New("some write error"), errClientWrite),
+			withCode(errors.New(
+				"unable to write to client: some write error"),
+				codeClientWriteFailed,
+			)},
 	} {
 		err := wrapClientToServerError(tc.input)
 		if tc.output == nil {
@@ -464,10 +485,15 @@ func TestWrapServerToClientError(t *testing.T) {
 		{errors.Mark(errors.New("foo"), context.Canceled), nil},
 		{errors.Wrap(context.DeadlineExceeded, "foo"), nil},
 		// Forwarding errors.
-		{errors.New("foo"), newErrorf(
+		{errors.New("foo"), withCode(errors.New(
+			"unexpected error copying from target server to client: foo"),
 			codeBackendDisconnected,
-			"copying from target server to client: foo",
 		)},
+		{errors.Mark(errors.New("some read error"), errServerRead),
+			withCode(errors.New(
+				"unable to read from sql server: some read error"),
+				codeBackendReadFailed,
+			)},
 	} {
 		err := wrapServerToClientError(tc.input)
 		if tc.output == nil {
@@ -521,12 +547,15 @@ func TestSuspendResumeProcessor(t *testing.T) {
 			interceptor.NewPGConn(serverProxy),
 		)
 		require.EqualError(t, p.resume(ctx), context.Canceled.Error())
+		p.mu.Lock()
+		require.True(t, p.mu.closed)
+		p.mu.Unlock()
 
 		// Set resumed to true to simulate suspend loop.
 		p.mu.Lock()
 		p.mu.resumed = true
 		p.mu.Unlock()
-		require.EqualError(t, p.suspend(ctx), context.Canceled.Error())
+		require.EqualError(t, p.suspend(ctx), errProcessorClosed.Error())
 	})
 
 	t.Run("wait_for_resumed", func(t *testing.T) {
@@ -586,15 +615,15 @@ func TestSuspendResumeProcessor(t *testing.T) {
 			interceptor.NewPGConn(serverProxy),
 		)
 
-		// Ensure that everything will return a resumed error except 1.
+		// Ensure that two resume calls will return right away.
 		errCh := make(chan error, 2)
 		go func() { errCh <- p.resume(ctx) }()
 		go func() { errCh <- p.resume(ctx) }()
 		go func() { errCh <- p.resume(ctx) }()
 		err := <-errCh
-		require.EqualError(t, err, errProcessorResumed.Error())
+		require.NoError(t, err)
 		err = <-errCh
-		require.EqualError(t, err, errProcessorResumed.Error())
+		require.NoError(t, err)
 
 		// Suspend the last goroutine.
 		err = p.waitResumed(ctx)
@@ -604,7 +633,7 @@ func TestSuspendResumeProcessor(t *testing.T) {
 
 		// Validate suspension.
 		err = <-errCh
-		require.Nil(t, err)
+		require.NoError(t, err)
 		p.mu.Lock()
 		require.False(t, p.mu.resumed)
 		require.False(t, p.mu.inPeek)
@@ -694,10 +723,7 @@ func TestSuspendResumeProcessor(t *testing.T) {
 		// Wait until all resume calls except 1 have returned.
 		for i := 0; i < concurrency-1; i++ {
 			err := <-errResumeCh
-			// If error is not nil, it has to be an already resumed error.
-			if err != nil {
-				require.EqualError(t, err, errProcessorResumed.Error())
-			}
+			require.NoError(t, err)
 		}
 
 		// Wait until the last one returns. We can guarantee that this is for

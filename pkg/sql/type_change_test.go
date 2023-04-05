@@ -16,10 +16,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -30,93 +27,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
-
-// TestDrainingNamesAreCleanedTypeChangeOnFailure ensures that draining names
-// are cleaned up if the type schema change job runs into a failure in Resume().
-func TestDrainingNamesAreCleanedOnTypeChangeFailure(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SQLTypeSchemaChanger = &sql.TypeSchemaChangerTestingKnobs{
-		RunBeforeExec: func() error {
-			// As the job is non-cancelable, return a permanent-marked error so that
-			// the job can revert.
-			return jobs.MarkAsPermanentJobError(errors.New("boom"))
-		},
-	}
-	// Decrease the adopt loop interval so that retries happen quickly.
-	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
-
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-
-	// Create a type.
-	if _, err := sqlDB.Exec(`
-CREATE DATABASE d;
-CREATE TYPE d.t AS ENUM()
-`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Try a rename. This should fail with "boom".
-	_, err := sqlDB.Exec(`ALTER TYPE d.t RENAME TO t2`)
-	if err == nil {
-		t.Fatal("expected error, found nil")
-	}
-	if !testutils.IsError(err, "boom") {
-		t.Fatalf("expected boom, found %v", err)
-	}
-
-	// The failure hook should kick in and drain the names.
-	testutils.SucceedsSoon(t, func() error {
-		_, err := sqlDB.Exec(`CREATE TYPE d.t AS ENUM ('drained')`)
-		return err
-	})
-}
-
-// TestTypeSchemaChangeHandlesDeletedDescriptor ensures that the type schema
-// change process is resilient to deleted descriptors.
-func TestTypeSchemaChangeHandlesDeletedDescriptor(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	var delTypeDesc func()
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs.SQLTypeSchemaChanger = &sql.TypeSchemaChangerTestingKnobs{
-		RunBeforeExec: func() error {
-			delTypeDesc()
-			return nil
-		},
-	}
-
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
-
-	// Create a type.
-	if _, err := sqlDB.Exec(`
-CREATE DATABASE d;
-CREATE TYPE d.t AS ENUM();
-`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Set up delTypeDesc to delete t.
-	desc := desctestutils.TestingGetPublicTypeDescriptor(kvDB, keys.SystemSQLCodec, "d", "t")
-	delTypeDesc = func() {
-		// Delete the descriptor.
-		if err := kvDB.Del(ctx, catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, desc.GetID())); err != nil {
-			t.Error(err)
-		}
-	}
-
-	// A job running on this descriptor shouldn't fail horribly.
-	if _, err := sqlDB.Exec(`ALTER TYPE d.t RENAME TO t2`); err != nil {
-		t.Fatal(err)
-	}
-}
 
 // TestTypeSchemaChangeRetriesTransparently tests that a type schema change
 // that runs into a non permanent error will retry transparently.
@@ -542,16 +452,16 @@ CREATE TYPE db.greetings AS ENUM ('hi', 'yo');
 `)
 			require.NoError(t, err)
 
-			go func() {
-				_, err := sqlDB.Exec(tc.query)
-				if tc.cancelable && !testutils.IsError(err, "job canceled by user") {
+			go func(query string, isCancellable bool) {
+				_, err := sqlDB.Exec(query)
+				if isCancellable && !testutils.IsError(err, "job canceled by user") {
 					t.Errorf("expected user to have canceled job, got %v", err)
 				}
-				if !tc.cancelable && err != nil {
+				if !isCancellable && err != nil {
 					t.Error(err)
 				}
 				close(finishedSchemaChange)
-			}()
+			}(tc.query, tc.cancelable)
 
 			<-typeSchemaChangeStarted
 

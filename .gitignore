@@ -14,6 +14,7 @@ artifacts
 /bin.*
 /lib
 /lib.*
+/tmp
 .buildinfo
 # cockroach-data, cockroach{,.race}-{darwin,linux,windows}-*
 /cockroach*
@@ -23,8 +24,15 @@ artifacts
 # fuzz tests
 work-Fuzz*
 *-fuzz.zip
+/vendor
 # vendoring by `go mod vendor` may produce this file temporarily
 /.vendor.tmp.*
+# The Observability Service binary.
+/obsservice
+
+# Instrumentation artifacts.
+/instrument*
+.instrumentor_exclusions.tmp
 
 # Custom or private env vars (e.g. internal keys, access tokens, etc).
 customenv.mk

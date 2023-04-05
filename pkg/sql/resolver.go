@@ -16,14 +16,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -33,11 +34,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
-	"github.com/lib/pq/oid"
 )
 
 var _ resolver.SchemaResolver = &planner{}
@@ -74,7 +73,7 @@ func (p *planner) resolveUncachedTableDescriptor(
 	var desc catalog.Descriptor
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
 		lookupFlags := tree.ObjectLookupFlags{
-			CommonLookupFlags:    tree.CommonLookupFlags{Required: required},
+			Required:             required,
 			DesiredObjectKind:    tree.TableObject,
 			DesiredTableDescKind: requiredType,
 		}
@@ -116,8 +115,7 @@ func (p *planner) ResolveTargetObject(
 func (p *planner) GetSchemasForDB(
 	ctx context.Context, dbName string,
 ) (map[descpb.ID]string, error) {
-	dbDesc, err := p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn, dbName,
-		tree.DatabaseLookupFlags{AvoidLeased: true})
+	dbDesc, err := p.Descriptors().ByName(p.txn).Get().Database(ctx, dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -136,98 +134,8 @@ func (p *planner) SchemaExists(ctx context.Context, dbName, scName string) (foun
 	return found, err
 }
 
-// IsTableVisible is part of the eval.DatabaseCatalog interface.
-func (p *planner) IsTableVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, tableID oid.Oid,
-) (isVisible, exists bool, err error) {
-	tableDesc, err := p.LookupTableByID(ctx, descpb.ID(tableID))
-	if err != nil {
-		// If a "not found" error happened here, we return "not exists" rather than
-		// the error.
-		if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-			errors.Is(err, catalog.ErrDescriptorDropped) ||
-			pgerror.GetPGCode(err) == pgcode.UndefinedTable ||
-			pgerror.GetPGCode(err) == pgcode.UndefinedObject {
-			return false, false, nil //nolint:returnerrcheck
-		}
-		return false, false, err
-	}
-	schemaID := tableDesc.GetParentSchemaID()
-	schemaDesc, err := p.Descriptors().GetImmutableSchemaByID(ctx, p.Txn(), schemaID,
-		tree.SchemaLookupFlags{
-			Required:    true,
-			AvoidLeased: p.skipDescriptorCache})
-	if err != nil {
-		return false, false, err
-	}
-	if schemaDesc.SchemaKind() != catalog.SchemaVirtual {
-		dbID := tableDesc.GetParentID()
-		_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.Txn(), dbID,
-			tree.DatabaseLookupFlags{
-				Required:    true,
-				AvoidLeased: p.skipDescriptorCache})
-		if err != nil {
-			return false, false, err
-		}
-		if dbDesc.GetName() != curDB {
-			// If the table is in a different database, then it's considered to be
-			// "not existing" instead of just "not visible"; this matches PostgreSQL.
-			return false, false, nil
-		}
-	}
-	iter := searchPath.Iter()
-	for scName, ok := iter.Next(); ok; scName, ok = iter.Next() {
-		if schemaDesc.GetName() == scName {
-			return true, true, nil
-		}
-	}
-	return false, true, nil
-}
-
-// IsTypeVisible is part of the eval.DatabaseCatalog interface.
-func (p *planner) IsTypeVisible(
-	ctx context.Context, curDB string, searchPath sessiondata.SearchPath, typeID oid.Oid,
-) (isVisible bool, exists bool, err error) {
-	// Check builtin types first. They are always globally visible.
-	if _, ok := types.OidToType[typeID]; ok {
-		return true, true, nil
-	}
-
-	if !types.IsOIDUserDefinedType(typeID) {
-		return false, false, nil //nolint:returnerrcheck
-	}
-
-	id, err := typedesc.UserDefinedTypeOIDToID(typeID)
-	if err != nil {
-		return false, false, err
-	}
-	typName, _, err := p.GetTypeDescriptor(ctx, id)
-	if err != nil {
-		// If a "not found" error happened here, we return "not exists" rather than
-		// the error.
-		if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-			errors.Is(err, catalog.ErrDescriptorDropped) ||
-			pgerror.GetPGCode(err) == pgcode.UndefinedObject {
-			return false, false, nil //nolint:returnerrcheck
-		}
-		return false, false, err
-	}
-	if typName.CatalogName.String() != curDB {
-		// If the type is in a different database, then it's considered to be
-		// "not existing" instead of just "not visible"; this matches PostgreSQL.
-		return false, false, nil
-	}
-	iter := searchPath.Iter()
-	for scName, ok := iter.Next(); ok; scName, ok = iter.Next() {
-		if typName.SchemaName.String() == scName {
-			return true, true, nil
-		}
-	}
-	return false, true, nil
-}
-
-// HasAnyPrivilege is part of the eval.DatabaseCatalog interface.
-func (p *planner) HasAnyPrivilege(
+// HasAnyPrivilegeForSpecifier is part of the eval.DatabaseCatalog interface.
+func (p *planner) HasAnyPrivilegeForSpecifier(
 	ctx context.Context,
 	specifier eval.HasPrivilegeSpecifier,
 	user username.SQLUsername,
@@ -253,28 +161,21 @@ func (p *planner) HasAnyPrivilege(
 			continue
 		}
 
-		if err := p.CheckPrivilegeForUser(ctx, desc, priv.Kind, user); err != nil {
-			if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
-				continue
-			}
+		if ok, err := p.HasPrivilege(ctx, desc, priv.Kind, user); err != nil {
 			return eval.HasNoPrivilege, err
+		} else if !ok {
+			continue
 		}
 
 		if priv.GrantOption {
-			if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-				if err := p.CheckPrivilegeForUser(ctx, desc, privilege.GRANT, user); err != nil {
-					if pgerror.GetPGCode(err) == pgcode.InsufficientPrivilege {
-						continue
-					}
-					return eval.HasNoPrivilege, err
-				}
-			} else {
-				if err := p.CheckGrantOptionsForUser(ctx, desc, []privilege.Kind{priv.Kind}, user, true /* isGrant */); err != nil {
-					if pgerror.GetPGCode(err) == pgcode.WarningPrivilegeNotGranted {
-						continue
-					}
-					return eval.HasNoPrivilege, err
-				}
+			isGrantable, err := p.CheckGrantOptionsForUser(
+				ctx, desc.GetPrivileges(), desc, []privilege.Kind{priv.Kind}, user,
+			)
+			if err != nil {
+				return eval.HasNoPrivilege, err
+			}
+			if !isGrantable {
+				continue
 			}
 		}
 		return eval.HasPrivilege, nil
@@ -289,24 +190,26 @@ func (p *planner) ResolveDescriptorForPrivilegeSpecifier(
 	ctx context.Context, specifier eval.HasPrivilegeSpecifier,
 ) (catalog.Descriptor, error) {
 	if specifier.DatabaseName != nil {
-		return p.Descriptors().GetImmutableDatabaseByName(
-			ctx, p.txn, *specifier.DatabaseName, tree.DatabaseLookupFlags{Required: true},
-		)
+		return p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, *specifier.DatabaseName)
 	} else if specifier.DatabaseOID != nil {
-		_, database, err := p.Descriptors().GetImmutableDatabaseByID(
-			ctx, p.txn, descpb.ID(*specifier.DatabaseOID), tree.DatabaseLookupFlags{},
-		)
+		database, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Database(ctx, descpb.ID(*specifier.DatabaseOID))
+		// When a DatabaseOID is specified and the database is not found,
+		// we return NULL.
+		if err != nil && sqlerrors.IsUndefinedDatabaseError(err) {
+			// nolint:returnerrcheck
+			return nil, nil
+		}
 		return database, err
 	} else if specifier.SchemaName != nil {
-		database, err := p.Descriptors().GetImmutableDatabaseByName(
-			ctx, p.txn, *specifier.SchemaDatabaseName, tree.DatabaseLookupFlags{Required: true},
-		)
+		database, err := p.Descriptors().ByNameWithLeased(p.txn).Get().Database(ctx, *specifier.SchemaDatabaseName)
 		if err != nil {
 			return nil, err
 		}
-		return p.Descriptors().GetImmutableSchemaByName(
-			ctx, p.txn, database, *specifier.SchemaName, tree.SchemaLookupFlags{Required: *specifier.SchemaIsRequired},
-		)
+		b := p.Descriptors().ByNameWithLeased(p.txn)
+		if *specifier.SchemaIsRequired {
+			return b.Get().Schema(ctx, database, *specifier.SchemaName)
+		}
+		return b.MaybeGet().Schema(ctx, database, *specifier.SchemaName)
 	} else if specifier.TableName != nil || specifier.TableOID != nil {
 		var table catalog.TableDescriptor
 		var err error
@@ -326,13 +229,9 @@ func (p *planner) ResolveDescriptorForPrivilegeSpecifier(
 				return nil, pgerror.Newf(pgcode.FeatureNotSupported,
 					"cross-database references are not implemented: %s", tn)
 			}
-			_, table, err = p.Descriptors().GetImmutableTableByName(
-				ctx, p.txn, tn, tree.ObjectLookupFlags{},
-			)
+			_, table, err = descs.PrefixAndTable(ctx, p.Descriptors().ByNameWithLeased(p.txn).MaybeGet(), tn)
 		} else {
-			table, err = p.Descriptors().GetImmutableTableByID(
-				ctx, p.txn, descpb.ID(*specifier.TableOID), tree.ObjectLookupFlags{},
-			)
+			table, err = p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(*specifier.TableOID))
 			// When a TableOID is specified and the relation is not found, we return NULL.
 			if err != nil && sqlerrors.IsUndefinedRelationError(err) {
 				// nolint:returnerrcheck
@@ -357,6 +256,9 @@ func (p *planner) ResolveDescriptorForPrivilegeSpecifier(
 			}
 		}
 		return table, nil
+	} else if specifier.FunctionOID != nil {
+		fnID := funcdesc.UserDefinedFunctionOIDToID(*specifier.FunctionOID)
+		return p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Function(ctx, fnID)
 	}
 	return nil, errors.AssertionFailedf("invalid HasPrivilegeSpecifier")
 }
@@ -365,7 +267,7 @@ func validateColumnForHasPrivilegeSpecifier(
 	table catalog.TableDescriptor, specifier eval.HasPrivilegeSpecifier,
 ) error {
 	if specifier.ColumnName != nil {
-		_, err := table.FindColumnWithName(*specifier.ColumnName)
+		_, err := catalog.MustFindColumnByTreeName(table, *specifier.ColumnName)
 		return err
 	}
 	if specifier.ColumnAttNum != nil {
@@ -385,35 +287,34 @@ func validateColumnForHasPrivilegeSpecifier(
 	return nil
 }
 
-// ObjectLookupFlags is part of the resolver.SchemaResolver interface.
-func (p *planner) ObjectLookupFlags(required, requireMutable bool) tree.ObjectLookupFlags {
-	flags := p.CommonLookupFlags(required)
-	flags.RequireMutable = requireMutable
-	return tree.ObjectLookupFlags{CommonLookupFlags: flags}
+// DescriptorWithObjectType wraps a descriptor with the corresponding
+// privilege object type.
+type DescriptorWithObjectType struct {
+	descriptor catalog.Descriptor
+	objectType privilege.ObjectType
 }
 
-// getDescriptorsFromTargetListForPrivilegeChange fetches the descriptors for the targets.
-func getDescriptorsFromTargetListForPrivilegeChange(
-	ctx context.Context, p *planner, targets tree.TargetList,
-) ([]catalog.Descriptor, error) {
+// getDescriptorsFromTargetListForPrivilegeChange fetches the descriptors
+// for the targets. Each descriptor is marked along with the corresponding
+// object type.
+func (p *planner) getDescriptorsFromTargetListForPrivilegeChange(
+	ctx context.Context, targets tree.GrantTargetList,
+) ([]DescriptorWithObjectType, error) {
 	const required = true
-	flags := tree.CommonLookupFlags{
-		Required:       required,
-		AvoidLeased:    p.skipDescriptorCache,
-		RequireMutable: true,
-	}
 	if targets.Databases != nil {
 		if len(targets.Databases) == 0 {
 			return nil, errNoDatabase
 		}
-		descs := make([]catalog.Descriptor, 0, len(targets.Databases))
+		descs := make([]DescriptorWithObjectType, 0, len(targets.Databases))
 		for _, database := range targets.Databases {
-			descriptor, err := p.Descriptors().
-				GetMutableDatabaseByName(ctx, p.txn, string(database), flags)
+			descriptor, err := p.Descriptors().MutableByName(p.txn).Database(ctx, string(database))
 			if err != nil {
 				return nil, err
 			}
-			descs = append(descs, descriptor)
+			descs = append(descs, DescriptorWithObjectType{
+				descriptor: descriptor,
+				objectType: privilege.Database,
+			})
 		}
 		if len(descs) == 0 {
 			return nil, errNoMatch
@@ -425,14 +326,17 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		if len(targets.Types) == 0 {
 			return nil, errNoType
 		}
-		descs := make([]catalog.Descriptor, 0, len(targets.Types))
+		descs := make([]DescriptorWithObjectType, 0, len(targets.Types))
 		for _, typ := range targets.Types {
 			_, descriptor, err := p.ResolveMutableTypeDescriptor(ctx, typ, required)
 			if err != nil {
 				return nil, err
 			}
 
-			descs = append(descs, descriptor)
+			descs = append(descs, DescriptorWithObjectType{
+				descriptor: descriptor,
+				objectType: privilege.Type,
+			})
 		}
 
 		if len(descs) == 0 {
@@ -441,39 +345,129 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		return descs, nil
 	}
 
+	if targets.Functions != nil {
+		if len(targets.Functions) == 0 {
+			return nil, errNoFunction
+		}
+		descs := make([]DescriptorWithObjectType, 0, len(targets.Functions))
+		fnResolved := catalog.DescriptorIDSet{}
+		for _, f := range targets.Functions {
+			overload, err := p.matchUDF(ctx, &f, true /* required */)
+			if err != nil {
+				return nil, err
+			}
+			fnID := funcdesc.UserDefinedFunctionOIDToID(overload.Oid)
+			if fnResolved.Contains(fnID) {
+				continue
+			}
+			fnResolved.Add(fnID)
+			fnDesc, err := p.Descriptors().MutableByID(p.txn).Function(ctx, fnID)
+			if err != nil {
+				return nil, err
+			}
+			descs = append(descs, DescriptorWithObjectType{
+				descriptor: fnDesc,
+				objectType: privilege.Function,
+			})
+		}
+		return descs, nil
+	}
+
 	if targets.Schemas != nil {
 		if len(targets.Schemas) == 0 {
 			return nil, errNoSchema
 		}
-		if targets.AllTablesInSchema {
+		if targets.AllTablesInSchema || targets.AllSequencesInSchema {
 			// Get all the descriptors for the tables in the specified schemas.
-			db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, p.CurrentDatabase(), flags)
-			if err != nil {
-				return nil, err
-			}
-			var descs []catalog.Descriptor
-			for _, sc := range targets.Schemas {
-				_, objectIDs, err := resolver.GetObjectNamesAndIDs(
-					ctx, p.txn, p, p.ExecCfg().Codec, db, sc.Schema(), true, /* explicitPrefix */
-				)
+			var descs []DescriptorWithObjectType
+			for _, scName := range targets.Schemas {
+				dbName := p.CurrentDatabase()
+				if scName.ExplicitCatalog {
+					dbName = scName.Catalog()
+				}
+				db, err := p.Descriptors().MutableByName(p.txn).Database(ctx, dbName)
 				if err != nil {
 					return nil, err
 				}
-				muts, err := p.Descriptors().GetMutableDescriptorsByID(ctx, p.txn, objectIDs...)
+				sc, err := p.byNameGetterBuilder().Get().Schema(ctx, db, scName.Schema())
+				if err != nil {
+					return nil, err
+				}
+				_, objectIDs, err := p.GetObjectNamesAndIDs(ctx, db, sc)
+				if err != nil {
+					return nil, err
+				}
+				muts, err := p.Descriptors().MutableByID(p.txn).Descs(ctx, objectIDs)
 				if err != nil {
 					return nil, err
 				}
 				for _, mut := range muts {
-					if mut != nil && mut.DescriptorType() == catalog.Table {
-						descs = append(descs, mut)
+					if targets.AllTablesInSchema {
+						if mut != nil {
+							if mut.DescriptorType() == catalog.Table {
+								descs = append(
+									descs,
+									DescriptorWithObjectType{
+										descriptor: mut,
+										objectType: privilege.Table,
+									})
+							}
+						}
+					} else if targets.AllSequencesInSchema {
+						if mut.DescriptorType() == catalog.Table {
+							tableDesc, err := catalog.AsTableDescriptor(mut)
+							if err != nil {
+								return nil, err
+							}
+							if tableDesc.IsSequence() {
+								descs = append(
+									descs,
+									DescriptorWithObjectType{
+										descriptor: mut,
+										objectType: privilege.Sequence,
+									},
+								)
+							}
+						}
 					}
 				}
 			}
 
 			return descs, nil
+		} else if targets.AllFunctionsInSchema {
+			var descs []DescriptorWithObjectType
+			for _, scName := range targets.Schemas {
+				dbName := p.CurrentDatabase()
+				if scName.ExplicitCatalog {
+					dbName = scName.Catalog()
+				}
+				db, err := p.Descriptors().MutableByName(p.txn).Database(ctx, dbName)
+				if err != nil {
+					return nil, err
+				}
+				sc, err := p.Descriptors().ByName(p.txn).Get().Schema(ctx, db, scName.Schema())
+				if err != nil {
+					return nil, err
+				}
+				err = sc.ForEachFunctionSignature(func(sig descpb.SchemaDescriptor_FunctionSignature) error {
+					fn, err := p.Descriptors().MutableByID(p.txn).Function(ctx, sig.ID)
+					if err != nil {
+						return err
+					}
+					descs = append(descs, DescriptorWithObjectType{
+						descriptor: fn,
+						objectType: privilege.Function,
+					})
+					return nil
+				})
+				if err != nil {
+					return nil, err
+				}
+			}
+			return descs, nil
 		}
 
-		descs := make([]catalog.Descriptor, 0, len(targets.Schemas))
+		descs := make([]DescriptorWithObjectType, 0, len(targets.Schemas))
 
 		// Resolve the databases being changed
 		type schemaWithDBDesc struct {
@@ -486,22 +480,31 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 			if sc.ExplicitCatalog {
 				dbName = sc.Catalog()
 			}
-			db, err := p.Descriptors().GetMutableDatabaseByName(ctx, p.txn, dbName, flags)
+			db, err := p.Descriptors().MutableByName(p.txn).Database(ctx, dbName)
 			if err != nil {
 				return nil, err
 			}
-			targetSchemas = append(targetSchemas, schemaWithDBDesc{schema: sc.Schema(), dbDesc: db})
+			targetSchemas = append(
+				targetSchemas,
+				schemaWithDBDesc{schema: sc.Schema(), dbDesc: db},
+			)
 		}
 
 		for _, sc := range targetSchemas {
-			resSchema, err := p.Descriptors().GetSchemaByName(
-				ctx, p.txn, sc.dbDesc, sc.schema, flags)
+			resSchema, err := p.byNameGetterBuilder().Get().Schema(ctx, sc.dbDesc, sc.schema)
 			if err != nil {
 				return nil, err
 			}
 			switch resSchema.SchemaKind() {
 			case catalog.SchemaUserDefined:
-				descs = append(descs, resSchema)
+				mutSchema, err := p.Descriptors().MutableByID(p.txn).Schema(ctx, resSchema.GetID())
+				if err != nil {
+					return nil, err
+				}
+				descs = append(descs, DescriptorWithObjectType{
+					descriptor: mutSchema,
+					objectType: privilege.Schema,
+				})
 			default:
 				return nil, pgerror.Newf(pgcode.InvalidSchemaName,
 					"cannot change privileges on schema %q", resSchema.GetName())
@@ -510,26 +513,46 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 		return descs, nil
 	}
 
-	if len(targets.Tables) == 0 {
+	if len(targets.Tables.TablePatterns) == 0 {
 		return nil, errNoTable
 	}
-	descs := make([]catalog.Descriptor, 0, len(targets.Tables))
-	for _, tableTarget := range targets.Tables {
+	descs := make([]DescriptorWithObjectType, 0, len(targets.Tables.TablePatterns))
+	for _, tableTarget := range targets.Tables.TablePatterns {
 		tableGlob, err := tableTarget.NormalizeTablePattern()
 		if err != nil {
 			return nil, err
 		}
-		_, objectIDs, err := expandTableGlob(ctx, p, tableGlob)
+		_, objectIDs, err := p.ExpandTableGlob(ctx, tableGlob)
 		if err != nil {
 			return nil, err
 		}
-		muts, err := p.Descriptors().GetMutableDescriptorsByID(ctx, p.txn, objectIDs...)
+		muts, err := p.Descriptors().MutableByID(p.txn).Descs(ctx, objectIDs)
 		if err != nil {
 			return nil, err
 		}
 		for _, mut := range muts {
 			if mut != nil && mut.DescriptorType() == catalog.Table {
-				descs = append(descs, mut)
+				tableDesc, err := catalog.AsTableDescriptor(mut)
+				if err != nil {
+					return nil, err
+				}
+				if tableDesc.IsSequence() {
+					descs = append(
+						descs,
+						DescriptorWithObjectType{
+							descriptor: mut,
+							objectType: privilege.Sequence,
+						},
+					)
+				} else {
+					descs = append(
+						descs,
+						DescriptorWithObjectType{
+							descriptor: mut,
+							objectType: privilege.Table,
+						},
+					)
+				}
 			}
 		}
 	}
@@ -539,27 +562,30 @@ func getDescriptorsFromTargetListForPrivilegeChange(
 	return descs, nil
 }
 
-// getFullyQualifiedTableNamesFromIDs resolves a list of table IDs to their
+// getFullyQualifiedNamesFromIDs resolves a list of table IDs to their
 // fully qualified names.
-func (p *planner) getFullyQualifiedTableNamesFromIDs(
+func (p *planner) getFullyQualifiedNamesFromIDs(
 	ctx context.Context, ids []descpb.ID,
-) (fullyQualifiedNames []*tree.TableName, _ error) {
+) (fullyQualifiedNames []string, _ error) {
 	for _, id := range ids {
-		desc, err := p.Descriptors().GetImmutableTableByID(ctx, p.txn, id, tree.ObjectLookupFlags{
-			CommonLookupFlags: tree.CommonLookupFlags{
-				AvoidLeased:    true,
-				IncludeDropped: true,
-				IncludeOffline: true,
-			},
-		})
+		desc, err := p.Descriptors().ByID(p.txn).Get().Desc(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		fqName, err := p.getQualifiedTableName(ctx, desc)
-		if err != nil {
-			return nil, err
+		switch t := desc.(type) {
+		case catalog.TableDescriptor:
+			tbName, err := p.getQualifiedTableName(ctx, t)
+			if err != nil {
+				return nil, err
+			}
+			fullyQualifiedNames = append(fullyQualifiedNames, tbName.FQString())
+		case catalog.FunctionDescriptor:
+			fName, err := p.getQualifiedFunctionName(ctx, t)
+			if err != nil {
+				return nil, err
+			}
+			fullyQualifiedNames = append(fullyQualifiedNames, fName.FQString())
 		}
-		fullyQualifiedNames = append(fullyQualifiedNames, fqName)
 	}
 	return fullyQualifiedNames, nil
 }
@@ -569,11 +595,7 @@ func (p *planner) getFullyQualifiedTableNamesFromIDs(
 func (p *planner) getQualifiedSchemaName(
 	ctx context.Context, desc catalog.SchemaDescriptor,
 ) (*tree.ObjectNamePrefix, error) {
-	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(),
-		tree.DatabaseLookupFlags{
-			Required:    true,
-			AvoidLeased: true,
-		})
+	dbDesc, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return nil, err
 	}
@@ -590,19 +612,13 @@ func (p *planner) getQualifiedSchemaName(
 func (p *planner) getQualifiedTypeName(
 	ctx context.Context, desc catalog.TypeDescriptor,
 ) (*tree.TypeName, error) {
-	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(ctx, p.txn, desc.GetParentID(),
-		tree.DatabaseLookupFlags{
-			Required:    true,
-			AvoidLeased: true,
-		})
+	dbDesc, err := p.Descriptors().ByID(p.txn).WithoutNonPublic().Get().Database(ctx, desc.GetParentID())
 	if err != nil {
 		return nil, err
 	}
 
 	schemaID := desc.GetParentSchemaID()
-	scDesc, err := p.Descriptors().GetImmutableSchemaByID(
-		ctx, p.txn, schemaID, tree.SchemaLookupFlags{Required: true},
-	)
+	scDesc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, schemaID)
 	if err != nil {
 		return nil, err
 	}
@@ -630,23 +646,18 @@ func expandMutableIndexName(
 	ctx context.Context, p *planner, index *tree.TableIndexName, requireTable bool,
 ) (tn *tree.TableName, desc *tabledesc.Mutable, err error) {
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		tn, desc, err = expandIndexName(ctx, p.txn, p, p.ExecCfg().Codec, index, requireTable)
+		tn, desc, err = expandIndexName(ctx, p, index, requireTable)
 	})
 	return tn, desc, err
 }
 
 func expandIndexName(
-	ctx context.Context,
-	txn *kv.Txn,
-	sc resolver.SchemaResolver,
-	codec keys.SQLCodec,
-	index *tree.TableIndexName,
-	requireTable bool,
+	ctx context.Context, p *planner, index *tree.TableIndexName, requireTable bool,
 ) (tn *tree.TableName, desc *tabledesc.Mutable, err error) {
 	tn = &index.Table
 	if tn.Object() != "" {
 		// The index and its table prefix must exist already. Resolve the table.
-		_, desc, err = resolver.ResolveMutableExistingTableObject(ctx, sc, tn, requireTable, tree.ResolveRequireTableOrViewDesc)
+		_, desc, err = resolver.ResolveMutableExistingTableObject(ctx, p, tn, requireTable, tree.ResolveRequireTableOrViewDesc)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -657,7 +668,15 @@ func expandIndexName(
 		return tn, desc, nil
 	}
 
-	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(ctx, sc, index, txn, codec, requireTable, false /*requireActiveIndex*/)
+	found, resolvedPrefix, tbl, _, err := resolver.ResolveIndex(
+		ctx,
+		p,
+		index,
+		tree.IndexLookupFlags{
+			Required:              requireTable,
+			IncludeNonActiveIndex: true,
+		},
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -674,7 +693,10 @@ func expandIndexName(
 	// Memoize the table name that was found. tn is a reference to the table name
 	// stored in index.Table.
 	*tn = tableName
-	tblMutable := tbl.NewBuilder().BuildExistingMutable().(*tabledesc.Mutable)
+	tblMutable, err := p.Descriptors().MutableByID(p.Txn()).Table(ctx, tbl.GetID())
+	if err != nil {
+		return nil, nil, err
+	}
 	return &tableName, tblMutable, nil
 }
 
@@ -698,7 +720,11 @@ func (p *planner) getTableAndIndexImpl(
 	ctx context.Context, tableWithIndex *tree.TableIndexName, privilege privilege.Kind,
 ) (catalog.ResolvedObjectPrefix, *tabledesc.Mutable, catalog.Index, error) {
 	_, resolvedPrefix, tbl, idx, err := resolver.ResolveIndex(
-		ctx, p, tableWithIndex, p.Txn(), p.EvalContext().Codec, true /* required */, true, /* requireActiveIndex */
+		ctx, p, tableWithIndex,
+		tree.IndexLookupFlags{
+			Required:              true,
+			IncludeNonActiveIndex: false,
+		},
 	)
 	if err != nil {
 		return catalog.ResolvedObjectPrefix{}, nil, nil, err
@@ -720,12 +746,12 @@ func (p *planner) getTableAndIndexImpl(
 	// Use the descriptor collection to get a proper handle to the mutable
 	// descriptor for the relevant table and use that mutable object to
 	// get a handle to the corresponding index.
-	mut, err := p.Descriptors().GetMutableTableVersionByID(ctx, tbl.GetID(), p.Txn())
+	mut, err := p.Descriptors().MutableByID(p.Txn()).Table(ctx, tbl.GetID())
 	if err != nil {
 		return catalog.ResolvedObjectPrefix{}, nil, nil, errors.NewAssertionErrorWithWrappedErrf(err,
 			"failed to re-resolve table %d for index %s", tbl.GetID(), tableWithIndex)
 	}
-	retIdx, err := mut.FindIndexWithID(idx.GetID())
+	retIdx, err := catalog.MustFindIndexByID(mut, idx.GetID())
 	if err != nil {
 		return catalog.ResolvedObjectPrefix{}, nil, nil, errors.NewAssertionErrorWithWrappedErrf(err,
 			"retrieving index %s (%d) from table which was known to already exist for table %d",
@@ -734,10 +760,10 @@ func (p *planner) getTableAndIndexImpl(
 	return resolvedPrefix, mut, retIdx, nil
 }
 
-// expandTableGlob expands pattern into a list of objects represented
-// as a tree.TableNames.
-func expandTableGlob(
-	ctx context.Context, p *planner, pattern tree.TablePattern,
+// ExpandTableGlob expands pattern into a list of objects represented
+// as a tree.TableNames and corresponding descriptor IDs.
+func (p *planner) ExpandTableGlob(
+	ctx context.Context, pattern tree.TablePattern,
 ) (tree.TableNames, descpb.IDs, error) {
 	var catalog optCatalog
 	catalog.init(p)
@@ -799,6 +825,8 @@ type internalLookupCtx struct {
 	tbIDs       []descpb.ID
 	typDescs    map[descpb.ID]catalog.TypeDescriptor
 	typIDs      []descpb.ID
+	fnDescs     map[descpb.ID]catalog.FunctionDescriptor
+	fnIDs       []descpb.ID
 }
 
 // GetSchemaName looks up a schema with the given id in the LookupContext.
@@ -829,27 +857,24 @@ func (l *internalLookupCtx) GetSchemaName(
 	return schemaName, found, nil
 }
 
+var metamorphicDefaultUseIndexLookupForDescriptorsInDatabase = util.ConstantWithMetamorphicTestBool(
+	`use-index-lookup-for-descriptors-in-database`, true,
+)
+
+// useIndexLookupForDescriptorsInDatabase controls whether an index against the
+// namespace table should be used to fetch the set of descriptors needed to
+// materialize most system tables.
+var useIndexLookupForDescriptorsInDatabase = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.catalog.virtual_tables.use_index_lookup_for_descriptors_in_database.enabled",
+	"if enabled, virtual tables will do a lookup against the namespace table to"+
+		" find the descriptors in a database instead of scanning all descriptors",
+	metamorphicDefaultUseIndexLookupForDescriptorsInDatabase,
+)
+
 // tableLookupFn can be used to retrieve a table descriptor and its corresponding
 // database descriptor using the table's ID.
 type tableLookupFn = *internalLookupCtx
-
-// newInternalLookupCtxFromDescriptorProtos "unwraps" the descriptors into the
-// appropriate implementation of Descriptor before constructing a new
-// internalLookupCtx. It also hydrates any table descriptors with enum
-// information. It is intended only for use when dealing with backups.
-func newInternalLookupCtxFromDescriptorProtos(
-	ctx context.Context, rawDescs []descpb.Descriptor, prefix catalog.DatabaseDescriptor,
-) (*internalLookupCtx, error) {
-	descriptors := make([]catalog.Descriptor, len(rawDescs))
-	for i := range rawDescs {
-		descriptors[i] = descbuilder.NewBuilder(&rawDescs[i]).BuildImmutable()
-	}
-	lCtx := newInternalLookupCtx(descriptors, prefix)
-	if err := descs.HydrateGivenDescriptors(ctx, descriptors); err != nil {
-		return nil, err
-	}
-	return lCtx, nil
-}
 
 // newInternalLookupCtx provides cached access to a set of descriptors for use
 // in virtual tables.
@@ -863,7 +888,9 @@ func newInternalLookupCtx(
 
 	tbDescs := make(map[descpb.ID]catalog.TableDescriptor)
 	typDescs := make(map[descpb.ID]catalog.TypeDescriptor)
-	var tbIDs, typIDs, dbIDs, schemaIDs []descpb.ID
+	fnDescs := make(map[descpb.ID]catalog.FunctionDescriptor)
+
+	var tbIDs, typIDs, dbIDs, schemaIDs, fnIDs []descpb.ID
 
 	// Record descriptors for name lookups.
 	for i := range descs {
@@ -894,6 +921,11 @@ func newInternalLookupCtx(
 				schemaIDs = append(schemaIDs, desc.GetID())
 				schemaNames[desc.GetID()] = desc.GetName()
 			}
+		case catalog.FunctionDescriptor:
+			fnDescs[desc.GetID()] = desc
+			if prefix == nil || prefix.GetID() == desc.GetParentID() {
+				fnIDs = append(fnIDs, desc.GetID())
+			}
 		}
 	}
 
@@ -905,9 +937,11 @@ func newInternalLookupCtx(
 		schemaIDs:   schemaIDs,
 		tbDescs:     tbDescs,
 		typDescs:    typDescs,
+		fnDescs:     fnDescs,
 		tbIDs:       tbIDs,
 		dbIDs:       dbIDs,
 		typIDs:      typIDs,
+		fnIDs:       fnIDs,
 	}
 }
 
@@ -940,6 +974,9 @@ func (l *internalLookupCtx) getTypeByID(id descpb.ID) (catalog.TypeDescriptor, e
 func (l *internalLookupCtx) getSchemaByID(id descpb.ID) (catalog.SchemaDescriptor, error) {
 	sc, ok := l.schemaDescs[id]
 	if !ok {
+		if id == keys.SystemPublicSchemaID {
+			return schemadesc.GetPublicSchema(), nil
+		}
 		return nil, sqlerrors.NewUndefinedSchemaError(fmt.Sprintf("[%d]", id))
 	}
 	return sc, nil
@@ -1036,6 +1073,44 @@ func getTypeNameFromTypeDescriptor(
 	return typeName, nil
 }
 
+func getSchemaNameFromSchemaDescriptor(
+	l simpleSchemaResolver, sc catalog.SchemaDescriptor,
+) (tree.ObjectNamePrefix, error) {
+	var scName tree.ObjectNamePrefix
+	db, err := l.getDatabaseByID(sc.GetParentID())
+	if err != nil {
+		return scName, err
+	}
+	return tree.ObjectNamePrefix{
+		CatalogName:     tree.Name(db.GetName()),
+		SchemaName:      tree.Name(sc.GetName()),
+		ExplicitCatalog: true,
+		ExplicitSchema:  true,
+	}, nil
+}
+
+func getFunctionNameFromFunctionDescriptor(
+	l simpleSchemaResolver, fn catalog.FunctionDescriptor,
+) (tree.FunctionName, error) {
+	var fnName tree.FunctionName
+	db, err := l.getDatabaseByID(fn.GetParentID())
+	if err != nil {
+		return fnName, err
+	}
+	var scName string
+	// TODO(richardjcai): Remove this in 22.2.
+	if fn.GetParentSchemaID() == keys.PublicSchemaID {
+		scName = tree.PublicSchema
+	} else {
+		sc, err := l.getSchemaByID(fn.GetParentSchemaID())
+		if err != nil {
+			return fnName, err
+		}
+		scName = sc.GetName()
+	}
+	return tree.MakeQualifiedFunctionName(db.GetName(), scName, fn.GetName()), nil
+}
+
 // ResolveMutableTypeDescriptor resolves a type descriptor for mutable access.
 func (p *planner) ResolveMutableTypeDescriptor(
 	ctx context.Context, name *tree.UnresolvedObjectName, required bool,
@@ -1094,7 +1169,8 @@ func (p *planner) ResolveMutableTableDescriptorExAllowNoPrimaryKey(
 	requiredType tree.RequiredTableKind,
 ) (catalog.ResolvedObjectPrefix, *tabledesc.Mutable, error) {
 	lookupFlags := tree.ObjectLookupFlags{
-		CommonLookupFlags:      tree.CommonLookupFlags{Required: required, RequireMutable: true},
+		Required:               required,
+		RequireMutable:         true,
 		AllowWithoutPrimaryKey: true,
 		DesiredObjectKind:      tree.TableObject,
 		DesiredTableDescKind:   requiredType,
@@ -1136,7 +1212,8 @@ func (p *planner) ResolveExistingObjectEx(
 	requiredType tree.RequiredTableKind,
 ) (res catalog.TableDescriptor, err error) {
 	lookupFlags := tree.ObjectLookupFlags{
-		CommonLookupFlags:    p.CommonLookupFlags(required),
+		Required:             required,
+		AvoidLeased:          p.skipDescriptorCache,
 		DesiredObjectKind:    tree.TableObject,
 		DesiredTableDescKind: requiredType,
 	}

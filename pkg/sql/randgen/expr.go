@@ -85,6 +85,7 @@ func isAllowedPartialIndexColType(columnTableDef *tree.ColumnTableDef) bool {
 	}
 }
 
+// TODO(jordan): should we be including more comparison operators here?
 var cmpOps = []treecmp.ComparisonOperatorSymbol{treecmp.EQ, treecmp.NE, treecmp.LT, treecmp.LE, treecmp.GE, treecmp.GT}
 
 // randBoolColumnExpr returns a random boolean expression with the given column.
@@ -172,15 +173,26 @@ func randExpr(
 			var expr tree.Expr
 			expr = tree.NewUnresolvedName(string(cols[0].Name))
 			referencedCols[cols[0].Name] = struct{}{}
+			colType := cols[0].Type.(*types.T)
 			for _, x := range cols[1:] {
+				origExpr := expr
+				origColType := colType
 				expr = &tree.BinaryExpr{
 					Operator: treebin.MakeBinaryOperator(treebin.Plus),
 					Left:     expr,
 					Right:    tree.NewUnresolvedName(string(x.Name)),
 				}
 				referencedCols[x.Name] = struct{}{}
+				// Make sure the data type is large enough to hold the result. For
+				// example, (INT4 + INT8) should be an INT8, not an INT4.
+				colType = tree.InferBinaryType(treebin.Plus, colType, x.Type.(*types.T))
+				if colType == nil {
+					// If the plus expression is illegal, don't use it.
+					colType = origColType
+					expr = origExpr
+				}
 			}
-			return expr, cols[0].Type.(*types.T), nullability, referencedCols
+			return expr, colType, nullability, referencedCols
 		}
 	}
 
@@ -209,6 +221,9 @@ func randExpr(
 			Left:     tree.NewUnresolvedName(string(x.Name)),
 			Right:    RandDatum(rng, xTyp, nullOk),
 		}
+		// Make sure the data type is large enough to hold the result. For
+		// example, (INT4 + INT8) should be an INT8, not an INT4.
+		typ = tree.InferBinaryType(treebin.Plus, typ, expr.(*tree.BinaryExpr).Right.(tree.Datum).ResolvedType())
 
 	case types.StringFamily:
 		typ = types.String
@@ -218,7 +233,7 @@ func randExpr(
 		}
 
 	default:
-		vol, ok := cast.LookupCastVolatility(xTyp, types.String, cast.SessionOptions{})
+		vol, ok := cast.LookupCastVolatility(xTyp, types.String)
 		if ok && vol <= volatility.Immutable &&
 			!typeToStringCastHasIncorrectVolatility(xTyp) {
 			// We can cast to string; use lower(x::string)

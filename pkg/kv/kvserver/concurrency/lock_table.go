@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -40,7 +41,7 @@ const (
 	_ waitKind = iota
 
 	// waitFor indicates that the request is waiting on another transaction to
-	// to release its locks or complete its own request. waitingStates with this
+	// release its locks or complete its own request. waitingStates with this
 	// waitKind will provide information on who the request is waiting on. The
 	// request will likely want to eventually push the conflicting transaction.
 	waitFor
@@ -96,11 +97,6 @@ type waitingState struct {
 	// Represents the action that the request was trying to perform when
 	// it hit the conflict. E.g. was it trying to read or write?
 	guardAccess spanset.SpanAccess
-
-	// lockWaitStart represents the timestamp when the request started waiting on
-	// the lock that this waitingState refers to. If multiple consecutive states
-	// refer to the same lock, they share the same lockWaitStart.
-	lockWaitStart time.Time
 }
 
 // String implements the fmt.Stringer interface.
@@ -169,9 +165,10 @@ type treeMu struct {
 // thread.
 //
 // Mutex ordering:   lockTableImpl.enabledMu
-//                 > treeMu.mu
-//                 > lockState.mu
-//                 > lockTableGuardImpl.mu
+//
+//	> treeMu.mu
+//	> lockState.mu
+//	> lockTableGuardImpl.mu
 type lockTableImpl struct {
 	// The ID of the range to which this replica's lock table belongs.
 	// Used to populate results when querying the lock table.
@@ -316,46 +313,46 @@ func (t *lockTableImpl) setMaxLocks(maxLocks int64) {
 // transitions where the transitions are notified via newState() and the current
 // state can be read using CurState().
 //
-// - The waitFor* states provide information on who the request is waiting for.
-//   The waitForDistinguished state is a sub-case -- a distinguished waiter is
-//   responsible for taking extra actions e.g. immediately pushing the transaction
-//   it is waiting for. The implementation ensures that if there are multiple
-//   requests in waitFor state waiting on the same transaction at least one will
-//   be a distinguished waiter.
+//   - The waitFor* states provide information on who the request is waiting for.
+//     The waitForDistinguished state is a sub-case -- a distinguished waiter is
+//     responsible for taking extra actions e.g. immediately pushing the transaction
+//     it is waiting for. The implementation ensures that if there are multiple
+//     requests in waitFor state waiting on the same transaction at least one will
+//     be a distinguished waiter.
 //
-//   TODO(sbhola): investigate removing the waitForDistinguished state which
-//   will simplify the code here. All waitFor requests would wait (currently
-//   50ms) before pushing the transaction (for deadlock detection) they are
-//   waiting on, say T. Typically T will be done before 50ms which is considered
-//   ok: the one exception we will need to make is if T has the min priority or
-//   the waiting transaction has max priority -- in both cases it will push
-//   immediately. The bad case is if T is ABORTED: the push will succeed after,
-//   and if T left N intents, each push would wait for 50ms, incurring a latency
-//   of 50*N ms. A cache of recently encountered ABORTED transactions on each
-//   Store should mitigate this latency increase. Whenever a transaction sees a
-//   waitFor state, it will consult this cache and if T is found, push
-//   immediately (if there isn't already a push in-flight) -- even if T is not
-//   initially in the cache, the first push will place it in the cache, so the
-//   maximum latency increase is 50ms.
+//     TODO(sbhola): investigate removing the waitForDistinguished state which
+//     will simplify the code here. All waitFor requests would wait (currently
+//     50ms) before pushing the transaction (for deadlock detection) they are
+//     waiting on, say T. Typically T will be done before 50ms which is considered
+//     ok: the one exception we will need to make is if T has the min priority or
+//     the waiting transaction has max priority -- in both cases it will push
+//     immediately. The bad case is if T is ABORTED: the push will succeed after,
+//     and if T left N intents, each push would wait for 50ms, incurring a latency
+//     of 50*N ms. A cache of recently encountered ABORTED transactions on each
+//     Store should mitigate this latency increase. Whenever a transaction sees a
+//     waitFor state, it will consult this cache and if T is found, push
+//     immediately (if there isn't already a push in-flight) -- even if T is not
+//     initially in the cache, the first push will place it in the cache, so the
+//     maximum latency increase is 50ms.
 //
-// - The waitElsewhere state is a rare state that is used when the lockTable is
-//   under memory pressure and is clearing its internal queue state. Like the
-//   waitFor* states, it informs the request who it is waiting for so that
-//   deadlock detection works. However, sequencing information inside the
-//   lockTable is mostly discarded.
+//   - The waitElsewhere state is a rare state that is used when the lockTable is
+//     under memory pressure and is clearing its internal queue state. Like the
+//     waitFor* states, it informs the request who it is waiting for so that
+//     deadlock detection works. However, sequencing information inside the
+//     lockTable is mostly discarded.
 //
-// - The waitSelf state is a rare state when a different request from the same
-//   transaction has a reservation. See the comment about "Reservations" in
-//   lockState.
+//   - The waitSelf state is a rare state when a different request from the same
+//     transaction has a reservation. See the comment about "Reservations" in
+//     lockState.
 //
-// - The waitQueueMaxLengthExceeded state is used to indicate that the request
-//   was rejected because it attempted to enter a lock wait-queue as a writer
-//   and found that the queue's length was already equal to or exceeding the
-//   request's configured maximum.
+//   - The waitQueueMaxLengthExceeded state is used to indicate that the request
+//     was rejected because it attempted to enter a lock wait-queue as a writer
+//     and found that the queue's length was already equal to or exceeding the
+//     request's configured maximum.
 //
-// - The doneWaiting state is used to indicate that the request should make
-//   another call to ScanAndEnqueue() (that next call is more likely to return a
-//   lockTableGuard that returns false from StartWaiting()).
+//   - The doneWaiting state is used to indicate that the request should make
+//     another call to ScanAndEnqueue() (that next call is more likely to return a
+//     lockTableGuard that returns false from StartWaiting()).
 type lockTableGuardImpl struct {
 	seqNum uint64
 	lt     *lockTableImpl
@@ -364,6 +361,7 @@ type lockTableGuardImpl struct {
 	txn                *enginepb.TxnMeta
 	ts                 hlc.Timestamp
 	spans              *spanset.SpanSet
+	waitPolicy         lock.WaitPolicy
 	maxWaitQueueLength int
 
 	// Snapshots of the trees for which this request has some spans. Note that
@@ -533,15 +531,14 @@ func (g *lockTableGuardImpl) CurState() waitingState {
 
 func (g *lockTableGuardImpl) updateStateLocked(newState waitingState) {
 	g.mu.state = newState
-	switch newState.kind {
-	case waitFor, waitForDistinguished, waitSelf, waitElsewhere:
-		g.mu.state.lockWaitStart = g.mu.curLockWaitStart
-	default:
-		g.mu.state.lockWaitStart = time.Time{}
-	}
 }
 
 func (g *lockTableGuardImpl) CheckOptimisticNoConflicts(spanSet *spanset.SpanSet) (ok bool) {
+	if g.waitPolicy == lock.WaitPolicy_SkipLocked {
+		// If the request is using a SkipLocked wait policy, lock conflicts are
+		// handled during evaluation.
+		return true
+	}
 	// Temporarily replace the SpanSet in the guard.
 	originalSpanSet := g.spans
 	g.spans = spanSet
@@ -566,6 +563,57 @@ func (g *lockTableGuardImpl) CheckOptimisticNoConflicts(spanSet *spanset.SpanSet
 		span = stepToNextSpan(g)
 	}
 	return true
+}
+
+func (g *lockTableGuardImpl) IsKeyLockedByConflictingTxn(
+	key roachpb.Key, strength lock.Strength,
+) (bool, *enginepb.TxnMeta) {
+	ss := spanset.SpanGlobal
+	if keys.IsLocal(key) {
+		ss = spanset.SpanLocal
+	}
+	tree := g.tableSnapshot[ss]
+	iter := tree.MakeIter()
+	iter.SeekGE(&lockState{key: key})
+	if !iter.Valid() || !iter.Cur().key.Equal(key) {
+		// No lock on key.
+		return false, nil
+	}
+	l := iter.Cur()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.isEmptyLock() {
+		// The lock is empty but has not yet been deleted.
+		return false, nil
+	}
+	if !l.holder.locked {
+		// Key reserved.
+		if strength == lock.None {
+			// Non-locking reads only care about locks, not reservations.
+			return false, nil
+		}
+		if g.isSameTxn(l.reservation.txn) {
+			// Already reserved by this txn.
+			return false, nil
+		}
+		// "If the key is reserved, nil is returned."
+		return true, nil
+	}
+	// Key locked.
+	txn, ts := l.getLockHolder()
+	if txn == nil {
+		panic("non-empty lockState with nil lock holder and nil reservation")
+	}
+	if strength == lock.None && g.ts.Less(ts) {
+		// Non-locking read below lock's timestamp.
+		return false, nil
+	}
+	if g.isSameTxn(txn) {
+		// Already locked by this txn.
+		return false, nil
+	}
+	// "If the key is locked, the lock holder is also returned."
+	return true, txn
 }
 
 func (g *lockTableGuardImpl) notify() {
@@ -701,12 +749,13 @@ func (g *lockTableGuardImpl) findNextLockAfter(notify bool) {
 // writer is typically waiting in an active state, i.e., the
 // lockTableGuardImpl.key refers to this lockState. However, there are
 // multiple reasons that can cause a writer to be an inactive waiter:
-// - Breaking of reservations (see the comment on reservations below, in
-//   lockState) can cause a writer to be an inactive waiter.
-// - A discovered lock causes the discoverer to become an inactive waiter
-//   (until it scans again).
-// - A lock held by a finalized txn causes the first waiter to be an inactive
-//   waiter.
+//   - Breaking of reservations (see the comment on reservations below, in
+//     lockState) can cause a writer to be an inactive waiter.
+//   - A discovered lock causes the discoverer to become an inactive waiter
+//     (until it scans again).
+//   - A lock held by a finalized txn causes the first waiter to be an inactive
+//     waiter.
+//
 // The first case above (breaking reservations) only occurs for transactional
 // requests, but the other cases can happen for both transactional and
 // non-transactional requests.
@@ -722,7 +771,7 @@ type lockHolderInfo struct {
 	// the lock is continuously held by a succession of different TxnMetas, the
 	// epoch must be monotonic and the ts (derived from txn.WriteTimestamp for
 	// some calls, and request.ts for other calls) must be monotonic. After ts
-	// is intialized, the timestamps inside txn are not used.
+	// is initialized, the timestamps inside txn are not used.
 	txn *enginepb.TxnMeta
 
 	// All the TxnSeqs in the current epoch at which this lock has been
@@ -826,7 +875,7 @@ type lockWaitQueue struct {
 	// seqnums but at another key req2 wants to read and req1 wants to write and
 	// since req2 does not wait in the queue it acquires a read reservation
 	// before req1. See the discussion at the end of this comment section on how
-	// the behavior will extend when we start supporting Shared and Upgrade
+	// the behavior will extend when we start supporting Shared and Update
 	// locks.
 	//
 	// Non-transactional requests can do both reads and writes but cannot be
@@ -889,7 +938,7 @@ type lockWaitQueue struct {
 	//   This is a deadlock caused by the lock table unless req2 partially
 	//   breaks the reservation at A.
 	//
-	// Extension for Shared and Upgrade locks:
+	// Extension for Shared and Update locks:
 	// There are 3 aspects to consider: holders; reservers; the dependencies
 	// that need to be captured when waiting.
 	//
@@ -1453,50 +1502,51 @@ func (l *lockState) clearLockHolder() {
 // It uses the finalizedTxnCache to decide that the caller does not need to
 // wait on a lock of a transaction that is already finalized.
 //
-// - For unreplicated locks, this method will silently remove the lock and
-//   proceed as normal.
-// - For replicated locks the behavior is more complicated since we need to
-//   resolve the intent. We desire:
-//   A. batching of intent resolution.
-//   B. minimize races where intent resolution is being performed by multiple
-//      requests.
-//   C. minimize races where the intent has not yet been resolved but has been
-//      removed from the lock table, thereby causing some other request to
-//      evaluate wastefully and discover the intent.
+//   - For unreplicated locks, this method will silently remove the lock and
+//     proceed as normal.
 //
-//  For A, the caller of tryActiveWait will accumulate the LockUpdates. For B,
-//  we only generate a LockUpdate here if this request is either a reader, or
-//  the first writer in the queue, i.e., it is only blocked by the lock
-//  holder. This prevents races between multiple writers in doing resolution
-//  but not between multiple readers and between readers and writers. We could
-//  be more conservative in only doing the intent resolution if the waiter was
-//  equivalent to a distinguished-waiter, but there it no guarantee that that
-//  distinguished waiter will do intent resolution in a timely manner (since
-//  it could block waiting on some other lock). Instead, the caller of
-//  tryActiveWait makes a best-effort to reduce racing (explained below). For
-//  C, the caller of tryActiveWait removes the lock from the in-memory
-//  data-structure only if the request does not need to wait anywhere, which
-//  means it will immediately proceed to intent resolution. Additionally, if
-//  the lock has already been removed, it suggests that some other request has
-//  already claimed intent resolution (or done it), so this request does not
-//  need to do the resolution.
+//   - For replicated locks the behavior is more complicated since we need to
+//     resolve the intent. We desire:
+//     A. batching of intent resolution.
+//     B. minimize races where intent resolution is being performed by multiple
+//     requests.
+//     C. minimize races where the intent has not yet been resolved but has been
+//     removed from the lock table, thereby causing some other request to
+//     evaluate wastefully and discover the intent.
 //
-//  Ideally, we would strengthen B and C -- a request should make a claim on
-//  intent resolution for a set of keys, and will either resolve the intent,
-//  or due to an error will return that claim so others can do so. A
-//  replicated lock (intent) would not be removed from the in-memory
-//  data-structure until it was actually gone.
-//  TODO(sumeer): do this cleaner solution for batched intent resolution.
+//     For A, the caller of tryActiveWait will accumulate the LockUpdates. For B,
+//     we only generate a LockUpdate here if this request is either a reader, or
+//     the first writer in the queue, i.e., it is only blocked by the lock
+//     holder. This prevents races between multiple writers in doing resolution
+//     but not between multiple readers and between readers and writers. We could
+//     be more conservative in only doing the intent resolution if the waiter was
+//     equivalent to a distinguished-waiter, but there it no guarantee that that
+//     distinguished waiter will do intent resolution in a timely manner (since
+//     it could block waiting on some other lock). Instead, the caller of
+//     tryActiveWait makes a best-effort to reduce racing (explained below). For
+//     C, the caller of tryActiveWait removes the lock from the in-memory
+//     data-structure only if the request does not need to wait anywhere, which
+//     means it will immediately proceed to intent resolution. Additionally, if
+//     the lock has already been removed, it suggests that some other request has
+//     already claimed intent resolution (or done it), so this request does not
+//     need to do the resolution.
 //
-//  In the future we'd like to augment the lockTable with an understanding of
-//  finalized but not yet resolved locks. These locks will allow conflicting
-//  transactions to proceed with evaluation without the need to first remove
-//  all traces of them via a round of replication. This is discussed in more
-//  detail in #41720. Specifically, see mention of "contention footprint" and
-//  COMMITTED_BUT_NOT_REMOVABLE.
-//  Also, resolving these locks/intents would proceed without latching, so we
-//  would not rely on MVCC scanning to add discovered locks to the lock table,
-//  since the discovered locks may be stale.
+//     Ideally, we would strengthen B and C -- a request should make a claim on
+//     intent resolution for a set of keys, and will either resolve the intent,
+//     or due to an error will return that claim so others can do so. A
+//     replicated lock (intent) would not be removed from the in-memory
+//     data-structure until it was actually gone.
+//     TODO(sumeer): do this cleaner solution for batched intent resolution.
+//
+//     In the future we'd like to augment the lockTable with an understanding of
+//     finalized but not yet resolved locks. These locks will allow conflicting
+//     transactions to proceed with evaluation without the need to first remove
+//     all traces of them via a round of replication. This is discussed in more
+//     detail in #41720. Specifically, see mention of "contention footprint" and
+//     COMMITTED_BUT_NOT_REMOVABLE.
+//     Also, resolving these locks/intents would proceed without latching, so we
+//     would not rely on MVCC scanning to add discovered locks to the lock table,
+//     since the discovered locks may be stale.
 //
 // The return value is true iff it is actively waiting.
 // Acquires l.mu, g.mu.
@@ -2413,6 +2463,15 @@ func (t *lockTableImpl) ScanAndEnqueue(req Request, guard lockTableGuard) lockTa
 		g.toResolve = g.toResolve[:0]
 	}
 	t.doSnapshotForGuard(g)
+
+	if g.waitPolicy == lock.WaitPolicy_SkipLocked {
+		// If the request is using a SkipLocked wait policy, it captures a lockTable
+		// snapshot but does not scan the lock table when sequencing. Instead, it
+		// calls into IsKeyLockedByConflictingTxn before adding keys to its result
+		// set to determine which keys it should skip.
+		return g
+	}
+
 	g.findNextLockAfter(true /* notify */)
 	if g.notRemovableLock != nil {
 		// Either waiting at the notRemovableLock, or elsewhere. Either way we are
@@ -2430,6 +2489,7 @@ func (t *lockTableImpl) newGuardForReq(req Request) *lockTableGuardImpl {
 	g.txn = req.txnMeta()
 	g.ts = req.Timestamp
 	g.spans = req.LockSpans
+	g.waitPolicy = req.WaitPolicy
 	g.maxWaitQueueLength = req.MaxLockWaitQueueLength
 	g.sa = spanset.NumSpanAccess - 1
 	g.index = -1
@@ -2671,9 +2731,10 @@ func (t *lockTableImpl) lockCountForTesting() int64 {
 }
 
 // tryClearLocks attempts to clear locks.
-// - force=false: removes locks until it has removed numToClear locks. It does
-//   not remove locks marked as notRemovable.
-// - force=true: removes all locks.
+//   - force=false: removes locks until it has removed numToClear locks. It does
+//     not remove locks marked as notRemovable.
+//   - force=true: removes all locks.
+//
 // Waiters of removed locks are told to wait elsewhere or that they are done
 // waiting.
 func (t *lockTableImpl) tryClearLocks(force bool, numToClear int) {
@@ -2909,10 +2970,10 @@ func (t *lockTableImpl) QueryLockTableState(
 			// Check if adding the lock would exceed our byte or count limits,
 			// though we must ensure we return at least one lock.
 			if len(lockTableState) > 0 && opts.TargetBytes > 0 && (numBytes+nextByteSize) > opts.TargetBytes {
-				resumeState.ResumeReason = roachpb.RESUME_BYTE_LIMIT
+				resumeState.ResumeReason = kvpb.RESUME_BYTE_LIMIT
 				break
 			} else if len(lockTableState) > 0 && opts.MaxLocks > 0 && numLocks >= opts.MaxLocks {
-				resumeState.ResumeReason = roachpb.RESUME_KEY_LIMIT
+				resumeState.ResumeReason = kvpb.RESUME_KEY_LIMIT
 				break
 			}
 

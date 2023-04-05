@@ -27,7 +27,31 @@ func (DescID) SafeValue() {}
 
 // TypeIDToOID converts a type descriptor ID into a type OID.
 func TypeIDToOID(id DescID) oid.Oid {
+	return idToUserDefinedOID(id)
+}
+
+// FuncIDToOID converts a function descriptor ID into a function OID.
+func FuncIDToOID(id DescID) oid.Oid {
+	return idToUserDefinedOID(id)
+}
+
+func idToUserDefinedOID(id DescID) oid.Oid {
 	return oid.Oid(id) + oidext.CockroachPredefinedOIDMax
+}
+
+// UserDefinedOIDToID converts the OID of a user-defined type or function
+// to a descriptor ID. Returns zero if the OID is not user-defined.
+func UserDefinedOIDToID(oid oid.Oid) DescID {
+	if !IsOIDUserDefined(oid) {
+		return InvalidDescID
+	}
+	return DescID(oid) - oidext.CockroachPredefinedOIDMax
+}
+
+// IsOIDUserDefined returns true if oid is greater than
+// CockroachPredefinedOIDMax, otherwise false.
+func IsOIDUserDefined(oid oid.Oid) bool {
+	return DescID(oid) > oidext.CockroachPredefinedOIDMax
 }
 
 // ColumnID is a custom type for Column IDs.
@@ -59,3 +83,6 @@ type PGAttributeNum uint32
 
 // SafeValue implements the redact.SafeValue interface.
 func (PGAttributeNum) SafeValue() {}
+
+// RoleID is a custom type for a role id.
+type RoleID uint32

@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/url"
 	"strings"
@@ -26,9 +25,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -39,8 +40,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
@@ -51,23 +54,26 @@ func runImport(
 	spec *execinfrapb.ReadImportDataSpec,
 	progCh chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress,
 	seqChunkProvider *row.SeqChunkProvider,
-) (*roachpb.BulkOpSummary, error) {
+) (*kvpb.BulkOpSummary, error) {
 	// Used to send ingested import rows to the KV layer.
 	kvCh := make(chan row.KVBatch, 10)
 
 	// Install type metadata in all of the import tables.
+	spec = protoutil.Clone(spec).(*execinfrapb.ReadImportDataSpec)
 	importResolver := newImportTypeResolver(spec.Types)
 	for _, table := range spec.Tables {
-		if err := typedesc.HydrateTypesInTableDescriptor(ctx, table.Desc, importResolver); err != nil {
+		cpy := tabledesc.NewBuilder(table.Desc).BuildCreatedMutableTable()
+		if err := typedesc.HydrateTypesInDescriptor(ctx, cpy, importResolver); err != nil {
 			return nil, err
 		}
+		table.Desc = cpy.TableDesc()
 	}
 
 	evalCtx := flowCtx.NewEvalCtx()
 	evalCtx.Regions = makeImportRegionOperator(spec.DatabasePrimaryRegion)
 	semaCtx := tree.MakeSemaContext()
 	semaCtx.TypeResolver = importResolver
-	conv, err := makeInputConverter(ctx, &semaCtx, spec, evalCtx, kvCh, seqChunkProvider, flowCtx.Cfg.DB)
+	conv, err := makeInputConverter(ctx, &semaCtx, spec, evalCtx, kvCh, seqChunkProvider, flowCtx.Cfg.DB.KV())
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +109,7 @@ func runImport(
 
 	// Ingest the KVs that the producer group emitted to the chan and the row result
 	// at the end is one row containing an encoded BulkOpSummary.
-	var summary *roachpb.BulkOpSummary
+	var summary *kvpb.BulkOpSummary
 	group.GoCtx(func(ctx context.Context) error {
 		summary, err = ingestKvs(ctx, flowCtx, spec, progCh, kvCh)
 		if err != nil {
@@ -243,6 +249,7 @@ func readInputFiles(
 				(format.Format == roachpb.IOFileFormat_MysqlOutfile && format.SaveRejected) {
 				rejected = make(chan string)
 			}
+			dataFile := dataFile // copy for safe reference in Go routine
 			if rejected != nil {
 				grp := ctxgroup.WithContext(ctx)
 				grp.GoCtx(func(ctx context.Context) error {
@@ -283,6 +290,7 @@ func readInputFiles(
 					return nil
 				})
 
+				dataFileIndex := dataFileIndex // copy for safe reference in Go routine
 				grp.GoCtx(func(ctx context.Context) error {
 					defer close(rejected)
 					if err := fileFunc(ctx, src, dataFileIndex, resumePos[dataFileIndex], rejected); err != nil {
@@ -323,9 +331,9 @@ func decompressingReader(
 	case roachpb.IOFileFormat_Gzip:
 		return gzip.NewReader(in)
 	case roachpb.IOFileFormat_Bzip:
-		return ioutil.NopCloser(bzip2.NewReader(in)), nil
+		return io.NopCloser(bzip2.NewReader(in)), nil
 	default:
-		return ioutil.NopCloser(in), nil
+		return io.NopCloser(in), nil
 	}
 }
 
@@ -525,7 +533,7 @@ type importRowProducer interface {
 // Implementations of this interface do not need to be thread safe.
 type importRowConsumer interface {
 	// FillDatums sends row data to the provide datum converter.
-	FillDatums(row interface{}, rowNum int64, conv *row.DatumRowConverter) error
+	FillDatums(ctx context.Context, row interface{}, rowNum int64, conv *row.DatumRowConverter) error
 }
 
 // batch represents batch of data to convert.
@@ -713,7 +721,7 @@ func (p *parallelImporter) importWorker(
 		conv.KvBatch.Progress = batch.progress
 		for batchIdx, record := range batch.data {
 			rowNum = batch.startPos + int64(batchIdx)
-			if err := consumer.FillDatums(record, rowNum, conv); err != nil {
+			if err := consumer.FillDatums(ctx, record, rowNum, conv); err != nil {
 				if err = handleCorruptRow(ctx, fileCtx, err); err != nil {
 					return err
 				}
@@ -722,7 +730,11 @@ func (p *parallelImporter) importWorker(
 
 			rowIndex := int64(timestamp) + rowNum
 			if err := conv.Row(ctx, conv.KvBatch.Source, rowIndex); err != nil {
-				return newImportRowError(err, fmt.Sprintf("%v", record), rowNum)
+				s := fmt.Sprintf("%v", record)
+				if r, ok := record.([]csv.Record); ok {
+					s = strRecord(r, ',')
+				}
+				return newImportRowError(err, s, rowNum)
 			}
 		}
 	}

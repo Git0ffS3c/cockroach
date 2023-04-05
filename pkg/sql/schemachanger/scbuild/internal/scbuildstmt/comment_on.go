@@ -11,6 +11,8 @@
 package scbuildstmt
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
@@ -32,6 +34,7 @@ func CommentOnDatabase(b BuildCtx, n *tree.CommentOnDatabase) {
 			switch e.(type) {
 			case *scpb.DatabaseComment:
 				b.Drop(e)
+				b.LogEventForExistingTarget(e)
 			}
 		})
 	} else {
@@ -45,6 +48,7 @@ func CommentOnDatabase(b BuildCtx, n *tree.CommentOnDatabase) {
 			}
 		})
 		b.Add(dc)
+		b.LogEventForExistingTarget(dc)
 	}
 }
 
@@ -57,6 +61,7 @@ func CommentOnSchema(b BuildCtx, n *tree.CommentOnSchema) {
 			switch e.(type) {
 			case *scpb.SchemaComment:
 				b.Drop(e)
+				b.LogEventForExistingTarget(e)
 			}
 		})
 	} else {
@@ -70,17 +75,27 @@ func CommentOnSchema(b BuildCtx, n *tree.CommentOnSchema) {
 			}
 		})
 		b.Add(sc)
+		b.LogEventForExistingTarget(sc)
 	}
 }
 
 // CommentOnTable implements COMMENT ON TABLE xxx IS xxx statement.
 func CommentOnTable(b BuildCtx, n *tree.CommentOnTable) {
 	tableElements := b.ResolveTable(n.Table, commentResolveParams)
+	_, _, tbl := scpb.FindTable(tableElements)
+	tbn := n.Table.ToTableName()
+	if tbl == nil {
+		b.MarkNameAsNonExistent(&tbn)
+		return
+	}
+	tbn.ObjectNamePrefix = b.NamePrefix(tbl)
+	n.Table = tbn.ToUnresolvedObjectName()
 
 	if n.Comment == nil {
 		_, _, tableComment := scpb.FindTableComment(tableElements)
 		if tableComment != nil {
 			b.Drop(tableComment)
+			b.LogEventForExistingTarget(tableComment)
 		}
 	} else {
 		_, _, table := scpb.FindTable(tableElements)
@@ -89,11 +104,15 @@ func CommentOnTable(b BuildCtx, n *tree.CommentOnTable) {
 			TableID: table.TableID,
 		}
 		b.Add(tc)
+		b.LogEventForExistingTarget(tc)
 	}
 }
 
 // CommentOnColumn implements COMMENT ON COLUMN xxx IS xxx statement.
 func CommentOnColumn(b BuildCtx, n *tree.CommentOnColumn) {
+	if n.ColumnItem.TableName == nil {
+		panic(pgerror.New(pgcode.Syntax, "column name must be qualified"))
+	}
 	tableElements := b.ResolveTable(n.ColumnItem.TableName, commentResolveParams)
 	_, _, table := scpb.FindTable(tableElements)
 	columnElements := b.ResolveColumn(table.TableID, n.ColumnItem.ColumnName, commentResolveParams)
@@ -103,6 +122,7 @@ func CommentOnColumn(b BuildCtx, n *tree.CommentOnColumn) {
 			switch e.(type) {
 			case *scpb.ColumnComment:
 				b.Drop(e)
+				b.LogEventForExistingTarget(e)
 			}
 		})
 	} else {
@@ -118,13 +138,14 @@ func CommentOnColumn(b BuildCtx, n *tree.CommentOnColumn) {
 			}
 		})
 		b.Add(cc)
+		b.LogEventForExistingTarget(cc)
 	}
 }
 
 // CommentOnIndex implements COMMENT ON INDEX xxx iS xxx statement.
 func CommentOnIndex(b BuildCtx, n *tree.CommentOnIndex) {
 	var tableID catid.DescID
-	indexElements := b.ResolveTableIndexBestEffort(&n.Index, commentResolveParams, true)
+	indexElements := b.ResolveIndexByName(&n.Index, commentResolveParams)
 	indexElements.ForEachElementStatus(func(_ scpb.Status, _ scpb.TargetStatus, e scpb.Element) {
 		switch e.(type) {
 		case *scpb.PrimaryIndex, *scpb.SecondaryIndex:
@@ -137,6 +158,7 @@ func CommentOnIndex(b BuildCtx, n *tree.CommentOnIndex) {
 			switch e.(type) {
 			case *scpb.IndexComment:
 				b.Drop(e)
+				b.LogEventForExistingTarget(e)
 			}
 		})
 	} else {
@@ -152,6 +174,7 @@ func CommentOnIndex(b BuildCtx, n *tree.CommentOnIndex) {
 			}
 		})
 		b.Add(ic)
+		b.LogEventForExistingTarget(ic)
 	}
 }
 
@@ -167,6 +190,7 @@ func CommentOnConstraint(b BuildCtx, n *tree.CommentOnConstraint) {
 			switch e.(type) {
 			case *scpb.ConstraintComment:
 				b.Drop(e)
+				b.LogEventForExistingTarget(e)
 			}
 		})
 	} else {
@@ -183,5 +207,6 @@ func CommentOnConstraint(b BuildCtx, n *tree.CommentOnConstraint) {
 			}
 		})
 		b.Add(cc)
+		b.LogEventForExistingTarget(cc)
 	}
 }

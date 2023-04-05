@@ -11,8 +11,12 @@
 import classNames from "classnames/bind";
 
 import styles from "./sessionsTable.module.scss";
-import { TimestampToMoment } from "src/util/convert";
-import { BytesWithPrecision } from "src/util/format";
+import {
+  DurationToMomentDuration,
+  DurationToNumber,
+  TimestampToMoment,
+} from "src/util/convert";
+import { BytesWithPrecision, Count } from "src/util/format";
 import { Link } from "react-router-dom";
 import React from "react";
 
@@ -101,7 +105,7 @@ const StatementTableCell = (props: { session: ISession }) => {
 };
 
 function formatSessionStart(session: ISession): string {
-  const formatStr = "MMM DD, YYYY [at] h:mm A";
+  const formatStr = "MMM DD, YYYY [at] H:mm";
   const start = moment.unix(Number(session.start.seconds)).utc();
 
   return start.format(formatStr);
@@ -111,7 +115,7 @@ function formatStatementStart(session: ISession): string {
   if (session.active_queries.length == 0) {
     return "N/A";
   }
-  const formatStr = "MMM DD, YYYY [at] h:mm A";
+  const formatStr = "MMM DD, YYYY [at] H:mm";
   const start = moment
     .unix(Number(session.active_queries[0].start.seconds))
     .utc();
@@ -175,8 +179,22 @@ export function makeSessionsColumns(
       name: "sessionDuration",
       title: statisticsTableTitles.sessionDuration(statType),
       className: cx("cl-table__col-session"),
-      cell: session => TimestampToMoment(session.session.start).fromNow(true),
+      cell: session => {
+        const startMoment = TimestampToMoment(session.session.start);
+        if (session.session.end != null) {
+          return TimestampToMoment(session.session.end).from(startMoment, true);
+        }
+        return startMoment.fromNow(true);
+      },
       sort: session => TimestampToMoment(session.session.start).valueOf(),
+    },
+    {
+      name: "sessionActiveDuration",
+      title: statisticsTableTitles.sessionActiveDuration(statType),
+      className: cx("cl-table__col-session"),
+      cell: session =>
+        DurationToMomentDuration(session.session.total_active_time).humanize(),
+      sort: session => DurationToNumber(session.session.total_active_time),
     },
     {
       name: "status",
@@ -201,6 +219,13 @@ export function makeSessionsColumns(
         session.session.active_queries.length > 0
           ? session.session.active_queries[0].start.seconds
           : 0,
+    },
+    {
+      name: "sessionTxnCount",
+      title: statisticsTableTitles.sessionTxnCount(statType),
+      className: cx("cl-table__col-session"),
+      cell: session => Count(session.session?.num_txns_executed),
+      sort: session => session.session?.num_txns_executed,
     },
     {
       name: "memUsage",

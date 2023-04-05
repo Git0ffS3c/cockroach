@@ -12,12 +12,12 @@ package descs
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -72,7 +72,7 @@ func makeLeasedDescriptors(lm leaseManager) leasedDescriptors {
 // transaction, and supports access by name and by ID.
 type leasedDescriptors struct {
 	lm    leaseManager
-	cache nstree.Map
+	cache nstree.NameMap
 }
 
 // getLeasedDescriptorByName return a leased descriptor valid for the
@@ -98,10 +98,6 @@ func (ld *leasedDescriptors) getByName(
 		return cached.(lease.LeasedDescriptor).Underlying(), false, nil
 	}
 
-	if systemschema.IsUnleasableSystemDescriptorByName(parentID, parentSchemaID, name) {
-		return nil, true, nil
-	}
-
 	readTimestamp := txn.ReadTimestamp()
 	ldesc, err := ld.lm.AcquireByName(ctx, readTimestamp, parentID, parentSchemaID, name)
 	const setTxnDeadline = true
@@ -116,10 +112,6 @@ func (ld *leasedDescriptors) getByID(
 	// First, look to see if we already have the table in the shared cache.
 	if cached := ld.getCachedByID(ctx, id); cached != nil {
 		return cached, false, nil
-	}
-
-	if systemschema.IsUnleasableSystemDescriptorByID(id) {
-		return nil, true, nil
 	}
 
 	readTimestamp := txn.ReadTimestamp()
@@ -173,7 +165,7 @@ func (ld *leasedDescriptors) getResult(
 		log.Fatalf(ctx, "bad descriptor for T=%s, expiration=%s", readTimestamp, expiration)
 	}
 
-	ld.cache.Upsert(ldesc)
+	ld.cache.Upsert(ldesc, ldesc.Underlying().SkipNamespace())
 	if log.V(2) {
 		log.Eventf(ctx, "added descriptor '%s' to collection: %+v", ldesc.GetName(), ldesc.Underlying())
 	}
@@ -197,18 +189,17 @@ func (ld *leasedDescriptors) maybeUpdateDeadline(
 	// and session expiration. The sqlliveness.Session will only be set in the
 	// multi-tenant environment for controlling transactions associated with ephemeral
 	// SQL pods.
+	//
+	// TODO(andrei,ajwerner): Using the session expiration here makes no sense at
+	// the moment. This was done with the mistaken impression that it'll do
+	// something for transactions that use the unique_rowid() function, but it
+	// doesn't (since that function cares about wall time, not the transaction's
+	// commit timestamp). We've left this code in place, though, because we intend
+	// to tie descriptor leases to sessions, at which point using the session
+	// expiration as the deadline will serve a purpose.
 	var deadline hlc.Timestamp
 	if session != nil {
-		if expiration, txnTS := session.Expiration(), txn.ReadTimestamp(); txnTS.Less(expiration) {
-			deadline = expiration
-		} else {
-			// If the session has expired relative to this transaction, propagate
-			// a clear error that that's what is going on.
-			return errors.Errorf(
-				"liveness session expired %s before transaction",
-				txnTS.GoTime().Sub(expiration.GoTime()),
-			)
-		}
+		deadline = session.Expiration()
 	}
 	if leaseDeadline, ok := ld.getDeadline(); ok && (deadline.IsEmpty() || leaseDeadline.Less(deadline)) {
 		// Set the deadline to the lease deadline if session expiration is empty
@@ -217,10 +208,39 @@ func (ld *leasedDescriptors) maybeUpdateDeadline(
 	}
 	// If the deadline has been set, update the transaction deadline.
 	if !deadline.IsEmpty() {
+		// If the deadline certainly cannot be met, return an error which will
+		// be retried explicitly.
+		if txnTs := txn.ReadTimestamp(); deadline.LessEq(txnTs) {
+			return &deadlineExpiredError{
+				txnTS:      txnTs,
+				expiration: deadline,
+			}
+		}
 		return txn.UpdateDeadline(ctx, deadline)
 	}
 	return nil
 }
+
+// deadlineExpiredError is returned when the deadline from either a descriptor
+// lease or a sqlliveness session is before the current transaction timestamp.
+// The error is a user-visible retry.
+type deadlineExpiredError struct {
+	txnTS, expiration hlc.Timestamp
+}
+
+func (e *deadlineExpiredError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("liveness session expired %v before transaction",
+		e.txnTS.GoTime().Sub(e.expiration.GoTime()))
+	return nil
+}
+
+func (e *deadlineExpiredError) ClientVisibleRetryError() {}
+
+func (e *deadlineExpiredError) Error() string {
+	return fmt.Sprint(errors.Formattable(e))
+}
+
+var _ errors.SafeFormatter = (*deadlineExpiredError)(nil)
 
 func (ld *leasedDescriptors) getDeadline() (deadline hlc.Timestamp, haveDeadline bool) {
 	_ = ld.cache.IterateByID(func(descriptor catalog.NameEntry) error {

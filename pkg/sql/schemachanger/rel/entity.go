@@ -56,6 +56,9 @@ func (sc *Schema) CompareOn(attrs []Attr, a, b interface{}) (less, eq bool) {
 			if err != nil {
 				panic(err)
 			}
+			if sc.sliceOrdinals.contains(ord) {
+				continue
+			}
 			aav = getAttrValue(at, ord, av)
 			bav = getAttrValue(bt, ord, bv)
 		}
@@ -93,10 +96,7 @@ func (sc *Schema) IterateAttributes(
 		}
 		seen = seen.add(field.attr)
 		if err := f(attr, v); err != nil {
-			if iterutil.Done(err) {
-				err = nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil

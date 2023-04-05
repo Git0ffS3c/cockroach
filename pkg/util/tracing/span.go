@@ -22,13 +22,9 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/petermattis/goid"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/trace"
-)
-
-const (
-	// TagPrefix is prefixed to all tags that should be output in SHOW TRACE.
-	TagPrefix = "cockroach."
 )
 
 // Span is the tracing Span that we use in CockroachDB. Depending on the tracing
@@ -274,9 +270,9 @@ func (sp *Span) finishInternal() {
 //
 // Returns nil if the span is not currently recording (even if it had been
 // recording in the past).
-func (sp *Span) FinishAndGetRecording(recType RecordingType) Recording {
-	rec := Recording(nil)
-	if sp.RecordingType() != RecordingOff {
+func (sp *Span) FinishAndGetRecording(recType tracingpb.RecordingType) tracingpb.Recording {
+	rec := tracingpb.Recording(nil)
+	if sp.RecordingType() != tracingpb.RecordingOff {
 		rec = sp.i.GetRecording(recType, true /* finishing */)
 	}
 	// Reach directly into sp.i to pass the finishing argument.
@@ -290,13 +286,13 @@ func (sp *Span) FinishAndGetRecording(recType RecordingType) Recording {
 //
 // Returns nil if the span is not currently recording (even if it had been
 // recording in the past).
-func (sp *Span) FinishAndGetConfiguredRecording() Recording {
-	rec := Recording(nil)
+func (sp *Span) FinishAndGetConfiguredRecording() tracingpb.Recording {
+	rec := tracingpb.Recording(nil)
 	recType := sp.RecordingType()
-	if recType != RecordingOff {
+	if recType != tracingpb.RecordingOff {
+		// Reach directly into sp.i to pass the finishing argument.
 		rec = sp.i.GetRecording(recType, true /* finishing */)
 	}
-	// Reach directly into sp.i to pass the finishing argument.
 	sp.finishInternal()
 	return rec
 }
@@ -320,17 +316,21 @@ func (sp *Span) FinishAndGetConfiguredRecording() Recording {
 //
 // A few internal tags are added to denote span properties:
 //
-//    "_unfinished"	The span was never Finish()ed
-//    "_verbose"	The span is a verbose one
-//    "_dropped"	The span dropped recordings due to sizing constraints
+//	"_unfinished":	The span was never Finish()ed.
+//	"_verbose":	The span is a verbose one.
+//	"_dropped_logs":	The span dropped events due to size limits.
+//	"_dropped_children": Some (direct) child spans were dropped because of the
+//											 trace size limit.
+//	"_dropped_indirect_children": Some indirect child spans were dropped
+//																because of the trace size limit.
 //
 // If recType is RecordingStructured, the return value will be nil if the span
 // doesn't have any structured events.
-func (sp *Span) GetRecording(recType RecordingType) Recording {
+func (sp *Span) GetRecording(recType tracingpb.RecordingType) tracingpb.Recording {
 	if sp.detectUseAfterFinish() {
 		return nil
 	}
-	if sp.RecordingType() == RecordingOff {
+	if sp.RecordingType() == tracingpb.RecordingOff {
 		return nil
 	}
 	return sp.i.GetRecording(recType, false /* finishing */)
@@ -341,29 +341,83 @@ func (sp *Span) GetRecording(recType RecordingType) Recording {
 //
 // Returns nil if the span is not currently recording (even if it had been
 // recording in the past).
-func (sp *Span) GetConfiguredRecording() Recording {
+func (sp *Span) GetConfiguredRecording() tracingpb.Recording {
 	if sp.detectUseAfterFinish() {
 		return nil
 	}
 	recType := sp.RecordingType()
-	if recType == RecordingOff {
+	if recType == tracingpb.RecordingOff {
 		return nil
 	}
 	return sp.i.GetRecording(recType, false /* finishing */)
 }
 
-// ImportRemoteSpans adds RecordedSpan data to the recording of the given Span;
-// these spans will be part of the result of GetRecording. Used to import
-// recorded traces from other nodes.
-func (sp *Span) ImportRemoteSpans(remoteSpans []tracingpb.RecordedSpan) {
-	if !sp.detectUseAfterFinish() {
-		sp.i.ImportRemoteSpans(remoteSpans)
+// GetTraceRecording returns the span's recording as a Trace.
+//
+// See also GetRecording(), which returns a tracingpb.Recording.
+func (sp *Span) GetTraceRecording(recType tracingpb.RecordingType) Trace {
+	if sp.detectUseAfterFinish() {
+		return Trace{}
 	}
+	return sp.i.GetTraceRecording(recType, false /* finishing */)
+}
+
+// FinishAndGetTraceRecording finishes the span and returns its recording as a
+// Trace.
+//
+// See also FinishAndGetRecording(), which returns a tracingpb.Recording.
+func (sp *Span) FinishAndGetTraceRecording(recType tracingpb.RecordingType) Trace {
+	if sp.detectUseAfterFinish() {
+		return Trace{}
+	}
+	rec := sp.i.GetTraceRecording(recType, true /* finishing */)
+	sp.Finish()
+	return rec
+}
+
+// ImportRemoteRecording adds the spans in remoteRecording as children of the
+// receiver. As a result of this, the imported recording will be a part of the
+// GetRecording() output for the receiver. All the structured events from the
+// trace are passed to the receiver's event listeners.
+//
+// This function is used to import a recording from another node.
+func (sp *Span) ImportRemoteRecording(remoteRecording tracingpb.Recording) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	// Handle recordings coming from 22.2 nodes that don't have the
+	// StructuredRecordsSizeBytes field set.
+	// TODO(andrei): remove this in 23.2.
+	for i := range remoteRecording {
+		if len(remoteRecording[i].StructuredRecords) != 0 && remoteRecording[i].StructuredRecordsSizeBytes == 0 {
+			size := int64(0)
+			for _, rec := range remoteRecording[i].StructuredRecords {
+				size += int64(rec.MemorySize())
+			}
+			remoteRecording[i].StructuredRecordsSizeBytes = size
+		}
+	}
+
+	sp.ImportTrace(treeifyRecording(remoteRecording))
+}
+
+// ImportTrace takes a trace recording and, depending on the receiver's
+// recording mode, adds it as a child to sp. All the structured events from the
+// trace are passed to the receiver's event listeners.
+//
+// ImportTrace takes ownership of trace; the caller should not use it anymore.
+// The caller can call Trace.PartialClone() to make a sufficient copy for
+// passing into ImportTrace.
+func (sp *Span) ImportTrace(trace Trace) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	sp.i.ImportTrace(trace)
 }
 
 // Meta returns the information which needs to be propagated across process
 // boundaries in order to derive child spans from this Span. This may return an
-// empty SpanMeta (which is a valid input to WithRemoteParentFromSpanMeta) if
+// Empty SpanMeta (which is a valid input to WithRemoteParentFromSpanMeta) if
 // the Span has been optimized out.
 func (sp *Span) Meta() SpanMeta {
 	if sp.detectUseAfterFinish() {
@@ -375,7 +429,7 @@ func (sp *Span) Meta() SpanMeta {
 // SetRecordingType sets the recording mode of the span and its children,
 // recursively. Setting it to RecordingOff disables further recording.
 // Everything recorded so far remains in memory.
-func (sp *Span) SetRecordingType(to RecordingType) {
+func (sp *Span) SetRecordingType(to tracingpb.RecordingType) {
 	if sp.detectUseAfterFinish() {
 		return
 	}
@@ -383,16 +437,16 @@ func (sp *Span) SetRecordingType(to RecordingType) {
 }
 
 // RecordingType returns the range's current recording mode.
-func (sp *Span) RecordingType() RecordingType {
+func (sp *Span) RecordingType() tracingpb.RecordingType {
 	if sp.detectUseAfterFinish() {
-		return RecordingOff
+		return tracingpb.RecordingOff
 	}
 	return sp.i.RecordingType()
 }
 
 // IsVerbose returns true if the Span is verbose. See SetVerbose for details.
 func (sp *Span) IsVerbose() bool {
-	return sp.RecordingType() == RecordingVerbose
+	return sp.RecordingType() == tracingpb.RecordingVerbose
 }
 
 // Record provides a way to record free-form text into verbose spans. Recordings
@@ -419,7 +473,8 @@ func (sp *Span) Recordf(format string, args ...interface{}) {
 // if the underlying Span has been optimized out (i.e. is a noop span). Payloads
 // may also be dropped due to sizing constraints.
 //
-// The caller must not mutate the item once RecordStructured has been called.
+// RecordStructured does not take ownership of item; it marshals it into an Any
+// proto.
 func (sp *Span) RecordStructured(item Structured) {
 	if sp.detectUseAfterFinish() {
 		return
@@ -450,19 +505,32 @@ type LazyTag interface {
 // SetLazyTag adds a tag to the span. The tag's value is expected to implement
 // either fmt.Stringer or LazyTag, and is only stringified using one of
 // the two on demand:
-// - if the Span has an otel span or a net.Trace, the tag
-//   is stringified immediately and passed to the external trace (see
-//   SetLazyStatusTag if you want to avoid that).
-//- if/when the span's recording is collected, the tag is stringified on demand.
-//  If the recording is collected multiple times, the tag is stringified
-//  multiple times (so, the tag can evolve over time). Since generally the
-//  collection of a recording can happen asynchronously, the implementation of
-//  Stringer or LazyTag should be thread-safe.
+//   - if the Span has an otel span or a net.Trace, the tag
+//     is stringified immediately and passed to the external trace (see
+//     SetLazyStatusTag if you want to avoid that).
+//   - if/when the span's recording is collected, the tag is stringified on demand.
+//     If the recording is collected multiple times, the tag is stringified
+//     multiple times (so, the tag can evolve over time). Since generally the
+//     collection of a recording can happen asynchronously, the implementation of
+//     Stringer or LazyTag should be thread-safe.
 func (sp *Span) SetLazyTag(key string, value interface{}) {
 	if sp.detectUseAfterFinish() {
 		return
 	}
 	sp.i.SetLazyTag(key, value)
+}
+
+// SetLazyTagLocked is the same as SetLazyTag but assumes that the mutex of sp
+// is being held.
+//
+// Deprecated: this method should not be used because it's introduced only to go
+// around some tech debt (#100438). Once that issue is addressed, this method
+// should be removed.
+func (sp *Span) SetLazyTagLocked(key string, value interface{}) {
+	if sp.detectUseAfterFinish() {
+		return
+	}
+	sp.i.setLazyTagLocked(key, value)
 }
 
 // GetLazyTag returns the value of the tag with the given key. If that tag doesn't
@@ -473,6 +541,33 @@ func (sp *Span) GetLazyTag(key string) (interface{}, bool) {
 	}
 	return sp.i.GetLazyTag(key)
 }
+
+// EventListener is an object that can be registered to listen for Structured
+// events recorded by the span and its children.
+type EventListener interface {
+	// Notify is invoked on every Structured event recorded by the span and its
+	// children, recursively.
+	//
+	// The caller holds the mutex of the span.
+	//
+	// Notify will not be called concurrently on the same span.
+	Notify(event Structured) EventConsumptionStatus
+}
+
+// EventConsumptionStatus describes whether the structured event has been "consumed"
+// by the EventListener.
+type EventConsumptionStatus int
+
+const (
+	// EventNotConsumed indicates that the event wasn't "consumed" by the
+	// EventListener, so other listeners as well as any ancestor spans should be
+	// notified about the event.
+	EventNotConsumed EventConsumptionStatus = iota
+	// EventConsumed indicates that the event has been "consumed" by the
+	// EventListener, so neither other listeners for the span nor the ancestor
+	// spans should be notified about it.
+	EventConsumed
+)
 
 // TraceID retrieves a span's trace ID.
 func (sp *Span) TraceID() tracingpb.TraceID {
@@ -520,11 +615,6 @@ func (sp *Span) UpdateGoroutineIDToCurrent() {
 	sp.i.crdb.setGoroutineID(goid.Get())
 }
 
-// parentFinished makes sp a root.
-func (sp *Span) parentFinished() {
-	sp.i.crdb.parentFinished()
-}
-
 // reset prepares sp for (re-)use.
 //
 // sp might be a re-allocated span that was previously used and Finish()ed. In
@@ -544,6 +634,7 @@ func (sp *Span) reset(
 	goroutineID uint64,
 	startTime time.Time,
 	logTags *logtags.Buffer,
+	eventListeners []EventListener,
 	kind oteltrace.SpanKind,
 	otelSpan oteltrace.Span,
 	netTr trace.Trace,
@@ -576,7 +667,7 @@ func (sp *Span) reset(
 			// quiet. We've detected a Span leak nonetheless, but it's likely that the
 			// test that leaked the span has already finished. Panicking in the middle
 			// of an unrelated test would be poor UX.
-			if sp.Tracer().closed() {
+			if sp.i.Tracer().closed() {
 				return
 			}
 			panic(fmt.Sprintf("Span not finished or references not released; "+
@@ -603,6 +694,10 @@ func (sp *Span) reset(
 	c.operation = operation
 	c.startTime = startTime
 	c.logTags = logTags
+	if len(c.eventListeners) != 0 {
+		panic(fmt.Sprintf("unexpected event listeners in span being reset: %v", c.eventListeners))
+	}
+	c.eventListeners = eventListeners
 	{
 		// Nobody is supposed to have a reference to the span at this point, but let's
 		// take the lock anyway to protect against buggy clients accessing the span
@@ -614,7 +709,7 @@ func (sp *Span) reset(
 		if len(c.mu.tags) != 0 {
 			panic(fmt.Sprintf("unexpected tags in span being reset: %v", c.mu.tags))
 		}
-		if len(c.mu.recording.finishedChildren) != 0 {
+		if !c.mu.recording.finishedChildren.Empty() {
 			panic(fmt.Sprintf("unexpected finished children in span being reset: %v", c.mu.recording.finishedChildren))
 		}
 		if c.mu.recording.structured.Len() != 0 {
@@ -630,14 +725,16 @@ func (sp *Span) reset(
 			openChildren: h.childrenAlloc[:0],
 			goroutineID:  goroutineID,
 			recording: recordingState{
-				logs:       makeSizeLimitedBuffer(maxLogBytesPerSpan, nil /* scratch */),
-				structured: makeSizeLimitedBuffer(maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
+				logs:             makeSizeLimitedBuffer[*tracingpb.LogRecord](maxLogBytesPerSpan, nil /* scratch */),
+				structured:       makeSizeLimitedBuffer[*tracingpb.StructuredRecord](maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
+				childrenMetadata: h.childrenMetadataAlloc,
+				finishedChildren: MakeTrace(tracingpb.RecordedSpan{}),
 			},
 			tags: h.tagsAlloc[:0],
 		}
 
 		if kind != oteltrace.SpanKindUnspecified {
-			c.setTagLocked(spanKindTagKey, attribute.StringValue(kind.String()))
+			c.setTagLocked(SpanKindTagKey, attribute.StringValue(kind.String()))
 		}
 		c.mu.Unlock()
 	}
@@ -650,11 +747,12 @@ func (sp *Span) reset(
 	sp.finishStack = ""
 }
 
-// visitOpenChildren calls the visitor for every open child. The receiver's lock
-// is held for the duration of the iteration, so the visitor should be quick.
-// The visitor is not allowed to hold on to children after it returns.
-func (sp *Span) visitOpenChildren(visitor func(sp *Span)) {
-	sp.i.crdb.visitOpenChildren(visitor)
+// SetOtelStatus sets the status of the OpenTelemetry span (if any).
+func (sp *Span) SetOtelStatus(code codes.Code, msg string) {
+	if sp.i.otelSpan == nil {
+		return
+	}
+	sp.i.otelSpan.SetStatus(codes.Error, msg)
 }
 
 // spanRef represents a reference to a span. In addition to a simple *Span, a
@@ -716,7 +814,7 @@ func tryMakeSpanRef(sp *Span) (spanRef, bool) {
 		if cnt == 0 {
 			// sp was Finish()ed, and it might be in the pool awaiting reallocation.
 			// It'd be unsafe to hold a reference to sp because of deadlock hazards,
-			// so we'll return an empty option (i.e. the resulting child will be a
+			// so we'll return an Empty option (i.e. the resulting child will be a
 			// root).
 			return spanRef{}, false
 		}
@@ -754,7 +852,7 @@ func (sr *spanRef) empty() bool {
 // Returns true if the span's refcount dropped to zero.
 func (sr *spanRef) release() bool {
 	if sr.empty() {
-		// There's no parent; nothing to do.
+		// There's no reference; nothing to do.
 		return false
 	}
 	sp := sr.Span
@@ -792,7 +890,7 @@ type SpanMeta struct {
 	otelCtx oteltrace.SpanContext
 
 	// If set, all spans derived from this context are being recorded.
-	recordingType RecordingType
+	recordingType tracingpb.RecordingType
 
 	// sterile is set if this span does not want to have children spans. In that
 	// case, trying to create a child span will result in the would-be child being
@@ -824,9 +922,9 @@ func (sm SpanMeta) String() string {
 	return s.String()
 }
 
-// ToProto converts a SpanMeta to the TraceInfo proto.
-func (sm SpanMeta) ToProto() tracingpb.TraceInfo {
-	ti := tracingpb.TraceInfo{
+// ToProto converts a SpanMeta to the *TraceInfo proto.
+func (sm SpanMeta) ToProto() *tracingpb.TraceInfo {
+	ti := &tracingpb.TraceInfo{
 		TraceID:       sm.traceID,
 		ParentSpanID:  sm.spanID,
 		RecordingMode: sm.recordingType.ToProto(),
@@ -862,13 +960,13 @@ func SpanMetaFromProto(info tracingpb.TraceInfo) SpanMeta {
 	}
 	switch info.RecordingMode {
 	case tracingpb.RecordingMode_OFF:
-		sm.recordingType = RecordingOff
+		sm.recordingType = tracingpb.RecordingOff
 	case tracingpb.RecordingMode_STRUCTURED:
-		sm.recordingType = RecordingStructured
+		sm.recordingType = tracingpb.RecordingStructured
 	case tracingpb.RecordingMode_VERBOSE:
-		sm.recordingType = RecordingVerbose
+		sm.recordingType = tracingpb.RecordingVerbose
 	default:
-		sm.recordingType = RecordingOff
+		sm.recordingType = tracingpb.RecordingOff
 	}
 	return sm
 }

@@ -11,8 +11,9 @@
 import React from "react";
 import Select from "react-select";
 import { Button } from "../button";
-import { CaretDown } from "@cockroachlabs/icons";
+import { CaretDown, Cancel } from "@cockroachlabs/icons";
 import { Input } from "antd";
+import "antd/lib/input/style";
 import { History } from "history";
 import { isEqual } from "lodash";
 import {
@@ -25,24 +26,35 @@ import {
   hidden,
   caretDown,
   checkbox,
+  badge,
+  clearBnt,
 } from "./filterClasses";
 import { MultiSelectCheckbox } from "../multiSelectCheckbox/multiSelectCheckbox";
 import { syncHistory } from "../util";
+import { selectCustomStyles } from "../common";
 
 interface QueryFilter {
   onSubmitFilters: (filters: Filters) => void;
   smth?: string;
-  appNames: string[];
+  appNames?: string[];
   activeFilters: number;
   filters: Filters;
   dbNames?: string[];
   usernames?: string[];
   sessionStatuses?: string[];
+  executionStatuses?: string[];
+  schemaInsightTypes?: string[];
+  workloadInsightTypes?: string[];
   regions?: string[];
   nodes?: string[];
+  hideAppNames?: boolean;
+  hideTimeLabel?: boolean;
   showDB?: boolean;
   showUsername?: boolean;
   showSessionStatus?: boolean;
+  showExecutionStatus?: boolean;
+  showSchemaInsightTypes?: boolean;
+  showWorkloadInsightTypes?: boolean;
   showSqlType?: boolean;
   showScan?: boolean;
   showRegions?: boolean;
@@ -52,11 +64,6 @@ interface QueryFilter {
 interface FilterState {
   hide: boolean;
   filters: Filters;
-}
-
-export interface SelectOptions {
-  label: string;
-  value: string;
 }
 
 export interface Filters extends Record<string, string | boolean> {
@@ -70,6 +77,9 @@ export interface Filters extends Record<string, string | boolean> {
   nodes?: string;
   username?: string;
   sessionStatus?: string;
+  executionStatus?: string;
+  schemaInsightType?: string;
+  workloadInsightType?: string;
 }
 
 const timeUnit = [
@@ -89,6 +99,9 @@ export const defaultFilters: Required<Filters> = {
   nodes: "",
   username: "",
   sessionStatus: "",
+  schemaInsightType: "",
+  workloadInsightType: "",
+  executionStatus: "",
 };
 
 // getFullFiltersObject returns Filters with every field defined as
@@ -103,7 +116,7 @@ export function getFullFiltersAsStringRecord(
       filterKey in partialFilters &&
       partialFilters[filterKey] !== inactiveFiltersState[filterKey]
     ) {
-      filters[filterKey] = partialFilters[filterKey].toString();
+      filters[filterKey] = partialFilters[filterKey]?.toString();
       return;
     }
     filters[filterKey] = null;
@@ -236,7 +249,7 @@ export const updateFiltersQueryParamsOnTab = (
 };
 
 /**
- * The State of the filter that is consider inactive.
+ * The State of the filter that is considered inactive.
  * It's different from defaultFilters because we don't want to take
  * timeUnit into consideration.
  * For example, if the timeUnit changes, but the timeValue is still 0,
@@ -249,19 +262,24 @@ export const inactiveFiltersState: Required<Omit<Filters, "timeUnit">> = {
   sqlType: "",
   database: "",
   regions: "",
+  sessionStatus: "",
   nodes: "",
+  workloadInsightType: "",
+  schemaInsightType: "",
+  executionStatus: "",
+  username: "",
+};
+
+const getActiveFilters = (filters: Filters): string[] => {
+  return Object.keys(inactiveFiltersState).filter(
+    filter =>
+      filters[filter] != null &&
+      inactiveFiltersState[filter] !== filters[filter],
+  );
 };
 
 export const calculateActiveFilters = (filters: Filters): number => {
-  return Object.keys(inactiveFiltersState).reduce(
-    (active, filter: keyof Filters) => {
-      return filters[filter] != null &&
-        inactiveFiltersState[filter] !== filters[filter]
-        ? (active += 1)
-        : active;
-    },
-    0,
-  );
+  return getActiveFilters(filters).length;
 };
 
 export const getTimeValueInSeconds = (filters: Filters): number | "empty" => {
@@ -371,8 +389,8 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
   };
 
   isOptionSelected = (option: string, field: string): boolean => {
-    const selection = field.split(",");
-    return selection.length > 0 && selection.includes(option);
+    const selection = field?.split(",");
+    return selection?.length > 0 && selection?.includes(option);
   };
 
   render(): React.ReactElement {
@@ -382,63 +400,47 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
       dbNames,
       usernames,
       sessionStatuses,
+      executionStatuses,
+      schemaInsightTypes,
+      workloadInsightTypes,
       regions,
       nodes,
       activeFilters,
+      hideAppNames,
       showDB,
       showSqlType,
       showScan,
       showRegions,
       showNodes,
       timeLabel,
+      hideTimeLabel,
       showUsername,
       showSessionStatus,
+      showExecutionStatus,
+      showSchemaInsightTypes,
+      showWorkloadInsightTypes,
     } = this.props;
     const dropdownArea = hide ? hidden : dropdown;
-    const customStyles = {
-      container: (provided: any) => ({
-        ...provided,
-        border: "none",
-      }),
-      option: (provided: any, state: any) => ({
-        ...provided,
-        backgroundColor: state.isSelected
-          ? "#DEEBFF"
-          : provided.backgroundColor,
-        color: "#394455",
-      }),
-      control: (provided: any) => ({
-        ...provided,
-        width: "100%",
-        borderColor: "#C0C6D9",
-      }),
-      dropdownIndicator: (provided: any) => ({
-        ...provided,
-        color: "#C0C6D9",
-      }),
-      singleValue: (provided: any) => ({
-        ...provided,
-        color: "#475872",
-      }),
-    };
-    const customStylesSmall = { ...customStyles };
+    const customStylesSmall = { ...selectCustomStyles };
     customStylesSmall.container = (provided: any) => ({
       ...provided,
       width: "141px",
       border: "none",
     });
 
-    const appsOptions = appNames.map(app => ({
-      label: app,
-      value: app,
-      isSelected: this.isOptionSelected(app, filters.app),
-    }));
+    const appsOptions = !hideAppNames
+      ? appNames.map(app => ({
+          label: app,
+          value: app,
+          isSelected: this.isOptionSelected(app, filters.app),
+        }))
+      : [];
     const appValue = appsOptions.filter(option => {
-      return filters.app.split(",").includes(option.label);
+      return filters.app?.split(",").includes(option.label);
     });
     const appFilter = (
       <div>
-        <div className={filterLabel.margin}>App</div>
+        <div className={filterLabel.margin}>{getLabelFromKey("app")}</div>
         <MultiSelectCheckbox
           options={appsOptions}
           placeholder="All"
@@ -457,11 +459,11 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
         }))
       : [];
     const databaseValue = databasesOptions.filter(option => {
-      return filters.database.split(",").includes(option.label);
+      return filters.database?.split(",").includes(option.label);
     });
     const dbFilter = (
       <div>
-        <div className={filterLabel.margin}>Database</div>
+        <div className={filterLabel.margin}>{getLabelFromKey("database")}</div>
         <MultiSelectCheckbox
           options={databasesOptions}
           placeholder="All"
@@ -484,7 +486,7 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
     });
     const usernameFilter = (
       <div>
-        <div className={filterLabel.margin}>Username</div>
+        <div className={filterLabel.margin}>{getLabelFromKey("username")}</div>
         <MultiSelectCheckbox
           options={usernameOptions}
           placeholder="All"
@@ -510,13 +512,101 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
     });
     const sessionStatusFilter = (
       <div>
-        <div className={filterLabel.margin}>Session Status</div>
+        <div className={filterLabel.margin}>
+          {getLabelFromKey("sessionStatus")}
+        </div>
         <MultiSelectCheckbox
           options={sessionStatusOptions}
           placeholder="All"
           field="sessionStatus"
           parent={this}
           value={sessionStatusValue}
+        />
+      </div>
+    );
+
+    const executionStatusOptions = showExecutionStatus
+      ? executionStatuses.map(executionStatus => ({
+          label: executionStatus,
+          value: executionStatus,
+          isSelected: this.isOptionSelected(
+            executionStatus,
+            filters.executionStatus,
+          ),
+        }))
+      : [];
+    const executionStatusValue = executionStatusOptions.filter(option =>
+      filters.executionStatus.split(",").includes(option.label),
+    );
+    const executionStatusFilter = (
+      <div>
+        <div className={filterLabel.margin}>
+          {getLabelFromKey("executionStatus")}
+        </div>
+        <MultiSelectCheckbox
+          options={executionStatusOptions}
+          placeholder="All"
+          field="executionStatus"
+          parent={this}
+          value={executionStatusValue}
+        />
+      </div>
+    );
+
+    const schemaInsightTypeOptions = showSchemaInsightTypes
+      ? schemaInsightTypes.map(schemaInsight => ({
+          label: schemaInsight,
+          value: schemaInsight,
+          isSelected: this.isOptionSelected(
+            schemaInsight,
+            filters.schemaInsightType,
+          ),
+        }))
+      : [];
+    const schemaInsightTypeValue = schemaInsightTypeOptions.filter(option => {
+      return filters.schemaInsightType.split(",").includes(option.label);
+    });
+    const schemaInsightTypeFilter = (
+      <div>
+        <div className={filterLabel.margin}>
+          {getLabelFromKey("schemaInsightType")}
+        </div>
+        <MultiSelectCheckbox
+          options={schemaInsightTypeOptions}
+          placeholder="All"
+          field="schemaInsightType"
+          parent={this}
+          value={schemaInsightTypeValue}
+        />
+      </div>
+    );
+
+    const workloadInsightTypeOptions = showWorkloadInsightTypes
+      ? workloadInsightTypes.map(workloadInsight => ({
+          label: workloadInsight,
+          value: workloadInsight,
+          isSelected: this.isOptionSelected(
+            workloadInsight,
+            filters.workloadInsightType,
+          ),
+        }))
+      : [];
+    const workloadInsightTypeValue = workloadInsightTypeOptions.filter(
+      option => {
+        return filters.workloadInsightType?.split(",").includes(option.label);
+      },
+    );
+    const workloadInsightTypeFilter = (
+      <div>
+        <div className={filterLabel.margin}>
+          {getLabelFromKey("workloadInsightType")}
+        </div>
+        <MultiSelectCheckbox
+          options={workloadInsightTypeOptions}
+          placeholder="All"
+          field="workloadInsightType"
+          parent={this}
+          value={workloadInsightTypeValue}
         />
       </div>
     );
@@ -533,7 +623,7 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
     );
     const regionsFilter = (
       <div>
-        <div className={filterLabel.margin}>Region</div>
+        <div className={filterLabel.margin}>{getLabelFromKey("regions")}</div>
         <MultiSelectCheckbox
           options={regionsOptions}
           placeholder="All"
@@ -556,7 +646,7 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
     });
     const nodesFilter = (
       <div>
-        <div className={filterLabel.margin}>Node</div>
+        <div className={filterLabel.margin}>{getLabelFromKey("nodes")}</div>
         <MultiSelectCheckbox
           options={nodesOptions}
           placeholder="All"
@@ -592,12 +682,12 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
         ]
       : [];
 
-    const sqlTypeValue = sqlTypes.filter(option => {
-      return filters.sqlType.split(",").includes(option.label);
+    const sqlTypeValue = sqlTypes?.filter(option => {
+      return filters.sqlType?.split(",").includes(option.label);
     });
     const sqlTypeFilter = (
       <div>
-        <div className={filterLabel.margin}>Statement Type</div>
+        <div className={filterLabel.margin}>{getLabelFromKey("sqlType")}</div>
         <MultiSelectCheckbox
           options={sqlTypes}
           placeholder="All"
@@ -632,39 +722,44 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
         </div>
         <div className={dropdownArea}>
           <div className={dropdownContentWrapper}>
-            {appFilter}
+            {!hideAppNames ? appFilter : ""}
             {showDB ? dbFilter : ""}
             {showUsername ? usernameFilter : ""}
             {showSessionStatus ? sessionStatusFilter : ""}
+            {showExecutionStatus ? executionStatusFilter : ""}
+            {showSchemaInsightTypes ? schemaInsightTypeFilter : ""}
+            {showWorkloadInsightTypes ? workloadInsightTypeFilter : ""}
             {showSqlType ? sqlTypeFilter : ""}
             {showRegions ? regionsFilter : ""}
             {showNodes ? nodesFilter : ""}
-            {filters.timeUnit && (
-              <>
-                <div className={filterLabel.margin}>
-                  {timeLabel
-                    ? timeLabel
-                    : "Statement fingerprint runs longer than"}
-                </div>
-                <section className={timePair.wrapper}>
-                  <Input
-                    value={filters.timeNumber}
-                    onChange={e => this.handleChange(e, "timeNumber")}
-                    onFocus={this.clearInput}
-                    className={timePair.timeNumber}
-                  />
-                  <Select
-                    options={timeUnit}
-                    value={timeUnit.filter(
-                      unit => unit.label == filters.timeUnit,
-                    )}
-                    onChange={e => this.handleSelectChange(e, "timeUnit")}
-                    className={timePair.timeUnit}
-                    styles={customStylesSmall}
-                  />
-                </section>
-              </>
-            )}
+            {hideTimeLabel
+              ? ""
+              : filters.timeUnit && (
+                  <>
+                    <div className={filterLabel.margin}>
+                      {timeLabel
+                        ? `${timeLabel} runs longer than`
+                        : "Statement fingerprint runs longer than"}
+                    </div>
+                    <section className={timePair.wrapper}>
+                      <Input
+                        value={filters.timeNumber}
+                        onChange={e => this.handleChange(e, "timeNumber")}
+                        onFocus={this.clearInput}
+                        className={timePair.timeNumber}
+                      />
+                      <Select
+                        options={timeUnit}
+                        value={timeUnit.filter(
+                          unit => unit.label == filters.timeUnit,
+                        )}
+                        onChange={e => this.handleSelectChange(e, "timeUnit")}
+                        className={timePair.timeUnit}
+                        styles={customStylesSmall}
+                      />
+                    </section>
+                  </>
+                )}
             {showScan ? fullScanFilter : ""}
             <div className={applyBtn.wrapper}>
               <Button
@@ -679,5 +774,110 @@ export class Filter extends React.Component<QueryFilter, FilterState> {
         </div>
       </div>
     );
+  }
+}
+
+interface SelectedFilterProps {
+  filters: Filters;
+  onRemoveFilter: (filters: Filters) => void;
+  onClearFilters: () => void;
+  className?: string;
+}
+export function SelectedFilters(
+  props: SelectedFilterProps,
+): React.ReactElement {
+  const { filters, onRemoveFilter, onClearFilters, className } = props;
+  const activeFilters = getActiveFilters(filters);
+  const badges = activeFilters.map(filter => {
+    return (
+      <FilterBadge
+        filters={filters}
+        name={filter}
+        values={filters[filter]}
+        unit={filters["timeUnit"]}
+        key={filter}
+        onRemoveFilter={onRemoveFilter}
+      />
+    );
+  });
+
+  return (
+    <div className={`${badge.area} ${className}`}>
+      {badges}
+      {activeFilters.length > 0 && (
+        <Button
+          onClick={() => onClearFilters()}
+          type="flat"
+          size="small"
+          className={clearBnt.btn}
+        >
+          Clear filters
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function removeFilter(
+  filters: Filters,
+  filter: string,
+  onRemoveFilter: (filters: Filters) => void,
+): void {
+  filters[filter] = inactiveFiltersState[filter];
+  onRemoveFilter({ ...filters });
+}
+interface FilterBadgeProps {
+  filters: Filters;
+  name: string;
+  values: string | boolean;
+  unit: string;
+  onRemoveFilter: (filters: Filters) => void;
+}
+function FilterBadge(props: FilterBadgeProps): React.ReactElement {
+  const { filters, name, values, onRemoveFilter } = props;
+  const unit = name === "timeNumber" ? props.unit : "";
+  let value = `${getLabelFromKey(name)}: ${values.toString()} ${unit}`;
+  if (value.length > 100) {
+    value = value.substring(0, 100) + "...";
+  }
+  return (
+    <div className={badge.wrapper}>
+      {value}
+      <Cancel
+        className={badge.closeArea}
+        onClick={() => removeFilter(filters, name, onRemoveFilter)}
+      />
+    </div>
+  );
+}
+
+function getLabelFromKey(key: string): string {
+  switch (key) {
+    case "app":
+      return "Application Name";
+    case "database":
+      return "Database";
+    case "executionStatus":
+      return "Execution Status";
+    case "fullScan":
+      return "Full Scan";
+    case "nodes":
+      return "Node";
+    case "regions":
+      return "Region";
+    case "schemaInsightType":
+      return "Schema Insight Type";
+    case "sessionStatus":
+      return "Session Status";
+    case "sqlType":
+      return "Statement Type";
+    case "timeNumber":
+      return "Runs Longer Than";
+    case "username":
+      return "User Name";
+    case "workloadInsightType":
+      return "Workload Insight Type";
+    default:
+      return key;
   }
 }

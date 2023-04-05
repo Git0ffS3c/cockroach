@@ -14,12 +14,13 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -43,7 +44,7 @@ func TestSessionMigration(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t, "session_migration"), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "session_migration"), func(t *testing.T, path string) {
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
 		defer tc.Stopper().Stop(ctx)
 
@@ -209,6 +210,30 @@ WHERE dump.variable IS NULL OR dump2.variable IS NULL OR dump.variable != dump2.
 					return err.Error()
 				}
 				return ret
+
+			case "error":
+				var errorRE string
+				for _, arg := range d.CmdArgs {
+					if arg.Key == "regexp" {
+						if len(arg.Vals) != 1 {
+							t.Fatalf("regexp arg expects one value")
+						}
+						errorRE = arg.Vals[0]
+					}
+				}
+				if errorRE == "" {
+					t.Fatalf("error requires regexp arg")
+				}
+				_, err := dbConn.Exec(ctx, getQuery())
+				if err != nil {
+					if ok, err := regexp.MatchString(errorRE, err.Error()); ok {
+						return ""
+					} else {
+						require.NoError(t, err)
+					}
+					t.Fatalf("error regexp didn't match: %s", err.Error())
+				}
+				t.Fatalf("expected error")
 			}
 			t.Fatalf("unknown command: %s", d.Cmd)
 			return "unexpected"

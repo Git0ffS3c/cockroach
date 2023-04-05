@@ -18,14 +18,16 @@ export type FilterSearchOptionProps = {
   value?: string;
 };
 
-export const FilterSearchOption = (props: FilterSearchOptionProps) => {
+export const FilterSearchOption = (
+  props: FilterSearchOptionProps,
+): React.ReactElement => {
   const { label, onChanged, value } = props;
   return (
     <div>
       <div className={filterLabel.margin}>{label}</div>
       <Search
         onChange={onChanged}
-        renderSuffix={false}
+        suffix={false}
         placeholder="Search"
         value={value}
       />

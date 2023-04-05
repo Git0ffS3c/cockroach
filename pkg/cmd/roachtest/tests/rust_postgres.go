@@ -22,6 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
+const rustPostgresSupportedTag = "postgres-v0.19.3"
+
 func registerRustPostgres(r registry.Registry) {
 	runRustPostgres := func(ctx context.Context, t test.Test, c cluster.Cluster) {
 		if c.IsLocal() {
@@ -58,10 +60,14 @@ func registerRustPostgres(r registry.Registry) {
 			t.Fatal(err)
 		}
 
-		if err := c.RunE(
+		if err := repeatGitCloneE(
 			ctx,
+			t,
+			c,
+			"https://github.com/sfackler/rust-postgres.git",
+			"/mnt/data1/rust-postgres",
+			rustPostgresSupportedTag,
 			node,
-			"cd /mnt/data1 && git clone https://github.com/sfackler/rust-postgres.git",
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -102,10 +108,11 @@ func registerRustPostgres(r registry.Registry) {
 
 		t.Status("building rust postgres (without test)")
 
-		blocklistName, expectedFailures, ignorelistName, ignorelist := rustPostgresBlocklists.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No rust-postgres blocklist defined for cockroach version %s", version)
-		}
+		blocklistName := "rustPostgresBlockList"
+		ignorelistName := "rustPostgresIgnoreList"
+		expectedFailures := rustPostgresBlocklist
+		ignorelist := rustPostgresIgnoreList
+
 		status := fmt.Sprintf("running cockroach version %s, using blocklist %s", version, blocklistName)
 		if ignorelist != nil {
 			status = fmt.Sprintf(
@@ -119,7 +126,10 @@ func registerRustPostgres(r registry.Registry) {
 		// We stop the cluster and restart with a port of 5433 since Rust postgres
 		// has all of it's test hardcoded to use that port.
 		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.All())
-		startOpts := option.DefaultStartOpts()
+
+		// Don't restart the cluster with automatic scheduled backups because roachprod's internal sql
+		// interface, through which the scheduled backup executes, is naive to the port change.
+		startOpts := option.DefaultStartOptsNoBackups()
 		startOpts.RoachprodOpts.ExtraArgs = []string{"--port=5433"}
 		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.All())
 
@@ -156,7 +166,7 @@ func registerRustPostgres(r registry.Registry) {
 
 	r.Add(registry.TestSpec{
 		Name:    "rust-postgres",
-		Owner:   registry.OwnerSQLExperience,
+		Owner:   registry.OwnerSQLSessions,
 		Cluster: r.MakeClusterSpec(1, spec.CPU(16)),
 		Tags:    []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {

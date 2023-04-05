@@ -23,26 +23,32 @@ import {
   FixLong,
   longToInt,
   TimestampToNumber,
-  TimestampToString,
   addStatementStats,
   flattenStatementStats,
   DurationToNumber,
   computeOrUseStmtSummary,
   transactionScopedStatementKey,
+  unset,
 } from "../util";
 
-type Statement = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+type Statement =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
-type Transaction = protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
+type Transaction =
+  protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
 
 export const getTrxAppFilterOptions = (
   transactions: Transaction[],
   prefix: string,
 ): string[] => {
   const uniqueAppNames = new Set(
-    transactions
-      .filter(t => !t.stats_data.app.startsWith(prefix))
-      .map(t => (t.stats_data.app ? t.stats_data.app : "(unset)")),
+    transactions.map(t =>
+      t.stats_data.app
+        ? t.stats_data.app.startsWith(prefix)
+          ? prefix
+          : t.stats_data.app
+        : unset,
+    ),
   );
 
   return Array.from(uniqueAppNames).sort();
@@ -55,8 +61,9 @@ export const getStatementsByFingerprintId = (
   statementFingerprintIds: Long[],
   statements: Statement[],
 ): Statement[] => {
-  return statements?.filter(s =>
-    statementFingerprintIds.some(id => id.eq(s.id)),
+  return (
+    statements?.filter(s => statementFingerprintIds.some(id => id.eq(s.id))) ||
+    []
   );
 };
 
@@ -95,12 +102,13 @@ export const aggregateStatements = (
     if (!(key in statsKey)) {
       statsKey[key] = {
         aggregatedFingerprintID: s.statement_fingerprint_id?.toString(),
+        aggregatedFingerprintHexID: s.statement_fingerprint_id.toString(16),
         label: s.statement,
         summary: s.statement_summary,
         aggregatedTs: s.aggregated_ts,
-        aggregationInterval: s.aggregation_interval,
         implicitTxn: s.implicit_txn,
         database: s.database,
+        applicationName: s.app,
         fullScan: s.full_scan,
         stats: s.stats,
       };
@@ -116,22 +124,39 @@ export const searchTransactionsData = (
   transactions: Transaction[],
   statements: Statement[],
 ): Transaction[] => {
+  let searchTerms = search?.split(" ");
+  // If search term is wrapped by quotes, do the exact search term.
+  if (search?.startsWith('"') && search?.endsWith('"')) {
+    searchTerms = [search.substring(1, search.length - 1)];
+  }
+
+  if (!search) {
+    return transactions;
+  }
+
   return transactions.filter((t: Transaction) =>
-    search
-      ? search.split(" ").every(val =>
-          collectStatementsText(
-            getStatementsByFingerprintId(
-              t.stats_data.statement_fingerprint_ids,
-              statements,
-            ),
-          )
-            .toLowerCase()
-            .includes(val.toLowerCase()),
+    searchTerms.every(val => {
+      if (
+        collectStatementsText(
+          getStatementsByFingerprintId(
+            t.stats_data.statement_fingerprint_ids,
+            statements,
+          ),
         )
-      : true,
+          .toLowerCase()
+          .includes(val.toLowerCase())
+      ) {
+        return true;
+      }
+
+      return t.stats_data.transaction_fingerprint_id
+        ?.toString(16)
+        ?.includes(val);
+    }),
   );
 };
 
+// TODO(todd): Remove unused nodeRegions parameter.
 export const filterTransactions = (
   data: Transaction[],
   filters: Filters,
@@ -146,8 +171,8 @@ export const filterTransactions = (
       activeFilters: 0,
     };
   const timeValue = getTimeValueInSeconds(filters);
-  const regions = filters.regions.length > 0 ? filters.regions.split(",") : [];
-  const nodes = filters.nodes.length > 0 ? filters.nodes.split(",") : [];
+  const regions = filters.regions?.length > 0 ? filters.regions.split(",") : [];
+  const nodes = filters.nodes?.length > 0 ? filters.nodes.split(",") : [];
 
   const activeFilters = calculateActiveFilters(filters);
 
@@ -166,7 +191,7 @@ export const filterTransactions = (
         if (apps.includes(internalAppNamePrefix)) {
           showInternal = true;
         }
-        if (apps.includes("(unset)")) {
+        if (apps.includes(unset)) {
           apps.push("");
         }
 
@@ -186,38 +211,60 @@ export const filterTransactions = (
         timeValue === "empty",
     )
     .filter((t: Transaction) => {
-      // The transaction must contain at least one value of the nodes
-      // and regions list (if the list is not empty).
-      if (regions.length == 0 && nodes.length == 0) return true;
-      // If the cluster is a tenant cluster we don't care
-      // about node/regions.
-      if (isTenant) return true;
-      let foundRegion: boolean = regions.length == 0;
-      let foundNode: boolean = nodes.length == 0;
+      // The transaction must contain at least one value of the regions list
+      // (if the list is not empty).
+      if (regions.length == 0) return true;
 
-      getStatementsByFingerprintId(
+      return getStatementsByFingerprintId(
         t.stats_data.statement_fingerprint_ids,
         statements,
-      ).some(stmt => {
-        stmt.stats.nodes &&
-          stmt.stats.nodes.some(node => {
-            if (foundRegion || regions.includes(nodeRegions[node.toString()])) {
-              foundRegion = true;
-            }
-            if (foundNode || nodes.includes("n" + node)) {
-              foundNode = true;
-            }
-            if (foundNode && foundRegion) return true;
-          });
-      });
+      ).some(stmt =>
+        stmt.stats.regions?.some(region => regions.includes(region)),
+      );
+    })
+    .filter((t: Transaction) => {
+      // The transaction must contain at least one value of the nodes list
+      // (if the list is not empty).
+      if (nodes.length == 0) return true;
 
-      return foundRegion && foundNode;
+      // If the cluster is a tenant cluster we don't care about nodes.
+      if (isTenant) return true;
+
+      return getStatementsByFingerprintId(
+        t.stats_data.statement_fingerprint_ids,
+        statements,
+      ).some(stmt =>
+        stmt.stats.nodes?.some(node => nodes.includes("n" + node)),
+      );
     });
 
   return {
     transactions: filteredTransactions,
     activeFilters,
   };
+};
+
+/**
+ * For each transaction, generate the list of regions all
+ * its statements were executed on.
+ * E.g. of one element of the list: `gcp-us-east1`
+ * @param transaction: list of transactions.
+ * @param statements: list of all statements collected.
+ */
+export const generateRegion = (
+  transaction: Transaction,
+  statements: Statement[],
+): string[] => {
+  const regions: Set<string> = new Set<string>();
+
+  getStatementsByFingerprintId(
+    transaction.stats_data.statement_fingerprint_ids,
+    statements,
+  ).forEach(stmt => {
+    stmt.stats.regions?.forEach(region => regions.add(region));
+  });
+
+  return Array.from(regions).sort();
 };
 
 /**
@@ -275,7 +322,7 @@ type TransactionWithFingerprint = Transaction & { fingerprint: string };
 
 // withFingerprint adds the concatenated statement fingerprints to the Transaction object since it
 // only comes with statement_fingerprint_ids
-const withFingerprint = function(
+const withFingerprint = function (
   t: Transaction,
   stmts: Statement[],
 ): TransactionWithFingerprint {
@@ -315,6 +362,7 @@ function addTransactionStats(
       countA,
       countB,
     ),
+    idle_lat: aggregateNumericStats(a.idle_lat, b.idle_lat, countA, countB),
     rows_read: aggregateNumericStats(a.rows_read, b.rows_read, countA, countB),
     rows_written: aggregateNumericStats(
       a.rows_written,
@@ -342,11 +390,12 @@ function combineTransactionStats(
 // and returns a copy of the first element with its `stats_data.stats` object replaced with a
 // merged stats object that aggregates statistics from every copy of the fingerprint in the list
 // provided
-const mergeTransactionStats = function(txns: Transaction[]): Transaction {
+// This function SHOULD NOT mutate any objects in the provided txns array.
+const mergeTransactionStats = function (txns: Transaction[]): Transaction {
   if (txns.length === 0) {
     return null;
   }
-  const txn = { ...txns[0] };
+  const txn = _.cloneDeep(txns[0]);
   txn.stats_data.stats = combineTransactionStats(
     txns.map(t => t.stats_data.stats),
   );
@@ -362,19 +411,13 @@ const mergeTransactionStats = function(txns: Transaction[]): Transaction {
 // The function uses the fingerprint and the `app` that ran the transaction as the key to group the
 // transactions when deduping.
 //
-export const aggregateAcrossNodeIDs = function(
+export const aggregateAcrossNodeIDs = function (
   t: Transaction[],
   stmts: Statement[],
 ): Transaction[] {
   return _.chain(t)
     .map(t => withFingerprint(t, stmts))
-    .groupBy(
-      t =>
-        t.fingerprint +
-        t.stats_data.app +
-        TimestampToNumber(t.stats_data.aggregated_ts) +
-        DurationToNumber(t.stats_data.aggregation_interval),
-    )
+    .groupBy(t => t.fingerprint)
     .mapValues(mergeTransactionStats)
     .values()
     .value();

@@ -51,18 +51,18 @@
 }
 
 .header-container {
-   align-items: baseline;
-   display: flex;
-   flex-direction: row;
-   justify-content: space-between;
-   width: 75%;
-   padding: 0 9px 12px;
- }
+  align-items: baseline;
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  width: 75%;
+  padding: 0 9px 12px;
+}
 
 .reset-info {
-   display: flex;
-   flex-direction: row;
- }
+  display: flex;
+  flex-direction: row;
+}
 
 .last-reset {
   color: $colors--neutral-6;
@@ -73,6 +73,7 @@
   &--row {
     background-color: $adminui-white;
     letter-spacing: 0.33px;
+    margin-left: 1px;
   }
   &--label {
     font-family: $font-family--semi-bold;
@@ -98,6 +99,24 @@
 }
 
 .index-recommendations {
+  &-rows {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 16px;
+
+    &__header {
+      font-family: $font-family--semi-bold;
+      flex-basis: 20%;
+      flex-shrink: 0;
+    }
+
+    &__content {
+      font-family: $font-family--base;
+      width: 65%;
+      flex-grow: 0;
+    }
+  }
   &__tooltip-anchor {
     a {
       &:hover {
@@ -107,3 +126,29 @@
     }
   }
 }
+
+.index-stats__reset-btn {
+  color: $colors--primary-blue-3;
+  font-size: $font-size--medium;
+  line-height: $line-height--small;
+
+  &:hover {
+    color: $colors--primary-blue-3;
+    text-decoration: underline;
+  }
+}
+
+.row-spaced {
+  margin-top: 20px;
+}
+
+.bottom-space {
+  margin-bottom: 40px;
+}
+
+.table-scroll {
+  width: calc(100% - -23px);
+  overflow-x: scroll;
+  padding-left: 0;
+}
+

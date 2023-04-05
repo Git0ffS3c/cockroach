@@ -13,31 +13,27 @@ package sql
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 )
 
@@ -55,6 +51,7 @@ var (
 	errNoSchema          = pgerror.Newf(pgcode.InvalidName, "no schema specified")
 	errNoTable           = pgerror.New(pgcode.InvalidName, "no table specified")
 	errNoType            = pgerror.New(pgcode.InvalidName, "no type specified")
+	errNoFunction        = pgerror.New(pgcode.InvalidName, "no function specified")
 	errNoMatch           = pgerror.New(pgcode.UndefinedObject, "no object matched")
 )
 
@@ -69,12 +66,11 @@ func (p *planner) createDatabase(
 ) (*dbdesc.Mutable, bool, error) {
 
 	dbName := string(database.Name)
-	dKey := catalogkeys.MakeDatabaseNameKey(p.ExecCfg().Codec, dbName)
 
-	if dbID, err := p.Descriptors().Direct().LookupDatabaseID(ctx, p.txn, dbName); err == nil && dbID != descpb.InvalidID {
+	if dbID, err := p.Descriptors().LookupDatabaseID(ctx, p.txn, dbName); err == nil && dbID != descpb.InvalidID {
 		if database.IfNotExists {
 			// Check if the database is in a dropping state
-			desc, err := p.Descriptors().Direct().MustGetDatabaseDescByID(ctx, p.txn, dbID)
+			desc, err := p.Descriptors().ByID(p.txn).Get().Database(ctx, dbID)
 			if err != nil {
 				return nil, false, err
 			}
@@ -91,7 +87,11 @@ func (p *planner) createDatabase(
 		return nil, false, err
 	}
 
-	id, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
+	id, err := p.extendedEvalCtx.DescIDGenerator.GenerateUniqueDescID(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	publicSchemaID, err := p.EvalContext().DescIDGenerator.GenerateUniqueDescID(ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -118,12 +118,8 @@ func (p *planner) createDatabase(
 		database.PrimaryRegion,
 		database.Regions,
 		database.Placement,
+		database.SecondaryRegion,
 	)
-	if err != nil {
-		return nil, false, err
-	}
-
-	publicSchemaID, err := p.createPublicSchema(ctx, id, database)
 	if err != nil {
 		return nil, false, err
 	}
@@ -138,19 +134,33 @@ func (p *planner) createDatabase(
 		}
 	}
 
-	desc := dbdesc.NewInitial(
+	db := dbdesc.NewInitial(
 		id,
 		string(database.Name),
 		owner,
 		dbdesc.MaybeWithDatabaseRegionConfig(regionConfig),
 		dbdesc.WithPublicSchemaID(publicSchemaID),
 	)
+	publicSchema := schemadesc.NewBuilder(&descpb.SchemaDescriptor{
+		ParentID:   id,
+		Name:       tree.PublicSchema,
+		ID:         publicSchemaID,
+		Privileges: catpb.NewPublicSchemaPrivilegeDescriptor(),
+		Version:    1,
+	}).BuildCreatedMutableSchema()
 
-	if err := p.checkCanAlterToNewOwner(ctx, desc, owner); err != nil {
+	if err := p.checkCanAlterToNewOwner(ctx, db, owner); err != nil {
 		return nil, true, err
 	}
 
-	if err := p.createDescriptorWithID(ctx, dKey, id, desc, jobDesc); err != nil {
+	if err := p.createDescriptor(ctx, db, jobDesc); err != nil {
+		return nil, true, err
+	}
+	if err := p.createDescriptor(
+		ctx,
+		publicSchema,
+		tree.AsStringWithFQNames(database, p.Ann()),
+	); err != nil {
 		return nil, true, err
 	}
 
@@ -158,138 +168,66 @@ func (p *planner) createDatabase(
 	// database-level zone configuration if there is a region config on the
 	// descriptor.
 
-	if err := p.maybeInitializeMultiRegionDatabase(ctx, desc, regionConfig); err != nil {
+	if err := p.maybeInitializeMultiRegionDatabase(ctx, db, regionConfig); err != nil {
 		return nil, true, err
 	}
 
-	return desc, true, nil
+	if database.SuperRegion.Name != "" {
+		if err := p.isSuperRegionEnabled(); err != nil {
+			return nil, false, err
+		}
+
+		typeID, err := db.MultiRegionEnumID()
+		if err != nil {
+			return nil, false, err
+		}
+		typeDesc, err := p.Descriptors().MutableByID(p.txn).Type(ctx, typeID)
+		if err != nil {
+			return nil, false, err
+		}
+
+		if err = p.addSuperRegion(
+			ctx,
+			db,
+			typeDesc,
+			database.SuperRegion.Regions,
+			database.SuperRegion.Name,
+			tree.AsStringWithFQNames(database, p.Ann()),
+		); err != nil {
+			return nil, false, err
+		}
+
+	}
+
+	return db, true, nil
 }
 
-func (p *planner) maybeCreatePublicSchemaWithDescriptor(
-	ctx context.Context, dbID descpb.ID, database *tree.CreateDatabase,
-) (descpb.ID, error) {
-	if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.PublicSchemasWithDescriptors) {
-		return descpb.InvalidID, nil
-	}
-
-	publicSchemaID, err := descidgen.GenerateUniqueDescID(ctx, p.ExecCfg().DB, p.ExecCfg().Codec)
-	if err != nil {
-		return descpb.InvalidID, err
-	}
-
-	// Every database must be initialized with the public schema.
-	// Create the SchemaDescriptor.
-	publicSchemaPrivileges := catpb.NewPublicSchemaPrivilegeDescriptor()
-	publicSchemaDesc := schemadesc.NewBuilder(&descpb.SchemaDescriptor{
-		ParentID:   dbID,
-		Name:       tree.PublicSchema,
-		ID:         publicSchemaID,
-		Privileges: publicSchemaPrivileges,
-		Version:    1,
-	}).BuildCreatedMutableSchema()
-
-	if err := p.createDescriptorWithID(
-		ctx,
-		catalogkeys.MakeSchemaNameKey(p.ExecCfg().Codec, dbID, tree.PublicSchema),
-		publicSchemaDesc.GetID(),
-		publicSchemaDesc,
-		tree.AsStringWithFQNames(database, p.Ann()),
-	); err != nil {
-		return descpb.InvalidID, err
-	}
-
-	return publicSchemaID, nil
-}
-
-func (p *planner) createPublicSchema(
-	ctx context.Context, dbID descpb.ID, database *tree.CreateDatabase,
-) (descpb.ID, error) {
-	publicSchemaID, err := p.maybeCreatePublicSchemaWithDescriptor(ctx, dbID, database)
-	if err != nil {
-		return descpb.InvalidID, err
-	}
-	if publicSchemaID != descpb.InvalidID {
-		return publicSchemaID, nil
-	}
-	// Every database must be initialized with the public schema.
-	key := catalogkeys.MakeSchemaNameKey(p.ExecCfg().Codec, dbID, tree.PublicSchema)
-	if err := p.CreateSchemaNamespaceEntry(ctx, key, keys.PublicSchemaID); err != nil {
-		return keys.PublicSchemaID, err
-	}
-	return keys.PublicSchemaID, nil
-}
-
-func (p *planner) createDescriptorWithID(
-	ctx context.Context,
-	idKey roachpb.Key,
-	id descpb.ID,
-	descriptor catalog.Descriptor,
-	jobDesc string,
+func (p *planner) createDescriptor(
+	ctx context.Context, descriptor catalog.MutableDescriptor, jobDesc string,
 ) error {
-	if descriptor.GetID() == 0 {
-		// TODO(ajwerner): Return the error here rather than fatal.
-		log.Fatalf(ctx, "%v", errors.AssertionFailedf("cannot create descriptor with an empty ID: %v", descriptor))
+	if !descriptor.IsNew() {
+		return errors.AssertionFailedf(
+			"expected new descriptor, not a modification of version %d",
+			descriptor.OriginalVersion())
 	}
-	if descriptor.GetID() != id {
-		log.Fatalf(ctx, "%v", errors.AssertionFailedf("cannot create descriptor with an unexpected (%v) ID: %v", id, descriptor))
-	}
-	// TODO(pmattis): The error currently returned below is likely going to be
-	// difficult to interpret.
-	//
-	// TODO(pmattis): Need to handle if-not-exists here as well.
-	//
-	// TODO(pmattis): This is writing the namespace and descriptor table entries,
-	// but not going through the normal INSERT logic and not performing a precise
-	// mimicry. In particular, we're only writing a single key per table, while
-	// perfect mimicry would involve writing a sentinel key for each row as well.
-
 	b := &kv.Batch{}
-	descID := descriptor.GetID()
-	if p.ExtendedEvalContext().Tracing.KVTracingEnabled() {
-		log.VEventf(ctx, 2, "CPut %s -> %d", idKey, descID)
-	}
-	b.CPut(idKey, descID, nil)
-	if err := p.Descriptors().Direct().WriteNewDescToBatch(
-		ctx,
-		p.ExtendedEvalContext().Tracing.KVTracingEnabled(),
-		b,
-		descriptor,
-	); err != nil {
+	kvTrace := p.ExtendedEvalContext().Tracing.KVTracingEnabled()
+	if err := p.Descriptors().WriteDescToBatch(ctx, kvTrace, descriptor, b); err != nil {
 		return err
 	}
-
-	mutDesc, ok := descriptor.(catalog.MutableDescriptor)
-	if !ok {
-		log.Fatalf(ctx, "unexpected type %T when creating descriptor", descriptor)
-	}
-
-	isTable := false
-	addUncommitted := false
-	switch mutDesc.(type) {
-	case *dbdesc.Mutable, *schemadesc.Mutable, *typedesc.Mutable:
-		addUncommitted = true
-	case *tabledesc.Mutable:
-		addUncommitted = true
-		isTable = true
-	default:
-		log.Fatalf(ctx, "unexpected type %T when creating descriptor", mutDesc)
-	}
-	if addUncommitted {
-		if err := p.Descriptors().AddUncommittedDescriptor(mutDesc); err != nil {
+	if !descriptor.SkipNamespace() {
+		if err := p.Descriptors().InsertNamespaceEntryToBatch(ctx, kvTrace, descriptor, b); err != nil {
 			return err
 		}
 	}
-
 	if err := p.txn.Run(ctx, b); err != nil {
 		return err
 	}
-	if isTable && mutDesc.Adding() {
+	if tbl, ok := descriptor.(*tabledesc.Mutable); ok && tbl.Adding() {
 		// Queue a schema change job to eventually make the table public.
 		if err := p.createOrUpdateSchemaChangeJob(
-			ctx,
-			mutDesc.(*tabledesc.Mutable),
-			jobDesc,
-			descpb.InvalidMutationID); err != nil {
+			ctx, tbl, jobDesc, descpb.InvalidMutationID,
+		); err != nil {
 			return err
 		}
 	}
@@ -340,12 +278,15 @@ func (p *planner) checkRegionIsCurrentlyActive(ctx context.Context, region catpb
 // CCL-licensed multi-region initialization code.
 var InitializeMultiRegionMetadataCCL = func(
 	ctx context.Context,
-	execCfg *ExecutorConfig,
+	descIDGenerator eval.DescIDGenerator,
+	settings *cluster.Settings,
+	clusterID uuid.UUID,
 	liveClusterRegions LiveClusterRegions,
 	survivalGoal tree.SurvivalGoal,
 	primaryRegion catpb.RegionName,
 	regions []tree.Name,
 	dataPlacement tree.DataPlacement,
+	secondaryRegion catpb.RegionName,
 ) (*multiregion.RegionConfig, error) {
 	return nil, sqlerrors.NewCCLRequiredError(
 		errors.New("creating multi-region databases requires a CCL binary"),
@@ -393,6 +334,7 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 	primaryRegion tree.Name,
 	regions []tree.Name,
 	placement tree.DataPlacement,
+	secondaryRegion tree.Name,
 ) (*multiregion.RegionConfig, error) {
 	if !p.execCfg.Codec.ForSystemTenant() &&
 		!SecondaryTenantsMultiRegionAbstractionsEnabled.Get(&p.execCfg.Settings.SV) {
@@ -429,12 +371,15 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 
 	regionConfig, err := InitializeMultiRegionMetadataCCL(
 		ctx,
-		p.ExecCfg(),
+		p.EvalContext().DescIDGenerator,
+		p.EvalContext().Settings,
+		p.ExecCfg().NodeInfo.LogicalClusterID(),
 		liveRegions,
 		survivalGoal,
 		catpb.RegionName(primaryRegion),
 		regions,
 		placement,
+		catpb.RegionName(secondaryRegion),
 	)
 	if err != nil {
 		return nil, err
@@ -445,12 +390,7 @@ func (p *planner) maybeInitializeMultiRegionMetadata(
 
 // GetImmutableTableInterfaceByID is part of the EvalPlanner interface.
 func (p *planner) GetImmutableTableInterfaceByID(ctx context.Context, id int) (interface{}, error) {
-	desc, err := p.Descriptors().GetImmutableTableByID(
-		ctx,
-		p.txn,
-		descpb.ID(id),
-		tree.ObjectLookupFlagsWithRequired(),
-	)
+	desc, err := p.Descriptors().ByIDWithLeased(p.txn).WithoutNonPublic().Get().Table(ctx, descpb.ID(id))
 	if err != nil {
 		return nil, err
 	}

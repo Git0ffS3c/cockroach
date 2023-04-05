@@ -380,10 +380,25 @@ var (
 	// internally on a connection between different Cockroach nodes.
 	InternalConnectionFailure = MakeCode("58C01")
 
+	// ProxyConnectionError is returned by the sqlproxyccl and it indicates a
+	// problem establishing the connection through the proxy.
+	ProxyConnectionError = MakeCode("08C00")
+
 	// Class XC - cockroach extension.
 	// CockroachDB distributed system related errors.
 
 	// UnsatisfiableBoundedStaleness signals that the bounded staleness query
 	// cannot be satisfied.
 	UnsatisfiableBoundedStaleness = MakeCode("XCUBS")
+
+	// QueryNotRunningInHomeRegion signals that a query is not running in its
+	// home region.
+	QueryNotRunningInHomeRegion = MakeCode("XCHR1")
+
+	// QueryHasNoHomeRegion signals that a query has no home region.
+	QueryHasNoHomeRegion = MakeCode("XCHR2")
+
+	// ExperimentalFeature signals that a feature we supported experimentally is being
+	// used without the session variable being enabled.
+	ExperimentalFeature = MakeCode("XCEXF")
 )

@@ -10,22 +10,75 @@
 
 import React from "react";
 import classNames from "classnames/bind";
-import { SortSetting } from "src/sortedtable";
+import { flatMap } from "lodash";
+import {
+  ISortedTablePagination,
+  SortedTable,
+  SortSetting,
+} from "src/sortedtable";
 
 import styles from "./indexDetailsPage.module.scss";
 import { baseHeadingClasses } from "src/transactionsPage/transactionsPageClasses";
 import { CaretRight } from "../icon/caretRight";
-import { Breadcrumbs } from "../breadcrumbs";
+import { BreadcrumbItem, Breadcrumbs } from "../breadcrumbs";
 import { Caution, Search as IndexIcon } from "@cockroachlabs/icons";
-import { SqlBox } from "src/sql";
+import { SqlBox, SqlBoxSize } from "src/sql";
 import { Col, Row, Tooltip } from "antd";
+import "antd/lib/col/style";
+import "antd/lib/row/style";
+import "antd/lib/tooltip/style";
 import { SummaryCard } from "../summaryCard";
 import moment, { Moment } from "moment";
 import { Heading } from "@cockroachlabs/ui-components";
 import { Anchor } from "../anchor";
-import { performanceTuningRecipes } from "../util";
+import {
+  calculateTotalWorkload,
+  Count,
+  DATE_FORMAT_24_UTC,
+  EncodeDatabaseTableIndexUri,
+  EncodeDatabaseTableUri,
+  EncodeDatabaseUri,
+  performanceTuningRecipes,
+  unique,
+  unset,
+} from "../util";
+import {
+  getStatementsUsingIndex,
+  StatementsListRequestFromDetails,
+  StatementsUsingIndexRequest,
+} from "../api/indexDetailsApi";
+import {
+  AggregateStatistics,
+  makeStatementsColumns,
+  populateRegionNodeForStatements,
+} from "../statementsTable";
+import { UIConfigState } from "../store";
+import statementsStyles from "../statementsPage/statementsPage.module.scss";
+import { Pagination } from "../pagination";
+import { TableStatistics } from "../tableStatistics";
+import { EmptyStatementsPlaceholder } from "../statementsPage/emptyStatementsPlaceholder";
+import { StatementViewType } from "../statementsPage/statementPageTypes";
+import { PageConfig, PageConfigItem } from "src/pageConfig";
+import {
+  TimeScale,
+  timeScale1hMinOptions,
+  TimeScaleDropdown,
+} from "../timeScaleDropdown";
+import { Search } from "../search";
+import {
+  calculateActiveFilters,
+  defaultFilters,
+  Filter,
+  Filters,
+} from "../queryFilter";
+import { commonStyles } from "../common";
+import { Loading } from "src";
+import LoadingError from "../sqlActivity/errorComponent";
+import { INTERNAL_APP_NAME_PREFIX } from "../recentExecutions/recentStatementUtils";
+import { filteredStatementsData } from "../sqlActivity/util";
 
 const cx = classNames.bind(styles);
+const stmtCx = classNames.bind(statementsStyles);
 
 // We break out separate interfaces for some of the nested objects in our data
 // so that we can make (typed) test assertions on narrower slices of the data.
@@ -42,6 +95,8 @@ const cx = classNames.bind(styles);
 //     details: { // IndexDetails;
 //       loading: boolean;
 //       loaded: boolean;
+//       tableID: string;
+//       indexID: string;
 //       createStatement: string;
 //       totalReads: number;
 //       lastRead: Moment;
@@ -54,11 +109,19 @@ export interface IndexDetailsPageData {
   tableName: string;
   indexName: string;
   details: IndexDetails;
+  breadcrumbItems: BreadcrumbItem[];
+  isTenant: UIConfigState["isTenant"];
+  hasViewActivityRedactedRole?: UIConfigState["hasViewActivityRedactedRole"];
+  hasAdminRole?: UIConfigState["hasAdminRole"];
+  nodeRegions: { [nodeId: string]: string };
+  timeScale: TimeScale;
 }
 
 interface IndexDetails {
   loading: boolean;
   loaded: boolean;
+  tableID: string;
+  indexID: string;
   createStatement: string;
   totalReads: number;
   lastRead: Moment;
@@ -66,8 +129,10 @@ interface IndexDetails {
   indexRecommendations: IndexRecommendation[];
 }
 
+export type RecommendationType = "DROP_UNUSED" | "Unknown";
+
 interface IndexRecommendation {
-  type: string;
+  type: RecommendationType;
   reason: string;
 }
 
@@ -75,38 +140,125 @@ export interface IndexDetailPageActions {
   refreshIndexStats?: (database: string, table: string) => void;
   resetIndexUsageStats?: (database: string, table: string) => void;
   refreshNodes?: () => void;
+  refreshUserSQLRoles: () => void;
+  onTimeScaleChange: (ts: TimeScale) => void;
 }
 
 export type IndexDetailsPageProps = IndexDetailsPageData &
   IndexDetailPageActions;
 
 interface IndexDetailsPageState {
-  sortSetting: SortSetting;
+  activeFilters: number;
+  filters?: Filters;
+  search: string;
+  lastStatementsError: Error | null;
+  lastStatementsUpdated: moment.Moment | null;
+  statements: AggregateStatistics[];
+  stmtPagination: ISortedTablePagination;
+  stmtSortSetting: SortSetting;
 }
 
 export class IndexDetailsPage extends React.Component<
   IndexDetailsPageProps,
   IndexDetailsPageState
 > {
+  refreshDataInterval: NodeJS.Timeout;
   constructor(props: IndexDetailsPageProps) {
     super(props);
 
     this.state = {
-      sortSetting: {
+      stmtSortSetting: {
         ascending: true,
+        columnTitle: "time",
       },
+      stmtPagination: {
+        pageSize: 10,
+        current: 1,
+      },
+      statements: [],
+      lastStatementsUpdated: null,
+      lastStatementsError: null,
+      search: null,
+      activeFilters: 0,
+      filters: defaultFilters,
     };
   }
 
-  componentDidMount() {
+  componentDidMount(): void {
+    this.refresh();
+
+    this.refreshDataInterval = setInterval(() => {
+      this.refreshStatementsList();
+    }, 100);
+  }
+
+  componentWillUnmount(): void {
+    if (this.refreshDataInterval) {
+      clearInterval(this.refreshDataInterval);
+    }
+  }
+
+  componentDidUpdate(): void {
     this.refresh();
   }
 
-  componentDidUpdate() {
+  onChangeSortSetting = (ss: SortSetting): void => {
+    this.setState({
+      stmtSortSetting: ss,
+    });
+  };
+
+  onChangePage = (current: number): void => {
+    const { stmtPagination } = this.state;
+    this.setState({ stmtPagination: { ...stmtPagination, current } });
+  };
+
+  resetPagination = (): void => {
+    this.setState({
+      stmtPagination: {
+        current: 1,
+        pageSize: 10,
+      },
+    });
+  };
+
+  onSubmitSearchField = (search: string): void => {
+    this.setState({ search: search });
+    this.resetPagination();
+  };
+
+  onClearSearchField = (): void => {
+    this.onSubmitSearchField("");
+  };
+
+  onSubmitFilters = (filters: Filters): void => {
+    this.setState({
+      filters: filters,
+      activeFilters: calculateActiveFilters(filters),
+    });
+
+    this.resetPagination();
+  };
+
+  onClearFilters = (): void => {
+    this.setState({
+      filters: defaultFilters,
+      activeFilters: 0,
+    });
+
+    this.resetPagination();
+  };
+
+  changeTimeScale = (ts: TimeScale): void => {
+    if (this.props.onTimeScaleChange) {
+      this.props.onTimeScaleChange(ts);
+    }
+    this.setState({ lastStatementsUpdated: null });
     this.refresh();
-  }
+  };
 
   private refresh() {
+    this.props.refreshUserSQLRoles();
     if (this.props.refreshNodes != null) {
       this.props.refreshNodes();
     }
@@ -118,39 +270,89 @@ export class IndexDetailsPage extends React.Component<
     }
   }
 
-  private getTimestampString(timestamp: Moment) {
+  private refreshStatementsList(): void {
+    const noData = this.state.lastStatementsUpdated == null;
+    const movingTimeScaleWithPeriodPassed =
+      this.props.timeScale.key !== "Custom" &&
+      moment().diff(this.state.lastStatementsUpdated, "minutes") >= 5;
+    if (
+      (noData || movingTimeScaleWithPeriodPassed) &&
+      this.props.details.loaded
+    ) {
+      const req: StatementsUsingIndexRequest = StatementsListRequestFromDetails(
+        this.props.details.tableID,
+        this.props.details.indexID,
+        this.props.databaseName,
+        this.props.timeScale,
+      );
+      getStatementsUsingIndex(req)
+        .then(res => {
+          populateRegionNodeForStatements(res, this.props.nodeRegions);
+          this.setState({
+            statements: res,
+            lastStatementsUpdated: moment(),
+            lastStatementsError: null,
+          });
+        })
+        .catch(error => {
+          this.setState({
+            lastStatementsUpdated: moment(),
+            lastStatementsError: error,
+          });
+        });
+    }
+  }
+
+  private getTimestampString(timestamp: Moment): string {
     const minDate = moment.utc("0001-01-01"); // minimum value as per UTC
     if (timestamp.isSame(minDate)) {
       return "Never";
     } else {
-      return timestamp.format("MMM DD, YYYY [at] h:mm A [(UTC)]");
+      return timestamp.format(DATE_FORMAT_24_UTC);
     }
+  }
+
+  private getApps(): string[] {
+    const { statements } = this.state;
+    let sawBlank = false;
+    let sawInternal = false;
+    const apps: { [app: string]: boolean } = {};
+    statements.forEach((statement: AggregateStatistics) => {
+      if (statement.applicationName.startsWith(INTERNAL_APP_NAME_PREFIX)) {
+        sawInternal = true;
+      } else if (statement.applicationName) {
+        apps[statement.applicationName] = true;
+      } else {
+        sawBlank = true;
+      }
+    });
+    return []
+      .concat(sawInternal ? [INTERNAL_APP_NAME_PREFIX] : [])
+      .concat(sawBlank ? [unset] : [])
+      .concat(Object.keys(apps).sort());
   }
 
   private renderIndexRecommendations(
     indexRecommendations: IndexRecommendation[],
   ) {
     if (indexRecommendations.length === 0) {
-      return "None";
+      return (
+        <tr>
+          <td>None</td>
+        </tr>
+      );
     }
-    return indexRecommendations.map(recommendation => {
+    return indexRecommendations.map((recommendation, key) => {
       let recommendationType: string;
       switch (recommendation.type) {
         case "DROP_UNUSED":
           recommendationType = "Drop unused index";
       }
-      // TODO(thomas): using recommendation.type as the key seems not good.
-      //  - if it is possible for an index to have multiple recommendations of the same type
-      //  this could cause issues.
       return (
-        <tr
-          key={recommendationType}
-          className={cx("summary-card--row", "table__row")}
-        >
+        <tr key={key} className={cx("index-recommendations-rows")}>
           <td
             className={cx(
-              "table__cell",
-              "summary-card--label",
+              "index-recommendations-rows__header",
               "icon__container",
             )}
           >
@@ -159,7 +361,7 @@ export class IndexDetailsPage extends React.Component<
           </td>
           <td
             className={cx(
-              "summary-card--value",
+              "index-recommendations-rows__content",
               "index-recommendations__tooltip-anchor",
             )}
           >
@@ -174,31 +376,105 @@ export class IndexDetailsPage extends React.Component<
     });
   }
 
-  render() {
+  private renderBreadcrumbs() {
+    if (this.props.breadcrumbItems) {
+      return (
+        <Breadcrumbs
+          items={this.props.breadcrumbItems}
+          divider={<CaretRight className={cx("icon--xxs", "icon--primary")} />}
+        />
+      );
+    }
+    // If no props are passed, render db-console breadcrumb links by default.
+    return (
+      <Breadcrumbs
+        items={[
+          { link: "/databases", name: "Databases" },
+          {
+            link: EncodeDatabaseUri(this.props.databaseName),
+            name: "Tables",
+          },
+          {
+            link: EncodeDatabaseTableUri(
+              this.props.databaseName,
+              this.props.tableName,
+            ),
+            name: `Table: ${this.props.tableName}`,
+          },
+          {
+            link: EncodeDatabaseTableIndexUri(
+              this.props.databaseName,
+              this.props.tableName,
+              this.props.indexName,
+            ),
+            name: `Index: ${this.props.indexName}`,
+          },
+        ]}
+        divider={<CaretRight className={cx("icon--xxs", "icon--primary")} />}
+      />
+    );
+  }
+
+  private filteredStatements = (): AggregateStatistics[] => {
+    const { filters, search, statements } = this.state;
+    const { nodeRegions, isTenant } = this.props;
+    let filteredStatements = statements;
+    const isInternal = (statement: AggregateStatistics) =>
+      statement.applicationName.startsWith(INTERNAL_APP_NAME_PREFIX);
+
+    if (filters.app && filters.app !== "All") {
+      const criteria = decodeURIComponent(filters.app).split(",");
+      let showInternal = false;
+      if (criteria.includes(INTERNAL_APP_NAME_PREFIX)) {
+        showInternal = true;
+      }
+      if (criteria.includes(unset)) {
+        criteria.push("");
+      }
+
+      filteredStatements = statements.filter(
+        (statement: AggregateStatistics) =>
+          (showInternal && isInternal(statement)) ||
+          criteria.includes(statement.applicationName),
+      );
+    }
+    return filteredStatementsData(
+      filters,
+      search,
+      filteredStatements,
+      nodeRegions,
+      isTenant,
+    );
+  };
+
+  render(): React.ReactElement {
+    const {
+      statements,
+      stmtSortSetting,
+      stmtPagination,
+      search,
+      activeFilters,
+      filters,
+    } = this.state;
+    const { nodeRegions, isTenant, hasViewActivityRedactedRole, hasAdminRole } =
+      this.props;
+    const apps = this.getApps();
+    const nodes = Object.keys(nodeRegions)
+      .map(n => Number(n))
+      .sort();
+    const regions = unique(
+      isTenant
+        ? flatMap(statements, statement => statement.stats.regions)
+        : nodes.map(node => nodeRegions[node.toString()]),
+    ).sort();
+
+    const filteredStmts = this.filteredStatements();
+
     return (
       <div className={cx("page-container")}>
         <div className="root table-area">
           <section className={baseHeadingClasses.wrapper}>
-            <Breadcrumbs
-              items={[
-                { link: "/databases", name: "Databases" },
-                {
-                  link: `/database/${this.props.databaseName}`,
-                  name: "Tables",
-                },
-                {
-                  link: `/database/${this.props.databaseName}/table/${this.props.tableName}`,
-                  name: `Table: ${this.props.tableName}`,
-                },
-                {
-                  link: `/database/${this.props.databaseName}/table/${this.props.tableName}/index/${this.props.indexName}`,
-                  name: `Index: ${this.props.indexName}`,
-                },
-              ]}
-              divider={
-                <CaretRight className={cx("icon--xxs", "icon--primary")} />
-              }
-            />
+            {this.renderBreadcrumbs()}
           </section>
           <div className={cx("header-container")}>
             <h3
@@ -212,32 +488,41 @@ export class IndexDetailsPage extends React.Component<
             <div className={cx("reset-info")}>
               <Tooltip
                 placement="bottom"
-                title="Index stats accumulate from the time the index was created or had its stats reset.. Clicking ‘Reset all index stats’ will reset index stats for the entire cluster."
+                title="Index stats accumulate from the time the index was created or had its stats reset.. Clicking ‘Reset all index stats’ will reset index stats for the entire cluster. Last reset is the timestamp at which the last reset started."
               >
                 <div className={cx("last-reset", "underline")}>
                   Last reset:{" "}
                   {this.getTimestampString(this.props.details.lastReset)}
                 </div>
               </Tooltip>
-              <div>
-                <a
-                  className={cx("action", "separator")}
-                  onClick={() =>
-                    this.props.resetIndexUsageStats(
-                      this.props.databaseName,
-                      this.props.tableName,
-                    )
-                  }
-                >
-                  Reset all index stats
-                </a>
-              </div>
+              {hasAdminRole && (
+                <div>
+                  <a
+                    className={cx(
+                      "action",
+                      "separator",
+                      "index-stats__reset-btn",
+                    )}
+                    onClick={() =>
+                      this.props.resetIndexUsageStats(
+                        this.props.databaseName,
+                        this.props.tableName,
+                      )
+                    }
+                  >
+                    Reset all index stats
+                  </a>
+                </div>
+              )}
             </div>
           </div>
           <section className={baseHeadingClasses.wrapper}>
             <Row gutter={18}>
               <Col className="gutter-row" span={18}>
-                <SqlBox value={this.props.details.createStatement} />
+                <SqlBox
+                  value={this.props.details.createStatement}
+                  size={SqlBoxSize.custom}
+                />
               </Col>
             </Row>
             <Row gutter={18}>
@@ -258,7 +543,7 @@ export class IndexDetailsPage extends React.Component<
                         </td>
                         <td className="table__cell">
                           <p className={cx("summary-card--value")}>
-                            {this.props.details.totalReads}
+                            {Count(this.props.details.totalReads)}
                           </p>
                         </td>
                       </tr>
@@ -286,17 +571,110 @@ export class IndexDetailsPage extends React.Component<
                 </SummaryCard>
               </Col>
             </Row>
-            <Row gutter={18}>
+            <Row gutter={18} className={cx("row-spaced")}>
               <Col className="gutter-row" span={18}>
                 <SummaryCard className={cx("summary-card--row")}>
-                  <Heading type="h5">Index recommendations</Heading>
-                  <table className="table">
+                  <Heading type="h5">Index Recommendations</Heading>
+                  <table>
                     <tbody>
                       {this.renderIndexRecommendations(
                         this.props.details.indexRecommendations,
                       )}
                     </tbody>
                   </table>
+                </SummaryCard>
+              </Col>
+            </Row>
+            <Row gutter={24} className={cx("row-spaced", "bottom-space")}>
+              <Col className="gutter-row" span={24}>
+                <SummaryCard className={cx("summary-card--row")}>
+                  <Heading type="h5">Index Usage</Heading>
+                  <PageConfig whiteBkg={true}>
+                    <PageConfigItem>
+                      <Search
+                        onSubmit={this.onSubmitSearchField}
+                        onClear={this.onClearSearchField}
+                        defaultValue={search}
+                      />
+                    </PageConfigItem>
+                    <PageConfigItem>
+                      <Filter
+                        onSubmitFilters={this.onSubmitFilters}
+                        appNames={apps}
+                        regions={regions}
+                        nodes={nodes.map(n => "n" + n)}
+                        activeFilters={activeFilters}
+                        filters={filters}
+                        hideTimeLabel={true}
+                        showDB={false}
+                        showSqlType={true}
+                        showScan={true}
+                        showRegions={regions.length > 1}
+                        showNodes={!isTenant && nodes.length > 1}
+                      />
+                    </PageConfigItem>
+                    <PageConfigItem className={commonStyles("separator")}>
+                      <TimeScaleDropdown
+                        options={timeScale1hMinOptions}
+                        currentScale={this.props.timeScale}
+                        setTimeScale={this.changeTimeScale}
+                      />
+                    </PageConfigItem>
+                  </PageConfig>
+                  <Loading
+                    loading={statements == null}
+                    page="index details"
+                    error={this.state.lastStatementsError}
+                    renderError={() =>
+                      LoadingError({
+                        statsType: "statements",
+                        timeout: this.state.lastStatementsError?.message
+                          ?.toLowerCase()
+                          .includes("timeout"),
+                      })
+                    }
+                  >
+                    <TableStatistics
+                      pagination={stmtPagination}
+                      totalCount={filteredStmts.length}
+                      arrayItemName={
+                        "most executed statement fingerprints using this index"
+                      }
+                      activeFilters={activeFilters}
+                      onClearFilters={this.onClearFilters}
+                    />
+                    <SortedTable
+                      data={filteredStmts}
+                      columns={makeStatementsColumns(
+                        statements,
+                        [],
+                        calculateTotalWorkload(statements),
+                        "statement",
+                        isTenant,
+                        hasViewActivityRedactedRole,
+                      ).filter(c => !(isTenant && c.hideIfTenant))}
+                      className={stmtCx("statements-table")}
+                      tableWrapperClassName={cx("table-scroll")}
+                      sortSetting={stmtSortSetting}
+                      onChangeSortSetting={this.onChangeSortSetting}
+                      pagination={stmtPagination}
+                      renderNoResult={
+                        <EmptyStatementsPlaceholder
+                          isEmptySearchResults={
+                            (search?.length > 0 || activeFilters > 0) &&
+                            filteredStmts?.length === 0
+                          }
+                          statementView={StatementViewType.USING_INDEX}
+                        />
+                      }
+                    />
+                    <Pagination
+                      pageSize={stmtPagination.pageSize}
+                      current={stmtPagination.current}
+                      total={filteredStmts.length}
+                      onChange={this.onChangePage}
+                    />
+                  </Loading>
                 </SummaryCard>
               </Col>
             </Row>

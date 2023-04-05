@@ -1015,6 +1015,7 @@ func TestHashJoiner(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 	}
 	var monitorRegistry colexecargs.MonitorRegistry
@@ -1027,9 +1028,10 @@ func TestHashJoiner(t *testing.T) {
 				runHashJoinTestCase(t, tc, rng, func(sources []colexecop.Operator) (colexecop.Operator, error) {
 					spec := createSpecForHashJoiner(tc)
 					args := &colexecargs.NewColOperatorArgs{
-						Spec:            spec,
-						Inputs:          colexectestutils.MakeInputs(sources),
-						MonitorRegistry: &monitorRegistry,
+						Spec:                spec,
+						StreamingMemAccount: monitorRegistry.NewStreamingMemAccount(flowCtx),
+						Inputs:              colexectestutils.MakeInputs(sources),
+						MonitorRegistry:     &monitorRegistry,
 					}
 					args.TestingKnobs.DiskSpillingDisabled = true
 					result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
@@ -1102,11 +1104,14 @@ func BenchmarkHashJoiner(b *testing.B) {
 											sourceTypes, sourceTypes,
 											rightDistinct,
 										)
-										hj := colexecjoin.NewHashJoiner(
-											testAllocator, testAllocator, hjSpec,
-											leftSource, rightSource,
-											colexecjoin.HashJoinerInitialNumBuckets,
-										)
+										hj := colexecjoin.NewHashJoiner(colexecjoin.NewHashJoinerArgs{
+											BuildSideAllocator:       testAllocator,
+											OutputUnlimitedAllocator: testAllocator,
+											Spec:                     hjSpec,
+											LeftSource:               leftSource,
+											RightSource:              rightSource,
+											InitialNumBuckets:        colexecjoin.HashJoinerInitialNumBuckets,
+										})
 										hj.Init(ctx)
 
 										for i := 0; i < nBatches; i++ {
@@ -1140,6 +1145,7 @@ func TestHashJoinerProjection(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},

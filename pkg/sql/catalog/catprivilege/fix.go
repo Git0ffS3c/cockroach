@@ -64,19 +64,23 @@ func MaybeFixUsagePrivForTablesAndDBs(ptr **catpb.PrivilegeDescriptor) bool {
 // * fixing default privileges for the "root" user
 // * fixing maximum privileges for users.
 // * populating the owner field if previously empty.
-// * updating version field to Version21_2.
-// MaybeFixPrivileges can be removed after v21.2.
+// * updating version field older than 21.2 to Version21_2.
+// MaybeFixPrivileges can be removed after v22.2.
 func MaybeFixPrivileges(
 	ptr **catpb.PrivilegeDescriptor,
 	parentID, parentSchemaID descpb.ID,
 	objectType privilege.ObjectType,
 	objectName string,
-) bool {
+) (bool, error) {
 	if *ptr == nil {
 		*ptr = &catpb.PrivilegeDescriptor{}
 	}
 	p := *ptr
-	allowedPrivilegesBits := privilege.GetValidPrivilegesForObject(objectType).ToBitField()
+	privList, err := privilege.GetValidPrivilegesForObject(objectType)
+	if err != nil {
+		return false, err
+	}
+	allowedPrivilegesBits := privList.ToBitField()
 	systemPrivs := SystemSuperuserPrivileges(descpb.NameInfo{
 		ParentID:       parentID,
 		ParentSchemaID: parentSchemaID,
@@ -137,38 +141,5 @@ func MaybeFixPrivileges(
 		p.SetVersion(catpb.Version21_2)
 		changed = true
 	}
-	return changed
-}
-
-// MaybeUpdateGrantOptions iterates over the users of the descriptor and checks
-// if they have the GRANT privilege - if so, then set the user's grant option
-// bits equal to the privilege bits.
-func MaybeUpdateGrantOptions(p *catpb.PrivilegeDescriptor) bool {
-	// If admin has grant option bits set, then we know the descriptor was
-	// created by a new binary, so all the other grant options are already
-	// correct. Note that admin always has SELECT on *every* table including
-	// system tables.
-	if p.CheckGrantOptions(username.AdminRoleName(), privilege.List{privilege.SELECT}) {
-		return false
-	}
-
-	changed := false
-	for i := range p.Users {
-		u := &p.Users[i]
-		if privilege.ALL.IsSetIn(u.Privileges) {
-			if !privilege.ALL.IsSetIn(u.WithGrantOption) {
-				changed = true
-			}
-			u.WithGrantOption = privilege.ALL.Mask()
-			continue
-		}
-		if privilege.GRANT.IsSetIn(u.Privileges) {
-			if u.Privileges != u.WithGrantOption {
-				changed = true
-			}
-			u.WithGrantOption |= u.Privileges
-		}
-	}
-
-	return changed
+	return changed, nil
 }

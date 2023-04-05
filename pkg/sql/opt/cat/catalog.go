@@ -26,9 +26,9 @@ import (
 // StableID permanently and uniquely identifies a catalog object (table, view,
 // index, column, etc.) within its scope:
 //
-//   data source StableID: unique within database
-//   index StableID: unique within table
-//   column StableID: unique within table
+//	data source StableID: unique within database
+//	index StableID: unique within table
+//	column StableID: unique within table
 //
 // If a new catalog object is created, it will always be assigned a new StableID
 // that has never, and will never, be reused by a different object in the same
@@ -62,6 +62,18 @@ type Flags struct {
 	// cases where we don't need them (like SHOW variants), to avoid polluting the
 	// stats cache.
 	NoTableStats bool
+
+	// IncludeOfflineTables considers offline tables (e.g. being imported). This is
+	// useful in cases where we are running a statement like `SHOW RANGES` for
+	// which we also want to show valid ranges when a table is being imported
+	// (offline).
+	IncludeOfflineTables bool
+
+	// IncludeNonActiveIndexes considers non-active indexes (e.g. being
+	// added). This is useful in cases where we are running a statement
+	// like `SHOW RANGES` for which we also want to show valid ranges
+	// when a table is being imported (offline).
+	IncludeNonActiveIndexes bool
 }
 
 // Catalog is an interface to a database catalog, exposing only the information
@@ -136,6 +148,14 @@ type Catalog interface {
 	ResolveIndex(
 		ctx context.Context, flags Flags, name *tree.TableIndexName,
 	) (Index, DataSourceName, error)
+
+	// ResolveFunction resolves a function by name.
+	ResolveFunction(
+		ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
+	) (*tree.ResolvedFunctionDefinition, error)
+
+	// ResolveFunctionByOID resolves a function overload by OID.
+	ResolveFunctionByOID(ctx context.Context, oid oid.Oid) (*tree.FunctionName, *tree.Overload, error)
 
 	// CheckPrivilege verifies that the current user has the given privilege on
 	// the given catalog object. If not, then CheckPrivilege returns an error.

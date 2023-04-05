@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
@@ -44,13 +45,14 @@ func newTestDiskMonitor(ctx context.Context, st *cluster.Settings) *mon.BytesMon
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	return diskMonitor
 }
 
 // Tests the de-duping functionality of DiskBackedNumberedRowContainer.
 func TestNumberedRowContainerDeDuping(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -83,7 +85,7 @@ func TestNumberedRowContainerDeDuping(t *testing.T) {
 		fmt.Printf("using smallMemoryBudget to spill to disk\n")
 		memoryBudget = smallMemoryBudget
 	}
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(int64(memoryBudget)))
+	memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(int64(memoryBudget)))
 	defer memoryMonitor.Stop(ctx)
 
 	// Use random types and random rows.
@@ -142,6 +144,7 @@ func TestNumberedRowContainerDeDuping(t *testing.T) {
 // elsewhere.
 func TestNumberedRowContainerIteratorCaching(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -169,7 +172,7 @@ func TestNumberedRowContainerIteratorCaching(t *testing.T) {
 	// This memory budget allows for some caching, but typically cannot
 	// cache all the rows.
 	const memoryBudget = 12000
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(memoryBudget))
+	memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(memoryBudget))
 	defer memoryMonitor.Stop(ctx)
 
 	// Use random types and random rows.
@@ -242,6 +245,7 @@ func TestNumberedRowContainerIteratorCaching(t *testing.T) {
 // DiskBackedIndexedRowContainer return the same results.
 func TestCompareNumberedAndIndexedRowContainers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	rng, _ := randutil.NewTestRand()
 
@@ -463,7 +467,7 @@ func makeMemMonitorAndStart(
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(budget))
+	memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(budget))
 	return memoryMonitor
 }
 
@@ -553,12 +557,15 @@ func accessPatternForBenchmarkIterations(totalAccesses int, accessPattern [][]in
 }
 
 func BenchmarkNumberedContainerIteratorCaching(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
 	const numRows = 10000
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.MakeTestingEvalContext(st)
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{InMemory: true, Settings: st}, base.DefaultTestStoreSpec)
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -68,7 +68,10 @@ func runTestFlow(
 ) (rowenc.EncDatumRows, error) {
 	distSQLSrv := srv.DistSQLServer().(*distsql.ServerImpl)
 
-	leafInputState := txn.GetLeafTxnInputState(context.Background())
+	leafInputState, err := txn.GetLeafTxnInputState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := execinfrapb.SetupFlowRequest{
 		Version:           execinfra.Version,
 		LeafTxnInputState: leafInputState,
@@ -84,7 +87,7 @@ func runTestFlow(
 	if err != nil {
 		t.Fatal(err)
 	}
-	flow.Run(ctx, func() {})
+	flow.Run(ctx, false /* noWait */)
 	flow.Cleanup(ctx)
 
 	if !rowBuf.ProducerClosed() {
@@ -226,7 +229,7 @@ func checkDistAggregationInfo(
 			t.Fatal(err)
 		}
 		var expr execinfrapb.Expression
-		expr, err = physicalplan.MakeExpression(renderExpr, nil, nil)
+		expr, err = physicalplan.MakeExpression(ctx, renderExpr, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -330,7 +333,7 @@ func checkDistAggregationInfo(
 			t.Fatal(err)
 		}
 		var expr execinfrapb.Expression
-		expr, err = physicalplan.MakeExpression(renderExpr, nil, nil)
+		expr, err = physicalplan.MakeExpression(ctx, renderExpr, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

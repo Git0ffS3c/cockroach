@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -16,7 +17,9 @@ go_library(
     visibility = ["//visibility:public"],
     # Pin the dependencies used in auto-generated code.
     deps = [
+        "//pkg/geo/geoindex",
         "//pkg/roachpb",
+        "//pkg/sql/appstatspb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/inverted",  # keep
@@ -25,14 +28,19 @@ go_library(
         "//pkg/sql/opt/constraint",
         "//pkg/sql/opt/exec",
         "//pkg/sql/opt/invertedexpr",  # keep
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util",
         "//pkg/util/errorutil",
         "//pkg/util/humanizeutil",
+        "//pkg/util/intsets",
         "//pkg/util/timeutil",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_dustin_go_humanize//:go-humanize",
     ],
 )
@@ -46,6 +54,7 @@ go_test(
         "output_test.go",
         "plan_gist_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]) + [
         "//pkg/sql/opt/testutils/opttester:testfixtures",
     ],
@@ -63,10 +72,15 @@ go_test(
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
+        "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
-        "//pkg/util",
         "//pkg/util/encoding",
+        "//pkg/util/grunning",
+        "//pkg/util/leaktest",
+        "//pkg/util/log",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_stretchr_testify//assert",
@@ -110,3 +124,5 @@ genrule(
         "//pkg/gen:__pkg__",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -14,11 +14,13 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
@@ -35,7 +37,12 @@ import (
 // Will fail on complex tables where that operation requires e.g. looking up
 // other tables.
 func CreateTestTableDescriptor(
-	ctx context.Context, parentID, id descpb.ID, schema string, privileges *catpb.PrivilegeDescriptor,
+	ctx context.Context,
+	parentID, id descpb.ID,
+	schema string,
+	privileges *catpb.PrivilegeDescriptor,
+	txn *kv.Txn,
+	collection *descs.Collection,
 ) (*tabledesc.Mutable, error) {
 	st := cluster.MakeTestingClusterSettings()
 	stmt, err := parser.ParseOne(schema)
@@ -44,13 +51,18 @@ func CreateTestTableDescriptor(
 	}
 	semaCtx := tree.MakeSemaContext()
 	evalCtx := eval.MakeTestingEvalContext(st)
+	sessionData := &sessiondata.SessionData{
+		LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
+			EnableUniqueWithoutIndexConstraints: true,
+		},
+	}
 	switch n := stmt.AST.(type) {
 	case *tree.CreateTable:
 		db := dbdesc.NewInitial(parentID, "test", username.RootUserName())
 		desc, err := NewTableDesc(
 			ctx,
 			nil, /* txn */
-			nil, /* vs */
+			NewSkippingCacheSchemaResolver(collection, sessiondata.NewStack(sessionData), txn, nil),
 			st,
 			n,
 			db,
@@ -59,14 +71,10 @@ func CreateTestTableDescriptor(
 			nil,             /* regionConfig */
 			hlc.Timestamp{}, /* creationTime */
 			privileges,
-			nil, /* affected */
+			make(map[descpb.ID]*tabledesc.Mutable),
 			&semaCtx,
 			&evalCtx,
-			&sessiondata.SessionData{
-				LocalOnlySessionData: sessiondatapb.LocalOnlySessionData{
-					EnableUniqueWithoutIndexConstraints: true,
-				},
-			}, /* sessionData */
+			sessionData,
 			tree.PersistencePermanent,
 		)
 		return desc, err
@@ -116,17 +124,14 @@ func (r *StmtBufReader) AdvanceOne() {
 // interface{} so that external packages can call NewInternalPlanner and pass
 // the result) and executes a sql statement through the DistSQLPlanner.
 func (dsp *DistSQLPlanner) Exec(
-	ctx context.Context, localPlanner interface{}, sql string, distribute bool,
+	ctx context.Context, localPlanner interface{}, stmt parser.Statement, distribute bool,
 ) error {
-	stmt, err := parser.ParseOne(sql)
-	if err != nil {
-		return err
-	}
 	p := localPlanner.(*planner)
 	p.stmt = makeStatement(stmt, clusterunique.ID{} /* queryID */)
 	if err := p.makeOptimizerPlan(ctx); err != nil {
 		return err
 	}
+	defer p.curPlan.close(ctx)
 	rw := NewCallbackResultWriter(func(ctx context.Context, row tree.Datums) error {
 		return nil
 	})
@@ -139,8 +144,6 @@ func (dsp *DistSQLPlanner) Exec(
 		p.txn,
 		execCfg.Clock,
 		p.ExtendedEvalContext().Tracing,
-		execCfg.ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
@@ -153,6 +156,39 @@ func (dsp *DistSQLPlanner) Exec(
 		distributionType)
 	planCtx.stmtType = recv.stmtType
 
-	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv)()
+	dsp.PlanAndRun(ctx, evalCtx, planCtx, p.txn, p.curPlan.main, recv, nil /* finishedSetupFn */)
 	return rw.Err()
+}
+
+// ExecLocalAll is basically a conn_executor free version of execWithDistSQLEngine
+// hard coded for non-distributed statements (currently used by copy testing).
+func (dsp *DistSQLPlanner) ExecLocalAll(
+	ctx context.Context, execCfg ExecutorConfig, p *planner, res RestrictedCommandResult,
+) error {
+	defer p.curPlan.close(ctx)
+	recv := MakeDistSQLReceiver(
+		ctx,
+		res,
+		p.stmt.AST.StatementReturnType(),
+		execCfg.RangeDescriptorCache,
+		p.txn,
+		execCfg.Clock,
+		p.ExtendedEvalContext().Tracing,
+	)
+	defer recv.Release()
+
+	distributionType := DistributionType(DistributionTypeNone)
+	evalCtx := p.ExtendedEvalContext()
+	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, p, p.txn,
+		distributionType)
+	planCtx.stmtType = recv.stmtType
+
+	var factoryEvalCtx = extendedEvalContext{Tracing: &SessionTracing{}}
+	evalCtxFactory := func(bool) *extendedEvalContext {
+		factoryEvalCtx.Context = evalCtx.Context
+		factoryEvalCtx.Placeholders = &p.semaCtx.Placeholders
+		factoryEvalCtx.Annotations = &p.semaCtx.Annotations
+		return &factoryEvalCtx
+	}
+	return dsp.PlanAndRunAll(ctx, evalCtx, planCtx, p, recv, evalCtxFactory)
 }

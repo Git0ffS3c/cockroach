@@ -15,7 +15,10 @@ import styles from "./highlightedText.module.scss";
 
 const cx = classNames.bind(styles);
 
-export function isStringIncludesArrayElement(arr: string[], text: string) {
+export function isStringIncludesArrayElement(
+  arr: string[],
+  text: string,
+): boolean {
   let includes = false;
   arr.forEach(val => {
     if (text.toLowerCase().includes(val.toLowerCase())) {
@@ -25,12 +28,12 @@ export function isStringIncludesArrayElement(arr: string[], text: string) {
   return includes;
 }
 
-export function getWordAt(word: string, text: string) {
+export function getWordAt(word: string, text: string): number {
   const regex = new RegExp("\\b" + word.toLowerCase() + "\\b");
   return text.toLowerCase().search(regex);
 }
 
-function rebaseText(text: string, highlight: string) {
+function rebaseText(text: string, highlight: string): string {
   const search = highlight.split(" ");
   const maxLength = 425;
   const defaultCropLength = 150;
@@ -76,8 +79,12 @@ export function getHighlightedText(
   if (!highlight || highlight.length === 0) {
     return text;
   }
+  if (highlight.startsWith('"') && highlight.endsWith('"')) {
+    highlight = highlight.substring(1, highlight.length - 1);
+  }
+
   highlight = highlight.replace(
-    /[°§%()\[\]{}\\?´`'#|;:+-]+/g,
+    /[°§%()\[\]{}\\?´`'#|;:+^*-]+/g,
     "highlightNotDefined",
   );
   const search = highlight
@@ -90,7 +97,7 @@ export function getHighlightedText(
     })
     .join("|");
   const parts = isOriginalText
-    ? text.split(new RegExp(`(${search})`, "gi"))
+    ? text?.split(new RegExp(`(${search})`, "gi"))
     : rebaseText(text, highlight).split(new RegExp(`(${search})`, "gi"));
   const highlightClass = hasDarkBkg ? "_text-bold-light" : "_text-bold";
   return parts.map((part, i) => {

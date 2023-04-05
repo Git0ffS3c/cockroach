@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
@@ -15,7 +16,9 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/roachpb",
+        "//pkg/storage/enginepb",
         "//pkg/util/hlc",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -31,15 +34,18 @@ proto_library(
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvpb:kvpb_proto",
+        "//pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb:kvflowcontrolpb_proto",
         "//pkg/kv/kvserver/liveness/livenesspb:livenesspb_proto",
         "//pkg/kv/kvserver/readsummary/rspb:rspb_proto",
         "//pkg/roachpb:roachpb_proto",
         "//pkg/storage/enginepb:enginepb_proto",
         "//pkg/util/hlc:hlc_proto",
         "//pkg/util/tracing/tracingpb:tracingpb_proto",
+        "@com_github_cockroachdb_errors//errorspb:errorspb_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
         "@com_google_protobuf//:timestamp_proto",
-        "@io_etcd_go_etcd_raft_v3//raftpb:raftpb_proto",
+        "@io_etcd_go_raft_v3//raftpb:raftpb_proto",
     ],
 )
 
@@ -50,7 +56,9 @@ go_proto_library(
     proto = ":kvserverpb_proto",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/closedts/ctpb",  # keep
+        "//pkg/kv/kvserver/kvflowcontrol/kvflowcontrolpb",
         "//pkg/kv/kvserver/liveness/livenesspb",
         "//pkg/kv/kvserver/readsummary/rspb",
         "//pkg/roachpb",
@@ -58,7 +66,10 @@ go_proto_library(
         "//pkg/util/hlc",
         "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",  # keep
+        "@com_github_cockroachdb_errors//errorspb",
         "@com_github_gogo_protobuf//gogoproto",
-        "@io_etcd_go_etcd_raft_v3//raftpb",
+        "@io_etcd_go_raft_v3//raftpb",
     ],
 )
+
+get_x_data(name = "get_x_data")

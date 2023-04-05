@@ -1,18 +1,23 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "utilccl",
-    srcs = ["license_check.go"],
+    srcs = [
+        "builtins.go",
+        "license_check.go",
+    ],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/utilccl",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/base",
         "//pkg/ccl/utilccl/licenseccl",
-        "//pkg/server",
         "//pkg/settings",
         "//pkg/settings/cluster",
+        "//pkg/sql",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
+        "//pkg/sql/sem/builtins/builtinsregistry",
+        "//pkg/sql/sem/tree",
         "//pkg/util/envutil",
         "//pkg/util/log",
         "//pkg/util/metric",
@@ -30,18 +35,25 @@ go_test(
     srcs = [
         "license_check_test.go",
         "license_test.go",
+        "main_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":utilccl"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
+        "//pkg/ccl",
         "//pkg/ccl/utilccl/licenseccl",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/util/envutil",
+        "//pkg/util/randutil",
         "//pkg/util/stop",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

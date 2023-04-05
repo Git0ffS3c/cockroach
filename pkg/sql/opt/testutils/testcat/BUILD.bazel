@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -10,6 +11,7 @@ go_library(
         "create_view.go",
         "drop_index.go",
         "drop_table.go",
+        "function.go",
         "set_zone_config.go",
         "table_expr.go",
         "test_catalog.go",
@@ -24,8 +26,10 @@ go_library(
         "//pkg/roachpb",
         "//pkg/security/username",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/catalog/multiregion",
         "//pkg/sql/catalog/systemschema",
         "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/catalog/typedesc",
@@ -38,13 +42,16 @@ go_library(
         "//pkg/sql/privilege",
         "//pkg/sql/roleoption",
         "//pkg/sql/rowenc",
+        "//pkg/sql/sem/catid",
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treecmp",
+        "//pkg/sql/sem/volatility",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/stats",
         "//pkg/sql/types",
         "//pkg/sql/vtable",
-        "//pkg/util",
+        "//pkg/util/intsets",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_lib_pq//oid",
@@ -56,12 +63,15 @@ go_test(
     name = "testcat_test",
     size = "small",
     srcs = ["test_catalog_test.go"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     deps = [
         ":testcat",
         "//pkg/sql/opt/testutils/opttester",
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/util/leaktest",
         "@com_github_cockroachdb_datadriven//:datadriven",
     ],
 )
+
+get_x_data(name = "get_x_data")

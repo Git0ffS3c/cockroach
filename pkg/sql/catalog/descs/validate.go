@@ -14,13 +14,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 )
 
 // Validate returns any descriptor validation errors after validating using the
@@ -33,6 +31,9 @@ func (tc *Collection) Validate(
 	targetLevel catalog.ValidationLevel,
 	descriptors ...catalog.Descriptor,
 ) (err error) {
+	if !tc.validationModeProvider.ValidateDescriptorsOnRead() && !tc.validationModeProvider.ValidateDescriptorsOnWrite() {
+		return nil
+	}
 	vd := tc.newValidationDereferencer(txn)
 	version := tc.settings.Version.ActiveVersion(ctx)
 	return validate.Validate(
@@ -51,31 +52,37 @@ func (tc *Collection) Validate(
 // be one version behind, in which case it's possible (and legitimate) that
 // those are missing back-references which would cause validation to fail.
 func (tc *Collection) ValidateUncommittedDescriptors(ctx context.Context, txn *kv.Txn) (err error) {
-	if tc.skipValidationOnWrite || !ValidateOnWriteEnabled.Get(&tc.settings.SV) {
+	if tc.skipValidationOnWrite || !tc.validationModeProvider.ValidateDescriptorsOnWrite() {
 		return nil
 	}
-	descs := tc.uncommitted.getUncommittedDescriptorsForValidation()
+	var descs []catalog.Descriptor
+	_ = tc.uncommitted.iterateUncommittedByID(func(desc catalog.Descriptor) error {
+		descs = append(descs, desc)
+		return nil
+	})
 	if len(descs) == 0 {
 		return nil
 	}
-	return tc.Validate(ctx, txn, catalog.ValidationWriteTelemetry, catalog.ValidationLevelAllPreTxnCommit, descs...)
+	return tc.Validate(ctx, txn, catalog.ValidationWriteTelemetry, validate.Write, descs...)
 }
 
 func (tc *Collection) newValidationDereferencer(txn *kv.Txn) validate.ValidationDereferencer {
-	return &collectionBackedDereferencer{tc: tc, txn: txn}
+	crvd := catkv.NewCatalogReaderBackedValidationDereferencer(tc.cr, txn, tc.validationModeProvider)
+	return &collectionBackedDereferencer{tc: tc, crvd: crvd}
 }
 
 // collectionBackedDereferencer wraps a Collection to implement the
 // validate.ValidationDereferencer interface for validation.
 type collectionBackedDereferencer struct {
-	tc  *Collection
-	txn *kv.Txn
+	tc   *Collection
+	crvd validate.ValidationDereferencer
 }
 
 var _ validate.ValidationDereferencer = &collectionBackedDereferencer{}
 
 // DereferenceDescriptors implements the validate.ValidationDereferencer
-// interface by leveraging the collection's uncommitted descriptors.
+// interface by leveraging the collection's uncommitted descriptors as well
+// as its storage cache.
 func (c collectionBackedDereferencer) DereferenceDescriptors(
 	ctx context.Context, version clusterversion.ClusterVersion, reqs []descpb.ID,
 ) (ret []catalog.Descriptor, _ error) {
@@ -83,103 +90,84 @@ func (c collectionBackedDereferencer) DereferenceDescriptors(
 	fallbackReqs := make([]descpb.ID, 0, len(reqs))
 	fallbackRetIndexes := make([]int, 0, len(reqs))
 	for i, id := range reqs {
-		desc, err := c.fastDescLookup(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		if desc == nil {
+		if uc := c.tc.uncommitted.getUncommittedByID(id); uc == nil {
 			fallbackReqs = append(fallbackReqs, id)
 			fallbackRetIndexes = append(fallbackRetIndexes, i)
 		} else {
-			ret[i] = desc
+			ret[i] = uc
 		}
 	}
-	if len(fallbackReqs) > 0 {
-		fallbackRet, err := catkv.GetCrossReferencedDescriptorsForValidation(
-			ctx,
-			version,
-			c.tc.codec(),
-			c.txn,
-			fallbackReqs,
-		)
-		if err != nil {
-			return nil, err
-		}
-		for j, desc := range fallbackRet {
-			if desc == nil {
-				continue
-			}
-			if uc, _ := c.tc.uncommitted.getImmutableByID(desc.GetID()); uc == nil {
-				desc, err = c.tc.uncommitted.add(desc.NewBuilder().BuildExistingMutable(), notValidatedYet)
-				if err != nil {
-					return nil, err
-				}
-			}
-			ret[fallbackRetIndexes[j]] = desc
+	if len(fallbackReqs) == 0 {
+		return ret, nil
+	}
+	fallbackRet, err := c.crvd.DereferenceDescriptors(ctx, version, fallbackReqs)
+	if err != nil {
+		return nil, err
+	}
+	for j, desc := range fallbackRet {
+		ret[fallbackRetIndexes[j]] = desc
+		if c.tc.validationModeProvider.ValidateDescriptorsOnRead() {
+			c.tc.ensureValidationLevel(desc, catalog.ValidationLevelSelfOnly)
 		}
 	}
 	return ret, nil
 }
 
-func (c collectionBackedDereferencer) fastDescLookup(
-	ctx context.Context, id descpb.ID,
-) (catalog.Descriptor, error) {
-	if uc, _ := c.tc.uncommitted.getImmutableByID(id); uc != nil {
-		return uc, nil
-	}
-	return nil, nil
-}
-
 // DereferenceDescriptorIDs implements the validate.ValidationDereferencer
-// interface.
+// interface by leveraging the collection's uncommitted descriptors as well
+// as its storage cache.
 func (c collectionBackedDereferencer) DereferenceDescriptorIDs(
 	ctx context.Context, reqs []descpb.NameInfo,
 ) (ret []descpb.ID, _ error) {
 	ret = make([]descpb.ID, len(reqs))
 	fallbackReqs := make([]descpb.NameInfo, 0, len(reqs))
 	fallbackRetIndexes := make([]int, 0, len(reqs))
-	for i, req := range reqs {
-		found, id, err := c.fastNamespaceLookup(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		if found {
-			ret[i] = id
-		} else {
-			fallbackReqs = append(fallbackReqs, req)
+	for i, ni := range reqs {
+		if uc := c.tc.uncommitted.getUncommittedByName(ni.ParentID, ni.ParentSchemaID, ni.Name); uc == nil {
+			fallbackReqs = append(fallbackReqs, ni)
 			fallbackRetIndexes = append(fallbackRetIndexes, i)
+		} else {
+			ret[i] = uc.GetID()
 		}
 	}
-	if len(fallbackReqs) > 0 {
-		// TODO(postamar): actually use the Collection here instead,
-		// either by calling the Collection's methods or by caching the results
-		// of this call in the Collection.
-		fallbackRet, err := catkv.LookupIDs(ctx, c.txn, c.tc.codec(), fallbackReqs)
-		if err != nil {
-			return nil, err
-		}
-		for j, id := range fallbackRet {
-			ret[fallbackRetIndexes[j]] = id
-		}
+	if len(fallbackReqs) == 0 {
+		return ret, nil
+	}
+	fallbackRet, err := c.crvd.DereferenceDescriptorIDs(ctx, fallbackReqs)
+	if err != nil {
+		return nil, err
+	}
+	for j, id := range fallbackRet {
+		ret[fallbackRetIndexes[j]] = id
 	}
 	return ret, nil
 }
 
-func (c collectionBackedDereferencer) fastNamespaceLookup(
-	ctx context.Context, req descpb.NameInfo,
-) (found bool, id descpb.ID, err error) {
-	// Handle special cases.
-	// TODO(postamar): namespace lookups should go through Collection
-	switch req.ParentID {
-	case descpb.InvalidID:
-		if req.ParentSchemaID == descpb.InvalidID && req.Name == catconstants.SystemDatabaseName {
-			// Looking up system database ID, which is hard-coded.
-			return true, keys.SystemDatabaseID, nil
-		}
-	case keys.SystemDatabaseID:
-		// Looking up system database objects, which are cached.
-		id = c.tc.kv.systemNamespace.lookup(req.ParentSchemaID, req.Name)
-		return id != descpb.InvalidID, id, nil
+func (tc *Collection) ensureValidationLevel(
+	desc catalog.Descriptor, newLevel catalog.ValidationLevel,
+) {
+	if desc == nil {
+		return
 	}
-	return false, descpb.InvalidID, nil
+	if tc.validationLevels == nil {
+		tc.validationLevels = make(map[descpb.ID]catalog.ValidationLevel)
+	}
+	vl, ok := tc.validationLevels[desc.GetID()]
+	if ok && vl >= newLevel {
+		return
+	}
+	tc.validationLevels[desc.GetID()] = newLevel
+}
+
+// ValidateSelf validates that the descriptor is internally consistent.
+// Validation may be skipped depending on mode.
+func ValidateSelf(
+	desc catalog.Descriptor,
+	version clusterversion.ClusterVersion,
+	dvmp DescriptorValidationModeProvider,
+) error {
+	if !dvmp.ValidateDescriptorsOnRead() && !dvmp.ValidateDescriptorsOnWrite() {
+		return nil
+	}
+	return validate.Self(version, desc)
 }

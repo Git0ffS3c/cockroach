@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -40,23 +40,23 @@ func TestCalcRangeCounterIsLiveMap(t *testing.T) {
 
 	threeVotersAndSingleNonVoter := roachpb.NewRangeDescriptor(123, roachpb.RKeyMin, roachpb.RKeyMax,
 		roachpb.MakeReplicaSet([]roachpb.ReplicaDescriptor{
-			{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: roachpb.ReplicaTypeVoterFull()},
-			{NodeID: 100, StoreID: 110, ReplicaID: 120, Type: roachpb.ReplicaTypeVoterFull()},
-			{NodeID: 1000, StoreID: 1100, ReplicaID: 1200, Type: roachpb.ReplicaTypeVoterFull()},
-			{NodeID: 2000, StoreID: 2100, ReplicaID: 2200, Type: roachpb.ReplicaTypeNonVoter()},
+			{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: roachpb.VOTER_FULL},
+			{NodeID: 100, StoreID: 110, ReplicaID: 120, Type: roachpb.VOTER_FULL},
+			{NodeID: 1000, StoreID: 1100, ReplicaID: 1200, Type: roachpb.VOTER_FULL},
+			{NodeID: 2000, StoreID: 2100, ReplicaID: 2200, Type: roachpb.NON_VOTER},
 		}))
 
 	oneVoterAndThreeNonVoters := roachpb.NewRangeDescriptor(123, roachpb.RKeyMin, roachpb.RKeyMax,
 		roachpb.MakeReplicaSet([]roachpb.ReplicaDescriptor{
-			{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: roachpb.ReplicaTypeVoterFull()},
-			{NodeID: 100, StoreID: 110, ReplicaID: 120, Type: roachpb.ReplicaTypeNonVoter()},
-			{NodeID: 1000, StoreID: 1100, ReplicaID: 1200, Type: roachpb.ReplicaTypeNonVoter()},
-			{NodeID: 2000, StoreID: 2100, ReplicaID: 2200, Type: roachpb.ReplicaTypeNonVoter()},
+			{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: roachpb.VOTER_FULL},
+			{NodeID: 100, StoreID: 110, ReplicaID: 120, Type: roachpb.NON_VOTER},
+			{NodeID: 1000, StoreID: 1100, ReplicaID: 1200, Type: roachpb.NON_VOTER},
+			{NodeID: 2000, StoreID: 2100, ReplicaID: 2200, Type: roachpb.NON_VOTER},
 		}))
 
 	{
-		ctr, down, under, over := calcRangeCounter(1100, threeVotersAndSingleNonVoter, leaseStatus, liveness.IsLiveMap{
-			1000: liveness.IsLiveMapEntry{IsLive: true}, // by NodeID
+		ctr, down, under, over := calcRangeCounter(1100, threeVotersAndSingleNonVoter, leaseStatus, livenesspb.IsLiveMap{
+			1000: livenesspb.IsLiveMapEntry{IsLive: true}, // by NodeID
 		}, 3 /* numVoters */, 4 /* numReplicas */, 4 /* clusterNodes */)
 
 		require.True(t, ctr)
@@ -66,8 +66,8 @@ func TestCalcRangeCounterIsLiveMap(t *testing.T) {
 	}
 
 	{
-		ctr, down, under, over := calcRangeCounter(1000, threeVotersAndSingleNonVoter, leaseStatus, liveness.IsLiveMap{
-			1000: liveness.IsLiveMapEntry{IsLive: false},
+		ctr, down, under, over := calcRangeCounter(1000, threeVotersAndSingleNonVoter, leaseStatus, livenesspb.IsLiveMap{
+			1000: livenesspb.IsLiveMapEntry{IsLive: false},
 		}, 3 /* numVoters */, 4 /* numReplicas */, 4 /* clusterNodes */)
 
 		// Does not confuse a non-live entry for a live one. In other words,
@@ -79,11 +79,11 @@ func TestCalcRangeCounterIsLiveMap(t *testing.T) {
 	}
 
 	{
-		ctr, down, under, over := calcRangeCounter(11, threeVotersAndSingleNonVoter, leaseStatus, liveness.IsLiveMap{
-			10:   liveness.IsLiveMapEntry{IsLive: true},
-			100:  liveness.IsLiveMapEntry{IsLive: true},
-			1000: liveness.IsLiveMapEntry{IsLive: true},
-			2000: liveness.IsLiveMapEntry{IsLive: true},
+		ctr, down, under, over := calcRangeCounter(11, threeVotersAndSingleNonVoter, leaseStatus, livenesspb.IsLiveMap{
+			10:   livenesspb.IsLiveMapEntry{IsLive: true},
+			100:  livenesspb.IsLiveMapEntry{IsLive: true},
+			1000: livenesspb.IsLiveMapEntry{IsLive: true},
+			2000: livenesspb.IsLiveMapEntry{IsLive: true},
 		}, 3 /* numVoters */, 4 /* numReplicas */, 4 /* clusterNodes */)
 
 		require.True(t, ctr)
@@ -94,11 +94,11 @@ func TestCalcRangeCounterIsLiveMap(t *testing.T) {
 
 	{
 		// Single non-voter dead
-		ctr, down, under, over := calcRangeCounter(11, oneVoterAndThreeNonVoters, leaseStatus, liveness.IsLiveMap{
-			10:   liveness.IsLiveMapEntry{IsLive: true},
-			100:  liveness.IsLiveMapEntry{IsLive: true},
-			1000: liveness.IsLiveMapEntry{IsLive: false},
-			2000: liveness.IsLiveMapEntry{IsLive: true},
+		ctr, down, under, over := calcRangeCounter(11, oneVoterAndThreeNonVoters, leaseStatus, livenesspb.IsLiveMap{
+			10:   livenesspb.IsLiveMapEntry{IsLive: true},
+			100:  livenesspb.IsLiveMapEntry{IsLive: true},
+			1000: livenesspb.IsLiveMapEntry{IsLive: false},
+			2000: livenesspb.IsLiveMapEntry{IsLive: true},
 		}, 1 /* numVoters */, 4 /* numReplicas */, 4 /* clusterNodes */)
 
 		require.True(t, ctr)
@@ -109,11 +109,11 @@ func TestCalcRangeCounterIsLiveMap(t *testing.T) {
 
 	{
 		// All non-voters are dead, but range is not unavailable
-		ctr, down, under, over := calcRangeCounter(11, oneVoterAndThreeNonVoters, leaseStatus, liveness.IsLiveMap{
-			10:   liveness.IsLiveMapEntry{IsLive: true},
-			100:  liveness.IsLiveMapEntry{IsLive: false},
-			1000: liveness.IsLiveMapEntry{IsLive: false},
-			2000: liveness.IsLiveMapEntry{IsLive: false},
+		ctr, down, under, over := calcRangeCounter(11, oneVoterAndThreeNonVoters, leaseStatus, livenesspb.IsLiveMap{
+			10:   livenesspb.IsLiveMapEntry{IsLive: true},
+			100:  livenesspb.IsLiveMapEntry{IsLive: false},
+			1000: livenesspb.IsLiveMapEntry{IsLive: false},
+			2000: livenesspb.IsLiveMapEntry{IsLive: false},
 		}, 1 /* numVoters */, 4 /* numReplicas */, 4 /* clusterNodes */)
 
 		require.True(t, ctr)
@@ -124,11 +124,11 @@ func TestCalcRangeCounterIsLiveMap(t *testing.T) {
 
 	{
 		// More non-voters than needed
-		ctr, down, under, over := calcRangeCounter(11, oneVoterAndThreeNonVoters, leaseStatus, liveness.IsLiveMap{
-			10:   liveness.IsLiveMapEntry{IsLive: true},
-			100:  liveness.IsLiveMapEntry{IsLive: true},
-			1000: liveness.IsLiveMapEntry{IsLive: true},
-			2000: liveness.IsLiveMapEntry{IsLive: true},
+		ctr, down, under, over := calcRangeCounter(11, oneVoterAndThreeNonVoters, leaseStatus, livenesspb.IsLiveMap{
+			10:   livenesspb.IsLiveMapEntry{IsLive: true},
+			100:  livenesspb.IsLiveMapEntry{IsLive: true},
+			1000: livenesspb.IsLiveMapEntry{IsLive: true},
+			2000: livenesspb.IsLiveMapEntry{IsLive: true},
 		}, 1 /* numVoters */, 3 /* numReplicas */, 4 /* clusterNodes */)
 
 		require.True(t, ctr)
@@ -144,10 +144,10 @@ func TestCalcRangeCounterLeaseHolder(t *testing.T) {
 
 	rangeDesc := roachpb.NewRangeDescriptor(123, roachpb.RKeyMin, roachpb.RKeyMax,
 		roachpb.MakeReplicaSet([]roachpb.ReplicaDescriptor{
-			{NodeID: 1, StoreID: 10, ReplicaID: 100, Type: roachpb.ReplicaTypeVoterFull()},
-			{NodeID: 2, StoreID: 20, ReplicaID: 200, Type: roachpb.ReplicaTypeNonVoter()},
-			{NodeID: 3, StoreID: 30, ReplicaID: 300, Type: roachpb.ReplicaTypeVoterFull()},
-			{NodeID: 4, StoreID: 40, ReplicaID: 400, Type: roachpb.ReplicaTypeVoterFull()},
+			{NodeID: 1, StoreID: 10, ReplicaID: 100, Type: roachpb.VOTER_FULL},
+			{NodeID: 2, StoreID: 20, ReplicaID: 200, Type: roachpb.NON_VOTER},
+			{NodeID: 3, StoreID: 30, ReplicaID: 300, Type: roachpb.VOTER_FULL},
+			{NodeID: 4, StoreID: 40, ReplicaID: 400, Type: roachpb.VOTER_FULL},
 		}))
 
 	leaseStatus := kvserverpb.LeaseStatus{
@@ -238,9 +238,9 @@ func TestCalcRangeCounterLeaseHolder(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.desc, func(t *testing.T) {
-			livenessMap := liveness.IsLiveMap{}
+			livenessMap := livenesspb.IsLiveMap{}
 			for _, nodeID := range tc.liveNodes {
-				livenessMap[nodeID] = liveness.IsLiveMapEntry{IsLive: true}
+				livenessMap[nodeID] = livenesspb.IsLiveMapEntry{IsLive: true}
 			}
 			ctr, _, _, _ := calcRangeCounter(tc.storeID, rangeDesc, tc.leaseStatus, livenessMap,
 				3 /* numVoters */, 4 /* numReplicas */, 4 /* clusterNodes */)

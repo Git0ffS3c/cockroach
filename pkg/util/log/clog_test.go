@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	stdLog "log"
 	"os"
 	"path/filepath"
@@ -27,6 +26,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
@@ -35,6 +35,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 )
@@ -139,6 +141,20 @@ func TestInfo(t *testing.T) {
 	}
 	if !contains("test", t) {
 		t.Error("Info failed")
+	}
+}
+
+// Test that error hints are included.
+func TestUnstructuredEntryEmbedsErrorHints(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer ScopeWithoutShowLogs(t).Close(t)
+
+	defer capture()()
+	err := errors.WithHint(errors.New("hello"), "world")
+	Infof(context.Background(), "hello %v", err)
+	t.Logf("log contents:\n%s", contents())
+	if !contains("HINT: "+startRedactable+"world"+endRedactable, t) {
+		t.Error("hint failed")
 	}
 }
 
@@ -424,7 +440,7 @@ func TestGetLogReader(t *testing.T) {
 	}
 
 	// Some arbitrary non-log file.
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "other.txt"), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "other.txt"), nil, 0644))
 	relPathFromLogDir := strings.Join([]string{"..", filepath.Base(dir), infoName}, string(os.PathSeparator))
 
 	cntr := 0
@@ -435,14 +451,14 @@ func TestGetLogReader(t *testing.T) {
 
 	// A log file in a non-default directory.
 	fname1 := genFileName("-g1")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir1, fname1), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir1, fname1), nil, 0644))
 
 	// A log file that matches the file pattern for the default sink,
 	// in a non-default directory.
 	fname2 := genFileName("")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir1, fname2), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir1, fname2), nil, 0644))
 	fname3 := genFileName("-g1")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, fname3), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, fname3), nil, 0644))
 
 	// Fake symlink to check the symlink error below.
 	fname4 := genFileName("")
@@ -611,7 +627,7 @@ func TestFd2Capture(t *testing.T) {
 	const stderrText = "hello stderr"
 	fmt.Fprint(os.Stderr, stderrText)
 
-	contents, err := ioutil.ReadFile(logging.testingFd2CaptureLogger.getFileSink().getFileName(t))
+	contents, err := os.ReadFile(logging.testingFd2CaptureLogger.getFileSink().getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +654,7 @@ func TestFileSeverityFilter(t *testing.T) {
 	Flush()
 
 	debugFileSink := debugFileSinkInfo.sink.(*fileSink)
-	contents, err := ioutil.ReadFile(debugFileSink.getFileName(t))
+	contents, err := os.ReadFile(debugFileSink.getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -759,11 +775,11 @@ func TestLogEntryPropagation(t *testing.T) {
 func BenchmarkLogEntry_String(b *testing.B) {
 	ctxtags := logtags.AddTag(context.Background(), "foo", "bar")
 	entry := &logEntry{
-		idPayload: idPayload{
-			clusterID:     "fooo",
-			nodeID:        "10",
-			tenantID:      "12",
-			sqlInstanceID: "9",
+		IDPayload: serverident.IDPayload{
+			ClusterID:        "fooo",
+			NodeID:           "10",
+			TenantIDInternal: "12",
+			SQLInstanceID:    "9",
 		},
 		ts:         timeutil.Now().UnixNano(),
 		header:     false,
@@ -798,7 +814,7 @@ func BenchmarkEventf_WithVerboseTraceSpan(b *testing.B) {
 			tracer.SetRedactable(redactable)
 			ctx, sp := tracer.StartSpanCtx(ctx, "benchspan", tracing.WithForceRealSpan())
 			defer sp.Finish()
-			sp.SetRecordingType(tracing.RecordingVerbose)
+			sp.SetRecordingType(tracingpb.RecordingVerbose)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				Eventf(ctx, "%s %s %s", "foo", "bar", "baz")

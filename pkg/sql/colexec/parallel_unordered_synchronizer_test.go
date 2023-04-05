@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -78,7 +79,8 @@ func TestParallelUnorderedSynchronizer(t *testing.T) {
 	inputs := make([]colexecargs.OpWithMetaInfo, numInputs)
 	for i := range inputs {
 		var source colexecop.Operator
-		batch := coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0 /* length */, rng.Float64())
+		args := coldatatestutils.RandomVecArgs{Rand: rng, NullProbability: rng.Float64()}
+		batch := coldatatestutils.RandomBatch(testAllocator, args, typs, coldata.BatchSize(), 0 /* length */)
 		if i < numInputs-1 {
 			s := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 			s.ResetBatchesToReturn(numBatches)
@@ -126,8 +128,7 @@ func TestParallelUnorderedSynchronizer(t *testing.T) {
 	ctx, cancelFn := context.WithCancel(context.Background())
 
 	var wg sync.WaitGroup
-	s := NewParallelUnorderedSynchronizer(inputs, &wg)
-	s.LocalPlan = true
+	s := NewParallelUnorderedSynchronizer(&execinfra.FlowCtx{Local: true, Gateway: true}, 0 /* processorID */, testAllocator, inputs, &wg)
 	s.Init(ctx)
 
 	t.Run(fmt.Sprintf("numInputs=%d/numBatches=%d/terminationScenario=%d", numInputs, numBatches, terminationScenario), func(t *testing.T) {
@@ -228,7 +229,7 @@ func TestUnorderedSynchronizerNoLeaksOnError(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	s := NewParallelUnorderedSynchronizer(inputs, &wg)
+	s := NewParallelUnorderedSynchronizer(&execinfra.FlowCtx{Local: true, Gateway: true}, 0 /* processorID */, testAllocator, inputs, &wg)
 	s.Init(ctx)
 	for {
 		if err := colexecerror.CatchVectorizedRuntimeError(func() { _ = s.Next() }); err != nil {
@@ -248,50 +249,6 @@ func TestUnorderedSynchronizerNoLeaksOnError(t *testing.T) {
 	require.Equal(t, len(inputs), int(atomic.LoadUint32(&s.numFinishedInputs)))
 }
 
-// TestParallelUnorderedSyncClosesInputs verifies that the parallel unordered
-// synchronizer closes the input trees if it encounters a panic during the
-// initialization.
-func TestParallelUnorderedSyncClosesInputs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	ctx := context.Background()
-	const injectedPanicMsg = "injected panic"
-	inputs := make([]colexecargs.OpWithMetaInfo, 2)
-
-	// Create the first input that is responsible for tracking whether the
-	// closure occurred as expected.
-	closed := false
-	firstInput := &colexecop.CallbackOperator{
-		CloseCb: func(context.Context) error {
-			closed = true
-			return nil
-		},
-	}
-	inputs[0].Root = firstInput
-	inputs[0].ToClose = append(inputs[0].ToClose, firstInput)
-
-	// Create the second input that injects a panic into Init.
-	inputs[1].Root = &colexecop.CallbackOperator{
-		InitCb: func(context.Context) {
-			colexecerror.InternalError(errors.New(injectedPanicMsg))
-		},
-	}
-
-	// Create and initialize (but don't run) the synchronizer.
-	var wg sync.WaitGroup
-	s := NewParallelUnorderedSynchronizer(inputs, &wg)
-	err := colexecerror.CatchVectorizedRuntimeError(func() { s.Init(ctx) })
-	require.NotNil(t, err)
-	require.True(t, strings.Contains(err.Error(), injectedPanicMsg))
-
-	// In the production setting, the user of the synchronizer is still expected
-	// to close it, even if a panic is encountered in Init, so we do the same
-	// thing here and verify that the first input is properly closed.
-	require.NoError(t, s.Close(ctx))
-	require.True(t, closed)
-}
-
 func BenchmarkParallelUnorderedSynchronizer(b *testing.B) {
 	const numInputs = 6
 
@@ -304,7 +261,7 @@ func BenchmarkParallelUnorderedSynchronizer(b *testing.B) {
 	}
 	var wg sync.WaitGroup
 	ctx, cancelFn := context.WithCancel(context.Background())
-	s := NewParallelUnorderedSynchronizer(inputs, &wg)
+	s := NewParallelUnorderedSynchronizer(&execinfra.FlowCtx{Local: true, Gateway: true}, 0 /* processorID */, testAllocator, inputs, &wg)
 	s.Init(ctx)
 	b.SetBytes(8 * int64(coldata.BatchSize()))
 	b.ResetTimer()

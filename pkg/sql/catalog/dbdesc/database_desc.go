@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
@@ -46,6 +47,9 @@ type immutable struct {
 	// changed represents whether or not the descriptor was changed
 	// after RunPostDeserializationChanges.
 	changes catalog.PostDeserializationChanges
+
+	// This is the raw bytes (tag + data) of the database descriptor in storage.
+	rawBytesInStorage []byte
 }
 
 // Mutable wraps a database descriptor and provides methods
@@ -81,13 +85,6 @@ func (desc *immutable) DescriptorType() catalog.DescriptorType {
 // DatabaseDesc implements the Descriptor interface.
 func (desc *immutable) DatabaseDesc() *descpb.DatabaseDescriptor {
 	return &desc.DatabaseDescriptor
-}
-
-// SetDrainingNames implements the MutableDescriptor interface.
-//
-// Deprecated: Do not use.
-func (desc *Mutable) SetDrainingNames(names []descpb.NameInfo) {
-	desc.DrainingNames = names
 }
 
 // GetParentID implements the Descriptor interface.
@@ -147,7 +144,9 @@ func (desc *immutable) ByteSize() int64 {
 
 // NewBuilder implements the catalog.Descriptor interface.
 func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
-	return newBuilder(desc.DatabaseDesc(), desc.isUncommittedVersion, desc.changes)
+	b := newBuilder(desc.DatabaseDesc(), hlc.Timestamp{}, desc.isUncommittedVersion, desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // NewBuilder implements the catalog.Descriptor interface.
@@ -155,7 +154,9 @@ func (desc *immutable) NewBuilder() catalog.DescriptorBuilder {
 // It overrides the wrapper's implementation to deal with the fact that
 // mutable has overridden the definition of IsUncommittedVersion.
 func (desc *Mutable) NewBuilder() catalog.DescriptorBuilder {
-	return newBuilder(desc.DatabaseDesc(), desc.IsUncommittedVersion(), desc.changes)
+	b := newBuilder(desc.DatabaseDesc(), hlc.Timestamp{}, desc.IsUncommittedVersion(), desc.changes)
+	b.SetRawBytesInStorage(desc.GetRawBytesInStorage())
+	return b
 }
 
 // IsMultiRegion implements the DatabaseDescriptor interface.
@@ -186,32 +187,11 @@ func (desc *Mutable) SetName(name string) {
 	desc.Name = name
 }
 
-// ForEachSchemaInfo implements the DatabaseDescriptor interface.
-func (desc *immutable) ForEachSchemaInfo(
-	f func(id descpb.ID, name string, isDropped bool) error,
-) error {
+// ForEachSchema implements the DatabaseDescriptor interface.
+func (desc *immutable) ForEachSchema(f func(id descpb.ID, name string) error) error {
 	for name, info := range desc.Schemas {
-		if err := f(info.ID, name, info.Dropped); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
-		}
-	}
-	return nil
-}
-
-// ForEachNonDroppedSchema implements the DatabaseDescriptor interface.
-func (desc *immutable) ForEachNonDroppedSchema(f func(id descpb.ID, name string) error) error {
-	for name, info := range desc.Schemas {
-		if info.Dropped {
-			continue
-		}
 		if err := f(info.ID, name); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil
@@ -220,9 +200,6 @@ func (desc *immutable) ForEachNonDroppedSchema(f func(id descpb.ID, name string)
 // GetSchemaID implements the DatabaseDescriptor interface.
 func (desc *immutable) GetSchemaID(name string) descpb.ID {
 	info := desc.Schemas[name]
-	if info.Dropped {
-		return descpb.InvalidID
-	}
 	return info.ID
 }
 
@@ -243,7 +220,7 @@ func (desc *immutable) HasPublicSchemaWithDescriptor() bool {
 // given ID, if it's not marked as dropped, empty string otherwise.
 func (desc *immutable) GetNonDroppedSchemaName(schemaID descpb.ID) string {
 	for name, info := range desc.Schemas {
-		if !info.Dropped && info.ID == schemaID {
+		if info.ID == schemaID {
 			return name
 		}
 	}
@@ -255,7 +232,7 @@ func (desc *immutable) GetNonDroppedSchemaName(schemaID descpb.ID) string {
 // is at least one read and write user.
 func (desc *immutable) ValidateSelf(vea catalog.ValidationErrorAccumulator) {
 	// Validate local properties of the descriptor.
-	vea.Report(catalog.ValidateName(desc.GetName(), "descriptor"))
+	vea.Report(catalog.ValidateName(desc))
 	if desc.GetID() == descpb.InvalidID {
 		vea.Report(fmt.Errorf("invalid database ID %d", desc.GetID()))
 	}
@@ -284,6 +261,10 @@ func (desc *immutable) validateMultiRegion(vea catalog.ValidationErrorAccumulato
 		vea.Report(errors.AssertionFailedf(
 			"primary region unset on a multi-region db %d", desc.GetID()))
 	}
+	if desc.RegionConfig.PrimaryRegion == desc.RegionConfig.SecondaryRegion {
+		vea.Report(errors.AssertionFailedf(
+			"primary region is same as secondary region on multi-region db %d", desc.GetID()))
+	}
 }
 
 // GetReferencedDescIDs returns the IDs of all descriptors referenced by
@@ -303,11 +284,14 @@ func (desc *immutable) GetReferencedDescIDs() (catalog.DescriptorIDSet, error) {
 	return ids, nil
 }
 
-// ValidateCrossReferences implements the catalog.Descriptor interface.
-func (desc *immutable) ValidateCrossReferences(
+// ValidateForwardReferences implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateForwardReferences(
 	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
 ) {
 	// Check multi-region enum type.
+	if !desc.IsMultiRegion() {
+		return
+	}
 	if enumID, err := desc.MultiRegionEnumID(); err == nil {
 		report := func(err error) {
 			vea.Report(errors.Wrap(err, "multi-region enum"))
@@ -327,17 +311,12 @@ func (desc *immutable) ValidateCrossReferences(
 	}
 }
 
-// ValidateTxnCommit implements the catalog.Descriptor interface.
-func (desc *immutable) ValidateTxnCommit(
+// ValidateBackReferences implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateBackReferences(
 	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
 ) {
 	// Check schema references.
-	// This could be done in ValidateCrossReferences but it can be quite expensive
-	// so we do it here instead.
 	for schemaName, schemaInfo := range desc.Schemas {
-		if schemaInfo.Dropped {
-			continue
-		}
 		report := func(err error) {
 			vea.Report(errors.Wrapf(err, "schema mapping entry %q (%d)",
 				errors.Safe(schemaName), schemaInfo.ID))
@@ -360,6 +339,13 @@ func (desc *immutable) ValidateTxnCommit(
 	}
 }
 
+// ValidateTxnCommit implements the catalog.Descriptor interface.
+func (desc *immutable) ValidateTxnCommit(
+	vea catalog.ValidationErrorAccumulator, vdg catalog.ValidationDescGetter,
+) {
+	// No-op.
+}
+
 // MaybeIncrementVersion implements the MutableDescriptor interface.
 func (desc *Mutable) MaybeIncrementVersion() {
 	// Already incremented, no-op.
@@ -367,6 +353,11 @@ func (desc *Mutable) MaybeIncrementVersion() {
 		return
 	}
 	desc.Version++
+	desc.ResetModificationTime()
+}
+
+// ResetModificationTime implements the catalog.MutableDescriptor interface.
+func (desc *Mutable) ResetModificationTime() {
 	desc.ModificationTime = hlc.Timestamp{}
 }
 
@@ -425,14 +416,6 @@ func (desc *Mutable) SetDropped() {
 func (desc *Mutable) SetOffline(reason string) {
 	desc.State = descpb.DescriptorState_OFFLINE
 	desc.OfflineReason = reason
-}
-
-// AddDrainingName adds a draining name to the DatabaseDescriptor's slice of
-// draining names.
-//
-// Deprecated: Do not use.
-func (desc *Mutable) AddDrainingName(name descpb.NameInfo) {
-	desc.DrainingNames = append(desc.DrainingNames, name)
 }
 
 // UnsetMultiRegionConfig removes the stored multi-region config from the
@@ -533,6 +516,26 @@ func (desc *immutable) GetDeclarativeSchemaChangerState() *scpb.DescriptorState 
 // interface.
 func (desc *Mutable) SetDeclarativeSchemaChangerState(state *scpb.DescriptorState) {
 	desc.DeclarativeSchemaChangerState = state
+}
+
+// GetObjectType implements the Object interface.
+func (desc *immutable) GetObjectType() privilege.ObjectType {
+	return privilege.Database
+}
+
+// SkipNamespace implements the descriptor interface.
+func (desc *immutable) SkipNamespace() bool {
+	return false
+}
+
+// GetRawBytesInStorage implements the catalog.Descriptor interface.
+func (desc *immutable) GetRawBytesInStorage() []byte {
+	return desc.rawBytesInStorage
+}
+
+// ForEachUDTDependentForHydration implements the catalog.Descriptor interface.
+func (desc *immutable) ForEachUDTDependentForHydration(fn func(t *types.T) error) error {
+	return nil
 }
 
 // maybeRemoveDroppedSelfEntryFromSchemas removes an entry in the Schemas map corresponding to the

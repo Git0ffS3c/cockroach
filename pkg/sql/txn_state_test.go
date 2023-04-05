@@ -15,9 +15,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -34,37 +34,35 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
+	"github.com/stretchr/testify/require"
 )
 
 var noRewindExpected = CmdPos(-1)
 var emptyTxnID = uuid.UUID{}
 
 type testContext struct {
-	manualClock *hlc.ManualClock
-	clock       *hlc.Clock
-	mockDB      *kv.DB
-	mon         *mon.BytesMonitor
-	tracer      *tracing.Tracer
+	clock  *hlc.Clock
+	mockDB *kv.DB
+	mon    *mon.BytesMonitor
+	tracer *tracing.Tracer
 	// ctx is mimicking the spirit of a client connection's context
 	ctx      context.Context
 	settings *cluster.Settings
 }
 
 func makeTestContext(stopper *stop.Stopper) testContext {
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	factory := kv.MakeMockTxnSenderFactory(
-		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+		func(context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			return nil, nil
 		})
 
 	settings := cluster.MakeTestingClusterSettings()
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	return testContext{
-		manualClock: manual,
-		clock:       clock,
-		mockDB:      kv.NewDB(ambient, factory, clock, stopper),
+		clock:  clock,
+		mockDB: kv.NewDB(ambient, factory, clock, stopper),
 		mon: mon.NewMonitor(
 			"test root mon",
 			mon.MemoryResource,
@@ -84,7 +82,6 @@ func makeTestContext(stopper *stop.Stopper) testContext {
 func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 	sp := tc.tracer.StartSpan("createOpenState")
 	ctx := tracing.ContextWithSpan(tc.ctx, sp)
-	ctx, cancel := context.WithCancel(ctx)
 
 	txnStateMon := mon.NewMonitor("test mon",
 		mon.MemoryResource,
@@ -94,12 +91,11 @@ func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 		1000, /* noteworthy */
 		cluster.MakeTestingClusterSettings(),
 	)
-	txnStateMon.Start(tc.ctx, tc.mon, mon.BoundAccount{})
+	txnStateMon.StartNoReserved(tc.ctx, tc.mon)
 
 	ts := txnState{
 		Ctx:           ctx,
 		connCtx:       tc.ctx,
-		cancel:        cancel,
 		sqlTimestamp:  timeutil.Now(),
 		priority:      roachpb.NormalUserPriority,
 		mon:           txnStateMon,
@@ -109,14 +105,17 @@ func (tc *testContext) createOpenState(typ txnType) (fsm.State, *txnState) {
 
 	state := stateOpen{
 		ImplicitTxn: fsm.FromBool(typ == implicitTxn),
+		WasUpgraded: fsm.FromBool(typ == upgradedExplicitTxn),
 	}
 	return state, &ts
 }
 
 // createAbortedState returns a txnState initialized with an aborted txn.
-func (tc *testContext) createAbortedState() (fsm.State, *txnState) {
-	_, ts := tc.createOpenState(explicitTxn)
-	return stateAborted{}, ts
+func (tc *testContext) createAbortedState(typ txnType) (fsm.State, *txnState) {
+	_, ts := tc.createOpenState(typ)
+	return stateAborted{
+		WasUpgraded: fsm.FromBool(typ == upgradedExplicitTxn),
+	}, ts
 }
 
 func (tc *testContext) createCommitWaitState() (fsm.State, *txnState, error) {
@@ -279,6 +278,12 @@ func TestTransitions(t *testing.T) {
 		// If nil, the kv txn is expected to be nil. Otherwise, the txn's fields are
 		// compared.
 		expTxn *expKVTxn
+
+		// The expected value of AutoRetryError after fsm transition.
+		expAutoRetryError string
+
+		// The expected value of AutoRetryCounter after fsm transition.
+		expAutoRetryCounter int32
 	}
 	tests := []test{
 		//
@@ -294,7 +299,7 @@ func TestTransitions(t *testing.T) {
 			ev: eventTxnStart{ImplicitTxn: fsm.True},
 			evPayload: makeEventTxnStartPayload(pri, tree.ReadWrite, timeutil.Now(),
 				nil /* historicalTimestamp */, tranCtx, sessiondatapb.Normal),
-			expState: stateOpen{ImplicitTxn: fsm.True},
+			expState: stateOpen{ImplicitTxn: fsm.True, WasUpgraded: fsm.False},
 			expAdv: expAdvance{
 				// We expect to stayInPlace; upon starting a txn the statement is
 				// executed again, this time in state Open.
@@ -319,7 +324,7 @@ func TestTransitions(t *testing.T) {
 			ev: eventTxnStart{ImplicitTxn: fsm.False},
 			evPayload: makeEventTxnStartPayload(pri, tree.ReadWrite, timeutil.Now(),
 				nil /* historicalTimestamp */, tranCtx, sessiondatapb.Normal),
-			expState: stateOpen{ImplicitTxn: fsm.False},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   txnStart,
@@ -378,6 +383,27 @@ func TestTransitions(t *testing.T) {
 			expTxn: nil,
 		},
 		{
+			// Finish an upgraded explicit txn.
+			name: "Open (upgraded explicit) -> NoTxn",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createOpenState(upgradedExplicitTxn)
+				// We commit the KV transaction, as that's done by the layer below
+				// txnState.
+				if err := ts.mu.txn.Commit(ts.Ctx); err != nil {
+					return nil, nil, emptyTxnID, err
+				}
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			ev:        eventTxnFinishCommitted{},
+			evPayload: nil,
+			expState:  stateNoTxn{},
+			expAdv: expAdvance{
+				expCode: advanceOne,
+				expEv:   txnCommit,
+			},
+			expTxn: nil,
+		},
+		{
 			// Get a retriable error while we can auto-retry.
 			name: "Open + auto-retry",
 			init: func() (fsm.State, *txnState, uuid.UUID, error) {
@@ -386,18 +412,44 @@ func TestTransitions(t *testing.T) {
 			},
 			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
 				b := eventRetriableErrPayload{
-					err:    ts.mu.txn.PrepareRetryableError(ctx, "test retriable err"),
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
 					rewCap: dummyRewCap,
 				}
 				return eventRetriableErr{CanAutoRetry: fsm.True, IsCommit: fsm.False}, b
 			},
-			expState: stateOpen{ImplicitTxn: fsm.False},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},
 			expAdv: expAdvance{
 				expCode: rewind,
 				expEv:   txnRestart,
 			},
 			// Expect non-nil txn.
-			expTxn: &expKVTxn{},
+			expTxn:              &expKVTxn{},
+			expAutoRetryCounter: 1,
+			expAutoRetryError:   "test retriable err",
+		},
+		{
+			// Get a retriable error while we can auto-retry.
+			name: "Open + auto-retry on upgraded txn",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createOpenState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
+				b := eventRetriableErrPayload{
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
+					rewCap: dummyRewCap,
+				}
+				return eventRetriableErr{CanAutoRetry: fsm.True, IsCommit: fsm.False}, b
+			},
+			expState: stateOpen{ImplicitTxn: fsm.True, WasUpgraded: fsm.False},
+			expAdv: expAdvance{
+				expCode: rewind,
+				expEv:   txnRestart,
+			},
+			// Expect non-nil txn.
+			expTxn:              &expKVTxn{},
+			expAutoRetryCounter: 1,
+			expAutoRetryError:   "test retriable err",
 		},
 		{
 			// Like the above test - get a retriable error while we can auto-retry,
@@ -410,18 +462,44 @@ func TestTransitions(t *testing.T) {
 			},
 			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
 				b := eventRetriableErrPayload{
-					err:    ts.mu.txn.PrepareRetryableError(ctx, "test retriable err"),
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
 					rewCap: dummyRewCap,
 				}
 				return eventRetriableErr{CanAutoRetry: fsm.True, IsCommit: fsm.True}, b
 			},
-			expState: stateOpen{ImplicitTxn: fsm.False},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},
 			expAdv: expAdvance{
 				expCode: rewind,
 				expEv:   txnRestart,
 			},
 			// Expect non-nil txn.
-			expTxn: &expKVTxn{},
+			expTxn:              &expKVTxn{},
+			expAutoRetryCounter: 1,
+		},
+		{
+			// Like the above test - get a retriable error while we can auto-retry,
+			// except this time the txn was upgraded to explicit. This shouldn't make
+			// any difference; we should still auto-retry like the above.
+			name: "Open + auto-retry (COMMIT) on upgraded txn",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createOpenState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
+				b := eventRetriableErrPayload{
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
+					rewCap: dummyRewCap,
+				}
+				return eventRetriableErr{CanAutoRetry: fsm.True, IsCommit: fsm.True}, b
+			},
+			expState: stateOpen{ImplicitTxn: fsm.True, WasUpgraded: fsm.False},
+			expAdv: expAdvance{
+				expCode: rewind,
+				expEv:   txnRestart,
+			},
+			// Expect non-nil txn.
+			expTxn:              &expKVTxn{},
+			expAutoRetryCounter: 1,
 		},
 		{
 			// Get a retriable error when we can no longer auto-retry, but the client
@@ -433,12 +511,39 @@ func TestTransitions(t *testing.T) {
 			},
 			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
 				b := eventRetriableErrPayload{
-					err:    ts.mu.txn.PrepareRetryableError(ctx, "test retriable err"),
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
 					rewCap: rewindCapability{},
 				}
 				return eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}, b
 			},
-			expState: stateAborted{},
+			expState: stateAborted{
+				WasUpgraded: fsm.False,
+			},
+			expAdv: expAdvance{
+				expCode: skipBatch,
+				expEv:   noEvent,
+			},
+			// Expect non-nil txn.
+			expTxn: &expKVTxn{},
+		},
+		{
+			// Get a retriable error when we can no longer auto-retry, but the client
+			// is doing client-side retries.
+			name: "Open (upgraded) + client retry",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createOpenState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
+				b := eventRetriableErrPayload{
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
+					rewCap: rewindCapability{},
+				}
+				return eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}, b
+			},
+			expState: stateAborted{
+				WasUpgraded: fsm.True,
+			},
 			expAdv: expAdvance{
 				expCode: skipBatch,
 				expEv:   noEvent,
@@ -460,7 +565,7 @@ func TestTransitions(t *testing.T) {
 			},
 			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
 				b := eventRetriableErrPayload{
-					err:    ts.mu.txn.PrepareRetryableError(ctx, "test retriable err"),
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
 					rewCap: rewindCapability{},
 				}
 				return eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.True}, b
@@ -500,7 +605,7 @@ func TestTransitions(t *testing.T) {
 			},
 			evFun: func(ts *txnState) (fsm.Event, fsm.EventPayload) {
 				b := eventRetriableErrPayload{
-					err:    ts.mu.txn.PrepareRetryableError(ctx, "test retriable err"),
+					err:    ts.mu.txn.GenerateForcedRetryableError(ctx, "test retriable err"),
 					rewCap: rewindCapability{},
 				}
 				return eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}, b
@@ -522,7 +627,27 @@ func TestTransitions(t *testing.T) {
 			},
 			ev:        eventNonRetriableErr{IsCommit: fsm.False},
 			evPayload: eventNonRetriableErrPayload{err: fmt.Errorf("test non-retriable err")},
-			expState:  stateAborted{},
+			expState: stateAborted{
+				WasUpgraded: fsm.False,
+			},
+			expAdv: expAdvance{
+				expCode: skipBatch,
+				expEv:   noEvent,
+			},
+			expTxn: &expKVTxn{},
+		},
+		{
+			// We get a non-retriable error.
+			name: "Open (upgraded) + non-retriable error",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createOpenState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			ev:        eventNonRetriableErr{IsCommit: fsm.False},
+			evPayload: eventNonRetriableErrPayload{err: fmt.Errorf("test non-retriable err")},
+			expState: stateAborted{
+				WasUpgraded: fsm.True,
+			},
 			expAdv: expAdvance{
 				expCode: skipBatch,
 				expEv:   noEvent,
@@ -554,7 +679,24 @@ func TestTransitions(t *testing.T) {
 				return s, ts, ts.mu.txn.ID(), nil
 			},
 			ev:       eventTxnRestart{},
-			expState: stateOpen{ImplicitTxn: fsm.False},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},
+			expAdv: expAdvance{
+				expCode: advanceOne,
+				expEv:   txnRestart,
+			},
+			// We would like to test that the transaction's epoch bumped if the txn
+			// performed any operations, but it's not easy to do the test.
+			expTxn: &expKVTxn{},
+		},
+		{
+			// Restarting from Open via ROLLBACK TO SAVEPOINT on an upgraded txn.
+			name: "Open (upgraded) + restart",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createOpenState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			ev:       eventTxnRestart{},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.True},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   txnRestart,
@@ -570,7 +712,22 @@ func TestTransitions(t *testing.T) {
 			// The txn finished, such as after a ROLLBACK.
 			name: "Aborted->NoTxn",
 			init: func() (fsm.State, *txnState, uuid.UUID, error) {
-				s, ts := testCon.createAbortedState()
+				s, ts := testCon.createAbortedState(explicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			ev:       eventTxnFinishAborted{},
+			expState: stateNoTxn{},
+			expAdv: expAdvance{
+				expCode: advanceOne,
+				expEv:   txnRollback,
+			},
+			expTxn: nil,
+		},
+		{
+			// The upgraded txn finished, such as after a ROLLBACK.
+			name: "Aborted(upgraded)->NoTxn",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createAbortedState(upgradedExplicitTxn)
 				return s, ts, ts.mu.txn.ID(), nil
 			},
 			ev:       eventTxnFinishAborted{},
@@ -585,11 +742,26 @@ func TestTransitions(t *testing.T) {
 			// The txn is starting again (ROLLBACK TO SAVEPOINT <not cockroach_restart> while in Aborted).
 			name: "Aborted->Open",
 			init: func() (fsm.State, *txnState, uuid.UUID, error) {
-				s, ts := testCon.createAbortedState()
+				s, ts := testCon.createAbortedState(explicitTxn)
 				return s, ts, ts.mu.txn.ID(), nil
 			},
 			ev:       eventSavepointRollback{},
-			expState: stateOpen{ImplicitTxn: fsm.False},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},
+			expAdv: expAdvance{
+				expCode: advanceOne,
+				expEv:   noEvent,
+			},
+			expTxn: &expKVTxn{},
+		},
+		{
+			// The upgraded txn is starting again (ROLLBACK TO SAVEPOINT <not cockroach_restart> while in Aborted).
+			name: "Aborted(upgraded)->Open",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createAbortedState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			ev:       eventSavepointRollback{},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.True},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   noEvent,
@@ -600,11 +772,31 @@ func TestTransitions(t *testing.T) {
 			// The txn is starting again (ROLLBACK TO SAVEPOINT cockroach_restart while in Aborted).
 			name: "Aborted->Restart",
 			init: func() (fsm.State, *txnState, uuid.UUID, error) {
-				s, ts := testCon.createAbortedState()
+				s, ts := testCon.createAbortedState(explicitTxn)
 				return s, ts, ts.mu.txn.ID(), nil
 			},
 			ev:       eventTxnRestart{},
-			expState: stateOpen{ImplicitTxn: fsm.False},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},
+			expAdv: expAdvance{
+				expCode: advanceOne,
+				expEv:   txnRestart,
+			},
+			expTxn: &expKVTxn{
+				userPriority:          &pri,
+				writeTSNanos:          &now.WallTime,
+				readTSNanos:           &now.WallTime,
+				uncertaintyLimitNanos: &uncertaintyLimit.WallTime,
+			},
+		},
+		{
+			// The upgraded txn is starting again (ROLLBACK TO SAVEPOINT cockroach_restart while in Aborted).
+			name: "Aborted(upgraded)->Restart",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createAbortedState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			ev:       eventTxnRestart{},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.True},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   txnRestart,
@@ -622,11 +814,30 @@ func TestTransitions(t *testing.T) {
 			// to the expTxn.
 			name: "Aborted->Starting (historical)",
 			init: func() (fsm.State, *txnState, uuid.UUID, error) {
-				s, ts := testCon.createAbortedState()
+				s, ts := testCon.createAbortedState(explicitTxn)
 				return s, ts, ts.mu.txn.ID(), nil
 			},
 			ev:       eventTxnRestart{},
-			expState: stateOpen{ImplicitTxn: fsm.False},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False},
+			expAdv: expAdvance{
+				expCode: advanceOne,
+				expEv:   txnRestart,
+			},
+			expTxn: &expKVTxn{
+				writeTSNanos: proto.Int64(now.WallTime),
+			},
+		},
+		{
+			// The upgraded txn is starting again (e.g. ROLLBACK TO SAVEPOINT while in Aborted).
+			// Verify that the historical timestamp from the evPayload is propagated
+			// to the expTxn.
+			name: "Aborted(upgraded)->Starting (historical)",
+			init: func() (fsm.State, *txnState, uuid.UUID, error) {
+				s, ts := testCon.createAbortedState(upgradedExplicitTxn)
+				return s, ts, ts.mu.txn.ID(), nil
+			},
+			ev:       eventTxnRestart{},
+			expState: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.True},
 			expAdv: expAdvance{
 				expCode: advanceOne,
 				expEv:   txnRestart,
@@ -719,6 +930,12 @@ func TestTransitions(t *testing.T) {
 				if err := checkTxn(ts.mu.txn, *tc.expTxn); err != nil {
 					t.Fatal(err)
 				}
+			}
+
+			// Check that AutoRetry information is in the expected state.
+			require.Equal(t, tc.expAutoRetryCounter, ts.mu.autoRetryCounter)
+			if tc.expAutoRetryError != "" {
+				strings.Contains(ts.mu.autoRetryReason.Error(), tc.expAutoRetryError)
 			}
 		})
 	}

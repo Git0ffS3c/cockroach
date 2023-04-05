@@ -14,12 +14,31 @@ import "src/polyfills";
 import "src/protobufInit";
 import { alertDataSync } from "src/redux/alerts";
 import { App } from "src/app";
-import { store, history } from "src/redux/state";
+import { history } from "src/redux/history";
+import { createAdminUIStore } from "src/redux/state";
 import "src/redux/analytics";
+import {
+  DataFromServer,
+  fetchDataFromServer,
+  getDataFromServer,
+  setDataFromServer,
+} from "src/util/dataFromServer";
+import { recomputeDocsURLs } from "src/util/docs";
 
-ReactDOM.render(
-  <App history={history} store={store} />,
-  document.getElementById("react-layout"),
-);
+async function fetchAndRender() {
+  setDataFromServer(
+    (await fetchDataFromServer().catch(() => {})) as DataFromServer,
+  );
 
-store.subscribe(alertDataSync(store));
+  const store = createAdminUIStore(history, getDataFromServer());
+  recomputeDocsURLs();
+
+  ReactDOM.render(
+    <App history={history} store={store} />,
+    document.getElementById("react-layout"),
+  );
+
+  store.subscribe(alertDataSync(store));
+}
+
+fetchAndRender();

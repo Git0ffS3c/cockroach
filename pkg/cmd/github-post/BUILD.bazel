@@ -1,16 +1,12 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 
 go_library(
     name = "github-post_lib",
     srcs = ["main.go"],
     importpath = "github.com/cockroachdb/cockroach/pkg/cmd/github-post",
     visibility = ["//visibility:private"],
-    deps = [
-        "//pkg/cmd/internal/issues",
-        "//pkg/internal/codeowners",
-        "//pkg/internal/team",
-        "@com_github_cockroachdb_errors//:errors",
-    ],
+    deps = ["//pkg/cmd/bazci/githubpost"],
 )
 
 go_binary(
@@ -19,17 +15,4 @@ go_binary(
     visibility = ["//visibility:public"],
 )
 
-go_test(
-    name = "github-post_test",
-    size = "small",
-    srcs = ["main_test.go"],
-    data = glob(["testdata/**"]),
-    embed = [":github-post_lib"],
-    tags = ["broken_in_bazel"],
-    deps = [
-        "//pkg/cmd/internal/issues",
-        "//pkg/testutils",
-        "@com_github_stretchr_testify//assert",
-        "@com_github_stretchr_testify//require",
-    ],
-)
+get_x_data(name = "get_x_data")

@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -49,6 +50,7 @@ type Catalog struct {
 	testSchema Schema
 	counter    int
 	enumTypes  map[string]*types.T
+	udfs       map[string]*tree.ResolvedFunctionDefinition
 }
 
 type dataSource interface {
@@ -467,6 +469,10 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 		tc.CreateType(stmt)
 		return "", nil
 
+	case *tree.CreateFunction:
+		tc.CreateFunction(stmt)
+		return "", nil
+
 	case *tree.SetZoneConfig:
 		tc.SetZoneConfig(stmt)
 		return "", nil
@@ -478,6 +484,14 @@ func (tc *Catalog) ExecuteDDLWithIndexVersion(
 			return "", err
 		}
 		return ds.(fmt.Stringer).String(), nil
+
+	case *tree.ShowCreateFunction:
+		fn := stmt.Name.FunctionReference.(*tree.UnresolvedName)
+		def, err := tc.ResolveFunction(context.Background(), fn, tree.EmptySearchPath)
+		if err != nil {
+			return "", err
+		}
+		return formatFunction(def), nil
 
 	default:
 		return "", errors.AssertionFailedf("unsupported statement: %v", stmt)
@@ -544,8 +558,8 @@ func (s *Schema) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (s *Schema) PostgresDescriptorID() cat.StableID {
-	return s.SchemaID
+func (s *Schema) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(s.SchemaID)
 }
 
 // Equals is part of the cat.Object interface.
@@ -601,8 +615,8 @@ func (tv *View) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (tv *View) PostgresDescriptorID() cat.StableID {
-	return tv.ViewID
+func (tv *View) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(tv.ViewID)
 }
 
 // Equals is part of the cat.Object interface.
@@ -652,6 +666,7 @@ func (tv *View) CollectTypes(ord int) (descpb.IDs, error) {
 // Table implements the cat.Table interface for testing purposes.
 type Table struct {
 	TabID      cat.StableID
+	DatabaseID descpb.ID
 	TabVersion int
 	TabName    tree.TableName
 	Columns    []cat.Column
@@ -677,14 +692,27 @@ type Table struct {
 	// partitionBy is the partitioning clause that corresponds to the primary
 	// index. Used to initialize the partitioning for the primary index.
 	partitionBy *tree.PartitionBy
+
+	multiRegion bool
+
+	implicitRBRIndexElem *tree.IndexElem
+
+	homeRegion string
 }
 
 var _ cat.Table = &Table{}
 
 func (tt *Table) String() string {
 	tp := treeprinter.New()
-	cat.FormatTable(tt.Catalog, tt, tp)
+	cat.FormatTable(tt.Catalog, tt, tp, false /* redactableValues */)
 	return tp.String()
+}
+
+// SetMultiRegion can make a table in the test catalog appear to be a
+// multiregion table, in that it can cause cat.Table.IsMultiregion() to return
+// true after SetMultiRegion(true) has been called.
+func (tt *Table) SetMultiRegion(val bool) {
+	tt.multiRegion = val
 }
 
 // ID is part of the cat.DataSource interface.
@@ -693,8 +721,8 @@ func (tt *Table) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (tt *Table) PostgresDescriptorID() cat.StableID {
-	return tt.TabID
+func (tt *Table) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(tt.TabID)
 }
 
 // Equals is part of the cat.Object interface.
@@ -829,7 +857,43 @@ func (tt *Table) Zone() cat.Zone {
 
 // IsPartitionAllBy is part of the cat.Table interface.
 func (tt *Table) IsPartitionAllBy() bool {
+	return tt.implicitRBRIndexElem != nil
+}
+
+// HomeRegion is part of the cat.Table interface.
+func (tt *Table) HomeRegion() (region string, ok bool) {
+	if tt.homeRegion == "" {
+		return "", false
+	}
+	return tt.homeRegion, true
+}
+
+// IsGlobalTable is part of the cat.Table interface.
+func (tt *Table) IsGlobalTable() bool {
 	return false
+}
+
+// IsRegionalByRow is part of the cat.Table interface.
+func (tt *Table) IsRegionalByRow() bool {
+	return tt.implicitRBRIndexElem != nil
+}
+
+// IsMultiregion is part of the cat.Table interface.
+func (tt *Table) IsMultiregion() bool {
+	return tt.multiRegion
+}
+
+// HomeRegionColName is part of the cat.Table interface.
+func (tt *Table) HomeRegionColName() (colName string, ok bool) {
+	if !tt.IsRegionalByRow() {
+		return "", false
+	}
+	return string(tree.RegionalByRowRegionDefaultColName), true
+}
+
+// GetDatabaseID is part of the cat.Table interface.
+func (tt *Table) GetDatabaseID() descpb.ID {
+	return tt.DatabaseID
 }
 
 // FindOrdinal returns the ordinal of the column with the given name.
@@ -884,13 +948,14 @@ func (tt *Table) CollectTypes(ord int) (descpb.IDs, error) {
 
 	ids := make(descpb.IDs, 0, len(visitor.OIDs))
 	for collectedOid := range visitor.OIDs {
-		id, err := typedesc.UserDefinedTypeOIDToID(collectedOid)
-		if err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
+		ids = append(ids, typedesc.UserDefinedTypeOIDToID(collectedOid))
 	}
 	return ids, nil
+}
+
+// IsRefreshViewRequired is a part of the cat.Table interface.
+func (tt *Table) IsRefreshViewRequired() bool {
+	return false
 }
 
 // Index implements the cat.Index interface for testing purposes.
@@ -915,6 +980,9 @@ type Index struct {
 
 	// Inverted is true when this index is an inverted index.
 	Inverted bool
+
+	// NotVisible is true when this index is a not visible index.
+	NotVisible bool
 
 	Columns []cat.IndexColumn
 
@@ -945,6 +1013,10 @@ type Index struct {
 
 	// version is the index descriptor version of the index.
 	version descpb.IndexDescriptorVersion
+
+	// numImplicitPartitioningColumns is the number of implicit partitioning
+	// columns defined in this index.
+	numImplicitPartitioningColumns int
 }
 
 // ID is part of the cat.Index interface.
@@ -963,7 +1035,7 @@ func (ti *Index) Table() cat.Table {
 }
 
 // Ordinal is part of the cat.Index interface.
-func (ti *Index) Ordinal() int {
+func (ti *Index) Ordinal() cat.IndexOrdinal {
 	return ti.ordinal
 }
 
@@ -975,6 +1047,11 @@ func (ti *Index) IsUnique() bool {
 // IsInverted is part of the cat.Index interface.
 func (ti *Index) IsInverted() bool {
 	return ti.Inverted
+}
+
+// IsNotVisible is part of the cat.Index interface.
+func (ti *Index) IsNotVisible() bool {
+	return ti.NotVisible
 }
 
 // ColumnCount is part of the cat.Index interface.
@@ -1037,12 +1114,12 @@ func (ti *Index) Predicate() (string, bool) {
 
 // ImplicitColumnCount is part of the cat.Index interface.
 func (ti *Index) ImplicitColumnCount() int {
-	return 0
+	return ti.numImplicitPartitioningColumns
 }
 
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
 func (ti *Index) ImplicitPartitioningColumnCount() int {
-	return 0
+	return ti.numImplicitPartitioningColumns
 }
 
 // GeoConfig is part of the cat.Index interface.
@@ -1101,8 +1178,11 @@ func (p *Partition) SetDatums(datums []tree.Datums) {
 
 // TableStat implements the cat.TableStatistic interface for testing purposes.
 type TableStat struct {
-	js stats.JSONStatistic
-	tt *Table
+	js            stats.JSONStatistic
+	tt            *Table
+	evalCtx       *eval.Context
+	histogram     []cat.HistogramBucket
+	histogramType *types.T
 }
 
 var _ cat.TableStatistic = &TableStat{}
@@ -1148,7 +1228,14 @@ func (ts *TableStat) AvgSize() uint64 {
 
 // Histogram is part of the cat.TableStatistic interface.
 func (ts *TableStat) Histogram() []cat.HistogramBucket {
-	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	if ts.histogram != nil {
+		return ts.histogram
+	}
+	evalCtx := ts.evalCtx
+	if evalCtx == nil {
+		evalCtxVal := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+		evalCtx = &evalCtxVal
+	}
 	if ts.js.HistogramColumnType == "" || ts.js.HistogramBuckets == nil {
 		return nil
 	}
@@ -1158,15 +1245,14 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 	}
 	colType := tree.MustBeStaticallyKnownType(colTypeRef)
 
-	var histogram []cat.HistogramBucket
 	var offset int
 	if ts.js.NullCount > 0 {
 		// A bucket for NULL is not persisted, but we create a fake one to
 		// make histograms easier to work with. The length of histogram
 		// is therefore 1 greater than the length of ts.js.HistogramBuckets.
 		// NOTE: This matches the logic in the TableStatisticsCache.
-		histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets)+1)
-		histogram[0] = cat.HistogramBucket{
+		ts.histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets)+1)
+		ts.histogram[0] = cat.HistogramBucket{
 			NumEq:         float64(ts.js.NullCount),
 			NumRange:      0,
 			DistinctRange: 0,
@@ -1174,24 +1260,57 @@ func (ts *TableStat) Histogram() []cat.HistogramBucket {
 		}
 		offset = 1
 	} else {
-		histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
+		ts.histogram = make([]cat.HistogramBucket, len(ts.js.HistogramBuckets))
 		offset = 0
 	}
 
-	for i := offset; i < len(histogram); i++ {
+	for i := offset; i < len(ts.histogram); i++ {
 		bucket := &ts.js.HistogramBuckets[i-offset]
-		datum, err := rowenc.ParseDatumStringAs(colType, bucket.UpperBound, &evalCtx)
+		datum, err := rowenc.ParseDatumStringAs(context.Background(), colType, bucket.UpperBound, evalCtx)
 		if err != nil {
 			panic(err)
 		}
-		histogram[i] = cat.HistogramBucket{
+		ts.histogram[i] = cat.HistogramBucket{
 			NumEq:         float64(bucket.NumEq),
 			NumRange:      float64(bucket.NumRange),
 			DistinctRange: bucket.DistinctRange,
 			UpperBound:    datum,
 		}
 	}
-	return histogram
+	return ts.histogram
+}
+
+// HistogramType is part of the cat.TableStatistic interface.
+func (ts *TableStat) HistogramType() *types.T {
+	if ts.histogramType != nil {
+		return ts.histogramType
+	}
+	colTypeRef, err := parser.GetTypeFromValidSQLSyntax(ts.js.HistogramColumnType)
+	if err != nil {
+		panic(err)
+	}
+	ts.histogramType = tree.MustBeStaticallyKnownType(colTypeRef)
+	return ts.histogramType
+}
+
+// IsPartial is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsPartial() bool {
+	return ts.js.IsPartial()
+}
+
+// IsMerged is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsMerged() bool {
+	return ts.js.IsMerged()
+}
+
+// IsForecast is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsForecast() bool {
+	return ts.js.IsForecast()
+}
+
+// IsAuto is part of the cat.TableStatistic interface.
+func (ts *TableStat) IsAuto() bool {
+	return ts.js.IsAuto()
 }
 
 // TableStats is a slice of TableStat pointers.
@@ -1371,8 +1490,8 @@ func (ts *Sequence) ID() cat.StableID {
 }
 
 // PostgresDescriptorID is part of the cat.Object interface.
-func (ts *Sequence) PostgresDescriptorID() cat.StableID {
-	return ts.SeqID
+func (ts *Sequence) PostgresDescriptorID() catid.DescID {
+	return catid.DescID(ts.SeqID)
 }
 
 // Equals is part of the cat.Object interface.

@@ -31,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -699,18 +700,19 @@ func TestZigzagJoiner(t *testing.T) {
 			defer evalCtx.Stop(ctx)
 			flowCtx := execinfra.FlowCtx{
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				Txn:     kv.NewTxn(ctx, s.DB(), s.NodeID()),
 			}
 
 			out := &distsqlutils.RowBuffer{}
 			post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-			z, err := newZigzagJoiner(&flowCtx, 0 /* processorID */, &c.spec, c.fixedValues, &post, out)
+			z, err := newZigzagJoiner(ctx, &flowCtx, 0 /* processorID */, &c.spec, c.fixedValues, &post)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			z.Run(ctx)
+			z.Run(ctx, out)
 
 			if !out.ProducerClosed() {
 				t.Fatalf("output RowReceiver not closed")
@@ -763,22 +765,26 @@ func TestZigzagJoinerDrain(t *testing.T) {
 
 	// Run the flow in a verbose trace so that we can test for tracing info.
 	tracer := s.TracerI().(*tracing.Tracer)
-	ctx, sp := tracer.StartSpanCtx(context.Background(), "test flow ctx", tracing.WithRecording(tracing.RecordingVerbose))
+	ctx, sp := tracer.StartSpanCtx(context.Background(), "test flow ctx", tracing.WithRecording(tracingpb.RecordingVerbose))
 	defer sp.Finish()
 	evalCtx := eval.MakeTestingEvalContext(s.ClusterSettings())
 	defer evalCtx.Stop(ctx)
 
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: s.ClusterSettings()},
 		Txn:     leafTxn,
+		Gateway: false,
 	}
 
-	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
+	testReaderProcessorDrain(ctx, t, func() (execinfra.Processor, error) {
 		return newZigzagJoiner(
+			ctx,
 			&flowCtx,
 			0, /* processorID */
 			&execinfrapb.ZigzagJoinerSpec{
@@ -796,7 +802,6 @@ func TestZigzagJoinerDrain(t *testing.T) {
 			},
 			[]rowenc.EncDatumRow{{encThree}, {encSeven}},
 			&execinfrapb.PostProcessSpec{Projection: true, OutputColumns: []uint32{0, 1}},
-			out,
 		)
 	})
 }

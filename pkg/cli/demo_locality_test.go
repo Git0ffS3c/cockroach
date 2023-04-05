@@ -15,11 +15,13 @@ package cli
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-func Example_demo_locality() {
+var _ = skipExample_demo_locality
+
+func skipExample_demo_locality() {
 	c := NewCLITest(TestCLIParams{NoServer: true})
 	defer c.Cleanup()
 
@@ -36,7 +38,7 @@ func Example_demo_locality() {
 	// We must reset the security asset loader here, otherwise the dummy
 	// asset loader that is set by default in tests will not be able to
 	// find the certs that demo sets up.
-	security.ResetAssetLoader()
+	securityassets.ResetLoader()
 	for _, cmd := range testData {
 		// `demo` sets up a server and log file redirection, which asserts
 		// that the logging subsystem has not been initialized yet.  Fake

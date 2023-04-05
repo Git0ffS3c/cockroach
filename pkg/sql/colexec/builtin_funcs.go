@@ -70,11 +70,11 @@ func (b *defaultBuiltinFuncOperator) Next() coldata.Batch {
 					err error
 				)
 				// Some functions cannot handle null arguments.
-				if hasNulls && !b.funcExpr.CanHandleNulls() {
+				if hasNulls && !b.funcExpr.ResolvedOverload().CalledOnNullInput {
 					res = tree.DNull
 				} else {
 					res, err = b.funcExpr.ResolvedOverload().
-						Fn.(eval.FnOverload)(b.evalCtx, b.row)
+						Fn.(eval.FnOverload)(b.Ctx, b.evalCtx, b.row)
 					if err != nil {
 						colexecerror.ExpectedError(b.funcExpr.MaybeWrapError(err))
 					}
@@ -103,6 +103,12 @@ func (b *defaultBuiltinFuncOperator) Release() {
 	b.toDatumConverter.Release()
 }
 
+// errFnWithExprsNotSupported is returned from NewBuiltinFunctionOperator
+// when the function in question uses FnWithExprs, which is not supported.
+var errFnWithExprsNotSupported = errors.New(
+	"builtins with FnWithExprs are not supported in the vectorized engine",
+)
+
 // NewBuiltinFunctionOperator returns an operator that applies builtin functions.
 func NewBuiltinFunctionOperator(
 	allocator *colmem.Allocator,
@@ -115,7 +121,7 @@ func NewBuiltinFunctionOperator(
 ) (colexecop.Operator, error) {
 	overload := funcExpr.ResolvedOverload()
 	if overload.FnWithExprs != nil {
-		return nil, errors.New("builtins with FnWithExprs are not supported in the vectorized engine")
+		return nil, errFnWithExprsNotSupported
 	}
 	outputType := funcExpr.ResolvedType()
 	input = colexecutils.NewVectorTypeEnforcer(allocator, input, outputType, outputIdx)
@@ -124,6 +130,16 @@ func NewBuiltinFunctionOperator(
 		return newSubstringOperator(
 			allocator, columnTypes, argumentCols, outputIdx, input,
 		), nil
+	case tree.CrdbInternalRangeStats:
+		if len(argumentCols) != 1 {
+			return nil, errors.AssertionFailedf(
+				"expected 1 input column to crdb_internal.range_stats, got %d",
+				len(argumentCols),
+			)
+		}
+		return newRangeStatsOperator(
+			evalCtx.RangeStatsFetcher, allocator, argumentCols[0], outputIdx, input,
+		)
 	default:
 		return &defaultBuiltinFuncOperator{
 			OneInputHelper:      colexecop.MakeOneInputHelper(input),

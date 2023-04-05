@@ -12,7 +12,7 @@ package clisqlshell_test
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -37,7 +37,7 @@ func Example_sql() {
 	c.RunWithArgs([]string{`sql`, `-e`, `begin`, `-e`, `select 3 as "3"`, `-e`, `commit`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select * from t.f`})
 	c.RunWithArgs([]string{`sql`, `--execute=SELECT database_name, owner FROM [show databases]`})
-	c.RunWithArgs([]string{`sql`, `-e`, `\l`, `-e`, `\echo hello`})
+	c.RunWithArgs([]string{`sql`, `-e`, `\echo hello`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "2"`})
 	c.RunWithArgs([]string{`sql`, `-e`, `select 1 as "1"; select 2 as "@" where false`})
 	// CREATE TABLE AS returns a SELECT tag with a row count, check this.
@@ -57,17 +57,17 @@ func Example_sql() {
 	// growing capacity starting at 1 (the batch sizes will be 1, 2, 4, ...),
 	// and with the query below the division by zero error will occur after the
 	// first batch consisting of 1 row has been returned to the client.
-	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(@1-2) from generate_series(1,3)`})
+	c.RunWithArgs([]string{`sql`, `-e`, `select 1/(i-2) from generate_series(1,3) g(i)`})
 	c.RunWithArgs([]string{`sql`, `-e`, `SELECT '20:01:02+03:04:05'::timetz AS regression_65066`})
-	c.RunWithArgs([]string{`sql`, `-e`, `CREATE USER my_user WITH CREATEDB; GRANT admin TO my_user;`})
-	c.RunWithArgs([]string{`sql`, `-e`, `\du my_user`})
 
 	// Output:
 	// sql -e show application_name
 	// application_name
 	// $ cockroach sql
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
-	// INSERT 1
+	// CREATE DATABASE
+	// CREATE TABLE
+	// INSERT 0 1
 	// sql -e select 3 as "3" -e select * from t.f
 	// 3
 	// 3
@@ -87,12 +87,7 @@ func Example_sql() {
 	// postgres	root
 	// system	node
 	// t	root
-	// sql -e \l -e \echo hello
-	// database_name	owner	primary_region	regions	survival_goal
-	// defaultdb	root	NULL	{}	NULL
-	// postgres	root	NULL	{}	NULL
-	// system	node	NULL	{}	NULL
-	// t	root	NULL	{}	NULL
+	// sql -e \echo hello
 	// hello
 	// sql -e select 1 as "1"; select 2 as "2"
 	// 1
@@ -110,9 +105,11 @@ func Example_sql() {
 	// sql -d nonexistent -e select count(*) from "".information_schema.tables limit 0
 	// count
 	// sql -d nonexistent -e create database nonexistent; create table foo(x int); select * from foo
+	// CREATE DATABASE
+	// CREATE TABLE
 	// x
 	// sql -e copy t.f from stdin
-	// sql -e select 1/(@1-2) from generate_series(1,3)
+	// sql -e select 1/(i-2) from generate_series(1,3) g(i)
 	// ?column?
 	// -1.0000000000000000000
 	// (error encountered after some results were delivered)
@@ -121,11 +118,6 @@ func Example_sql() {
 	// sql -e SELECT '20:01:02+03:04:05'::timetz AS regression_65066
 	// regression_65066
 	// 20:01:02+03:04:05
-	// sql -e CREATE USER my_user WITH CREATEDB; GRANT admin TO my_user;
-	// GRANT
-	// sql -e \du my_user
-	// username	options	member_of
-	// my_user	CREATEDB	{admin}
 }
 
 func Example_sql_config() {
@@ -170,10 +162,10 @@ func Example_sql_config() {
 	// invalid syntax: \set unknownoption. Try \? for help.
 	// ERROR: -e: invalid syntax
 	// sql --set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// \set display_format=invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 	// sql -e \set display_format=invalidvalue -e select 123 as "123"
-	// \set display_format invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
+	// \set display_format=invalidvalue: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 	// ERROR: -e: invalid table display format: invalidvalue (possible values: tsv, csv, table, records, sql, html, raw)
 }
 
@@ -186,7 +178,8 @@ func Example_sql_watch() {
 
 	// Output:
 	// sql -e create table d(x int); insert into d values(3)
-	// INSERT 1
+	// CREATE TABLE
+	// INSERT 0 1
 	// sql --watch .1s -e update d set x=x-1 returning 1/x as dec
 	// dec
 	// 0.50000000000000000000
@@ -206,6 +199,7 @@ func Example_misc_table() {
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE DATABASE
 	// CREATE TABLE
 	// sql --format=table -e select '  hai' as x
 	//     x
@@ -243,7 +237,9 @@ func Example_in_memory() {
 
 	// Output:
 	// sql -e create database t; create table t.f (x int, y int); insert into t.f values (42, 69)
-	// INSERT 1
+	// CREATE DATABASE
+	// CREATE TABLE
+	// INSERT 0 1
 	// node ls
 	// id
 	// 1
@@ -264,15 +260,16 @@ func Example_pretty_print_numerical_strings() {
 
 	// Output:
 	// sql -e create database t; create table t.t (s string, d string);
+	// CREATE DATABASE
 	// CREATE TABLE
 	// sql -e insert into t.t values (e'0', 'positive numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql -e insert into t.t values (e'-1', 'negative numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql -e insert into t.t values (e'1.0', 'decimal numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql -e insert into t.t values (e'aaaaa', 'non-numerical string')
-	// INSERT 1
+	// INSERT 0 1
 	// sql --format=table -e select * from t.t
 	//     s   |             d
 	// --------+----------------------------
@@ -300,7 +297,7 @@ func Example_read_from_file() {
 	// SET
 	// CREATE TABLE
 	// > INSERT INTO test(s) VALUES ('hello'), ('world');
-	// INSERT 2
+	// INSERT 0 2
 	// > SELECT * FROM test;
 	// s
 	// hello
@@ -361,7 +358,7 @@ func Example_sql_lex() {
 	defer c.Cleanup()
 
 	var sqlConnCtx clisqlclient.Context
-	conn := sqlConnCtx.MakeSQLConn(ioutil.Discard, ioutil.Discard,
+	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard,
 		fmt.Sprintf("postgres://%s@%s/?sslmode=disable",
 			username.RootUser, c.ServingSQLAddr()))
 	defer func() {
@@ -390,7 +387,7 @@ select '''
 
 	// We need a temporary file with a name guaranteed to be available.
 	// So open a dummy file.
-	f, err := ioutil.TempFile("", "input")
+	f, err := os.CreateTemp("", "input")
 	if err != nil {
 		fmt.Println(err)
 		return

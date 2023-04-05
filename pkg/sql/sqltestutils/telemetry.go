@@ -22,10 +22,10 @@ import (
 	"text/tabwriter"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -43,43 +43,42 @@ import (
 // database and a testing diagnostics reporting server. The test implements the
 // following data-driven commands:
 //
-//  - exec
+//   - exec
 //
-//    Executes SQL statements against the database. Outputs no results on
-//    success. In case of error, outputs the error message.
+//     Executes SQL statements against the database. Outputs no results on
+//     success. In case of error, outputs the error message.
 //
-//  - feature-allowlist
+//   - feature-allowlist
 //
-//    The input for this command is not SQL, but a list of regular expressions.
-//    Tests that follow (until the next feature-allowlist command) will only
-//    output counters that match a regexp in this allow list.
+//     The input for this command is not SQL, but a list of regular expressions.
+//     Tests that follow (until the next feature-allowlist command) will only
+//     output counters that match a regexp in this allow list.
 //
-//  - feature-usage, feature-counters
+//   - feature-usage, feature-counters
 //
-//    Executes SQL statements and then outputs the feature counters from the
-//    allowlist that have been reported to the diagnostic server. The first
-//    variant outputs only the names of the counters that changed; the second
-//    variant outputs the counts as well. It is necessary to use
-//    feature-allowlist before these commands to avoid test flakes (e.g. because
-//    of counters that are changed by looking up descriptors).
-//    TODO(yuzefovich): counters currently don't really work because they are
-//    reset before executing every statement by reporter.ReportDiagnostics.
+//     Executes SQL statements and then outputs the feature counters from the
+//     allowlist that have been reported to the diagnostic server. The first
+//     variant outputs only the names of the counters that changed; the second
+//     variant outputs the counts as well. It is necessary to use
+//     feature-allowlist before these commands to avoid test flakes (e.g. because
+//     of counters that are changed by looking up descriptors).
+//     TODO(yuzefovich): counters currently don't really work because they are
+//     reset before executing every statement by reporter.ReportDiagnostics.
 //
-//  - schema
+//   - schema
 //
-//    Outputs reported schema information.
+//     Outputs reported schema information.
 //
-//  - sql-stats
+//   - sql-stats
 //
-//    Executes SQL statements and then outputs information about reported sql
-//    statement statistics.
+//     Executes SQL statements and then outputs information about reported sql
+//     statement statistics.
 //
-//  - rewrite
+//   - rewrite
 //
-//    Installs a rule to rewrite all matches of the regexp in the first
-//    line to the string in the second line. This is useful to eliminate
-//    non-determinism in the output.
-//
+//     Installs a rule to rewrite all matches of the regexp in the first
+//     line to the string in the second line. This is useful to eliminate
+//     non-determinism in the output.
 func TelemetryTest(t *testing.T, serverArgs []base.TestServerArgs, testTenant bool) {
 	// Note: these tests cannot be run in parallel (with each other or with other
 	// tests) because telemetry counters are global.
@@ -90,6 +89,21 @@ func TelemetryTest(t *testing.T, serverArgs []base.TestServerArgs, testTenant bo
 		var test telemetryTest
 		test.Start(t, serverArgs)
 		defer test.Close()
+
+		if testTenant || test.cluster.StartedDefaultTestTenant() {
+			// TODO(andyk): Re-enable these tests once tenant clusters fully
+			// support the features they're using.
+			switch path {
+			case "testdata/telemetry/execution",
+				// Index & multiregion are disabled because it requires
+				// multi-region syntax to be enabled for secondary tenants.
+				"testdata/telemetry/multiregion",
+				"testdata/telemetry/index",
+				"testdata/telemetry/planning",
+				"testdata/telemetry/sql-stats":
+				skip.WithIssue(t, 47893, "tenant clusters do not support SQL features used by this test")
+			}
+		}
 
 		// Run test against physical CRDB cluster.
 		t.Run("server", func(t *testing.T) {
@@ -103,15 +117,6 @@ func TelemetryTest(t *testing.T, serverArgs []base.TestServerArgs, testTenant bo
 		if testTenant {
 			// Run test against logical tenant cluster.
 			t.Run("tenant", func(t *testing.T) {
-				// TODO(andyk): Re-enable these tests once tenant clusters fully
-				// support the features they're using.
-				switch path {
-				case "testdata/telemetry/execution",
-					"testdata/telemetry/planning",
-					"testdata/telemetry/sql-stats":
-					skip.WithIssue(t, 47893, "tenant clusters do not support SQL features used by this test")
-				}
-
 				datadriven.RunTest(t, path, func(t *testing.T, td *datadriven.TestData) string {
 					sqlServer := test.server.SQLServer().(*sql.Server)
 					reporter := test.tenant.DiagnosticsReporter().(*diagnostics.Reporter)
@@ -152,6 +157,7 @@ func (tt *telemetryTest) Start(t *testing.T, serverArgs []base.TestServerArgs) {
 	diagSrvURL := tt.diagSrv.URL()
 	mapServerArgs := make(map[int]base.TestServerArgs, len(serverArgs))
 	for i, v := range serverArgs {
+		v.DefaultTestTenant = base.TestTenantDisabled
 		v.Knobs.Server = &server.TestingKnobs{
 			DiagnosticsTestingKnobs: diagnostics.TestingKnobs{
 				OverrideReportingURL: &diagSrvURL,
@@ -170,9 +176,8 @@ func (tt *telemetryTest) Start(t *testing.T, serverArgs []base.TestServerArgs) {
 	tt.prepareCluster(tt.serverDB)
 
 	tt.tenant, tt.tenantDB = serverutils.StartTenant(tt.t, tt.server, base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		AllowSettingClusterSettings: true,
-		TestingKnobs:                mapServerArgs[0].Knobs,
+		TenantID:     serverutils.TestTenantID(),
+		TestingKnobs: mapServerArgs[0].Knobs,
 	})
 	tt.prepareCluster(tt.tenantDB)
 }
@@ -362,8 +367,8 @@ func formatTableDescriptor(desc *descpb.TableDescriptor) string {
 	return tp.String()
 }
 
-func formatSQLStats(stats []roachpb.CollectedStatementStatistics) string {
-	bucketByApp := make(map[string][]roachpb.CollectedStatementStatistics)
+func formatSQLStats(stats []appstatspb.CollectedStatementStatistics) string {
+	bucketByApp := make(map[string][]appstatspb.CollectedStatementStatistics)
 	for i := range stats {
 		s := &stats[i]
 

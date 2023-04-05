@@ -51,6 +51,7 @@ func TestSQLTypesIntegration(t *testing.T) {
 	defer diskMonitor.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -78,15 +79,17 @@ func TestSQLTypesIntegration(t *testing.T) {
 			typs := []*types.T{typ}
 			source := execinfra.NewRepeatableRowSource(typs, rows)
 
-			columnarizer := NewBufferingColumnarizer(testAllocator, flowCtx, 0 /* processorID */, source)
+			columnarizer := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0 /* processorID */, source)
 
-			c, err := colserde.NewArrowBatchConverter(typs)
+			c, err := colserde.NewArrowBatchConverter(typs, colserde.BiDirectional, testMemAcc)
 			require.NoError(t, err)
+			defer c.Release(ctx)
 			r, err := colserde.NewRecordBatchSerializer(typs)
 			require.NoError(t, err)
 			arrowOp := newArrowTestOperator(columnarizer, c, r, typs)
 
 			materializer := NewMaterializer(
+				nil, /* allocator */
 				flowCtx,
 				1, /* processorID */
 				colexecargs.OpWithMetaInfo{Root: arrowOp},
@@ -145,7 +148,7 @@ func (a *arrowTestOperator) Next() coldata.Batch {
 	batchIn := a.Input.Next()
 	// Note that we don't need to handle zero-length batches in a special way.
 	var buf bytes.Buffer
-	arrowDataIn, err := a.c.BatchToArrow(batchIn)
+	arrowDataIn, err := a.c.BatchToArrow(a.Ctx, batchIn)
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
@@ -153,7 +156,7 @@ func (a *arrowTestOperator) Next() coldata.Batch {
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
-	var arrowDataOut []*array.Data
+	var arrowDataOut []array.Data
 	batchLength, err := a.r.Deserialize(&arrowDataOut, buf.Bytes())
 	if err != nil {
 		colexecerror.InternalError(err)

@@ -24,11 +24,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"google.golang.org/grpc"
 )
@@ -72,11 +72,16 @@ func NewNetwork(
 	}
 	n.RPCContext = rpc.NewContext(ctx,
 		rpc.ContextOptions{
-			TenantID: roachpb.SystemTenantID,
-			Config:   &base.Config{Insecure: true},
-			Clock:    hlc.NewClock(hlc.UnixNano, time.Nanosecond),
-			Stopper:  n.Stopper,
-			Settings: cluster.MakeTestingClusterSettings(),
+			TenantID:        roachpb.SystemTenantID,
+			Config:          &base.Config{Insecure: true},
+			Clock:           &timeutil.DefaultTimeSource{},
+			ToleratedOffset: 0,
+			Stopper:         n.Stopper,
+			Settings:        cluster.MakeTestingClusterSettings(),
+
+			Knobs: rpc.ContextTestingKnobs{
+				NoLoopbackDialer: true,
+			},
 		})
 	var err error
 	n.tlsConfig, err = n.RPCContext.GetServerTLSConfig()
@@ -105,13 +110,17 @@ func NewNetwork(
 
 // CreateNode creates a simulation node and starts an RPC server for it.
 func (n *Network) CreateNode(defaultZoneConfig *zonepb.ZoneConfig) (*Node, error) {
-	server := rpc.NewServer(n.RPCContext)
+	server, err := rpc.NewServer(n.RPCContext)
+	if err != nil {
+		return nil, err
+	}
 	ln, err := net.Listen(util.IsolatedTestAddr.Network(), util.IsolatedTestAddr.String())
 	if err != nil {
 		return nil, err
 	}
 	node := &Node{Server: server, Listener: ln, Registry: metric.NewRegistry()}
-	node.Gossip = gossip.NewTest(0, n.RPCContext, server, n.Stopper, node.Registry, defaultZoneConfig)
+	node.Gossip = gossip.NewTest(0, n.Stopper, node.Registry, defaultZoneConfig)
+	gossip.RegisterGossipServer(server, node.Gossip)
 	n.Stopper.AddCloser(stop.CloserFn(server.Stop))
 	_ = n.Stopper.RunAsyncTask(context.TODO(), "node-wait-quiesce", func(context.Context) {
 		<-n.Stopper.ShouldQuiesce()
@@ -125,7 +134,7 @@ func (n *Network) CreateNode(defaultZoneConfig *zonepb.ZoneConfig) (*Node, error
 // StartNode initializes a gossip instance for the simulation node and
 // starts it.
 func (n *Network) StartNode(node *Node) error {
-	node.Gossip.Start(node.Addr(), node.Addresses)
+	node.Gossip.Start(node.Addr(), node.Addresses, n.RPCContext)
 	node.Gossip.EnableSimulationCycler(true)
 	n.nodeIDAllocator++
 	node.Gossip.NodeID.Set(context.TODO(), n.nodeIDAllocator)

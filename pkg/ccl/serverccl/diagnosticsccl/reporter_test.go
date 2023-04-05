@@ -49,13 +49,12 @@ func TestTenantReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rt := startReporterTest(t)
+	rt := startReporterTest(t, base.TestTenantDisabled)
 	defer rt.Close()
 
 	tenantArgs := base.TestTenantArgs{
-		TenantID:                    serverutils.TestTenantID(),
-		AllowSettingClusterSettings: true,
-		TestingKnobs:                rt.testingKnobs,
+		TenantID:     serverutils.TestTenantID(),
+		TestingKnobs: rt.testingKnobs,
 	}
 	tenant, tenantDB := serverutils.StartTenant(t, rt.server, tenantArgs)
 	reporter := tenant.DiagnosticsReporter().(*diagnostics.Reporter)
@@ -89,7 +88,7 @@ func TestTenantReport(t *testing.T) {
 	require.NotZero(t, len(last.FeatureUsage))
 
 	// Call PeriodicallyReportDiagnostics and ensure it sends out a report.
-	reporter.PeriodicallyReportDiagnostics(ctx, rt.server.Stopper())
+	reporter.PeriodicallyReportDiagnostics(ctx, tenant.Stopper())
 	testutils.SucceedsSoon(t, func() error {
 		if rt.diagServer.NumRequests() != 2 {
 			return errors.Errorf("did not receive a diagnostics report")
@@ -104,7 +103,8 @@ func TestServerReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rt := startReporterTest(t)
+	var defaultTestTenant base.DefaultTestTenantOptions
+	rt := startReporterTest(t, defaultTestTenant)
 	defer rt.Close()
 
 	ctx := context.Background()
@@ -391,7 +391,9 @@ func (t *reporterTest) Close() {
 	t.server.Stopper().Stop(context.Background())
 }
 
-func startReporterTest(t *testing.T) *reporterTest {
+func startReporterTest(
+	t *testing.T, defaultTestTenant base.DefaultTestTenantOptions,
+) *reporterTest {
 	// Disable cloud info reporting, since it slows down tests.
 	rt := &reporterTest{
 		cloudEnable: cloudinfo.Disable(),
@@ -416,6 +418,7 @@ func startReporterTest(t *testing.T) *reporterTest {
 	storeSpec := base.DefaultTestStoreSpec
 	storeSpec.Attributes = roachpb.Attributes{Attrs: []string{elemName}}
 	rt.serverArgs = base.TestServerArgs{
+		DefaultTestTenant: defaultTestTenant,
 		StoreSpecs: []base.StoreSpec{
 			storeSpec,
 			base.DefaultTestStoreSpec,

@@ -14,7 +14,7 @@ import (
 	"crypto/ed25519"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/rand"
@@ -90,12 +92,12 @@ func testTenantCertificatesInner(t *testing.T, embedded bool) {
 	var tenant uint64
 	if !embedded {
 		// Don't mock assets in this test, we're creating our own one-off certs.
-		security.ResetAssetLoader()
+		securityassets.ResetLoader()
 		defer ResetTest()
 		tenant = uint64(rand.Int63())
 		certsDir = makeTenantCerts(t, tenant)
 	} else {
-		certsDir = security.EmbeddedCertsDir
+		certsDir = certnames.EmbeddedCertsDir
 		tenant = security.EmbeddedTenantIDs()[0]
 	}
 
@@ -145,7 +147,7 @@ func testTenantCertificatesInner(t *testing.T, embedded bool) {
 	resp, err := httpClient.Get("https://" + ln.Addr().String())
 	require.NoError(t, err)
 	defer resp.Body.Close()
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Equal(t, fmt.Sprintf("hello, tenant %d", tenant), string(b))
 

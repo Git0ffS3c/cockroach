@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"go.opentelemetry.io/otel/attribute"
@@ -40,7 +41,7 @@ import (
 type router interface {
 	execinfra.RowReceiver
 	flowinfra.Startable
-	init(ctx context.Context, flowCtx *execinfra.FlowCtx, types []*types.T)
+	init(ctx context.Context, flowCtx *execinfra.FlowCtx, processorID int32, types []*types.T)
 }
 
 // makeRouter creates a router. The router's init must be called before the
@@ -175,7 +176,7 @@ func (ro *routerOutput) popRowsLocked(ctx context.Context) ([]rowenc.EncDatumRow
 				} else if !ok {
 					break
 				}
-				row, err := i.Row()
+				row, err := i.EncRow()
 				if err != nil {
 					return err
 				}
@@ -205,7 +206,9 @@ func (ro *routerOutput) popRowsLocked(ctx context.Context) ([]rowenc.EncDatumRow
 const semaphorePeriod = 8
 
 type routerBase struct {
-	types []*types.T
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
+	types       []*types.T
 
 	outputs []routerOutput
 
@@ -260,19 +263,23 @@ func (rb *routerBase) setupStreams(
 }
 
 // init must be called after setupStreams but before Start.
-func (rb *routerBase) init(ctx context.Context, flowCtx *execinfra.FlowCtx, types []*types.T) {
+func (rb *routerBase) init(
+	ctx context.Context, flowCtx *execinfra.FlowCtx, processorID int32, types []*types.T,
+) {
 	// Check if we're recording stats.
-	if s := tracing.SpanFromContext(ctx); s != nil && s.IsVerbose() {
+	if s := tracing.SpanFromContext(ctx); s != nil && s.RecordingType() != tracingpb.RecordingOff {
 		rb.statsCollectionEnabled = true
 	}
 
+	rb.flowCtx = flowCtx
+	rb.processorID = processorID
 	rb.types = types
 	for i := range rb.outputs {
 		// This method must be called before we Start() so we don't need
 		// to take the mutex.
 		evalCtx := flowCtx.NewEvalCtx()
 		rb.outputs[i].memoryMonitor = execinfra.NewLimitedMonitor(
-			ctx, evalCtx.Mon, flowCtx,
+			ctx, flowCtx.Mon, flowCtx,
 			redact.Sprintf("router-limited-%d", rb.outputs[i].streamID),
 		)
 		rb.outputs[i].diskMonitor = execinfra.NewMonitor(
@@ -283,7 +290,7 @@ func (rb *routerBase) init(ctx context.Context, flowCtx *execinfra.FlowCtx, type
 		// to fallback to disk if a memory budget error is encountered when
 		// we're popping rows from the row container into the row buffer.
 		rb.outputs[i].rowBufToPushFromMon = execinfra.NewMonitor(
-			ctx, evalCtx.Mon, redact.Sprintf("router-unlimited-%d", rb.outputs[i].streamID),
+			ctx, flowCtx.Mon, redact.Sprintf("router-unlimited-%d", rb.outputs[i].streamID),
 		)
 		memAcc := rb.outputs[i].rowBufToPushFromMon.MakeBoundAccount()
 		rb.outputs[i].rowBufToPushFromAcc = &memAcc
@@ -308,12 +315,15 @@ func (rb *routerBase) init(ctx context.Context, flowCtx *execinfra.FlowCtx, type
 func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, _ context.CancelFunc) {
 	wg.Add(len(rb.outputs))
 	for i := range rb.outputs {
-		go func(ctx context.Context, rb *routerBase, ro *routerOutput, wg *sync.WaitGroup) {
+		go func(ctx context.Context, rb *routerBase, ro *routerOutput) {
+			defer wg.Done()
 			var span *tracing.Span
 			if rb.statsCollectionEnabled {
-				ctx, span = execinfra.ProcessorSpan(ctx, "router output")
+				ctx, span = execinfra.ProcessorSpan(ctx, rb.flowCtx, "router output", rb.processorID)
 				defer span.Finish()
-				span.SetTag(execinfrapb.StreamIDTagKey, attribute.IntValue(int(ro.streamID)))
+				if span.IsVerbose() {
+					span.SetTag(execinfrapb.StreamIDTagKey, attribute.IntValue(int(ro.streamID)))
+				}
 				ro.stats.Inputs = make([]execinfrapb.InputStats, 1)
 			}
 
@@ -376,7 +386,7 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, _ context.C
 						ro.stats.Exec.MaxAllocatedMem.Set(uint64(ro.memoryMonitor.MaximumBytes()))
 						ro.stats.Exec.MaxAllocatedDisk.Set(uint64(ro.diskMonitor.MaximumBytes()))
 						span.RecordStructured(&ro.stats)
-						if meta := execinfra.GetTraceDataAsMetadata(span); meta != nil {
+						if meta := execinfra.GetTraceDataAsMetadata(rb.flowCtx, span); meta != nil {
 							ro.mu.Unlock()
 							rb.semaphore <- struct{}{}
 							status := ro.stream.Push(nil /* row */, meta)
@@ -399,9 +409,7 @@ func (rb *routerBase) Start(ctx context.Context, wg *sync.WaitGroup, _ context.C
 			ro.memoryMonitor.Stop(ctx)
 			ro.diskMonitor.Stop(ctx)
 			ro.rowBufToPushFromMon.Stop(ctx)
-
-			wg.Done()
-		}(ctx, rb, &rb.outputs[i], wg)
+		}(ctx, rb, &rb.outputs[i])
 	}
 }
 

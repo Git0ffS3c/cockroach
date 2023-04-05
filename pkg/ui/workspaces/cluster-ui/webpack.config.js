@@ -12,12 +12,14 @@ const path = require("path");
 const webpack = require("webpack");
 const WebpackBar = require("webpackbar");
 const MomentLocalesPlugin = require("moment-locales-webpack-plugin");
+const { ESBuildMinifyPlugin } = require("esbuild-loader");
 
 // tslint:disable:object-literal-sort-keys
 module.exports = (env, argv) => {
   env = env || {};
 
   return {
+    context: __dirname,
     name: "cluster-ui",
     entry: path.resolve(__dirname, "./src/index.ts"),
 
@@ -69,7 +71,7 @@ module.exports = (env, argv) => {
                 }
               },
             },
-            "sass-loader"
+            "sass-loader",
           ],
         },
         // Ant design styles defined as global styles with .scss files which don't follow
@@ -84,7 +86,13 @@ module.exports = (env, argv) => {
         {
           test: /\.(ts|js)x?$/,
           use: [
-            "babel-loader",
+            {
+              loader: "esbuild-loader",
+              options: {
+                loader: "tsx",
+                target: "es6",
+              },
+            },
             {
               loader: "astroturf/loader",
               options: {extension: ".module.scss"},
@@ -124,9 +132,27 @@ module.exports = (env, argv) => {
         },
         {
           test: /\.css$/,
-          use: ["style-loader", "css-loader"],
+          use: [
+            "style-loader",
+            "css-loader",
+            {
+              loader: "esbuild-loader",
+              options: {
+                loader: "css",
+                minify: true,
+              },
+            },
+          ],
           exclude: /node_modules/,
         },
+      ],
+    },
+
+    optimization: {
+      minimizer: [
+        new ESBuildMinifyPlugin({
+          target: "es6",
+        }),
       ],
     },
 
@@ -134,7 +160,7 @@ module.exports = (env, argv) => {
       new WebpackBar({
         name: "cluster-ui",
         color: "cyan",
-        reporters: [ env.WEBPACK_WATCH ? "basic" : "fancy" ],
+        reporters: [ "basic" ],
         profile: true,
       }),
       new MomentLocalesPlugin(),
@@ -150,6 +176,9 @@ module.exports = (env, argv) => {
     // dependencies, which allows browsers to cache those libraries between builds.
     externals: {
       protobufjs: "protobufjs",
+      // Importing protobufjs/minimal resolves to the protobufjs module, but webpack's
+      // "externals" checking appears to be based on string comparisons.
+      "protobufjs/minimal": "protobufjs/minimal",
       react: {
         commonjs: "react",
         commonjs2: "react",
@@ -162,6 +191,7 @@ module.exports = (env, argv) => {
         amd: "react-dom",
         root: "ReactDom",
       },
+      "react-router": "react-router",
       "react-router-dom": "react-router-dom",
       "react-redux": "react-redux",
       "redux-saga": "redux-saga",

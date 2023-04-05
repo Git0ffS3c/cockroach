@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"math/bits"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -195,7 +196,32 @@ type BytesMonitor struct {
 
 		// maxBytesHist is the metric object used to track the high watermark of bytes
 		// allocated by the monitor during its lifetime.
-		maxBytesHist *metric.Histogram
+		maxBytesHist metric.IHistogram
+
+		// head is the head of the doubly-linked list of children of this
+		// monitor.
+		// NOTE: a child's mutex **cannot** be acquired while holding this
+		// monitor's lock since it could lead to deadlocks. The main allocation
+		// code path (reserveBytes() and releaseBytes()) might acquire the
+		// parent's lock, so only locking "upwards" is allowed while keeping the
+		// current monitor's lock.
+		head *BytesMonitor
+
+		// numChildren is the number of children of this BytesMonitor (i.e. the
+		// number of nodes in the linked list).
+		numChildren int
+
+		// stopped indicates whether this monitor has been stopped.
+		stopped bool
+	}
+
+	// parentMu encompasses the fields that must be accessed while holding the
+	// mutex of the parent monitor.
+	parentMu struct {
+		// prevSibling and nextSibling are references to the previous and the
+		// next siblings of this monitor (i.e. the previous and the next nodes
+		// in the doubly-linked list of children of the parent monitor).
+		prevSibling, nextSibling *BytesMonitor
 	}
 
 	// name identifies this monitor in logging messages.
@@ -212,7 +238,7 @@ type BytesMonitor struct {
 	// pool, reserved determines the maximum allocation capacity of this
 	// monitor. The reserved bytes are released to their owner monitor
 	// upon Stop.
-	reserved BoundAccount
+	reserved *BoundAccount
 
 	// limit specifies a hard limit on the number of bytes a monitor allows to
 	// be allocated. Note that this limit will not be observed if allocations
@@ -226,11 +252,99 @@ type BytesMonitor struct {
 	// pool.
 	poolAllocationSize int64
 
+	// relinquishAllOnReleaseBytes, if true, indicates that the monitor should
+	// relinquish all bytes on releaseBytes() call.
+	relinquishAllOnReleaseBytes bool
+
 	// noteworthyUsageBytes is the size beyond which total allocations start to
 	// become reported in the logs.
 	noteworthyUsageBytes int64
 
 	settings *cluster.Settings
+}
+
+// MonitorState describes the current state of a single monitor.
+type MonitorState struct {
+	// Level tracks how many "generations" away the current monitor is from the
+	// root.
+	Level int
+	// Name is the name of the monitor.
+	Name string
+	// ID is the "id" of the monitor (its address converted to int64).
+	ID int64
+	// ParentID is the "id" of the parent monitor (parent's address converted to
+	// int64), or 0 if the monitor doesn't have a parent.
+	ParentID int64
+	// Used is amount of bytes currently used by the monitor (as reported by
+	// curBudget.used). This doesn't include the usage registered with the
+	// reserved account.
+	Used int64
+	// ReservedUsed is amount of bytes currently consumed from the reserved
+	// account, or 0 if no reserved account was provided in Start.
+	ReservedUsed int64
+	// ReservedReserved is amount of bytes reserved in the reserved account, or
+	// 0 if no reserved account was provided in Start.
+	ReservedReserved int64
+}
+
+// TraverseTree traverses the tree of monitors rooted in the BytesMonitor. The
+// passed-in callback is called for each non-stopped monitor. If the callback
+// returns an error, the traversal stops immediately.
+//
+// Note that this state can be inconsistent since a parent's state is recorded
+// before its children without synchronization with children being stopped.
+// Namely, the parent's MonitorState might include the state of the monitors
+// that don't get the callback called on their MonitorState.
+func (mm *BytesMonitor) TraverseTree(monitorStateCb func(MonitorState) error) error {
+	return mm.traverseTree(0 /* level */, monitorStateCb)
+}
+
+// traverseTree recursively traverses the tree of monitors rooted in the current
+// monitor. If the monitor is stopped, then the tree is not traversed and the
+// callback is not called.
+func (mm *BytesMonitor) traverseTree(level int, monitorStateCb func(MonitorState) error) error {
+	mm.mu.Lock()
+	if mm.mu.stopped {
+		// The monitor has been stopped, so it should be ignored.
+		mm.mu.Unlock()
+		return nil
+	}
+	var reservedUsed, reservedReserved int64
+	if mm.reserved != nil {
+		reservedUsed = mm.reserved.used
+		reservedReserved = mm.reserved.reserved
+	}
+	id := uintptr(unsafe.Pointer(mm))
+	var parentID uintptr
+	if parent := mm.mu.curBudget.mon; parent != nil {
+		parentID = uintptr(unsafe.Pointer(parent))
+	}
+	monitorState := MonitorState{
+		Level:            level,
+		Name:             string(mm.name),
+		ID:               int64(id),
+		ParentID:         int64(parentID),
+		Used:             mm.mu.curBudget.used,
+		ReservedUsed:     reservedUsed,
+		ReservedReserved: reservedReserved,
+	}
+	// Note that we cannot call traverseTree on the children while holding mm's
+	// lock since it could lead to deadlocks. Instead, we store all children as
+	// of right now, and then export them after unlocking ourselves.
+	children := make([]*BytesMonitor, 0, mm.mu.numChildren)
+	for c := mm.mu.head; c != nil; c = c.parentMu.nextSibling {
+		children = append(children, c)
+	}
+	mm.mu.Unlock()
+	if err := monitorStateCb(monitorState); err != nil {
+		return err
+	}
+	for _, c := range children {
+		if err := c.traverseTree(level+1, monitorStateCb); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // maxAllocatedButUnusedBlocks determines the maximum difference between the
@@ -248,27 +362,28 @@ var DefaultPoolAllocationSize = envutil.EnvOrDefaultInt64("COCKROACH_ALLOCATION_
 
 // NewMonitor creates a new monitor.
 // Arguments:
-// - name is used to annotate log messages, can be used to distinguish
-//   monitors.
 //
-// - resource specifies what kind of resource the monitor is tracking
-//   allocations for (e.g. memory or disk).
+//   - name is used to annotate log messages, can be used to distinguish
+//     monitors.
 //
-// - curCount and maxHist are the metric objects to update with usage
-//   statistics. Can be nil.
+//   - resource specifies what kind of resource the monitor is tracking
+//     allocations for (e.g. memory or disk).
 //
-// - increment is the block size used for upstream allocations from
-//   the pool. Note: if set to 0 or lower, the default pool allocation
-//   size is used.
+//   - curCount and maxHist are the metric objects to update with usage
+//     statistics. Can be nil.
 //
-// - noteworthy determines the minimum total allocated size beyond
-//   which the monitor starts to log increases. Use 0 to always log
-//   or math.MaxInt64 to never log.
+//   - increment is the block size used for upstream allocations from
+//     the pool. Note: if set to 0 or lower, the default pool allocation
+//     size is used.
+//
+//   - noteworthy determines the minimum total allocated size beyond
+//     which the monitor starts to log increases. Use 0 to always log
+//     or math.MaxInt64 to never log.
 func NewMonitor(
 	name redact.RedactableString,
 	res Resource,
 	curCount *metric.Gauge,
-	maxHist *metric.Histogram,
+	maxHist metric.IHistogram,
 	increment int64,
 	noteworthy int64,
 	settings *cluster.Settings,
@@ -284,7 +399,7 @@ func NewMonitorWithLimit(
 	res Resource,
 	limit int64,
 	curCount *metric.Gauge,
-	maxHist *metric.Histogram,
+	maxHist metric.IHistogram,
 	increment int64,
 	noteworthy int64,
 	settings *cluster.Settings,
@@ -321,8 +436,6 @@ func NewMonitorWithLimit(
 func NewMonitorInheritWithLimit(
 	name redact.RedactableString, limit int64, m *BytesMonitor,
 ) *BytesMonitor {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	return NewMonitorWithLimit(
 		name,
 		m.resource,
@@ -335,14 +448,23 @@ func NewMonitorInheritWithLimit(
 	)
 }
 
+// noReserved is safe to be used by multiple monitors as the "reserved" account
+// since only its 'used' field will ever be read.
+var noReserved = BoundAccount{}
+
+// StartNoReserved is the same as Start when there is no pre-reserved budget.
+func (mm *BytesMonitor) StartNoReserved(ctx context.Context, pool *BytesMonitor) {
+	mm.Start(ctx, pool, &noReserved)
+}
+
 // Start begins a monitoring region.
 // Arguments:
-// - pool is the upstream monitor that provision allocations exceeding the
-//   pre-reserved budget. If pool is nil, no upstream allocations are possible
-//   and the pre-reserved budget determines the entire capacity of this monitor.
+//   - pool is the upstream monitor that provision allocations exceeding the
+//     pre-reserved budget. If pool is nil, no upstream allocations are possible
+//     and the pre-reserved budget determines the entire capacity of this monitor.
 //
 // - reserved is the pre-reserved budget (see above).
-func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved BoundAccount) {
+func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved *BoundAccount) {
 	if mm.mu.curAllocated != 0 {
 		panic(fmt.Sprintf("%s: started with %d bytes left over", mm.name, mm.mu.curAllocated))
 	}
@@ -352,6 +474,7 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 	mm.mu.curAllocated = 0
 	mm.mu.maxAllocated = 0
 	mm.mu.curBudget = pool.MakeBoundAccount()
+	mm.mu.stopped = false
 	mm.reserved = reserved
 	if log.V(2) {
 		poolname := redact.RedactableString("(none)")
@@ -363,6 +486,18 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 			humanizeutil.IBytes(mm.reserved.used),
 			poolname)
 	}
+	if pool != nil {
+		// If we have a "parent" monitor, then register mm as its child by
+		// making it the head of the doubly-linked list.
+		pool.mu.Lock()
+		if s := pool.mu.head; s != nil {
+			s.parentMu.prevSibling = mm
+			mm.parentMu.nextSibling = s
+		}
+		pool.mu.head = mm
+		pool.mu.numChildren++
+		pool.mu.Unlock()
+	}
 }
 
 // NewUnlimitedMonitor creates a new monitor and starts the monitor in
@@ -372,7 +507,7 @@ func NewUnlimitedMonitor(
 	name redact.RedactableString,
 	res Resource,
 	curCount *metric.Gauge,
-	maxHist *metric.Histogram,
+	maxHist metric.IHistogram,
 	noteworthy int64,
 	settings *cluster.Settings,
 ) *BytesMonitor {
@@ -386,7 +521,7 @@ func NewUnlimitedMonitor(
 		limit:                math.MaxInt64,
 		noteworthyUsageBytes: noteworthy,
 		poolAllocationSize:   DefaultPoolAllocationSize,
-		reserved:             MakeStandaloneBudget(math.MaxInt64),
+		reserved:             NewStandaloneBudget(math.MaxInt64),
 		settings:             settings,
 	}
 	m.mu.curBytesCount = curCount
@@ -411,11 +546,18 @@ func (mm *BytesMonitor) Name() string {
 	return string(mm.name)
 }
 
+// Limit returns the memory limit of the monitor.
+func (mm *BytesMonitor) Limit() int64 {
+	return mm.limit
+}
+
 const bytesMaxUsageLoggingThreshold = 100 * 1024
 
 func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
-	// NB: No need to lock mm.mu here, when StopMonitor() is called the
-	// monitor is not shared any more.
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	mm.mu.stopped = true
+
 	if log.V(1) && mm.mu.maxAllocated >= bytesMaxUsageLoggingThreshold {
 		log.InfofDepth(ctx, 1, "%s, bytes usage max %s",
 			mm.name,
@@ -440,12 +582,32 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 		mm.mu.maxBytesHist.RecordValue(val)
 	}
 
+	if parent := mm.mu.curBudget.mon; parent != nil {
+		// If we have a "parent" monitor, then unregister mm from the list of
+		// the parent's children.
+		parent.mu.Lock()
+		prev, next := mm.parentMu.prevSibling, mm.parentMu.nextSibling
+		if parent.mu.head == mm {
+			parent.mu.head = next
+		}
+		if prev != nil {
+			prev.parentMu.nextSibling = next
+		}
+		if next != nil {
+			next.parentMu.prevSibling = prev
+		}
+		parent.mu.numChildren--
+		parent.mu.Unlock()
+	}
+
 	// Disable the pool for further allocations, so that further
 	// uses outside of monitor control get errors.
 	mm.mu.curBudget.mon = nil
 
 	// Release the reserved budget to its original pool, if any.
-	mm.reserved.Clear(ctx)
+	if mm.reserved != &noReserved {
+		mm.reserved.Clear(ctx)
+	}
 }
 
 // MaximumBytes returns the maximum number of bytes that were allocated by this
@@ -464,7 +626,7 @@ func (mm *BytesMonitor) AllocBytes() int64 {
 }
 
 // SetMetrics sets the metric objects for the monitor.
-func (mm *BytesMonitor) SetMetrics(curCount *metric.Gauge, maxHist *metric.Histogram) {
+func (mm *BytesMonitor) SetMetrics(curCount *metric.Gauge, maxHist metric.IHistogram) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	mm.mu.curBytesCount = curCount
@@ -505,10 +667,9 @@ type BoundAccount struct {
 	Mu *syncutil.Mutex
 }
 
-// MakeStandaloneBudget creates a BoundAccount suitable for root
-// monitors.
-func MakeStandaloneBudget(capacity int64) BoundAccount {
-	return BoundAccount{used: capacity}
+// NewStandaloneBudget creates a BoundAccount suitable for root monitors.
+func NewStandaloneBudget(capacity int64) *BoundAccount {
+	return &BoundAccount{used: capacity}
 }
 
 // Used returns the number of bytes currently allocated through this account.
@@ -533,7 +694,7 @@ func (b *BoundAccount) Monitor() *BytesMonitor {
 	return b.mon
 }
 
-func (b *BoundAccount) allocated() int64 {
+func (b *BoundAccount) Allocated() int64 {
 	if b == nil {
 		return 0
 	}
@@ -543,6 +704,24 @@ func (b *BoundAccount) allocated() int64 {
 // MakeBoundAccount creates a BoundAccount connected to the given monitor.
 func (mm *BytesMonitor) MakeBoundAccount() BoundAccount {
 	return BoundAccount{mon: mm}
+}
+
+// TransferAccount creates a new account with the budget
+// allocated in the given origAccount.
+// The new account is owned by this monitor.
+//
+// If the operation succeeds, origAccount is released.
+// If an error occurs, origAccount remains open and the caller
+// remains responsible for closing / shrinking it.
+func (mm *BytesMonitor) TransferAccount(
+	ctx context.Context, origAccount *BoundAccount,
+) (newAccount BoundAccount, err error) {
+	b := mm.MakeBoundAccount()
+	if err = b.Grow(ctx, origAccount.used); err != nil {
+		return newAccount, err
+	}
+	origAccount.Close(ctx)
+	return b, nil
 }
 
 // Init initializes a BoundAccount, connecting it to the given monitor. It is
@@ -601,7 +780,7 @@ func (b *BoundAccount) Clear(ctx context.Context) {
 		return
 	}
 	if b.mon == nil {
-		// An account created by MakeStandaloneBudget is disconnected from any
+		// An account created by NewStandaloneBudget is disconnected from any
 		// monitor -- "bytes out of the aether". This needs not be closed.
 		return
 	}
@@ -611,16 +790,17 @@ func (b *BoundAccount) Clear(ctx context.Context) {
 }
 
 // Close releases all the cumulated allocations of an account at once.
+// TODO(yuzefovich): consider removing this method in favor of Clear.
 func (b *BoundAccount) Close(ctx context.Context) {
 	if b == nil {
 		return
 	}
 	if b.mon == nil {
-		// An account created by MakeStandaloneBudget is disconnected from any
+		// An account created by NewStandaloneBudget is disconnected from any
 		// monitor -- "bytes out of the aether". This needs not be closed.
 		return
 	}
-	if a := b.allocated(); a > 0 {
+	if a := b.Allocated(); a > 0 {
 		b.mon.releaseBytes(ctx, a)
 	}
 }
@@ -700,7 +880,7 @@ func (b *BoundAccount) Grow(ctx context.Context, x int64) error {
 //
 // If Mu is set, it is safe for use by concurrent goroutines.
 func (b *BoundAccount) Shrink(ctx context.Context, delta int64) {
-	if b == nil {
+	if b == nil || delta == 0 {
 		return
 	}
 	if b.Mu != nil {
@@ -836,18 +1016,27 @@ func (mm *BytesMonitor) roundSize(sz int64) int64 {
 func (mm *BytesMonitor) releaseBudget(ctx context.Context) {
 	// NB: mm.mu need not be locked here, as this is only called from StopMonitor().
 	if log.V(2) {
-		log.Infof(ctx, "%s: releasing %d bytes to the pool", mm.name, mm.mu.curBudget.allocated())
+		log.Infof(ctx, "%s: releasing %d bytes to the pool", mm.name, mm.mu.curBudget.Allocated())
 	}
 	mm.mu.curBudget.Clear(ctx)
+}
+
+// RelinquishAllOnReleaseBytes makes it so that the monitor doesn't keep any
+// margin bytes when the bytes are released from it.
+func (mm *BytesMonitor) RelinquishAllOnReleaseBytes() {
+	mm.relinquishAllOnReleaseBytes = true
 }
 
 // adjustBudget ensures that the monitor does not keep many more bytes reserved
 // from the pool than it currently has allocated. Bytes are relinquished when
 // there are at least maxAllocatedButUnusedBlocks*poolAllocationSize bytes
-// reserved but unallocated.
+// reserved but unallocated (if relinquishAllOnReleaseBytes is false).
 func (mm *BytesMonitor) adjustBudget(ctx context.Context) {
 	// NB: mm.mu Already locked by releaseBytes().
-	margin := mm.poolAllocationSize * int64(maxAllocatedButUnusedBlocks)
+	var margin int64
+	if !mm.relinquishAllOnReleaseBytes {
+		margin = mm.poolAllocationSize * int64(maxAllocatedButUnusedBlocks)
+	}
 
 	neededBytes := mm.mu.curAllocated
 	if neededBytes <= mm.reserved.used {

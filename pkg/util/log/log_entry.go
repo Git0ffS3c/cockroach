@@ -18,12 +18,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
-	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/cockroachdb/redact/interfaces"
@@ -38,7 +39,7 @@ import (
 // formatters. logpb.Entry, in comparison, was tailored specifically
 // to the legacy crdb-v1 formatter, and is a lossy representation.
 type logEntry struct {
-	idPayload
+	serverident.IDPayload
 
 	// The entry timestamp.
 	ts int64
@@ -190,10 +191,10 @@ func makeUnsafePayload(ctx context.Context, m string) entryPayload {
 
 // makeEntry creates a logEntry.
 func makeEntry(ctx context.Context, s Severity, c Channel, depth int) (res logEntry) {
-	ids := getIdentificationPayload(ctx)
+	ids := serverident.GetIdentificationPayload(ctx)
 
 	res = logEntry{
-		idPayload: ids,
+		IDPayload: ids,
 		ts:        timeutil.Now().UnixNano(),
 		sev:       s,
 		ch:        c,
@@ -209,7 +210,7 @@ func makeEntry(ctx context.Context, s Severity, c Channel, depth int) (res logEn
 
 // makeStructuredEntry creates a logEntry using a structured payload.
 func makeStructuredEntry(
-	ctx context.Context, s Severity, c Channel, depth int, payload eventpb.EventPayload,
+	ctx context.Context, s Severity, c Channel, depth int, payload logpb.EventPayload,
 ) (res logEntry) {
 	res = makeEntry(ctx, s, c, depth+1)
 
@@ -243,10 +244,29 @@ func makeUnstructuredEntry(
 		} else {
 			buf.Printf(format, args...)
 		}
+		// Collect and append the hints, if any.
+		for _, a := range args {
+			if e, ok := a.(error); ok {
+				h := errors.FlattenHints(e)
+				if h != "" {
+					buf.Printf("\nHINT: %s", h)
+				}
+			}
+		}
 		res.payload = makeRedactablePayload(ctx, buf.RedactableString())
 	} else {
 		var buf strings.Builder
 		formatArgs(&buf, format, args...)
+		// Collect and append the hints, if any.
+		for _, a := range args {
+			if e, ok := a.(error); ok {
+				h := errors.FlattenHints(e)
+				if h != "" {
+					buf.WriteString("\nHINT:")
+					buf.WriteString(h)
+				}
+			}
+		}
 		res.payload = makeUnsafePayload(ctx, buf.String())
 	}
 
@@ -277,9 +297,9 @@ func (l *sinkInfo) getStartLines(now time.Time) []*buffer {
 	messages := make([]*buffer, 0, 6)
 	messages = append(messages,
 		makeStartLine(f, "file created at: %s", redact.Safe(now.Format("2006/01/02 15:04:05"))),
-		makeStartLine(f, "running on machine: %s", fullHostName),
+		makeStartLine(f, "running on machine: %s", SafeManaged(fullHostName)),
 		makeStartLine(f, "binary: %s", redact.Safe(build.GetInfo().Short())),
-		makeStartLine(f, "arguments: %s", os.Args),
+		makeStartLine(f, "arguments: %s", SafeManaged(os.Args)),
 	)
 
 	// Including a non-ascii character in the first 1024 bytes of the log helps
@@ -306,6 +326,7 @@ func (e logEntry) convertToLegacy() (res logpb.Entry) {
 		Counter:    e.counter,
 		Redactable: e.payload.redactable,
 		Message:    e.payload.message,
+		TenantID:   e.TenantID(),
 	}
 
 	if e.payload.tags != nil {

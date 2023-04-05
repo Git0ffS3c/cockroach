@@ -16,9 +16,9 @@ import {
   DatabaseTablePageActions,
   DatabaseTablePageData,
   DatabaseTablePageDataDetails,
-  DatabaseTablePageDataStats,
   DatabaseTablePageIndexStats,
   util,
+  api as clusterUiApi,
 } from "@cockroachlabs/cluster-ui";
 
 import { AdminUIState, createAdminUIStore } from "src/redux/state";
@@ -26,7 +26,7 @@ import { databaseNameAttr, tableNameAttr } from "src/util/constants";
 import * as fakeApi from "src/util/fakeApi";
 import { mapStateToProps, mapDispatchToProps } from "./redux";
 import { makeTimestamp } from "src/views/databases/utils";
-import { assertDeepStrictEqual } from "src/test-utils";
+import moment from "moment";
 
 function fakeRouteComponentProps(
   k1: string,
@@ -85,22 +85,30 @@ class TestDriver {
   ) {
     // Assert moments are equal if not in pre-loading state.
     if (compareTimestamps) {
-      assertDeepStrictEqual(
+      expect(this.properties().indexStats.lastReset).toEqual(
         expected.indexStats.lastReset,
-        this.properties().indexStats.lastReset,
       );
     }
     delete this.properties().indexStats.lastReset;
     delete expected.indexStats.lastReset;
-    assertDeepStrictEqual(expected, this.properties());
+    expect(this.properties()).toEqual(expected);
   }
 
   assertTableDetails(expected: DatabaseTablePageDataDetails) {
-    assertDeepStrictEqual(expected, this.properties().details);
-  }
-
-  assertTableStats(expected: DatabaseTablePageDataStats) {
-    assertDeepStrictEqual(expected, this.properties().stats);
+    // We destructure the expected and actual payloads to extract the field
+    // with Moment type. Moment types cannot be compared using toEqual or toBe,
+    // we need to use moment's isSame function.
+    const { statsLastUpdated, ...rest } = this.properties().details;
+    const { statsLastUpdated: expectedStatsLastUpdated, ...expectedRest } =
+      expected;
+    expect(rest).toEqual(expectedRest);
+    expect(
+      // Moments are the same
+      moment(statsLastUpdated).isSame(expectedStatsLastUpdated) ||
+        // Moments are null.
+        (statsLastUpdated === expectedStatsLastUpdated &&
+          statsLastUpdated === null),
+    ).toBe(true);
   }
 
   assertIndexStats(
@@ -109,22 +117,18 @@ class TestDriver {
   ) {
     // Assert moments are equal if not in pre-loading state.
     if (compareTimestamps) {
-      assertDeepStrictEqual(
-        expected.stats[0].lastUsed,
+      expect(expected.stats[0].lastUsed).toEqual(
         this.properties().indexStats.stats[0].lastUsed,
       );
     }
     delete this.properties().indexStats.stats[0].lastUsed;
     delete expected.stats[0].lastUsed;
-    assertDeepStrictEqual(
-      expected.lastReset,
-      this.properties().indexStats.lastReset,
-    );
+    expect(expected.lastReset).toEqual(this.properties().indexStats.lastReset);
     delete this.properties().indexStats.lastReset;
     delete expected.lastReset;
 
     // Assert objects without moments are equal.
-    assertDeepStrictEqual(expected, this.properties().indexStats);
+    expect(this.properties().indexStats).toEqual(expected);
   }
 
   async refreshSettings() {
@@ -134,19 +138,15 @@ class TestDriver {
     return this.actions.refreshTableDetails(this.database, this.table);
   }
 
-  async refreshTableStats() {
-    return this.actions.refreshTableStats(this.database, this.table);
-  }
-
   async refreshIndexStats() {
     return this.actions.refreshIndexStats(this.database, this.table);
   }
 }
 
-describe("Database Table Page", function() {
+describe("Database Table Page", function () {
   let driver: TestDriver;
 
-  beforeEach(function() {
+  beforeEach(function () {
     driver = new TestDriver(
       createAdminUIStore(createMemoryHistory()),
       "DATABASE",
@@ -154,11 +154,11 @@ describe("Database Table Page", function() {
     );
   });
 
-  afterEach(function() {
+  afterEach(function () {
     fakeApi.restore();
   });
 
-  it("starts in a pre-loading state", async function() {
+  it("starts in a pre-loading state", async function () {
     fakeApi.stubClusterSettings({
       key_values: {
         "sql.stats.automatic_collection.enabled": { value: "true" },
@@ -175,23 +175,24 @@ describe("Database Table Page", function() {
         details: {
           loading: false,
           loaded: false,
+          lastError: undefined,
           createStatement: "",
           replicaCount: 0,
           indexNames: [],
           grants: [],
           statsLastUpdated: null,
-        },
-        automaticStatsCollectionEnabled: true,
-        stats: {
-          loading: false,
-          loaded: false,
+          livePercentage: 0,
+          liveBytes: 0,
+          totalBytes: 0,
           sizeInBytes: 0,
           rangeCount: 0,
           nodesByRegionString: "",
         },
+        automaticStatsCollectionEnabled: true,
         indexStats: {
           loading: false,
           loaded: false,
+          lastError: undefined,
           stats: [],
           lastReset: null,
         },
@@ -200,61 +201,91 @@ describe("Database Table Page", function() {
     );
   });
 
-  it("loads table details", async function() {
-    fakeApi.stubTableDetails("DATABASE", "TABLE", {
-      grants: [
-        { user: "admin", privileges: ["CREATE", "DROP"] },
-        { user: "public", privileges: ["SELECT"] },
+  it("loads table details", async function () {
+    const mockStatsLastCreatedTimestamp = moment();
+
+    fakeApi.stubSqlApiCall<clusterUiApi.TableDetailsRow>(
+      clusterUiApi.createTableDetailsReq("DATABASE", "TABLE"),
+      [
+        // Table ID query
+        { rows: [{ table_id: "1" }] },
+        // Table grants query
+        {
+          rows: [
+            { user: "admin", privileges: ["CREATE", "DROP"] },
+            { user: "public", privileges: ["SELECT"] },
+          ],
+        },
+        // Table schema details query
+        {
+          rows: [
+            {
+              columns: ["colA", "colB", "c"],
+              indexes: ["primary", "anotha", "one"],
+            },
+          ],
+        },
+        // Table create statement query
+        { rows: [{ create_statement: "CREATE TABLE foo" }] },
+        // Table zone config statement query
+        {},
+        // Table heuristics query
+        { rows: [{ stats_last_created_at: mockStatsLastCreatedTimestamp }] },
+        // Table span stats query
+        {
+          rows: [
+            {
+              approximate_disk_bytes: 23,
+              live_bytes: 45,
+              total_bytes: 45,
+              range_count: 56,
+              live_percentage: 1,
+            },
+          ],
+        },
+        // Table index usage statistics query
+        {
+          rows: [
+            {
+              last_read: new Date().toISOString(),
+              created_at: new Date().toISOString(),
+              unused_threshold: "1m",
+            },
+          ],
+        },
+        // Table zone config query
+        {},
+        // Table replicas query
+        {
+          rows: [{ replicas: [1, 2, 3, 4, 5] }],
+        },
       ],
-      indexes: [
-        { name: "primary" },
-        { name: "another_index", seq: new Long(1) },
-        { name: "another_index", seq: new Long(2) },
-      ],
-      create_table_statement: "CREATE TABLE foo",
-      zone_config: {
-        num_replicas: 5,
-      },
-      stats_last_created_at: makeTimestamp("0001-01-01T00:00:00Z"),
-    });
+    );
 
     await driver.refreshTableDetails();
 
     driver.assertTableDetails({
       loading: false,
       loaded: true,
+      lastError: null,
       createStatement: "CREATE TABLE foo",
       replicaCount: 5,
-      indexNames: ["primary", "another_index"],
+      indexNames: ["primary", "anotha", "one"],
       grants: [
-        { user: "admin", privilege: "CREATE" },
-        { user: "admin", privilege: "DROP" },
-        { user: "public", privilege: "SELECT" },
+        { user: "admin", privileges: ["CREATE", "DROP"] },
+        { user: "public", privileges: ["SELECT"] },
       ],
-      statsLastUpdated: util.TimestampToMoment(
-        makeTimestamp("0001-01-01T00:00:00Z"),
-      ),
+      statsLastUpdated: mockStatsLastCreatedTimestamp,
+      livePercentage: 1,
+      liveBytes: 45,
+      totalBytes: 45,
+      sizeInBytes: 23,
+      rangeCount: 56,
+      nodesByRegionString: "undefined(n1,n2,n3,n4,n5)",
     });
   });
 
-  it("loads table stats", async function() {
-    fakeApi.stubTableStats("DATABASE", "TABLE", {
-      range_count: new Long(4200),
-      approximate_disk_bytes: new Long(44040192),
-    });
-
-    await driver.refreshTableStats();
-
-    driver.assertTableStats({
-      loading: false,
-      loaded: true,
-      sizeInBytes: 44040192,
-      rangeCount: 4200,
-      nodesByRegionString: "",
-    });
-  });
-
-  it("loads index stats", async function() {
+  it("loads index stats", async function () {
     fakeApi.stubIndexStats("DATABASE", "TABLE", {
       statistics: [
         {
@@ -303,6 +334,7 @@ describe("Database Table Page", function() {
     driver.assertIndexStats({
       loading: false,
       loaded: true,
+      lastError: null,
       stats: [
         {
           indexName: "jobs_status_created_idx",

@@ -62,42 +62,31 @@ func ListenAndServeGRPC(
 
 var httpLogger = log.NewStdLogger(severity.ERROR, "net/http")
 
-// Server is a thin wrapper around http.Server. See MakeServer for more detail.
-type Server struct {
+// HTTPServer is a thin wrapper around http.Server. See MakeHTTPServer for more detail.
+type HTTPServer struct {
 	*http.Server
 }
 
-// MakeServer constructs a Server that tracks active connections,
+// MakeHTTPServer constructs a http.Server that tracks active connections,
 // closing them when signaled by stopper.
-//
-// It can serve two different purposes simultaneously:
-//
-// - to serve as actual HTTP server, using the .Serve(net.Listener) method.
-// - to serve as plain TCP server, using the .ServeWith(...) method.
-//
-// The latter is used e.g. to accept SQL client connections.
-//
-// When the HTTP facility is not used, the Go HTTP server object is
-// still used internally to maintain/register the connections via the
-// ConnState() method, for convenience.
-func MakeServer(
+func MakeHTTPServer(
 	ctx context.Context, stopper *stop.Stopper, tlsConfig *tls.Config, handler http.Handler,
-) Server {
+) HTTPServer {
 	var mu syncutil.Mutex
 	activeConns := make(map[net.Conn]struct{})
-	server := Server{
+	server := HTTPServer{
 		Server: &http.Server{
 			Handler:   handler,
 			TLSConfig: tlsConfig,
 			ConnState: func(conn net.Conn, state http.ConnState) {
 				mu.Lock()
+				defer mu.Unlock()
 				switch state {
 				case http.StateNew:
 					activeConns[conn] = struct{}{}
 				case http.StateClosed:
 					delete(activeConns, conn)
 				}
-				mu.Unlock()
 			},
 			ErrorLog: httpLogger,
 		},
@@ -113,10 +102,10 @@ func MakeServer(
 		<-stopper.ShouldQuiesce()
 
 		mu.Lock()
+		defer mu.Unlock()
 		for conn := range activeConns {
 			conn.Close()
 		}
-		mu.Unlock()
 	}
 	if err := stopper.RunAsyncTask(ctx, "http2-wait-quiesce", waitQuiesce); err != nil {
 		waitQuiesce(ctx)
@@ -125,18 +114,58 @@ func MakeServer(
 	return server
 }
 
+// MakeTCPServer constructs a connection server that tracks active connections,
+// closing them when signaled by stopper.
+func MakeTCPServer(ctx context.Context, stopper *stop.Stopper) *TCPServer {
+	server := &TCPServer{
+		stopper:     stopper,
+		activeConns: make(map[net.Conn]struct{}),
+	}
+
+	waitQuiesce := func(context.Context) {
+		<-stopper.ShouldQuiesce()
+
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		for conn := range server.activeConns {
+			conn.Close()
+		}
+	}
+	if err := stopper.RunAsyncTask(ctx, "tcp-wait-quiesce", waitQuiesce); err != nil {
+		waitQuiesce(ctx)
+	}
+	return server
+}
+
+// TCPServer is wrapper around a map of active connections.
+type TCPServer struct {
+	mu          syncutil.Mutex
+	stopper     *stop.Stopper
+	activeConns map[net.Conn]struct{}
+}
+
+func (s *TCPServer) addConn(n net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeConns[n] = struct{}{}
+}
+
+func (s *TCPServer) rmConn(n net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.activeConns, n)
+}
+
 // ServeWith accepts connections on ln and serves them using serveConn.
-func (s *Server) ServeWith(
-	ctx context.Context,
-	stopper *stop.Stopper,
-	l net.Listener,
-	serveConn func(context.Context, net.Conn),
+func (s *TCPServer) ServeWith(
+	ctx context.Context, l net.Listener, serveConn func(context.Context, net.Conn),
 ) error {
 	// Inspired by net/http.(*Server).Serve
 	var tempDelay time.Duration // how long to sleep on accept failure
 	for {
 		rw, e := l.Accept()
 		if e != nil {
+			//lint:ignore SA1019 see discussion at https://github.com/cockroachdb/cockroach/pull/84590#issuecomment-1192709976
 			if ne := (net.Error)(nil); errors.As(e, &ne) && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
@@ -153,12 +182,9 @@ func (s *Server) ServeWith(
 			return e
 		}
 		tempDelay = 0
-		err := stopper.RunAsyncTask(ctx, "pgwire-serve", func(ctx context.Context) {
-			defer stopper.Recover(ctx)
-			// NB: ConnState is used to manage the list of active connections that
-			// need draining; see MakeServer().
-			s.Server.ConnState(rw, http.StateNew) // before Serve can return
-			defer s.Server.ConnState(rw, http.StateClosed)
+		err := s.stopper.RunAsyncTask(ctx, "tcp-serve", func(ctx context.Context) {
+			s.addConn(rw)
+			defer s.rmConn(rw)
 			serveConn(ctx, rw)
 		})
 		if err != nil {
@@ -171,6 +197,7 @@ func (s *Server) ServeWith(
 // cmux.ErrListenerClosed, grpc.ErrServerStopped, io.EOF, or net.ErrClosed.
 func IsClosedConnection(err error) bool {
 	if netError := net.Error(nil); errors.As(err, &netError) {
+		//lint:ignore SA1019 see discussion at https://github.com/cockroachdb/cockroach/pull/84590#issuecomment-1192709976
 		return !netError.Temporary()
 	}
 	return errors.IsAny(err, cmux.ErrListenerClosed, grpc.ErrServerStopped, io.EOF, net.ErrClosed) ||
@@ -195,7 +222,7 @@ type InitialHeartbeatFailedError struct {
 
 var _ error = (*InitialHeartbeatFailedError)(nil)
 var _ fmt.Formatter = (*InitialHeartbeatFailedError)(nil)
-var _ errors.Formatter = (*InitialHeartbeatFailedError)(nil)
+var _ errors.SafeFormatter = (*InitialHeartbeatFailedError)(nil)
 
 // Error implements error.
 func (e *InitialHeartbeatFailedError) Error() string { return fmt.Sprintf("%v", e) }
@@ -203,12 +230,12 @@ func (e *InitialHeartbeatFailedError) Error() string { return fmt.Sprintf("%v", 
 // Cause implements causer.
 func (e *InitialHeartbeatFailedError) Cause() error { return e.WrappedErr }
 
-// Format implements fmt.Formatter.
+// Format formats the error.
 func (e *InitialHeartbeatFailedError) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }
 
-// FormatError implements errors.FormatError.
-func (e *InitialHeartbeatFailedError) FormatError(p errors.Printer) error {
-	p.Print("initial connection heartbeat failed")
+// SafeFormatError implements errors.SafeFormatter.
+func (e *InitialHeartbeatFailedError) SafeFormatError(p errors.Printer) (next error) {
+	p.Printf("initial connection heartbeat failed")
 	return e.WrappedErr
 }
 

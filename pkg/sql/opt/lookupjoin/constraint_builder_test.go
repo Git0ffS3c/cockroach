@@ -29,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	tu "github.com/cockroachdb/cockroach/pkg/testutils"
+	tu "github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/datadriven"
 )
@@ -45,25 +45,25 @@ import (
 //
 //       Information about the left columns.
 
-//     - right=(<column> <type> [not null] [as <expr> [stored|virtual], ...)
+// - right=(<column> <type> [not null] [as <expr> [stored|virtual], ...)
 //
-//       Information about the left columns.
+//	Information about the left columns.
 //
-//     - index=(<column> [asc|desc], ...)
+// - index=(<column> [asc|desc], ...)
 //
-//       Information for the index on the right table.
-//
+//	Information for the index on the right table.
 func TestLookupConstraints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	datadriven.Walk(t, tu.TestDataPath(t), func(t *testing.T, path string) {
 		semaCtx := tree.MakeSemaContext()
 		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+		evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
 
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			testCatalog := testcat.New()
 			var f norm.Factory
-			f.Init(&evalCtx, testCatalog)
+			f.Init(context.Background(), &evalCtx, testCatalog)
 			md := f.Metadata()
 
 			for _, arg := range d.CmdArgs {
@@ -141,12 +141,10 @@ func TestLookupConstraints(t *testing.T) {
 				}
 
 				var cb lookupjoin.ConstraintBuilder
-				ok := cb.Init(&f, md, f.EvalContext(), rightTable, leftCols, rightCols, filters)
-				if !ok {
-					return "lookup join not possible"
-				}
+				cb.Init(&f, md, f.EvalContext(), rightTable, leftCols, rightCols)
 
-				lookupConstraint := cb.Build(index, filters, optionalFilters)
+				lookupConstraint, _ := cb.Build(index, filters, optionalFilters,
+					memo.FiltersExpr{} /* derivedFkOnFilters */)
 				var b strings.Builder
 				if lookupConstraint.IsUnconstrained() {
 					b.WriteString("lookup join not possible")
@@ -223,7 +221,7 @@ func TestIsCanonicalFilter(t *testing.T) {
 			want:   true,
 		},
 		{name: "and-eq-lt",
-			filter: "i = 10 AND i < 10",
+			filter: "i = 9 AND i < 10",
 			want:   false,
 		},
 		{name: "or-eq-lt",
@@ -282,7 +280,8 @@ func makeFilters(
 	}
 
 	// Create a fake Select and input so that normalization rules are run.
-	p := &props.Relational{OutputCols: cols, Cardinality: card, Stats: stats}
+	p := &props.Relational{OutputCols: cols, Cardinality: card}
+	*p.Statistics() = stats
 	fakeRel := f.ConstructFakeRel(&memo.FakeRelPrivate{Props: p})
 	sel := f.ConstructSelect(fakeRel, filters)
 
@@ -321,8 +320,9 @@ func makeFiltersExpr(
 
 func formatScalar(e opt.Expr, f *norm.Factory, evalCtx *eval.Context) string {
 	execBld := execbuilder.New(
-		nil /* execFactory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
+		context.Background(), nil /* execFactory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
 		e, evalCtx, false, /* allowAutoCommit */
+		false, /* isANSIDML */
 	)
 	expr, err := execBld.BuildScalar()
 	if err != nil {
@@ -349,7 +349,7 @@ type testFilterBuilder struct {
 func makeFilterBuilder(t *testing.T) testFilterBuilder {
 	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	var f norm.Factory
-	f.Init(&evalCtx, nil)
+	f.Init(context.Background(), &evalCtx, nil)
 	cat := testcat.New()
 	if _, err := cat.ExecuteDDL("CREATE TABLE a (i INT PRIMARY KEY, b BOOL)"); err != nil {
 		t.Fatal(err)

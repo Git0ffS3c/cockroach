@@ -84,15 +84,20 @@ type KVAccessor interface {
 // for the span[3].
 //
 // [1]: The contents of the StoreReader and ProtectedTSReader at t1 corresponds
-//      exactly to the contents of the global span configuration state at t0
-//      where t0 <= t1. If the StoreReader or ProtectedTSReader is read from at
-//      t2 where t2 > t1, it's guaranteed to observe a view of the global state
-//      at t >= t0.
+//
+//	exactly to the contents of the global span configuration state at t0
+//	where t0 <= t1. If the StoreReader or ProtectedTSReader is read from at
+//	t2 where t2 > t1, it's guaranteed to observe a view of the global state
+//	at t >= t0.
+//
 // [2]: For the canonical KVSubscriber implementation, this is typically lagging
-//      by the closed timestamp target duration.
+//
+//	by the closed timestamp target duration.
+//
 // [3]: The canonical KVSubscriber implementation is bounced whenever errors
-//      occur, which may result in the re-transmission of earlier updates
-//      (typically through a coarsely targeted [min,max) span).
+//
+//	occur, which may result in the re-transmission of earlier updates
+//	(typically through a coarsely targeted [min,max) span).
 type KVSubscriber interface {
 	StoreReader
 	ProtectedTSReader
@@ -106,23 +111,22 @@ type KVSubscriber interface {
 //
 // Concretely, for the following zone configuration hierarchy:
 //
-//    CREATE DATABASE db;
-//    CREATE TABLE db.t1();
-//    ALTER DATABASE db CONFIGURE ZONE USING num_replicas=7;
-//    ALTER TABLE db.t1 CONFIGURE ZONE USING num_voters=5;
+//	CREATE DATABASE db;
+//	CREATE TABLE db.t1();
+//	ALTER DATABASE db CONFIGURE ZONE USING num_replicas=7;
+//	ALTER TABLE db.t1 CONFIGURE ZONE USING num_voters=5;
 //
 // The SQLTranslator produces the following translation (represented as a diff
 // against RANGE DEFAULT for brevity):
 //
-// 		Table/5{3-4}                  num_replicas=7 num_voters=5
+//	Table/5{3-4}                  num_replicas=7 num_voters=5
 type SQLTranslator interface {
 	// Translate generates the span configuration state given a list of
 	// {descriptor, named zone} IDs. Entries are unique, and are omitted for IDs
 	// that don't exist.
 	// Additionally, if `generateSystemSpanConfigurations` is set to true,
 	// Translate will generate all the span configurations that apply to
-	// `spanconfig.SystemTargets`. The timestamp at which the translation is valid
-	// is also returned.
+	// `spanconfig.SystemTargets`.
 	//
 	// For every ID we first descend the zone configuration hierarchy with the
 	// ID as the root to accumulate IDs of all leaf objects. Leaf objects are
@@ -132,14 +136,17 @@ type SQLTranslator interface {
 	// for each one of these accumulated IDs, we generate <span, config> tuples
 	// by following up the inheritance chain to fully hydrate the span
 	// configuration. Translate also accounts for and negotiates subzone spans.
-	Translate(ctx context.Context, ids descpb.IDs,
-		generateSystemSpanConfigurations bool) ([]Record, hlc.Timestamp, error)
+	Translate(
+		ctx context.Context,
+		ids descpb.IDs,
+		generateSystemSpanConfigurations bool,
+	) ([]Record, error)
 }
 
 // FullTranslate translates the entire SQL zone configuration state to the span
 // configuration state. The timestamp at which such a translation is valid is
 // also returned.
-func FullTranslate(ctx context.Context, s SQLTranslator) ([]Record, hlc.Timestamp, error) {
+func FullTranslate(ctx context.Context, s SQLTranslator) ([]Record, error) {
 	// As RANGE DEFAULT is the root of all zone configurations (including other
 	// named zones for the system tenant), we can construct the entire span
 	// configuration state by starting from RANGE DEFAULT.
@@ -267,8 +274,8 @@ type StoreWriter interface {
 // StoreReader is the read-only portion of the Store interface. It doubles as an
 // adaptor interface for config.SystemConfig.
 type StoreReader interface {
-	NeedsSplit(ctx context.Context, start, end roachpb.RKey) bool
-	ComputeSplitKey(ctx context.Context, start, end roachpb.RKey) roachpb.RKey
+	NeedsSplit(ctx context.Context, start, end roachpb.RKey) (bool, error)
+	ComputeSplitKey(ctx context.Context, start, end roachpb.RKey) (roachpb.RKey, error)
 	GetSpanConfigForKey(ctx context.Context, key roachpb.RKey) (roachpb.SpanConfig, error)
 }
 
@@ -286,28 +293,27 @@ type Limiter interface {
 // indexes, partitions and sub-partitions) and figures out the actual key
 // boundaries that we may need to split over. For example:
 //
-//		CREATE TABLE db.parts(i INT PRIMARY KEY, j INT) PARTITION BY LIST (i) (
-//			PARTITION one_and_five    VALUES IN (1, 5),
-//			PARTITION four_and_three  VALUES IN (4, 3),
-//			PARTITION everything_else VALUES IN (6, default)
-//		);
+//	CREATE TABLE db.parts(i INT PRIMARY KEY, j INT) PARTITION BY LIST (i) (
+//		PARTITION one_and_five    VALUES IN (1, 5),
+//		PARTITION four_and_three  VALUES IN (4, 3),
+//		PARTITION everything_else VALUES IN (6, default)
+//	);
 //
 // We'd spit out 15:
 //
-//	+ 1  between start of table and start of 1st index
-//	+ 1  between start of index and start of 1st partition-by-list value
-//	+ 1  for 1st partition-by-list value
-//	+ 1  for 2nd partition-by-list value
-//	+ 1  for 3rd partition-by-list value
-//	+ 1  for 4th partition-by-list value
-//	+ 1  for 5th partition-by-list value
-//	+ 1  for 6th partition-by-list value
-//	+ 5  gap(s) between 6 partition-by-list value spans
-//	+ 1  between end of 6th partition-by-list value span and end of index
-//	+ 13 for 1st index
-//	+ 1  between end of 1st index and end of table
-//	= 15
-//
+//   - 1  between start of table and start of 1st index
+//   - 1  between start of index and start of 1st partition-by-list value
+//   - 1  for 1st partition-by-list value
+//   - 1  for 2nd partition-by-list value
+//   - 1  for 3rd partition-by-list value
+//   - 1  for 4th partition-by-list value
+//   - 1  for 5th partition-by-list value
+//   - 1  for 6th partition-by-list value
+//   - 5  gap(s) between 6 partition-by-list value spans
+//   - 1  between end of 6th partition-by-list value span and end of index
+//   - 13 for 1st index
+//   - 1  between end of 1st index and end of table
+//     = 15
 type Splitter interface {
 	Splits(ctx context.Context, table catalog.TableDescriptor) (int, error)
 }
@@ -344,6 +350,19 @@ func Delta(
 
 	delta := uncommittedSplits - committedSplits
 	return delta, nil
+}
+
+// Reporter generates a conformance report over the given spans, i.e. whether
+// the backing ranges conform to the span configs that apply to them.
+//
+// NB: The standard implementation does not use a point-in-time snapshot of span
+// config state, but could be made to do so if needed. See commentary on the
+// spanconfigreporter.Reporter type for more details ("... we might not have a
+// point-in-time snapshot ...").
+type Reporter interface {
+	SpanConfigConformance(
+		ctx context.Context, spans []roachpb.Span,
+	) (roachpb.SpanConfigConformanceReport, error)
 }
 
 // SQLUpdate captures either a descriptor or a protected timestamp update.

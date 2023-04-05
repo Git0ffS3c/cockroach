@@ -24,15 +24,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvtenant"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil/singleflight"
@@ -69,7 +73,7 @@ type Connector struct {
 	rpcContext      *rpc.Context
 	rpcRetryOptions retry.Options
 	rpcDialTimeout  time.Duration // for testing
-	rpcDial         singleflight.Group
+	rpcDial         *singleflight.Group
 	defaultZoneCfg  *zonepb.ZoneConfig
 	addrs           []string
 
@@ -77,6 +81,7 @@ type Connector struct {
 		syncutil.RWMutex
 		client               *client
 		nodeDescs            map[roachpb.NodeID]*roachpb.NodeDescriptor
+		storeDescs           map[roachpb.StoreID]*roachpb.StoreDescriptor
 		systemConfig         *config.SystemConfig
 		systemConfigChannels map[chan<- struct{}]struct{}
 	}
@@ -93,8 +98,10 @@ type Connector struct {
 
 // client represents an RPC client that proxies to a KV instance.
 type client struct {
-	roachpb.InternalClient
+	kvpb.InternalClient
 	serverpb.StatusClient
+	serverpb.AdminClient
+	tspb.TimeSeriesClient
 }
 
 // Connector is capable of providing information on each of the KV nodes in the
@@ -116,18 +123,24 @@ var _ rangecache.RangeDescriptorDB = (*Connector)(nil)
 // network.
 var _ config.SystemConfigProvider = (*Connector)(nil)
 
-// Connector is capable of find the region of every node in the cluster.
-// This is necessary for region validation for zone configurations and
-// multi-region primitives.
-var _ serverpb.RegionsServer = (*Connector)(nil)
-
 // Connector is capable of finding debug information about the current
 // tenant within the cluster. This is necessary for things such as
 // debug zip and range reports.
 var _ serverpb.TenantStatusServer = (*Connector)(nil)
 
+// Connector is capable of finding debug information about the cluster
+// the tenant belongs to. This is necessary for proper functioning of
+// the DB Console in cases where the tenant has privileges allowing it
+// to access system-level information.
+var _ serverpb.TenantAdminServer = (*Connector)(nil)
+var _ tspb.TenantTimeSeriesServer = (*Connector)(nil)
+
 // Connector is capable of accessing span configurations for secondary tenants.
 var _ spanconfig.KVAccessor = (*Connector)(nil)
+
+// Reporter is capable of generating span configuration conformance reports for
+// secondary tenants.
+var _ spanconfig.Reporter = (*Connector)(nil)
 
 // NewConnector creates a new Connector.
 // NOTE: Calling Start will set cfg.RPCContext.ClusterID.
@@ -140,12 +153,14 @@ func NewConnector(cfg kvtenant.ConnectorConfig, addrs []string) *Connector {
 		tenantID:        cfg.TenantID,
 		AmbientContext:  cfg.AmbientCtx,
 		rpcContext:      cfg.RPCContext,
+		rpcDial:         singleflight.NewGroup("dial tenant connector", singleflight.NoTags),
 		rpcRetryOptions: cfg.RPCRetryOptions,
 		defaultZoneCfg:  cfg.DefaultZoneConfig,
 		addrs:           addrs,
 	}
 
 	c.mu.nodeDescs = make(map[roachpb.NodeID]*roachpb.NodeDescriptor)
+	c.mu.storeDescs = make(map[roachpb.StoreID]*roachpb.StoreDescriptor)
 	c.mu.systemConfigChannels = make(map[chan<- struct{}]struct{})
 	c.settingsMu.allTenantOverrides = make(map[string]settings.EncodedValue)
 	c.settingsMu.specificOverrides = make(map[string]settings.EncodedValue)
@@ -199,6 +214,9 @@ func (c *Connector) Start(ctx context.Context) error {
 			settingsStartupCh = nil
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-c.rpcContext.Stopper.ShouldQuiesce():
+			log.Infof(ctx, "kv connector asked to shut down before full start")
+			return errors.New("request to shut down early")
 		}
 	}
 	return nil
@@ -213,7 +231,7 @@ func (c *Connector) runGossipSubscription(ctx context.Context, startupCh chan st
 		if err != nil {
 			continue
 		}
-		stream, err := client.GossipSubscription(ctx, &roachpb.GossipSubscriptionRequest{
+		stream, err := client.GossipSubscription(ctx, &kvpb.GossipSubscriptionRequest{
 			Patterns: gossipSubsPatterns,
 		})
 		if err != nil {
@@ -258,7 +276,9 @@ var gossipSubsHandlers = map[string]func(*Connector, context.Context, string, ro
 	// Subscribe to the ClusterID update.
 	gossip.KeyClusterID: (*Connector).updateClusterID,
 	// Subscribe to all *NodeDescriptor updates.
-	gossip.MakePrefixPattern(gossip.KeyNodeIDPrefix): (*Connector).updateNodeAddress,
+	gossip.MakePrefixPattern(gossip.KeyNodeDescPrefix): (*Connector).updateNodeAddress,
+	// Subscribe to all *StoreDescriptor updates.
+	gossip.MakePrefixPattern(gossip.KeyStoreDescPrefix): (*Connector).updateStoreMap,
 	// Subscribe to a filtered view of *SystemConfig updates.
 	gossip.KeyDeprecatedSystemConfig: (*Connector).updateSystemConfig,
 }
@@ -308,13 +328,47 @@ func (c *Connector) updateNodeAddress(ctx context.Context, key string, content r
 	c.mu.nodeDescs[desc.NodeID] = desc
 }
 
+// updateStoreMap handles updates to "store" gossip keys, performing the
+// corresponding update to the Connector's cached StoreDescriptor set.
+func (c *Connector) updateStoreMap(ctx context.Context, key string, content roachpb.Value) {
+	desc := new(roachpb.StoreDescriptor)
+	if err := content.GetProto(desc); err != nil {
+		log.Errorf(ctx, "could not unmarshal store descriptor: %v", err)
+		return
+	}
+
+	// TODO(nvanbenschoten): this doesn't handle StoreDescriptor removal from the
+	// gossip network. See comment in updateNodeAddress.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mu.storeDescs[desc.StoreID] = desc
+}
+
 // GetNodeDescriptor implements the kvcoord.NodeDescStore interface.
 func (c *Connector) GetNodeDescriptor(nodeID roachpb.NodeID) (*roachpb.NodeDescriptor, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	desc, ok := c.mu.nodeDescs[nodeID]
 	if !ok {
-		return nil, errors.Errorf("unable to look up descriptor for n%d", nodeID)
+		return nil, errorutil.NewNodeNotFoundError(nodeID)
+	}
+	return desc, nil
+}
+
+// GetNodeDescriptorCount implements the kvcoord.NodeDescStore interface.
+func (c *Connector) GetNodeDescriptorCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.mu.nodeDescs)
+}
+
+// GetStoreDescriptor implements the kvcoord.NodeDescStore interface.
+func (c *Connector) GetStoreDescriptor(storeID roachpb.StoreID) (*roachpb.StoreDescriptor, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	desc, ok := c.mu.storeDescs[storeID]
+	if !ok {
+		return nil, errorutil.NewStoreNotFoundError(storeID)
 	}
 	return desc, nil
 }
@@ -374,7 +428,7 @@ func (c *Connector) RegisterSystemConfigChannel() (_ <-chan struct{}, unregister
 
 // RangeLookup implements the kvcoord.RangeDescriptorDB interface.
 func (c *Connector) RangeLookup(
-	ctx context.Context, key roachpb.RKey, useReverseScan bool,
+	ctx context.Context, key roachpb.RKey, rc rangecache.RangeLookupConsistency, useReverseScan bool,
 ) ([]roachpb.RangeDescriptor, []roachpb.RangeDescriptor, error) {
 	// Proxy range lookup requests through the Internal service.
 	ctx = c.AnnotateCtx(ctx)
@@ -383,21 +437,13 @@ func (c *Connector) RangeLookup(
 		if err != nil {
 			continue
 		}
-		resp, err := client.RangeLookup(ctx, &roachpb.RangeLookupRequest{
+		resp, err := client.RangeLookup(ctx, &kvpb.RangeLookupRequest{
 			Key: key,
-			// We perform the range lookup scan with a READ_UNCOMMITTED consistency
-			// level because we want the scan to return intents as well as committed
-			// values. The reason for this is because it's not clear whether the
-			// intent or the previous value points to the correct location of the
-			// Range. It gets even more complicated when there are split-related
-			// intents or a txn record co-located with a replica involved in the
-			// split. Since we cannot know the correct answer, we lookup both the
-			// pre- and post- transaction values.
-			ReadConsistency: roachpb.READ_UNCOMMITTED,
-			// Until we add protection in the Internal service implementation to
-			// prevent prefetching from traversing into RangeDescriptors owned by
-			// other tenants, we must disable prefetching.
-			PrefetchNum:     0,
+			// See the comment on (*kvcoord.DistSender).RangeLookup or kv.RangeLookup
+			// for more discussion on the choice of ReadConsistency and its
+			// implications.
+			ReadConsistency: rc,
+			PrefetchNum:     kvcoord.RangeLookupPrefetchCount,
 			PrefetchReverse: useReverseScan,
 		})
 		if err != nil {
@@ -416,37 +462,40 @@ func (c *Connector) RangeLookup(
 		}
 		return resp.Descriptors, resp.PrefetchedDescriptors, nil
 	}
-	return nil, nil, ctx.Err()
+	return nil, nil, errors.Wrap(ctx.Err(), "range lookup")
 }
 
-// Regions implements the serverpb.RegionsServer interface.
+// Nodes implements the serverpb.TenantStatusServer interface
+func (c *Connector) Nodes(
+	ctx context.Context, req *serverpb.NodesRequest,
+) (resp *serverpb.NodesResponse, retErr error) {
+	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
+		resp, err = client.Nodes(ctx, req)
+		return
+	})
+	return
+}
+
+// Regions implements the serverpb.TenantStatusServer interface
 func (c *Connector) Regions(
 	ctx context.Context, req *serverpb.RegionsRequest,
-) (resp *serverpb.RegionsResponse, _ error) {
-	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
-		var err error
-		resp, err = c.Regions(ctx, req)
-		return err
-	}); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+) (resp *serverpb.RegionsResponse, retErr error) {
+	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
+		resp, err = client.Regions(ctx, req)
+		return
+	})
+	return
 }
 
 // TenantRanges implements the serverpb.TenantStatusServer interface
 func (c *Connector) TenantRanges(
 	ctx context.Context, req *serverpb.TenantRangesRequest,
-) (resp *serverpb.TenantRangesResponse, _ error) {
-	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
-		var err error
-		resp, err = c.TenantRanges(ctx, req)
-		return err
-	}); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+) (resp *serverpb.TenantRangesResponse, retErr error) {
+	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
+		resp, err = client.TenantRanges(ctx, req)
+		return
+	})
+	return
 }
 
 // FirstRange implements the kvcoord.RangeDescriptorDB interface.
@@ -454,10 +503,58 @@ func (c *Connector) FirstRange() (*roachpb.RangeDescriptor, error) {
 	return nil, status.Error(codes.Unauthenticated, "kvtenant.Proxy does not have access to FirstRange")
 }
 
+// NewIterator implements the rangedesc.IteratorFactory interface.
+func (c *Connector) NewIterator(
+	ctx context.Context, span roachpb.Span,
+) (rangedesc.Iterator, error) {
+	var rangeDescriptors []roachpb.RangeDescriptor
+	for ctx.Err() == nil {
+		rangeDescriptors = rangeDescriptors[:0] // clear out.
+		client, err := c.getClient(ctx)
+		if err != nil {
+			continue
+		}
+		stream, err := client.GetRangeDescriptors(ctx, &kvpb.GetRangeDescriptorsRequest{
+			Span: span,
+		})
+		if err != nil {
+			// TODO(arul): We probably don't want to treat all errors here as "soft".
+			// for example, it doesn't make much sense to retry the request if it fails
+			// the keybounds check.
+			// Soft RPC error. Drop client and retry.
+			log.Warningf(ctx, "error issuing GetRangeDescriptors RPC: %v", err)
+			c.tryForgetClient(ctx, client)
+			continue
+		}
+
+		for ctx.Err() == nil {
+			e, err := stream.Recv()
+			if err != nil {
+				if err == io.EOF {
+					return &rangeDescIterator{
+						rangeDescs: rangeDescriptors,
+						curIdx:     0,
+					}, nil
+				}
+				log.Warningf(ctx, "error consuming GetRangeDescriptors RPC: %v", err)
+				if grpcutil.IsAuthError(err) {
+					// Authentication or authorization error. Propagate.
+					return nil, err
+				}
+				// Soft RPC error. Drop client and retry.
+				c.tryForgetClient(ctx, client)
+				break
+			}
+			rangeDescriptors = append(rangeDescriptors, e.RangeDescriptors...)
+		}
+	}
+	return nil, errors.Wrap(ctx.Err(), "new iterator")
+}
+
 // TokenBucket implements the kvtenant.TokenBucketProvider interface.
 func (c *Connector) TokenBucket(
-	ctx context.Context, in *roachpb.TokenBucketRequest,
-) (*roachpb.TokenBucketResponse, error) {
+	ctx context.Context, in *kvpb.TokenBucketRequest,
+) (*kvpb.TokenBucketResponse, error) {
 	// Proxy token bucket requests through the Internal service.
 	ctx = c.AnnotateCtx(ctx)
 	for ctx.Err() == nil {
@@ -482,7 +579,7 @@ func (c *Connector) TokenBucket(
 		}
 		return resp, nil
 	}
-	return nil, ctx.Err()
+	return nil, errors.Wrap(ctx.Err(), "token bucket")
 }
 
 // GetSpanConfigRecords implements the spanconfig.KVAccessor interface.
@@ -494,7 +591,7 @@ func (c *Connector) GetSpanConfigRecords(
 			Targets: spanconfig.TargetsToProtos(targets),
 		})
 		if err != nil {
-			return err
+			return errors.Wrap(err, "get span configs error")
 		}
 
 		records, err = spanconfig.EntriesToRecords(resp.SpanConfigEntries)
@@ -524,7 +621,7 @@ func (c *Connector) UpdateSpanConfigRecords(
 			MaxCommitTimestamp: maxCommitTS,
 		})
 		if err != nil {
-			return err
+			return errors.Wrap(err, "update span configs error")
 		}
 		if resp.Error.IsSet() {
 			// Logical error; propagate as such.
@@ -534,6 +631,43 @@ func (c *Connector) UpdateSpanConfigRecords(
 	})
 }
 
+// SpanConfigConformance implements the spanconfig.Reporter interface.
+func (c *Connector) SpanConfigConformance(
+	ctx context.Context, spans []roachpb.Span,
+) (roachpb.SpanConfigConformanceReport, error) {
+	var report roachpb.SpanConfigConformanceReport
+	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
+		resp, err := c.SpanConfigConformance(ctx, &roachpb.SpanConfigConformanceRequest{
+			Spans: spans,
+		})
+		if err != nil {
+			return err
+		}
+
+		report = resp.Report
+		return nil
+	}); err != nil {
+		return roachpb.SpanConfigConformanceReport{}, err
+	}
+	return report, nil
+}
+
+// SpanStats implements the serverpb.TenantStatusServer interface.
+func (c *Connector) SpanStats(
+	ctx context.Context, req *roachpb.SpanStatsRequest,
+) (*roachpb.SpanStatsResponse, error) {
+	var response *roachpb.SpanStatsResponse
+	err := c.withClient(ctx, func(ctx context.Context, c *client) error {
+		stats, err := c.SpanStats(ctx, req)
+		if err != nil {
+			return err
+		}
+		response = stats
+		return nil
+	})
+	return response, err
+}
+
 // GetAllSystemSpanConfigsThatApply implements the spanconfig.KVAccessor
 // interface.
 func (c *Connector) GetAllSystemSpanConfigsThatApply(
@@ -541,13 +675,12 @@ func (c *Connector) GetAllSystemSpanConfigsThatApply(
 ) ([]roachpb.SpanConfig, error) {
 	var spanConfigs []roachpb.SpanConfig
 	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
-		var err error
 		resp, err := c.GetAllSystemSpanConfigsThatApply(
 			ctx, &roachpb.GetAllSystemSpanConfigsThatApplyRequest{
 				TenantID: id,
 			})
 		if err != nil {
-			return err
+			return errors.Wrap(err, "get all system span configs that apply error")
 		}
 
 		spanConfigs = resp.SpanConfigs
@@ -556,6 +689,29 @@ func (c *Connector) GetAllSystemSpanConfigsThatApply(
 		return nil, err
 	}
 	return spanConfigs, nil
+}
+
+// HotRangesV2 implements the serverpb.HotRangesV2 interface
+func (c *Connector) HotRangesV2(
+	ctx context.Context, req *serverpb.HotRangesRequest,
+) (*serverpb.HotRangesResponseV2, error) {
+	var resp *serverpb.HotRangesResponseV2
+	r := *req
+	// Force to assign tenant ID in request to be the same as requested tenant
+	if len(req.TenantID) == 0 {
+		r.TenantID = c.tenantID.String()
+		log.Warningf(ctx, "tenant ID is set to %s", c.tenantID)
+	} else if c.tenantID.String() != req.TenantID {
+		return nil, status.Error(codes.PermissionDenied, "cannot request hot ranges for another tenant")
+	}
+	if err := c.withClient(ctx, func(ctx context.Context, c *client) error {
+		var err error
+		resp, err = c.HotRangesV2(ctx, &r)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // WithTxn implements the spanconfig.KVAccessor interface.
@@ -576,7 +732,7 @@ func (c *Connector) withClient(
 		}
 		return f(ctx, c)
 	}
-	return ctx.Err()
+	return errors.Wrap(ctx.Err(), "with client")
 }
 
 // getClient returns the singleton InternalClient if one is currently active. If
@@ -584,41 +740,41 @@ func (c *Connector) withClient(
 // blocks until either a connection is successfully established or the provided
 // context is canceled.
 func (c *Connector) getClient(ctx context.Context) (*client, error) {
+	ctx = c.AnnotateCtx(ctx)
 	c.mu.RLock()
 	if client := c.mu.client; client != nil {
 		c.mu.RUnlock()
 		return client, nil
 	}
-	ch, _ := c.rpcDial.DoChan("dial", func() (interface{}, error) {
-		dialCtx := c.AnnotateCtx(context.Background())
-		dialCtx, cancel := c.rpcContext.Stopper.WithCancelOnQuiesce(dialCtx)
-		defer cancel()
-		var client *client
-		err := c.rpcContext.Stopper.RunTaskWithErr(dialCtx, "kvtenant.Connector: dial",
-			func(ctx context.Context) error {
-				var err error
-				client, err = c.dialAddrs(ctx)
-				return err
-			})
-		if err != nil {
-			return nil, err
-		}
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.mu.client = client
-		return client, nil
-	})
+	future, _ := c.rpcDial.DoChan(ctx,
+		"dial",
+		singleflight.DoOpts{
+			Stop:               c.rpcContext.Stopper,
+			InheritCancelation: false,
+		},
+		func(ctx context.Context) (interface{}, error) {
+			var client *client
+			err := c.rpcContext.Stopper.RunTaskWithErr(ctx, "kvtenant.Connector: dial",
+				func(ctx context.Context) error {
+					var err error
+					client, err = c.dialAddrs(ctx)
+					return err
+				})
+			if err != nil {
+				return nil, err
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.mu.client = client
+			return client, nil
+		})
 	c.mu.RUnlock()
 
-	select {
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		return res.Val.(*client), nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	res := future.WaitForResult(ctx)
+	if res.Err != nil {
+		return nil, res.Err
 	}
+	return res.Val.(*client), nil
 }
 
 // dialAddrs attempts to dial each of the configured addresses in a retry loop.
@@ -634,12 +790,14 @@ func (c *Connector) dialAddrs(ctx context.Context) (*client, error) {
 				continue
 			}
 			return &client{
-				InternalClient: roachpb.NewInternalClient(conn),
-				StatusClient:   serverpb.NewStatusClient(conn),
+				InternalClient:   kvpb.NewInternalClient(conn),
+				StatusClient:     serverpb.NewStatusClient(conn),
+				AdminClient:      serverpb.NewAdminClient(conn),
+				TimeSeriesClient: tspb.NewTimeSeriesClient(conn),
 			}, nil
 		}
 	}
-	return nil, ctx.Err()
+	return nil, errors.Wrap(ctx.Err(), "dial addrs")
 }
 
 func (c *Connector) dialAddr(ctx context.Context, addr string) (conn *grpc.ClientConn, err error) {
@@ -653,7 +811,7 @@ func (c *Connector) dialAddr(ctx context.Context, addr string) (conn *grpc.Clien
 	return conn, err
 }
 
-func (c *Connector) tryForgetClient(ctx context.Context, client roachpb.InternalClient) {
+func (c *Connector) tryForgetClient(ctx context.Context, client kvpb.InternalClient) {
 	if ctx.Err() != nil {
 		// Error (may be) due to context. Don't forget client.
 		return
@@ -664,4 +822,26 @@ func (c *Connector) tryForgetClient(ctx context.Context, client roachpb.Internal
 	if c.mu.client == client {
 		c.mu.client = nil
 	}
+}
+
+// Liveness implements the serverpb.TenantAdminServer interface
+func (c *Connector) Liveness(
+	ctx context.Context, req *serverpb.LivenessRequest,
+) (resp *serverpb.LivenessResponse, retErr error) {
+	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
+		resp, err = client.Liveness(ctx, req)
+		return
+	})
+	return
+}
+
+// Query implements the serverpb.TenantTimeSeriesServer interface
+func (c *Connector) Query(
+	ctx context.Context, req *tspb.TimeSeriesQueryRequest,
+) (resp *tspb.TimeSeriesQueryResponse, retErr error) {
+	retErr = c.withClient(ctx, func(ctx context.Context, client *client) (err error) {
+		resp, err = client.Query(ctx, req)
+		return
+	})
+	return
 }

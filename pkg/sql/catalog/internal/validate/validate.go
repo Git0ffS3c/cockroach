@@ -22,6 +22,19 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+const (
+	// ImmutableRead is the default validation level when reading an immutable
+	// descriptor.
+	ImmutableRead = catalog.ValidationLevelForwardReferences
+
+	// MutableRead is the default validation level when reading a mutable
+	// descriptor.
+	MutableRead = catalog.ValidationLevelBackReferences
+
+	// Write is the default validation level when writing a descriptor.
+	Write = catalog.ValidationLevelAllPreTxnCommit
+)
+
 // Self is a convenience function for Validate called at the
 // ValidationLevelSelfOnly level and combining the resulting errors.
 func Self(version clusterversion.ClusterVersion, descriptors ...catalog.Descriptor) error {
@@ -45,6 +58,15 @@ func Validate(
 	targetLevel catalog.ValidationLevel,
 	descriptors ...catalog.Descriptor,
 ) catalog.ValidationErrors {
+	for i, d := range descriptors {
+		// Replace mutable descriptors with immutable copies. Validation is
+		// read-only in any case, and using immutables can have a significant
+		// impact on performance when validating tables due to columns, indexes,
+		// and so forth being cached.
+		if mut, ok := d.(catalog.MutableDescriptor); ok {
+			descriptors[i] = mut.ImmutableCopy()
+		}
+	}
 	vea := validationErrorAccumulator{
 		ValidationTelemetry: telemetry,
 		targetLevel:         targetLevel,
@@ -68,13 +90,24 @@ func Validate(
 		vea.reportDescGetterError(collectingReferencedDescriptors, descGetterErr)
 		return vea.errors
 	}
-	// Descriptor cross-reference checks.
+	// Descriptor forward-reference checks.
 	if !vea.validateDescriptorsAtLevel(
-		catalog.ValidationLevelCrossReferences,
+		catalog.ValidationLevelForwardReferences,
 		descriptors,
 		func(desc catalog.Descriptor) {
 			if !desc.Dropped() {
-				desc.ValidateCrossReferences(&vea, vdg)
+				desc.ValidateForwardReferences(&vea, vdg)
+			}
+		}) {
+		return vea.errors
+	}
+	// Descriptor backward-reference checks.
+	if !vea.validateDescriptorsAtLevel(
+		catalog.ValidationLevelBackReferences,
+		descriptors,
+		func(desc catalog.Descriptor) {
+			if !desc.Dropped() {
+				desc.ValidateBackReferences(&vea, vdg)
 			}
 		}) {
 		return vea.errors
@@ -211,21 +244,25 @@ func (vea *validationErrorAccumulator) decorate(err error) error {
 		// This contrived switch case is required to make the linter happy.
 		switch vea.currentDescriptor.DescriptorType() {
 		case catalog.Table:
-			err = errors.Wrapf(err, catalog.Table+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Table)+" %q (%d)", name, id)
 		case catalog.Database:
-			err = errors.Wrapf(err, catalog.Database+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Database)+" %q (%d)", name, id)
 		case catalog.Schema:
-			err = errors.Wrapf(err, catalog.Schema+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Schema)+" %q (%d)", name, id)
 		case catalog.Type:
-			err = errors.Wrapf(err, catalog.Type+" %q (%d)", name, id)
+			err = errors.Wrapf(err, string(catalog.Type)+" %q (%d)", name, id)
+		case catalog.Function:
+			err = errors.Wrapf(err, string(catalog.Function)+" %q (%d)", name, id)
 		default:
 			return err
 		}
 		switch vea.currentLevel {
 		case catalog.ValidationLevelSelfOnly:
 			tkSuffix = "self"
-		case catalog.ValidationLevelCrossReferences:
-			tkSuffix = "cross_references"
+		case catalog.ValidationLevelForwardReferences:
+			tkSuffix = "forward_references"
+		case catalog.ValidationLevelBackReferences:
+			tkSuffix = "backward_references"
 		case catalog.ValidationLevelNamespace:
 			tkSuffix = "namespace"
 		case catalog.ValidationLevelAllPreTxnCommit:
@@ -252,6 +289,15 @@ type validationDescGetterImpl struct {
 }
 
 var _ catalog.ValidationDescGetter = (*validationDescGetterImpl)(nil)
+
+// GetDescriptor implements the ValidationDescGetter interface.
+func (vdg *validationDescGetterImpl) GetDescriptor(id descpb.ID) (catalog.Descriptor, error) {
+	desc, found := vdg.descriptors[id]
+	if !found || desc == nil {
+		return nil, catalog.WrapDescRefErr(id, catalog.ErrReferencedDescriptorNotFound)
+	}
+	return desc, nil
+}
 
 // GetDatabaseDescriptor implements the ValidationDescGetter interface.
 func (vdg *validationDescGetterImpl) GetDatabaseDescriptor(
@@ -301,6 +347,16 @@ func (vdg *validationDescGetterImpl) GetTypeDescriptor(
 	return descriptor, err
 }
 
+func (vdg *validationDescGetterImpl) GetFunctionDescriptor(
+	id descpb.ID,
+) (catalog.FunctionDescriptor, error) {
+	desc, found := vdg.descriptors[id]
+	if !found || desc == nil {
+		return nil, catalog.WrapFunctionDescRefErr(id, catalog.ErrReferencedDescriptorNotFound)
+	}
+	return catalog.AsFunctionDescriptor(desc)
+}
+
 func (vdg *validationDescGetterImpl) addNamespaceEntries(
 	ctx context.Context, descriptors []catalog.Descriptor, vd ValidationDereferencer,
 ) error {
@@ -314,7 +370,6 @@ func (vdg *validationDescGetterImpl) addNamespaceEntries(
 			ParentSchemaID: desc.GetParentSchemaID(),
 			Name:           desc.GetName(),
 		})
-		reqs = append(reqs, desc.GetDrainingNames()...)
 	}
 
 	ids, err := vd.DereferenceDescriptorIDs(ctx, reqs)
@@ -363,9 +418,17 @@ func (cs *collectorState) getMissingDescs(
 		return nil, err
 	}
 	for _, desc := range resps {
-		if desc != nil {
-			cs.vdg.descriptors[desc.GetID()] = desc
+		if desc == nil {
+			continue
 		}
+		if mut, ok := desc.(catalog.MutableDescriptor); ok {
+			// Replace mutable descriptors with immutable copies. Validation is
+			// read-only in any case, and using immutables can have a significant
+			// impact on performance when validating tables due to columns, indexes,
+			// and so forth being cached.
+			desc = mut.ImmutableCopy()
+		}
+		cs.vdg.descriptors[desc.GetID()] = desc
 	}
 	return resps, nil
 }
@@ -386,7 +449,7 @@ func collectDescriptorsForValidation(
 		referencedBy: catalog.MakeDescriptorIDSet(),
 	}
 	for _, desc := range descriptors {
-		if desc == nil {
+		if desc == nil || desc.Dropped() {
 			continue
 		}
 		if err := cs.addDirectReferences(desc); err != nil {
@@ -426,6 +489,10 @@ func validateNamespace(
 		return
 	}
 
+	if desc.SkipNamespace() {
+		return
+	}
+
 	key := descpb.NameInfo{
 		ParentID:       desc.GetParentID(),
 		ParentSchemaID: desc.GetParentSchemaID(),
@@ -439,18 +506,6 @@ func validateNamespace(
 			vea.Report(errors.Errorf("expected matching namespace entry, found none"))
 		} else if id != desc.GetID() {
 			vea.Report(errors.Errorf("expected matching namespace entry value, instead found %d", id))
-		}
-	}
-
-	// Check that all draining name entries exist and are correct.
-	for _, dn := range desc.GetDrainingNames() {
-		id := namespace[dn]
-		if id == descpb.InvalidID {
-			vea.Report(errors.Errorf("expected matching namespace entry for draining name (%d, %d, %s), found none",
-				dn.ParentID, dn.ParentSchemaID, dn.Name))
-		} else if id != desc.GetID() {
-			vea.Report(errors.Errorf("expected matching namespace entry value for draining name (%d, %d, %s), instead found %d",
-				dn.ParentID, dn.ParentSchemaID, dn.Name, id))
 		}
 	}
 }

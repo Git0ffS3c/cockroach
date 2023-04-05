@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils/spanconfigtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -33,29 +35,28 @@ import (
 // TestDataDriven is a data-driven test for spanconfig.Limiter. It offers the
 // following commands:
 //
-// - "initialize" tenant=<int>
-//   Initialize a secondary tenant with the given ID.
+//   - "initialize" tenant=<int>
+//     Initialize a secondary tenant with the given ID.
 //
-// - "exec-sql" [tenant=<int>]
-//   Executes the input SQL query for the given tenant. All statements are
-//   executed in a single transaction.
+//   - "exec-sql" [tenant=<int>]
+//     Executes the input SQL query for the given tenant. All statements are
+//     executed in a single transaction.
 //
-// - "query-sql" [tenant=<int>] [retry]
-//   Executes the input SQL query for the given tenant and print the results.
-//   If retry is specified and the expected results do not match the actual
-//   results, the query will be retried under a testutils.SucceedsSoon block.
-//   If run with -rewrite, we insert a 500ms sleep before executing the query
-//   once.
+//   - "query-sql" [tenant=<int>] [retry]
+//     Executes the input SQL query for the given tenant and print the results.
+//     If retry is specified and the expected results do not match the actual
+//     results, the query will be retried under a testutils.SucceedsSoon block.
+//     If run with -rewrite, we insert a 500ms sleep before executing the query
+//     once.
 //
-// - override limit=<int>
-//   Override the span limit each tenant is configured with.
-//
+//   - override limit=<int>
+//     Override the span limit each tenant is configured with.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		// TODO(irfansharif): This is a stop-gap for tenant read-only cluster
 		// settings. See https://github.com/cockroachdb/cockroach/pull/76929. Once
 		// that's done, this test should be updated to use:
@@ -72,6 +73,7 @@ func TestDataDriven(t *testing.T) {
 		}
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
+				DefaultTestTenant: base.TestTenantProbabilistic,
 				Knobs: base.TestingKnobs{
 					SpanConfig: scKnobs,
 				},
@@ -92,7 +94,7 @@ func TestDataDriven(t *testing.T) {
 			if d.HasArg("tenant") {
 				var id uint64
 				d.ScanArgs(t, "tenant", &id)
-				tenantID = roachpb.MakeTenantID(id)
+				tenantID = roachpb.MustMakeTenantID(id)
 			}
 
 			tenant, found := spanConfigTestCluster.LookupTenant(tenantID)
@@ -135,6 +137,12 @@ func TestDataDriven(t *testing.T) {
 				return output
 
 			case "override":
+				if tc.StartedDefaultTestTenant() {
+					// Tests using an override need to run from the system
+					// tenant. Skip the test if running with a default test
+					// tenant.
+					skip.IgnoreLintf(t, "unable to run with a default test tenant")
+				}
 				d.ScanArgs(t, "limit", &limitOverride)
 
 			default:

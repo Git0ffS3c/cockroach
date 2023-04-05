@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -48,14 +49,18 @@ go_test(
         "topology_operations_test.go",
         "unary_operators_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = ["//c-deps:libgeos"],
     embed = [":geogfn"],
     deps = [
         "//pkg/geo",
         "//pkg/geo/geoprojbase",
+        "//pkg/geo/geotest",
         "@com_github_golang_geo//s1",
         "@com_github_golang_geo//s2",
         "@com_github_stretchr_testify//require",
         "@com_github_twpayne_go_geom//:go-geom",
     ],
 )
+
+get_x_data(name = "get_x_data")

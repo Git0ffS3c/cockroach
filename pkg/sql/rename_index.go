@@ -32,8 +32,9 @@ type renameIndexNode struct {
 
 // RenameIndex renames the index.
 // Privileges: CREATE on table.
-//   notes: postgres requires CREATE on the table.
-//          mysql requires ALTER, CREATE, INSERT on the table.
+//
+//	notes: postgres requires CREATE on the table.
+//	       mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
 		ctx,
@@ -52,7 +53,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 		return newZeroNode(nil /* columns */), nil
 	}
 
-	idx, err := tableDesc.FindIndexWithName(string(n.Index.Index))
+	idx, err := catalog.MustFindIndexByName(tableDesc, string(n.Index.Index))
 	if err != nil {
 		if n.IfExists {
 			// Noop.
@@ -84,7 +85,7 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		if tableRef.IndexID != idx.GetID() {
 			continue
 		}
-		return p.dependentViewError(
+		return p.dependentError(
 			ctx, "index", n.n.Index.Index.String(), tableDesc.ParentID, tableRef.ID, "rename",
 		)
 	}
@@ -98,7 +99,7 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		return nil
 	}
 
-	if foundIndex, _ := tableDesc.FindIndexWithName(string(n.n.NewName)); foundIndex != nil {
+	if foundIndex := catalog.FindIndexByName(tableDesc, string(n.n.NewName)); foundIndex != nil {
 		return pgerror.Newf(pgcode.DuplicateRelation, "index name %q already exists", string(n.n.NewName))
 	}
 

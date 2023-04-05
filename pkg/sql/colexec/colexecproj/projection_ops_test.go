@@ -46,6 +46,7 @@ func TestProjPlusInt64Int64ConstOp(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -68,6 +69,7 @@ func TestProjPlusInt64Int64Op(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -90,6 +92,7 @@ func TestProjDivFloat64Float64Op(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -115,6 +118,7 @@ func TestRandomComparisons(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -211,20 +215,22 @@ func TestGetProjectionOperator(t *testing.T) {
 	inputTypes[col1Idx] = typ
 	inputTypes[col2Idx] = typ
 	outputIdx := 9
+	calledOnNullInput := false
 	op, err := GetProjectionOperator(
 		testAllocator, inputTypes, types.Int2, binOp, input, col1Idx, col2Idx,
-		outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil, /* cmpExpr */
+		outputIdx, nil /* EvalCtx */, nil /* BinFn */, nil /* cmpExpr */, calledOnNullInput,
 	)
 	if err != nil {
 		t.Error(err)
 	}
 	expected := &projMultInt16Int16Op{
 		projOpBase: projOpBase{
-			OneInputHelper: colexecop.MakeOneInputHelper(op.(*projMultInt16Int16Op).Input),
-			allocator:      testAllocator,
-			col1Idx:        col1Idx,
-			col2Idx:        col2Idx,
-			outputIdx:      outputIdx,
+			OneInputHelper:    colexecop.MakeOneInputHelper(op.(*projMultInt16Int16Op).Input),
+			allocator:         testAllocator,
+			col1Idx:           col1Idx,
+			col2Idx:           col2Idx,
+			outputIdx:         outputIdx,
+			calledOnNullInput: calledOnNullInput,
 		},
 	}
 	if !reflect.DeepEqual(op, expected) {
@@ -290,6 +296,7 @@ func BenchmarkProjOp(b *testing.B) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},

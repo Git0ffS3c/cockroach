@@ -11,9 +11,9 @@ package streamingest
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
@@ -24,23 +24,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/keysutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -54,27 +56,33 @@ import (
 // partition addresses.
 type mockStreamClient struct {
 	partitionEvents map[string][]streamingccl.Event
+	doneCh          chan struct{}
 }
 
 var _ streamclient.Client = &mockStreamClient{}
 
 // Create implements the Client interface.
 func (m *mockStreamClient) Create(
-	ctx context.Context, target roachpb.TenantID,
-) (streaming.StreamID, error) {
+	_ context.Context, _ roachpb.TenantName,
+) (streampb.ReplicationProducerSpec, error) {
+	panic("unimplemented")
+}
+
+// Dial implements the Client interface.
+func (m *mockStreamClient) Dial(_ context.Context) error {
 	panic("unimplemented")
 }
 
 // Heartbeat implements the Client interface.
 func (m *mockStreamClient) Heartbeat(
-	ctx context.Context, ID streaming.StreamID, _ hlc.Timestamp,
-) error {
+	_ context.Context, _ streampb.StreamID, _ hlc.Timestamp,
+) (streampb.StreamReplicationStatus, error) {
 	panic("unimplemented")
 }
 
 // Plan implements the Client interface.
 func (m *mockStreamClient) Plan(
-	ctx context.Context, _ streaming.StreamID,
+	_ context.Context, _ streampb.StreamID,
 ) (streamclient.Topology, error) {
 	panic("unimplemented mock method")
 }
@@ -84,7 +92,7 @@ type mockSubscription struct {
 }
 
 // Subscribe implements the Subscription interface.
-func (m *mockSubscription) Subscribe(ctx context.Context) error {
+func (m *mockSubscription) Subscribe(_ context.Context) error {
 	return nil
 }
 
@@ -101,34 +109,43 @@ func (m *mockSubscription) Err() error {
 // Subscribe implements the Client interface.
 func (m *mockStreamClient) Subscribe(
 	ctx context.Context,
-	stream streaming.StreamID,
-	spec streamclient.SubscriptionToken,
-	checkpoint hlc.Timestamp,
+	_ streampb.StreamID,
+	token streamclient.SubscriptionToken,
+	initialScanTime hlc.Timestamp,
+	_ hlc.Timestamp,
 ) (streamclient.Subscription, error) {
 	var events []streamingccl.Event
 	var ok bool
-	if events, ok = m.partitionEvents[string(spec)]; !ok {
-		return nil, errors.Newf("no events found for paritition %s", string(spec))
+	if events, ok = m.partitionEvents[string(token)]; !ok {
+		return nil, errors.Newf("no events found for partition %s", string(token))
 	}
+	log.Infof(ctx, "%q beginning subscription from time %v ", string(token), initialScanTime)
 
-	log.Infof(ctx, "%q emitting %d events", string(spec), len(events))
+	log.Infof(ctx, "%q emitting %d events", string(token), len(events))
 	eventCh := make(chan streamingccl.Event, len(events))
 	for _, event := range events {
-		log.Infof(ctx, "%q emitting event %v", string(spec), event)
+		log.Infof(ctx, "%q emitting event %v", string(token), event)
 		eventCh <- event
 	}
-	log.Infof(ctx, "%q done emitting %d events", string(spec), len(events))
-	close(eventCh)
+	log.Infof(ctx, "%q done emitting %d events", string(token), len(events))
+	go func() {
+		if m.doneCh != nil {
+			log.Infof(ctx, "%q waiting for doneCh", string(token))
+			<-m.doneCh
+			log.Infof(ctx, "%q received event on doneCh", string(token))
+		}
+		close(eventCh)
+	}()
 	return &mockSubscription{eventsCh: eventCh}, nil
 }
 
 // Close implements the Client interface.
-func (m *mockStreamClient) Close() error {
+func (m *mockStreamClient) Close(_ context.Context) error {
 	return nil
 }
 
 // Complete implements the streamclient.Client interface.
-func (m *mockStreamClient) Complete(ctx context.Context, streamID streaming.StreamID) error {
+func (m *mockStreamClient) Complete(_ context.Context, _ streampb.StreamID, _ bool) error {
 	return nil
 }
 
@@ -139,16 +156,17 @@ var _ streamclient.Client = &errorStreamClient{}
 
 // ConsumePartition implements the streamclient.Client interface.
 func (m *errorStreamClient) Subscribe(
-	ctx context.Context,
-	stream streaming.StreamID,
-	spec streamclient.SubscriptionToken,
-	checkpoint hlc.Timestamp,
+	_ context.Context,
+	_ streampb.StreamID,
+	_ streamclient.SubscriptionToken,
+	_ hlc.Timestamp,
+	_ hlc.Timestamp,
 ) (streamclient.Subscription, error) {
 	return nil, errors.New("this client always returns an error")
 }
 
 // Complete implements the streamclient.Client interface.
-func (m *errorStreamClient) Complete(ctx context.Context, streamID streaming.StreamID) error {
+func (m *errorStreamClient) Complete(_ context.Context, _ streampb.StreamID, _ bool) error {
 	return nil
 }
 
@@ -160,52 +178,37 @@ func TestStreamIngestionProcessor(t *testing.T) {
 
 	tc := testcluster.StartTestCluster(t, 3 /* nodes */, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
-	kvDB := tc.Server(0).DB()
+	db := tc.Server(0).InternalDB().(descs.DB)
 	registry := tc.Server(0).JobRegistry().(*jobs.Registry)
 	const tenantID = 20
 	tenantRekey := execinfrapb.TenantRekey{
-		OldID: roachpb.MakeTenantID(tenantID),
-		NewID: roachpb.MakeTenantID(tenantID + 10),
+		OldID: roachpb.MustMakeTenantID(tenantID),
+		NewID: roachpb.MustMakeTenantID(tenantID + 10),
 	}
 
-	t.Run("finite stream client", func(t *testing.T) {
-		v := roachpb.MakeValueFromString("value_1")
-		v.Timestamp = hlc.Timestamp{WallTime: 1}
-		sampleKV := func() roachpb.KeyValue {
-			key, err := keys.RewriteKeyToTenantPrefix(roachpb.Key("key_1"),
-				keys.MakeTenantPrefix(roachpb.MakeTenantID(tenantID)))
-			require.NoError(t, err)
-			return roachpb.KeyValue{Key: key, Value: v}
-		}
-		//sampleKV := roachpb.KeyValue{Key: roachpb.Key("key_1"), Value: v}
-		events := func() []streamingccl.Event {
-			return []streamingccl.Event{
-				streamingccl.MakeKVEvent(sampleKV()),
-				streamingccl.MakeKVEvent(sampleKV()),
-				streamingccl.MakeCheckpointEvent(hlc.Timestamp{WallTime: 1}),
-				streamingccl.MakeKVEvent(sampleKV()),
-				streamingccl.MakeKVEvent(sampleKV()),
-				streamingccl.MakeCheckpointEvent(hlc.Timestamp{WallTime: 4}),
-			}
-		}
-		p1 := streamclient.SubscriptionToken("p1")
-		p2 := streamclient.SubscriptionToken("p2")
-		mockClient := &mockStreamClient{
-			partitionEvents: map[string][]streamingccl.Event{string(p1): events(), string(p2): events()},
-		}
+	p1 := streamclient.SubscriptionToken("p1")
+	p2 := streamclient.SubscriptionToken("p2")
+	v := roachpb.MakeValueFromString("value_1")
+	v.Timestamp = hlc.Timestamp{WallTime: 1}
+	p1Key := roachpb.Key("key_1")
+	p1Span := roachpb.Span{Key: p1Key, EndKey: p1Key.Next()}
+	p2Key := roachpb.Key("key_2")
+	p2Span := roachpb.Span{Key: p2Key, EndKey: p2Key.Next()}
 
-		startTime := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		partitions := []streamclient.PartitionInfo{
-			{ID: "1", SubscriptionToken: p1},
-			{ID: "2", SubscriptionToken: p2},
-		}
-		out, err := runStreamIngestionProcessor(ctx, t, registry, kvDB, "randomgen://test/",
-			partitions, startTime, nil /* interceptEvents */, tenantRekey, mockClient)
+	sampleKV := func() roachpb.KeyValue {
+		key, err := keys.RewriteKeyToTenantPrefix(p1Key,
+			keys.MakeTenantPrefix(roachpb.MustMakeTenantID(tenantID)))
 		require.NoError(t, err)
+		return roachpb.KeyValue{Key: key, Value: v}
+	}
+	sampleCheckpoint := func(span roachpb.Span, ts int64) []jobspb.ResolvedSpan {
+		return []jobspb.ResolvedSpan{{Span: span, Timestamp: hlc.Timestamp{WallTime: ts}}}
+	}
 
+	readRows := func(streamOut *distsqlutils.RowBuffer) map[string]struct{} {
 		actualRows := make(map[string]struct{})
 		for {
-			row := out.NextNoMeta(t)
+			row := streamOut.NextNoMeta(t)
 			if row == nil {
 				break
 			}
@@ -219,84 +222,116 @@ func TestStreamIngestionProcessor(t *testing.T) {
 				actualRows[fmt.Sprintf("%s %s", resolvedSpan.Span, resolvedSpan.Timestamp)] = struct{}{}
 			}
 		}
+		return actualRows
+	}
+
+	t.Run("finite stream client", func(t *testing.T) {
+		events := func() []streamingccl.Event {
+			return []streamingccl.Event{
+				streamingccl.MakeKVEvent(sampleKV()),
+				streamingccl.MakeKVEvent(sampleKV()),
+				streamingccl.MakeCheckpointEvent(sampleCheckpoint(p1Span, 2)),
+				streamingccl.MakeKVEvent(sampleKV()),
+				streamingccl.MakeKVEvent(sampleKV()),
+				streamingccl.MakeCheckpointEvent(sampleCheckpoint(p1Span, 4)),
+				streamingccl.MakeCheckpointEvent(sampleCheckpoint(p2Span, 5)),
+			}
+		}
+		mockClient := &mockStreamClient{
+			partitionEvents: map[string][]streamingccl.Event{string(p1): events(), string(p2): events()},
+		}
+
+		initialScanTimestamp := hlc.Timestamp{WallTime: 1}
+		partitions := []streamclient.PartitionInfo{
+			{ID: "1", SubscriptionToken: p1, Spans: []roachpb.Span{p1Span}},
+			{ID: "2", SubscriptionToken: p2, Spans: []roachpb.Span{p2Span}},
+		}
+		topology := streamclient.Topology{
+			Partitions: partitions,
+		}
+		out, err := runStreamIngestionProcessor(ctx, t, registry, db,
+			topology, initialScanTimestamp, []jobspb.ResolvedSpan{}, tenantRekey,
+			mockClient, nil /* cutoverProvider */, nil /* streamingTestingKnobs */)
+		require.NoError(t, err)
+
+		emittedRows := readRows(out)
 
 		// Only compare the latest advancement, since not all intermediary resolved
 		// timestamps might be flushed (due to the minimum flush interval setting in
 		// the ingestion processor).
-		require.Contains(t, actualRows, "1{-\\x00} 0.000000004,0",
+		require.Contains(t, emittedRows, "key_1{-\\x00} 0.000000004,0",
 			"partition 1 should advance to timestamp 4")
-		require.Contains(t, actualRows, "2{-\\x00} 0.000000004,0",
-			"partition 2 should advance to timestamp 4")
+		require.Contains(t, emittedRows, "key_2{-\\x00} 0.000000005,0",
+			"partition 2 should advance to timestamp 5")
+	})
+
+	// Two partitions, checkpoint for each, client start time for each should match
+	t.Run("resume from checkpoint", func(t *testing.T) {
+		events := func() []streamingccl.Event {
+			return []streamingccl.Event{
+				streamingccl.MakeKVEvent(sampleKV()),
+				streamingccl.MakeCheckpointEvent(sampleCheckpoint(p2Span, 2)),
+				streamingccl.MakeKVEvent(sampleKV()),
+				streamingccl.MakeCheckpointEvent(sampleCheckpoint(p1Span, 6)),
+			}
+		}
+		mockClient := &mockStreamClient{
+			partitionEvents: map[string][]streamingccl.Event{string(p1): events(), string(p2): events()},
+		}
+
+		initialScanTimestamp := hlc.Timestamp{WallTime: 1}
+		partitions := []streamclient.PartitionInfo{
+			{ID: "1", SubscriptionToken: p1, Spans: []roachpb.Span{p1Span}},
+			{ID: "2", SubscriptionToken: p2, Spans: []roachpb.Span{p2Span}},
+		}
+		topology := streamclient.Topology{
+			Partitions: partitions,
+		}
+		checkpoint := []jobspb.ResolvedSpan{
+			{Span: p1Span, Timestamp: hlc.Timestamp{WallTime: 4}},
+			{Span: p2Span, Timestamp: hlc.Timestamp{WallTime: 5}},
+		}
+
+		lastClientStart := make(map[string]hlc.Timestamp)
+		streamingTestingKnobs := &sql.StreamingTestingKnobs{BeforeClientSubscribe: func(addr string, token string, clientStartTime hlc.Timestamp) {
+			lastClientStart[token] = clientStartTime
+		}}
+		out, err := runStreamIngestionProcessor(ctx, t, registry, db,
+			topology, initialScanTimestamp, checkpoint, tenantRekey, mockClient,
+			nil /* cutoverProvider */, streamingTestingKnobs)
+		require.NoError(t, err)
+
+		emittedRows := readRows(out)
+
+		// Only compare the latest advancement, since not all intermediary resolved
+		// timestamps might be flushed (due to the minimum flush interval setting in
+		// the ingestion processor).
+		require.Contains(t, emittedRows, "key_1{-\\x00} 0.000000004,0",
+			"partition 1 should advance to timestamp 4")
+		require.Contains(t, emittedRows, "key_2{-\\x00} 0.000000005,0",
+			"partition 2 should advance to timestamp 5")
+		require.Equal(t, lastClientStart[string(p1)], hlc.Timestamp{WallTime: 4})
+		require.Equal(t, lastClientStart[string(p2)], hlc.Timestamp{WallTime: 5})
 	})
 
 	t.Run("error stream client", func(t *testing.T) {
-		startTime := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+		initialScanTimestamp := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 		partitions := []streamclient.PartitionInfo{
 			{SubscriptionToken: streamclient.SubscriptionToken("1")},
 			{SubscriptionToken: streamclient.SubscriptionToken("2")},
 		}
-		out, err := runStreamIngestionProcessor(ctx, t, registry, kvDB, "randomgen://test",
-			partitions, startTime, nil /* interceptEvents */, tenantRekey, &errorStreamClient{})
+		topology := streamclient.Topology{
+			Partitions: partitions,
+		}
+		out, err := runStreamIngestionProcessor(ctx, t, registry, db,
+			topology, initialScanTimestamp, []jobspb.ResolvedSpan{}, tenantRekey, &errorStreamClient{},
+			nil /* cutoverProvider */, nil /* streamingTestingKnobs */)
 		require.NoError(t, err)
 
 		// Expect no rows, and just the error.
 		row, meta := out.Next()
 		require.Nil(t, row)
 		testutils.IsError(meta.Err, "this client always returns an error")
-	})
-
-	t.Run("stream ingestion processor shuts down gracefully on losing client connection", func(t *testing.T) {
-		events := []streamingccl.Event{streamingccl.MakeGenerationEvent()}
-		mockClient := &mockStreamClient{
-			partitionEvents: map[string][]streamingccl.Event{"foo": events},
-		}
-
-		startTime := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
-		partitions := []streamclient.PartitionInfo{{SubscriptionToken: streamclient.SubscriptionToken("foo")}}
-
-		processEventCh := make(chan struct{})
-		defer close(processEventCh)
-		streamingTestingKnob := &sql.StreamingTestingKnobs{RunAfterReceivingEvent: func(ctx context.Context) {
-			processEventCh <- struct{}{}
-		}}
-		sip, out, err := getStreamIngestionProcessor(ctx, t, registry, kvDB, "randomgen://test/",
-			partitions, startTime, nil /* interceptEvents */, tenantRekey, mockClient, streamingTestingKnob)
-		defer func() {
-			require.NoError(t, sip.forceClientForTests.Close())
-		}()
-		require.NoError(t, err)
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sip.Run(ctx)
-		}()
-
-		// The channel will block on read if the event has not been intercepted yet.
-		// Once it unblocks, we are guaranteed that the mockClient has sent the
-		// GenerationEvent and the processor has read it.
-		<-processEventCh
-
-		// The sip processor has received a GenerationEvent and is thus
-		// waiting for a cutover signal, so let's send one!
-		sip.cutoverCh <- struct{}{}
-
-		wg.Wait()
-		// Ensure that all the outputs are properly closed.
-		if !out.ProducerClosed() {
-			t.Fatalf("output RowReceiver not closed")
-		}
-
-		for {
-			// No metadata should have been produced since the processor
-			// should have been moved to draining state with a nil error.
-			row := out.NextNoMeta(t)
-			if row == nil {
-				break
-			}
-			t.Fatalf("more output rows than expected")
-		}
 	})
 }
 
@@ -307,7 +342,7 @@ func getPartitionSpanToTableID(
 
 	// Aggregate the table IDs which should have been ingested.
 	for _, pa := range partitions {
-		pKey := roachpb.Key(pa.SubscriptionToken)
+		pKey := roachpb.Key(pa.ID)
 		pSpan := roachpb.Span{Key: pKey, EndKey: pKey.Next()}
 		paURL, err := url.Parse(string(pa.SubscriptionToken))
 		require.NoError(t, err)
@@ -329,11 +364,11 @@ func assertEqualKVs(
 	tableID int,
 	partitionTimestamp hlc.Timestamp,
 ) {
-	key := keys.TODOSQLCodec.TablePrefix(uint32(tableID))
+	key := keysutils.TestingSQLCodec.TablePrefix(uint32(tableID))
 
 	// Iterate over the store.
 	store := tc.GetFirstStoreFromServer(t, 0)
-	it := store.Engine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	it := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		LowerBound: key,
 		UpperBound: key.PrefixEnd(),
 	})
@@ -351,19 +386,19 @@ func assertEqualKVs(
 
 		// We only want to process MVCC KVs with a ts less than or equal to the max
 		// resolved ts for this partition.
-		if partitionTimestamp.Less(it.Key().Timestamp) {
+		if partitionTimestamp.Less(it.UnsafeKey().Timestamp) {
 			continue
 		}
 
-		newKey := (prevKey != nil && !it.Key().Key.Equal(prevKey)) || prevKey == nil
-		prevKey = it.Key().Key
+		newKey := (prevKey != nil && !it.UnsafeKey().Key.Equal(prevKey)) || prevKey == nil
+		prevKey = it.UnsafeKey().Clone().Key
 
 		if newKey {
 			// All value ts should have been drained at this point, otherwise there is
 			// a mismatch between the streamed and ingested data.
 			require.Equal(t, 0, len(valueTimestampTuples))
 			valueTimestampTuples, err = streamValidator.getValuesForKeyBelowTimestamp(
-				string(it.Key().Key), partitionTimestamp)
+				string(it.UnsafeKey().Key), partitionTimestamp)
 			require.NoError(t, err)
 		}
 
@@ -371,11 +406,13 @@ func assertEqualKVs(
 		// Since the iterator goes from latest to older versions, we compare
 		// starting from the end of the slice that is sorted by timestamp.
 		latestVersionInChain := valueTimestampTuples[len(valueTimestampTuples)-1]
+		v, err := it.Value()
+		require.NoError(t, err)
 		require.Equal(t, roachpb.KeyValue{
-			Key: it.Key().Key,
+			Key: it.UnsafeKey().Key,
 			Value: roachpb.Value{
-				RawBytes:  it.Value(),
-				Timestamp: it.Key().Timestamp,
+				RawBytes:  v,
+				Timestamp: it.UnsafeKey().Timestamp,
 			},
 		}, latestVersionInChain)
 		// Truncate the latest version which we just checked against in preparation
@@ -385,20 +422,29 @@ func assertEqualKVs(
 }
 
 func makeTestStreamURI(
-	valueRange, kvsPerResolved, numPartitions int, kvFrequency time.Duration, dupProbability float64,
+	valueRange, kvsPerResolved, numPartitions int,
+	kvFrequency time.Duration,
+	dupProbability float64,
+	tenantID roachpb.TenantID,
+	tenantName roachpb.TenantName,
 ) string {
 	return streamclient.RandomGenScheme + ":///" + "?VALUE_RANGE=" + strconv.Itoa(valueRange) +
 		"&EVENT_FREQUENCY=" + strconv.Itoa(int(kvFrequency)) +
 		"&KVS_PER_CHECKPOINT=" + strconv.Itoa(kvsPerResolved) +
 		"&NUM_PARTITIONS=" + strconv.Itoa(numPartitions) +
-		"&DUP_PROBABILITY=" + strconv.FormatFloat(dupProbability, 'f', -1, 32)
+		"&DUP_PROBABILITY=" + strconv.FormatFloat(dupProbability, 'f', -1, 32) +
+		"&TENANT_ID=" + strconv.Itoa(int(tenantID.ToUint64())) +
+		"&TENANT_NAME=" + string(tenantName)
 }
+
+type noCutover struct{}
+
+func (n noCutover) cutoverReached(context.Context) (bool, error) { return false, nil }
 
 // TestRandomClientGeneration tests the ingestion processor against a random
 // stream workload.
 func TestRandomClientGeneration(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 61287, "flaky test")
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
@@ -406,45 +452,55 @@ func TestRandomClientGeneration(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 3 /* nodes */, base.TestClusterArgs{})
 	defer tc.Stopper().Stop(ctx)
 	registry := tc.Server(0).JobRegistry().(*jobs.Registry)
-	kvDB := tc.Server(0).DB()
-	conn := tc.Conns[0]
-	sqlDB := sqlutils.MakeSQLRunner(conn)
+	db := tc.Server(0).InternalDB().(descs.DB)
 
 	// TODO: Consider testing variations on these parameters.
-	streamAddr := getTestRandomClientURI()
+	tenantID := roachpb.MustMakeTenantID(20)
+	tenantName := roachpb.TenantName("20")
+	streamAddr := getTestRandomClientURI(tenantID, tenantName)
 
 	// The random client returns system and table data partitions.
-	streamClient, err := streamclient.NewStreamClient(streamingccl.StreamAddress(streamAddr))
-	require.NoError(t, err)
-	const tenantID = 20
-	id, err := streamClient.Create(ctx, roachpb.MakeTenantID(tenantID))
+	streamClient, err := streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(streamAddr), nil)
 	require.NoError(t, err)
 
-	topo, err := streamClient.Plan(ctx, id)
+	randomStreamClient, ok := streamClient.(*streamclient.RandomStreamClient)
+	require.True(t, ok)
+	rps, err := randomStreamClient.Create(ctx, tenantName)
+	require.NoError(t, err)
+
+	topo, err := randomStreamClient.Plan(ctx, rps.StreamID)
 	require.NoError(t, err)
 	// One system and two table data partitions.
-	require.Equal(t, 2 /* numPartitions */, len(topo))
+	require.Equal(t, 2 /* numPartitions */, len(topo.Partitions))
 
-	startTime := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
+	initialScanTimestamp := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 
 	ctx, cancel := context.WithCancel(ctx)
 	// Cancel the flow after emitting 1000 checkpoint events from the client.
 	mu := syncutil.Mutex{}
 	cancelAfterCheckpoints := makeCheckpointEventCounter(&mu, 1000, cancel)
 	tenantRekey := execinfrapb.TenantRekey{
-		OldID: roachpb.MakeTenantID(tenantID),
-		NewID: roachpb.MakeTenantID(tenantID + 10),
+		OldID: tenantID,
+		NewID: roachpb.MustMakeTenantID(tenantID.ToUint64() + 10),
 	}
-	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(roachpb.MakeTenantID(tenantID)),
+	rekeyer, err := backupccl.MakeKeyRewriterFromRekeys(keys.MakeSQLCodec(tenantID),
 		nil /* tableRekeys */, []execinfrapb.TenantRekey{tenantRekey}, true /* restoreTenantFromStream */)
 	require.NoError(t, err)
 	streamValidator := newStreamClientValidator(rekeyer)
-	validator := registerValidatorWithClient(streamValidator)
-	out, err := runStreamIngestionProcessor(ctx, t, registry, kvDB, streamAddr, topo,
-		startTime, []streamclient.InterceptFn{cancelAfterCheckpoints, validator}, tenantRekey, nil /* mockClient */)
+
+	randomStreamClient.ClearInterceptors()
+	randomStreamClient.RegisterSSTableGenerator(func(keyValues []roachpb.KeyValue) kvpb.RangeFeedSSTable {
+		return sstMaker(t, keyValues)
+	})
+	randomStreamClient.RegisterInterception(cancelAfterCheckpoints)
+	randomStreamClient.RegisterInterception(validateFnWithValidator(t, streamValidator))
+
+	out, err := runStreamIngestionProcessor(ctx, t, registry, db,
+		topo, initialScanTimestamp, []jobspb.ResolvedSpan{}, tenantRekey,
+		randomStreamClient, noCutover{}, nil /* streamingTestingKnobs*/)
 	require.NoError(t, err)
 
-	partitionSpanToTableID := getPartitionSpanToTableID(t, topo)
+	partitionSpanToTableID := getPartitionSpanToTableID(t, topo.Partitions)
 	numResolvedEvents := 0
 	maxResolvedTimestampPerPartition := make(map[string]hlc.Timestamp)
 	for {
@@ -459,6 +515,7 @@ func TestRandomClientGeneration(t *testing.T) {
 		if row == nil {
 			break
 		}
+
 		datum := row[0].Datum
 		protoBytes, ok := datum.(*tree.DBytes)
 		require.True(t, ok)
@@ -466,14 +523,11 @@ func TestRandomClientGeneration(t *testing.T) {
 		var resolvedSpans jobspb.ResolvedSpans
 		require.NoError(t, protoutil.Unmarshal([]byte(*protoBytes), &resolvedSpans))
 
+		latestResolvedTimestamp := hlc.MinTimestamp
 		for _, resolvedSpan := range resolvedSpans.ResolvedSpans {
-			if _, ok := partitionSpanToTableID[resolvedSpan.Span.String()]; !ok {
-				t.Fatalf("expected resolved span %v to be either in one of the supplied partition"+
-					" addresses %v", resolvedSpan.Span, topo)
+			if latestResolvedTimestamp.Less(resolvedSpan.Timestamp) {
+				latestResolvedTimestamp = resolvedSpan.Timestamp
 			}
-
-			// All resolved timestamp events should be greater than the start time.
-			require.Greater(t, resolvedSpan.Timestamp.WallTime, startTime.WallTime)
 
 			// Track the max resolved timestamp per partition.
 			if ts, ok := maxResolvedTimestampPerPartition[resolvedSpan.Span.String()]; !ok ||
@@ -482,6 +536,9 @@ func TestRandomClientGeneration(t *testing.T) {
 			}
 			numResolvedEvents++
 		}
+
+		// We must have at least some progress across the frontier
+		require.Greater(t, latestResolvedTimestamp.WallTime, initialScanTimestamp.WallTime)
 	}
 
 	// Ensure that no errors were reported to the validator.
@@ -490,11 +547,6 @@ func TestRandomClientGeneration(t *testing.T) {
 	}
 
 	for pSpan, id := range partitionSpanToTableID {
-		numRows, err := strconv.Atoi(sqlDB.QueryStr(t, fmt.Sprintf(
-			`SELECT count(*) FROM defaultdb.%s%d`, streamclient.IngestionTablePrefix, id))[0][0])
-		require.NoError(t, err)
-		require.Greater(t, numRows, 0, "at least 1 row ingested expected")
-
 		// Scan the store for KVs ingested by this partition, and compare the MVCC
 		// KVs against the KVEvents streamed up to the max ingested timestamp for
 		// the partition.
@@ -507,25 +559,27 @@ func runStreamIngestionProcessor(
 	ctx context.Context,
 	t *testing.T,
 	registry *jobs.Registry,
-	kvDB *kv.DB,
-	streamAddr string,
+	db descs.DB,
 	partitions streamclient.Topology,
-	startTime hlc.Timestamp,
-	interceptEvents []streamclient.InterceptFn,
+	initialScanTimestamp hlc.Timestamp,
+	checkpoint []jobspb.ResolvedSpan,
 	tenantRekey execinfrapb.TenantRekey,
 	mockClient streamclient.Client,
+	cutoverProvider cutoverProvider,
+	streamingTestingKnobs *sql.StreamingTestingKnobs,
 ) (*distsqlutils.RowBuffer, error) {
-	sip, out, err := getStreamIngestionProcessor(ctx, t, registry, kvDB, streamAddr,
-		partitions, startTime, interceptEvents, tenantRekey, mockClient, nil /* streamingTestingKnobs */)
+	sip, err := getStreamIngestionProcessor(ctx, t, registry, db,
+		partitions, initialScanTimestamp, checkpoint, tenantRekey, mockClient, cutoverProvider, streamingTestingKnobs)
 	require.NoError(t, err)
 
-	sip.Run(ctx)
+	out := &distsqlutils.RowBuffer{}
+	sip.Run(ctx, out)
 
 	// Ensure that all the outputs are properly closed.
 	if !out.ProducerClosed() {
 		t.Fatalf("output RowReceiver not closed")
 	}
-	if err := sip.forceClientForTests.Close(); err != nil {
+	if err := sip.forceClientForTests.Close(ctx); err != nil {
 		return nil, err
 	}
 	return out, err
@@ -535,95 +589,124 @@ func getStreamIngestionProcessor(
 	ctx context.Context,
 	t *testing.T,
 	registry *jobs.Registry,
-	kvDB *kv.DB,
-	streamAddr string,
+	db descs.DB,
 	partitions streamclient.Topology,
-	startTime hlc.Timestamp,
-	interceptEvents []streamclient.InterceptFn,
+	initialScanTimestamp hlc.Timestamp,
+	checkpoint []jobspb.ResolvedSpan,
 	tenantRekey execinfrapb.TenantRekey,
 	mockClient streamclient.Client,
+	cutoverProvider cutoverProvider,
 	streamingTestingKnobs *sql.StreamingTestingKnobs,
-) (*streamIngestionProcessor, *distsqlutils.RowBuffer, error) {
+) (*streamIngestionProcessor, error) {
 	st := cluster.MakeTestingClusterSettings()
 	evalCtx := eval.MakeTestingEvalContext(st)
+	if mockClient == nil {
+		return nil, errors.AssertionFailedf("non-nil streamclient required")
+	}
 
 	testDiskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer testDiskMonitor.Stop(ctx)
 
 	flowCtx := execinfra.FlowCtx{
 		Cfg: &execinfra.ServerConfig{
-			Settings:     st,
-			DB:           kvDB,
-			JobRegistry:  registry,
-			TestingKnobs: execinfra.TestingKnobs{StreamingTestingKnobs: streamingTestingKnobs},
+			Settings:          st,
+			DB:                db,
+			JobRegistry:       registry,
+			TestingKnobs:      execinfra.TestingKnobs{StreamingTestingKnobs: streamingTestingKnobs},
+			BulkSenderLimiter: limit.MakeConcurrentRequestLimiter("test", math.MaxInt),
 		},
 		EvalCtx:     &evalCtx,
+		Mon:         evalCtx.TestingMon,
 		DiskMonitor: testDiskMonitor,
 	}
 
-	out := &distsqlutils.RowBuffer{}
 	post := execinfrapb.PostProcessSpec{}
 
 	var spec execinfrapb.StreamIngestionDataSpec
-	spec.StreamAddress = streamAddr
+	spec.StreamAddress = "http://unused"
 	spec.TenantRekey = tenantRekey
-	spec.PartitionIds = make([]string, len(partitions))
-	spec.PartitionAddresses = make([]string, len(partitions))
-	spec.PartitionSpecs = make([]string, len(partitions))
-	for i, pa := range partitions {
-		spec.PartitionIds[i] = pa.ID
-		spec.PartitionAddresses[i] = string(pa.SrcAddr)
-		spec.PartitionSpecs[i] = string(pa.SubscriptionToken)
+	spec.PartitionSpecs = make(map[string]execinfrapb.StreamIngestionPartitionSpec)
+	for _, pa := range partitions.Partitions {
+		spec.PartitionSpecs[pa.ID] = execinfrapb.StreamIngestionPartitionSpec{
+			PartitionID:       pa.ID,
+			Address:           string(pa.SrcAddr),
+			SubscriptionToken: string(pa.SubscriptionToken),
+			Spans:             pa.Spans,
+		}
 	}
-	spec.StartTime = startTime
+	spec.InitialScanTimestamp = initialScanTimestamp
+	spec.Checkpoint.ResolvedSpans = checkpoint
 	processorID := int32(0)
-	proc, err := newStreamIngestionDataProcessor(&flowCtx, processorID, spec, &post, out)
+	proc, err := newStreamIngestionDataProcessor(ctx, &flowCtx, processorID, spec, &post)
 	require.NoError(t, err)
 	sip, ok := proc.(*streamIngestionProcessor)
 	if !ok {
 		t.Fatal("expected the processor that's created to be a split and scatter processor")
 	}
 
-	if mockClient != nil {
-		sip.forceClientForTests = mockClient
+	sip.forceClientForTests = mockClient
+	if cutoverProvider != nil {
+		sip.cutoverProvider = cutoverProvider
 	}
 
-	if interceptable, ok := sip.forceClientForTests.(streamclient.InterceptableStreamClient); ok {
-		for _, interceptor := range interceptEvents {
-			interceptable.RegisterInterception(interceptor)
-		}
-	}
-	return sip, out, err
+	return sip, err
 }
 
-func registerValidatorWithClient(
-	validator *streamClientValidator,
+func resolvedSpansMinTS(resolvedSpans []jobspb.ResolvedSpan) hlc.Timestamp {
+	minTS := hlc.MaxTimestamp
+	for _, rs := range resolvedSpans {
+		if rs.Timestamp.Less(minTS) {
+			minTS = rs.Timestamp
+		}
+	}
+	return minTS
+}
+
+func noteKeyVal(
+	validator *streamClientValidator, keyVal roachpb.KeyValue, spec streamclient.SubscriptionToken,
+) {
+	if validator.rekeyer != nil {
+		rekey, _, err := validator.rekeyer.RewriteKey(keyVal.Key, 0 /* wallTime*/)
+		if err != nil {
+			panic(err.Error())
+		}
+		keyVal.Key = rekey
+		keyVal.Value.ClearChecksum()
+		keyVal.Value.InitChecksum(keyVal.Key)
+	}
+	err := validator.noteRow(string(spec), string(keyVal.Key), string(keyVal.Value.RawBytes),
+		keyVal.Value.Timestamp)
+	if err != nil {
+		panic(err.Error())
+	}
+}
+
+func validateFnWithValidator(
+	t *testing.T, validator *streamClientValidator,
 ) func(event streamingccl.Event, spec streamclient.SubscriptionToken) {
 	return func(event streamingccl.Event, spec streamclient.SubscriptionToken) {
 		switch event.Type() {
 		case streamingccl.CheckpointEvent:
-			resolvedTS := *event.GetResolved()
+			resolvedTS := resolvedSpansMinTS(event.GetResolvedSpans())
 			err := validator.noteResolved(string(spec), resolvedTS)
 			if err != nil {
 				panic(err.Error())
 			}
+		case streamingccl.SSTableEvent:
+			kvs := storageutils.ScanSST(t, event.GetSSTable().Data)
+			for _, keyVal := range kvs.MVCCKeyValues() {
+				noteKeyVal(validator, roachpb.KeyValue{
+					Key: keyVal.Key.Key,
+					Value: roachpb.Value{
+						RawBytes:  keyVal.Value,
+						Timestamp: keyVal.Key.Timestamp,
+					},
+				}, spec)
+			}
 		case streamingccl.KVEvent:
-			kv := *event.GetKV()
-
-			if validator.rekeyer != nil {
-				rekey, _, err := validator.rekeyer.RewriteKey(kv.Key)
-				if err != nil {
-					panic(err.Error())
-				}
-				kv.Key = rekey
-				kv.Value.ClearChecksum()
-				kv.Value.InitChecksum(kv.Key)
-			}
-			err := validator.noteRow(string(spec), string(kv.Key), string(kv.Value.RawBytes),
-				kv.Value.Timestamp)
-			if err != nil {
-				panic(err.Error())
-			}
+			noteKeyVal(validator, *event.GetKV(), spec)
+		case streamingccl.DeleteRangeEvent:
+			panic(errors.New("unsupported event type"))
 		}
 	}
 }

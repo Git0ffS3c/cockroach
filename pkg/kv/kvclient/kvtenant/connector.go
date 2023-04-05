@@ -21,13 +21,18 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 )
@@ -44,8 +49,9 @@ type Connector interface {
 	Start(context.Context) error
 
 	// NodeDescStore provides information on each of the KV nodes in the cluster
-	// in the form of NodeDescriptors. This obviates the need for SQL-only
-	// tenant processes to join the cluster-wide gossip network.
+	// in the form of NodeDescriptors and StoreDescriptors. This obviates the
+	// need for SQL-only tenant processes to join the cluster-wide gossip
+	// network.
 	kvcoord.NodeDescStore
 
 	// RangeDescriptorDB provides range addressing information in the form of
@@ -56,15 +62,27 @@ type Connector interface {
 	// (e.g. is the Range being requested owned by the requesting tenant?).
 	rangecache.RangeDescriptorDB
 
-	// RegionsServer provides access to a tenant's available regions. This is
-	// necessary for region validation for zone configurations and multi-region
-	// primitives.
-	serverpb.RegionsServer
+	// IteratorFactory allows secondary tenants to access Range Metadata in the
+	// form of iterators that return RangeDescriptors. Iterators are constructed
+	// through delegated GetRangeDescriptors requests; the rationale behind
+	// proxying requests is similar to the RangeDescriptorDB interface -- doing so
+	// ensures SQL-only tenants are not able to access Range Metadata for Ranges
+	// not owned by the requesting tenant.
+	rangedesc.IteratorFactory
 
 	// TenantStatusServer is the subset of the serverpb.StatusInterface that is
 	// used by the SQL system to query for debug information, such as tenant-specific
 	// range reports.
 	serverpb.TenantStatusServer
+
+	// TenantAdminServer is the subset of the serverpb.AdminInterface that is
+	// used by the SQL system to query for debug information, such as cluster-wide
+	// observability.
+	serverpb.TenantAdminServer
+
+	// TenantTimeSeriesServer is the subset of the tspb.TimeSeriesServer that is
+	// used by the SQL system to query for timeseries data.
+	tspb.TenantTimeSeriesServer
 
 	// TokenBucketProvider provides access to the tenant cost control token
 	// bucket.
@@ -73,6 +91,10 @@ type Connector interface {
 	// KVAccessor provides access to the subset of the cluster's span configs
 	// applicable to secondary tenants.
 	spanconfig.KVAccessor
+
+	// Reporter provides access to conformance reports, i.e. whether ranges
+	// backing queried keyspans conform the span configs that apply to them.
+	spanconfig.Reporter
 
 	// OverridesMonitor provides access to tenant cluster setting overrides.
 	settingswatcher.OverridesMonitor
@@ -89,8 +111,8 @@ type Connector interface {
 // token bucket.
 type TokenBucketProvider interface {
 	TokenBucket(
-		ctx context.Context, in *roachpb.TokenBucketRequest,
-	) (*roachpb.TokenBucketResponse, error)
+		ctx context.Context, in *kvpb.TokenBucketRequest,
+	) (*kvpb.TokenBucketResponse, error)
 }
 
 // ConnectorConfig encompasses the configuration required to create a Connector.
@@ -115,7 +137,9 @@ var Factory ConnectorFactory = requiresCCLBinaryFactory{}
 type requiresCCLBinaryFactory struct{}
 
 func (requiresCCLBinaryFactory) NewConnector(_ ConnectorConfig, _ []string) (Connector, error) {
-	return nil, errors.Errorf(`tenant connector requires a CCL binary`)
+	return nil, pgerror.WithCandidateCode(
+		errors.New(`tenant connector requires a CCL binary`),
+		pgcode.CCLRequired)
 }
 
 // AddressResolver wraps a NodeDescStore interface in an adapter that allows it

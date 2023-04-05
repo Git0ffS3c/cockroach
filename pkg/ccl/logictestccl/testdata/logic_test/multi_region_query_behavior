@@ -1,4 +1,5 @@
-# LogicTest: multiregion-9node-3region-3azs
+# tenant-cluster-setting-override-opt: sql.multi_region.allow_abstractions_for_secondary_tenants.enabled=true
+# LogicTest: multiregion-9node-3region-3azs multiregion-9node-3region-3azs-no-los
 # TODO(#75864): enable multiregion-9node-3region-3azs-tenant.
 
 # Set the closed timestamp interval to be short to shorten the amount of time
@@ -47,10 +48,8 @@ vectorized: true
 │       │ label: buffer 1
 │       │
 │       └── • render
-│           │ estimated row count: 2
 │           │
 │           └── • render
-│               │ estimated row count: 2
 │               │
 │               └── • values
 │                     size: 2 columns, 2 rows
@@ -65,9 +64,9 @@ vectorized: true
             │ equality cols are key
             │
             └── • render
-                │ estimated row count: 2
                 │
                 └── • scan buffer
+                      estimated row count: 2
                       label: buffer 1
 
 
@@ -256,6 +255,7 @@ ALTER TABLE history INJECT STATISTICS '[
 
 # Regression test for #63735. Ensure that we choose locality optimized anti
 # joins for the foreign key checks.
+skipif config multiregion-9node-3region-3azs-no-los
 query T retry
 EXPLAIN INSERT
 INTO
@@ -285,15 +285,16 @@ vectorized: true
 │           │ estimated row count: 0
 │           │ table: customer@primary
 │           │ equality cols are key
-│           │ lookup condition: (((column3 = c_w_id) AND (column2 = c_d_id)) AND (column1 = c_id)) AND (crdb_region IN ('ca-central-1', 'us-east-1'))
+│           │ lookup condition: (((crdb_region IN ('ca-central-1', 'us-east-1')) AND (column3 = c_w_id)) AND (column2 = c_d_id)) AND (column1 = c_id)
 │           │
 │           └── • lookup join (anti)
 │               │ estimated row count: 1
 │               │ table: customer@primary
 │               │ equality cols are key
-│               │ lookup condition: (((column3 = c_w_id) AND (column2 = c_d_id)) AND (column1 = c_id)) AND (crdb_region = 'ap-southeast-2')
+│               │ lookup condition: (((crdb_region = 'ap-southeast-2') AND (column3 = c_w_id)) AND (column2 = c_d_id)) AND (column1 = c_id)
 │               │
 │               └── • scan buffer
+│                     estimated row count: 1
 │                     label: buffer 1
 │
 └── • constraint-check
@@ -304,15 +305,16 @@ vectorized: true
             │ estimated row count: 0
             │ table: district@primary
             │ equality cols are key
-            │ lookup condition: ((column5 = d_w_id) AND (column4 = d_id)) AND (crdb_region IN ('ca-central-1', 'us-east-1'))
+            │ lookup condition: ((crdb_region IN ('ca-central-1', 'us-east-1')) AND (column5 = d_w_id)) AND (column4 = d_id)
             │
             └── • lookup join (anti)
                 │ estimated row count: 1
                 │ table: district@primary
                 │ equality cols are key
-                │ lookup condition: ((column5 = d_w_id) AND (column4 = d_id)) AND (crdb_region = 'ap-southeast-2')
+                │ lookup condition: ((crdb_region = 'ap-southeast-2') AND (column5 = d_w_id)) AND (column4 = d_id)
                 │
                 └── • scan buffer
+                      estimated row count: 1
                       label: buffer 1
 
 # Regression test for #62269. Ensure that locality optimized search results in
@@ -338,6 +340,7 @@ INSERT INTO promos VALUES ('7fe2dce4-ecac-4d12-87b6-e1c1f837d835', 50, '{"some":
 INSERT INTO orders
   VALUES ('94e4b847-8f2f-4ac5-83f1-641d6e3df727', 100, '7fe2dce4-ecac-4d12-87b6-e1c1f837d835', '{"some": "info"}')
 
+skipif config multiregion-9node-3region-3azs-no-los
 query T nodeidx=3
 USE multi_region_test_db; EXPLAIN (DISTSQL) SELECT
     order_id, promo_id, price AS price_without_promo, price * discount AS price_with_promo
@@ -371,6 +374,7 @@ vectorized: true
 ·
 Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJysk9tO20wQx--_pxjNDQdtlPgACZaQjPhSGpQGmlC1UjeKjHcCW5Jdd3etpkK56rP1vSp7SUNQgwTthb2n-e_M72_PPdqvM0yw--myf9IbwO7_vdHV6H1_D0bdfvf0CrQRZCZSMCiMnuuHmcwJTkZ-Mvkm3a0u3aQOWJ3ug5A216Vym4E-Ct4ML975uy2cX_QG_nYLH0a9wRnsrnLtwce33WH3dxVwDDtHMcXXnbjd6EzDaSPO8oNGJ5oGjcM4EIcUiWk7bO8gQ6UFDbI5WUw-Y4xjhoXROVmrTbV1Xwf0xAKTFkOpitJV22OGuTaEyT066WaECV5l1zMaUibINFvIUJDL5Ky-1hOkfpgUd_QdGZ7qWTlXNtnwTua0thAZjoqsCmlyTDk2OXK-OIo5X1D1uu6ccb7oTJvnP39wvpgGgvNFINRxtWjvcGy2IFMCAtDulgyOlwx16dYI1mU3hEmwZK_DDP49ZgXUehXqVrxwK96aypKR2QxKVVdJYgNsvPyDDwPd0EUz3HSgL-fSQbC1lNZLnD7XUj0YHW2m8V2Q-mFldF_ru7KAL1oq0CqBNHrs_rotVw2HDIekBJkE0oBBGjFIw-rZTw-2AkQvARiSLbSy9MTMbdaMGZK4If9hrC5NTpdG53Uav7yodfWGIOv8aegXPVUf1f_yY3HwN-LwWXG0IW49FUfPiuMn4vHyv18BAAD__47ayRw=
 
+skipif config multiregion-9node-3region-3azs-no-los
 query T nodeidx=3
 USE multi_region_test_db; EXPLAIN (DISTSQL) SELECT
     order_id, promos.promo_id, price AS price_without_promo, price * discount AS price_with_promo
@@ -406,7 +410,7 @@ vectorized: true
                   table: orders@orders_pkey
                   spans: [/'ap-southeast-2'/'94e4b847-8f2f-4ac5-83f1-641d6e3df727' - /'ap-southeast-2'/'94e4b847-8f2f-4ac5-83f1-641d6e3df727'] [/'us-east-1'/'94e4b847-8f2f-4ac5-83f1-641d6e3df727' - /'us-east-1'/'94e4b847-8f2f-4ac5-83f1-641d6e3df727']
 ·
-Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyslM1uGjEQx-99CmsuaSMT9otAVorkKKUtEYUUIrVSjdBmPSRuwN7a3nariFOfre9V7S4hISpUSXsA2-P5M_Mbz3AL9uscYuh-Ou-f9Abk5eve-GL8of-KjLv97ukF0UagmUpBSWb0QtuDalkZZIrkZFxvpt-lu9a5m1YOd7f7REib6ly5Tcfai7wZDd_XISw5G_YGqyBkeLc7kGqmCeO554W48qxtH991R911euSY7B1FGF12onajMwtmjShJW41OOPMbh5EvDjEUs3bQ3gMKSgscJAu0EH-GCCYUMqNTtFab0nRbOfREAbFHQaosd6V5QiHVBiG-BSfdHCGGi-RyjiNMBJqmBxQEukTOq5-tM2X1Ms1u8AdQONXzfKFsvFFUmSIlJRFQGGdJed3kwDg0OXBeHEWcF1h-XXbecl50Zs2zXz85L2a-4LzwhTouD-09Dk2PJEoQn2h3jQYmSwo6d_fpW5dcIcT-kj4P0f-_iCWM9yzMrWjBVrR7IotGJnOSqypDFBtQk-UfajDQDZ01g036vlxIR_ytqXhPqXJPfUPjUJxpqdA0w81Q9SSwepmWdZxKUQBdy7pFZghrrceEhQ9f4n5gV08wzF1MmE9ZQFlIWbSVIXwKQ5n7qlGiXfmvGqWv9U2ekS9aKqJVTFgpGg4Ia_8V4-4fZQ00QiXQVEyEtShhQfnZZ4dbyaKnkI3QZlpZfNQp2959QgHFFdZdZ3VuUjw3Oq3C1MdhpasMAq2rb4P60FPVVTWkD8X-v4iDneJwQ-w9Foc7xdFucbRT3Hoknixf_A4AAP__TIEqRA==
+Diagram: https://cockroachdb.github.io/distsqlplan/decode.html#eJyslN1u2koQx-_PU6zmJudES_AnEEuRNsqhLRGFFCK1Uhchxzsk28Cuu163riKu-mx9r8o2-SCqqUh7Aeudmb9nfrOzvoPs8xIi6H-4GJ4ORuTf_wfTy-m74X9k2h_2zy6JNgLNXApKUqNXOjuqlo1BJkhOp_XD_Ku0Nzq38yrg3ntIhMwSnSu7HVhHkVeT8ds6RUbOx4PRJgkZ3z8dSbXQhPHccXzcRNa292_6k_5DeeSEHBwHGFz1gm6rt_AWrSBOwlbPX7itTuCKDvpi0fW6B0BBaYGjeIUZRB8hgBmF1OgEs0yb0nRXBQxEAZFDQao0t6V5RiHRBiG6AyvtEiGCy_hqiROMBZq2AxQE2lguq9fWlbJ6mae3-A0onOllvlJZtNVUmSAlJRFQmKZx6W5zYBzaHDgvjgPOCyz_rnqvOS96i_b5j--cFwtXcF64Qp2Um-4Bh7ZDYiWIS7S9QQOzNQWd28fyMxtfI0Tumr4M0f27iCWM8yLMRjSvEe2RKEMj4yXJVVUhii2o2foXPRjplk7b3jb9UK6kJW5jKc4-XR6oL2gsinMtFZq2v52qvgmsXuZlH-dSFEAfZP0iNYSFD9eE-U9P4vHCbo5gnNuIMJcyjzKfsqCRwd-Hoax9MyjBrvo3gzLU-jZPySctFdEqIqwUjUeEdX-Lcf9FaQIKKetQ1m3ECvbBqg8_3CaaoBJoqpyEBZQwr_wdsrAxZ7hPzglmqVYZPhvNpkGbUUBxjfWYZzo3CV4YnVRp6u240lUGgZmtvV69GajKVX0VnordPxF7O8X-lth5LvZ3ioPd4mCnONwtDneKO8_Es_U_PwMAAP__O2xhIQ==
 
 # Regression test for #74890. Code should not panic due to distribution already
 # provided by input.
@@ -422,3 +426,44 @@ USE multi_region_test_db; SELECT g FROM t74890 ORDER BY g
 3
 4
 5
+
+# Regression test for #85043. Distribute enforcer should not prevent the
+# optimizer from planning auto-commit.
+statement ok
+CREATE DATABASE one_region_test_db PRIMARY REGION "ca-central-1";
+USE one_region_test_db;
+CREATE TABLE t85043 (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ts TIMESTAMP
+);
+
+query T
+EXPLAIN UPDATE t85043 SET ts = '2022-08-01 18:07:07' WHERE id = 'ab020c49-ba5e-4800-8000-00000000014e'
+----
+distribution: local
+vectorized: true
+·
+• update
+│ table: t85043
+│ set: ts
+│ auto commit
+│
+└── • render
+    │
+    └── • scan
+          missing stats
+          table: t85043@t85043_pkey
+          spans: [/'ab020c49-ba5e-4800-8000-00000000014e' - /'ab020c49-ba5e-4800-8000-00000000014e']
+          locking strength: for update
+
+# Regression test for #85288. Distribute enforcer should not prevent the
+# optimizer from using bounded staleness.
+statement ok
+CREATE TABLE t85288 (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ts TIMESTAMP
+);
+
+statement ok
+select ts FROM t85288 AS OF SYSTEM TIME with_max_staleness('1h') WHERE
+ id = '00000000-0000-4000-8000-000000000000';

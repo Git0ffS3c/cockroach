@@ -52,16 +52,17 @@ func newSorter(
 	for i, ord := range orderingCols[:len(orderingCols)-1] {
 		partitioners[i] = newPartitioner(inputTypes[ord.ColIdx], false /* nullsAreDistinct */)
 	}
-	return &sortOp{
-		allocator:             allocator,
-		input:                 input,
-		inputTypes:            inputTypes,
-		sorters:               make([]colSorter, len(orderingCols)),
-		partitioners:          partitioners,
-		orderingCols:          orderingCols,
-		state:                 sortSpooling,
-		maxOutputBatchMemSize: maxOutputBatchMemSize,
+	s := &sortOp{
+		allocator:    allocator,
+		input:        input,
+		inputTypes:   inputTypes,
+		sorters:      make([]colSorter, len(orderingCols)),
+		partitioners: partitioners,
+		orderingCols: orderingCols,
+		state:        sortSpooling,
 	}
+	s.helper.Init(allocator, maxOutputBatchMemSize)
+	return s
 }
 
 // spooler is a column vector operator that spools the data from its input.
@@ -180,6 +181,7 @@ type sortOp struct {
 	colexecop.InitHelper
 
 	allocator *colmem.Allocator
+	helper    colmem.AccountingHelper
 	input     spooler
 
 	// inputTypes contains the types of all of the columns from input.
@@ -222,8 +224,7 @@ type sortOp struct {
 		partitionsCol []bool
 	}
 
-	output                coldata.Batch
-	maxOutputBatchMemSize int64
+	output coldata.Batch
 
 	exported int
 }
@@ -287,7 +288,7 @@ func (p *sortOp) Next() coldata.Batch {
 				p.state = sortDone
 				continue
 			}
-			p.output, _ = p.allocator.ResetMaybeReallocate(p.inputTypes, p.output, toEmit, p.maxOutputBatchMemSize)
+			p.output, _ = p.helper.ResetMaybeReallocate(p.inputTypes, p.output, toEmit)
 			if toEmit > p.output.Capacity() {
 				toEmit = p.output.Capacity()
 			}
@@ -388,7 +389,7 @@ func (p *sortOp) sort() {
 		p.scratch.partitionsCol = colexecutils.MaybeAllocateBoolArray(p.scratch.partitionsCol, spooledTuples)
 		partitionsCol = p.scratch.partitionsCol
 		sizeAfter := memsize.Bool * int64(cap(p.scratch.partitionsCol))
-		p.allocator.AdjustMemoryUsage(sizeAfter - sizeBefore)
+		p.allocator.AdjustMemoryUsageAfterAllocation(sizeAfter - sizeBefore)
 	} else {
 		// There are at least two partitions already, so the first column needs the
 		// same special treatment as all others. The general sequence is as
@@ -440,7 +441,7 @@ func (p *sortOp) sort() {
 		sizeBefore := memsize.Int * int64(cap(p.scratch.partitions))
 		p.scratch.partitions = boolVecToSel(partitionsCol, p.scratch.partitions[:0])
 		sizeAfter := memsize.Int * int64(cap(p.scratch.partitions))
-		p.allocator.AdjustMemoryUsage(sizeAfter - sizeBefore)
+		p.allocator.AdjustMemoryUsageAfterAllocation(sizeAfter - sizeBefore)
 		// For each partition (set of tuples that are identical in all of the sort
 		// columns we've seen so far), sort based on the new column.
 		sorter.sortPartitions(p.scratch.partitions)

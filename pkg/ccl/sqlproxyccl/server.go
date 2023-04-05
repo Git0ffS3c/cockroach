@@ -10,6 +10,7 @@ package sqlproxyccl
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -21,9 +22,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	proxyproto "github.com/pires/go-proxyproto"
+)
+
+var (
+	awaitNoConnectionsInterval = time.Minute
 )
 
 // Server is a TCP server that proxies SQL connections to a configurable
@@ -67,6 +72,7 @@ func NewServer(ctx context.Context, stopper *stop.Stopper, options ProxyOptions)
 	// endpoints.
 	mux.HandleFunc("/_status/vars/", s.handleVars)
 	mux.HandleFunc("/_status/healthz/", s.handleHealth)
+	mux.HandleFunc("/_status/cancel/", s.handleCancel)
 
 	// Taken from pprof's `init()` method. See:
 	// https://golang.org/src/net/http/pprof/pprof.go
@@ -110,14 +116,70 @@ func (s *Server) handleVars(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleCancel processes a cancel request that has been forwarded from another
+// sqlproxy.
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	var retErr error
+	defer func() {
+		if retErr != nil {
+			// Lots of noise from this log indicates that somebody is spamming
+			// fake cancel requests.
+			log.Warningf(
+				r.Context(), "could not handle cancel request from client %s: %v",
+				r.RemoteAddr, retErr,
+			)
+		}
+		if f := s.handler.testingKnobs.httpCancelErrHandler; f != nil {
+			f(retErr)
+		}
+	}()
+	buf := make([]byte, proxyCancelRequestLen)
+	n, err := r.Body.Read(buf)
+	// Write the response as soon as we read the data, so we don't reveal if we
+	// are processing the request or not.
+	// Explicitly ignore any errors from writing the response as there's
+	// nothing to be done if the write fails.
+	_, _ = w.Write([]byte("OK"))
+	if err != nil && err != io.EOF {
+		retErr = err
+		return
+	}
+	if n != len(buf) {
+		retErr = errors.Errorf("unexpected number of bytes %d", n)
+		return
+	}
+	p := &proxyCancelRequest{}
+	if err := p.Decode(buf); err != nil {
+		retErr = err
+		return
+	}
+	// This request should never be forwarded, since if it is handled here, it
+	// was already forwarded to the correct node.
+	retErr = s.handler.handleCancelRequest(p, false /* allowForward */)
+}
+
 // ServeHTTP starts the proxy's HTTP server on the given listener.
 // The server provides Prometheus metrics at /_status/vars,
 // a health check endpoint at /_status/healthz, and pprof debug
 // endpoints at /debug/pprof.
 func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
-	srv := http.Server{
-		Handler: s.mux,
+	if s.handler.RequireProxyProtocol {
+		ln = &proxyproto.Listener{
+			Listener: ln,
+			Policy: func(upstream net.Addr) (proxyproto.Policy, error) {
+				// There is a possibility where components doing healthchecking
+				// (e.g. Kubernetes) do not support the PROXY protocol directly.
+				// We use the `USE` policy here (which is also the default) to
+				// optionally allow the PROXY protocol to be supported. If a
+				// connection doesn't have the proxy headers, it'll just be
+				// treated as a regular one.
+				return proxyproto.USE, nil
+			},
+			ValidateHeader: s.handler.testingKnobs.validateProxyHeader,
+		}
 	}
+
+	srv := http.Server{Handler: s.mux}
 
 	go func() {
 		<-ctx.Done()
@@ -151,6 +213,18 @@ func (s *Server) ServeHTTP(ctx context.Context, ln net.Listener) error {
 // Incoming client connections are taken through the Postgres handshake and
 // relayed to the configured backend server.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	if s.handler.RequireProxyProtocol {
+		ln = &proxyproto.Listener{
+			Listener: ln,
+			Policy: func(upstream net.Addr) (proxyproto.Policy, error) {
+				// REQUIRE enforces the connection to send a PROXY header.
+				// The connection will be rejected if one was not present.
+				return proxyproto.REQUIRE, nil
+			},
+			ValidateHeader: s.handler.testingKnobs.validateProxyHeader,
+		}
+	}
+
 	err := s.Stopper.RunAsyncTask(ctx, "listen-quiesce", func(ctx context.Context) {
 		<-s.Stopper.ShouldQuiesce()
 		if err := ln.Close(); err != nil && !grpcutil.IsClosedConnection(err) {
@@ -162,13 +236,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 
 	for {
-		origConn, err := ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		conn := &proxyConn{
-			Conn: origConn,
-		}
+		s.metrics.AcceptedConnCount.Inc(1)
 
 		err = s.Stopper.RunAsyncTask(ctx, "proxy-con-serve", func(ctx context.Context) {
 			defer func() { _ = conn.Close() }()
@@ -186,42 +258,31 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// proxyConn is a SQL connection into the proxy.
-type proxyConn struct {
-	net.Conn
+// AwaitNoConnections returns a channel that is closed once the server has no open connections.
+// This is meant to be used after the server has stopped accepting new connections and we are
+// waiting to shutdown the server without inturrupting existing connections
+//
+// If the context is cancelled the channel will never close because we have to end the async task
+// to allow the stopper to completely finish
+func (s *Server) AwaitNoConnections(ctx context.Context) <-chan struct{} {
+	c := make(chan struct{})
 
-	mu struct {
-		syncutil.Mutex
-		closed   bool
-		closedCh chan struct{}
-	}
-}
-
-// Done returns a channel that's closed when the connection is closed.
-func (c *proxyConn) done() <-chan struct{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mu.closedCh == nil {
-		c.mu.closedCh = make(chan struct{})
-		if c.mu.closed {
-			close(c.mu.closedCh)
+	_ = s.Stopper.RunAsyncTask(ctx, "await-no-connections", func(context.Context) {
+		for {
+			connCount := s.metrics.CurConnCount.Value()
+			if connCount == 0 {
+				close(c)
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(awaitNoConnectionsInterval):
+				continue
+			}
 		}
-	}
-	return c.mu.closedCh
-}
 
-// Close closes the connection.
-// Any blocked Read or Write operations will be unblocked and return errors.
-// The connection's Done channel will be closed. This overrides net.Conn.Close.
-func (c *proxyConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.mu.closed {
-		return nil
-	}
-	if c.mu.closedCh != nil {
-		close(c.mu.closedCh)
-	}
-	c.mu.closed = true
-	return c.Conn.Close()
+	})
+
+	return c
 }

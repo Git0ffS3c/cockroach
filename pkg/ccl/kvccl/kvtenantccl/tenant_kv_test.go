@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/load"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -30,13 +31,21 @@ func TestTenantRangeQPSStat(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			DisableWebSessionAuthentication: true,
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
-	ts := tc.Server(0)
+	ts, hostDB, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			InsecureWebAccess: true,
+			// Must disable test tenant because test below assumes that
+			// it is connecting to the host tenant.
+			DefaultTestTenant: base.TestTenantDisabled,
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					// We disable the split queue as an untimely split can cause the QPS
+					// stat to be split over multiple ranges for the tenant.
+					DisableSplitQueue: true,
+				},
+			},
+		})
+	defer ts.Stopper().Stop(ctx)
 
 	_, db := serverutils.StartTenant(
 		t, ts, base.TestTenantArgs{TenantID: serverutils.TestTenantID()},
@@ -50,8 +59,7 @@ func TestTenantRangeQPSStat(t *testing.T) {
 	r.Exec(t, `INSERT INTO foo.qps_test VALUES('abc')`)
 
 	// Host connection.
-	conn := tc.ServerConn(0)
-	sqlDB := sqlutils.MakeSQLRunner(conn)
+	sqlDB := sqlutils.MakeSQLRunner(hostDB)
 
 	var rangeID int
 	stmt := fmt.Sprintf(
@@ -65,15 +73,15 @@ func TestTenantRangeQPSStat(t *testing.T) {
 	require.NoError(t, err)
 	repl, err := store.GetReplica(roachpb.RangeID(rangeID))
 	require.NoError(t, err)
-
-	qpsBefore, durationBefore := repl.QueriesPerSecond()
-	queriesBefore := qpsBefore * durationBefore.Seconds()
+	// NB: We call directly into the load tracking struct, in order to avoid
+	// flakes due to timing differences affecting the result
+	loadStats := repl.GetLoadStatsForTesting()
+	qpsBefore := loadStats.TestingGetSum(load.Queries)
 	for i := 0; i < 110; i++ {
 		r.Exec(t, `SELECT k FROM foo.qps_test`)
 	}
-	qpsAfter, durationAfter := repl.QueriesPerSecond()
-	queriesAfter := qpsAfter * durationAfter.Seconds()
-	queriesIncrease := int(queriesAfter - queriesBefore)
+	qpsAfter := loadStats.TestingGetSum(load.Queries)
+	queriesIncrease := int(qpsAfter - qpsBefore)
 	// If queries are correctly recorded, we should see increase in query count by
 	// 110. As it is possible due to rounding and conversion from QPS to query count
 	// to get a slightly higher or lower number - we expect the increase to be at

@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import React from "react";
+import React, { ReactNode } from "react";
 import { ColumnDescriptor, SortedTable } from "src/sortedtable";
 import { Tooltip } from "@cockroachlabs/ui-components";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
@@ -18,19 +18,36 @@ import {
   longToInt,
   TimestampToMoment,
   RenderCount,
+  DATE_FORMAT_24_UTC,
+  explainPlan,
+  limitText,
+  Count,
+  intersperse,
+  EncodeUriName,
+  EncodeDatabaseTableIndexUri,
+  EncodeDatabaseTableUri,
 } from "../../util";
+import { Anchor } from "../../anchor";
+import classNames from "classnames/bind";
+import styles from "./plansTable.module.scss";
+import { Link } from "react-router-dom";
 
-export type PlanHashStats = cockroach.server.serverpb.StatementDetailsResponse.ICollectedStatementGroupedByPlanHash;
+export type PlanHashStats =
+  cockroach.server.serverpb.StatementDetailsResponse.ICollectedStatementGroupedByPlanHash;
 export class PlansSortedTable extends SortedTable<PlanHashStats> {}
 
+const cx = classNames.bind(styles);
+
 const planDetailsColumnLabels = {
-  planID: "Plan ID",
-  lastExecTime: "Last Execution Time",
   avgExecTime: "Average Execution Time",
-  execCount: "Execution Count",
   avgRowsRead: "Average Rows Read",
-  fullScan: "Full Scan",
   distSQL: "Distributed",
+  execCount: "Execution Count",
+  fullScan: "Full Scan",
+  insights: "Insights",
+  indexes: "Used Indexes",
+  lastExecTime: "Last Execution Time",
+  planGist: "Plan Gist",
   vectorized: "Vectorized",
 };
 export type PlanDetailsTableColumnKeys = keyof typeof planDetailsColumnLabels;
@@ -40,14 +57,21 @@ type PlanDetailsTableTitleType = {
 };
 
 export const planDetailsTableTitles: PlanDetailsTableTitleType = {
-  planID: () => {
+  planGist: () => {
     return (
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The ID of the Plan."}
+        content={
+          <p>
+            The Gist of the{" "}
+            <Anchor href={explainPlan} target="_blank">
+              Explain Plan.
+            </Anchor>
+          </p>
+        }
       >
-        {planDetailsColumnLabels.planID}
+        {planDetailsColumnLabels.planGist}
       </Tooltip>
     );
   },
@@ -56,7 +80,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The last time this Plan was executed."}
+        content={"The last time this Explain Plan was executed."}
       >
         {planDetailsColumnLabels.lastExecTime}
       </Tooltip>
@@ -67,7 +91,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The average execution time for this Plan."}
+        content={"The average execution time for this Explain Plan."}
       >
         {planDetailsColumnLabels.avgExecTime}
       </Tooltip>
@@ -78,7 +102,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The execution count for this Plan."}
+        content={"The execution count for this Explain Plan."}
       >
         {planDetailsColumnLabels.execCount}
       </Tooltip>
@@ -89,7 +113,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"The average of rows read by this Plan."}
+        content={"The average of rows read by this Explain Plan."}
       >
         {planDetailsColumnLabels.avgRowsRead}
       </Tooltip>
@@ -100,7 +124,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"If the Plan executed a Full Scan."}
+        content={"If the Explain Plan executed a full scan."}
       >
         {planDetailsColumnLabels.fullScan}
       </Tooltip>
@@ -111,7 +135,7 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"If the Plan was distributed."}
+        content={"If the Explain Plan was distributed."}
       >
         {planDetailsColumnLabels.distSQL}
       </Tooltip>
@@ -122,13 +146,117 @@ export const planDetailsTableTitles: PlanDetailsTableTitleType = {
       <Tooltip
         style="tableTitle"
         placement="bottom"
-        content={"If the Plan was vectorized."}
+        content={"If the Explain Plan was vectorized."}
       >
         {planDetailsColumnLabels.vectorized}
       </Tooltip>
     );
   },
+  insights: () => {
+    return (
+      <Tooltip
+        style="tableTitle"
+        placement="bottom"
+        content={"The amount of insights for the Explain Plan."}
+      >
+        {planDetailsColumnLabels.insights}
+      </Tooltip>
+    );
+  },
+  indexes: () => {
+    return (
+      <Tooltip
+        style="tableTitle"
+        placement="bottom"
+        content={"Indexes used by the Explain Plan."}
+      >
+        {planDetailsColumnLabels.indexes}
+      </Tooltip>
+    );
+  },
 };
+
+function formatInsights(recommendations: string[]): string {
+  if (!recommendations || recommendations.length == 0) {
+    return "None";
+  }
+  if (recommendations.length == 1) {
+    return "1 Insight";
+  }
+  return `${recommendations.length} Insights`;
+}
+
+export function formatIndexes(indexes: string[], database: string): ReactNode {
+  if (indexes.length == 0) {
+    return <></>;
+  }
+  const indexMap: Map<string, Array<string>> = new Map<string, Array<string>>();
+  let droppedCount = 0;
+  let tableName;
+  let idxName;
+  let indexInfo;
+  for (let i = 0; i < indexes.length; i++) {
+    if (indexes[i] === "dropped") {
+      droppedCount++;
+      continue;
+    }
+    if (!indexes[i].includes("@")) {
+      continue;
+    }
+    indexInfo = indexes[i].split("@");
+    tableName = indexInfo[0];
+    idxName = indexInfo[1];
+    if (indexMap.has(tableName)) {
+      indexMap.set(tableName, indexMap.get(tableName).concat(idxName));
+    } else {
+      indexMap.set(tableName, [idxName]);
+    }
+  }
+
+  let newLine;
+  const list = Array.from(indexMap).map((value, i) => {
+    const table = value[0];
+    newLine = i > 0 ? <br /> : "";
+    const indexesList = intersperse<ReactNode>(
+      value[1].map(idx => {
+        return (
+          <Link
+            className={cx("regular-link")}
+            to={EncodeDatabaseTableIndexUri(database, table, idx)}
+            key={`${table}${idx}`}
+          >
+            {idx}
+          </Link>
+        );
+      }),
+      ", ",
+    );
+    return (
+      <span key={table}>
+        {newLine}
+        <Link
+          className={cx("bold-link")}
+          to={EncodeDatabaseTableUri(database, table)}
+        >
+          {table}
+        </Link>
+        : {indexesList}
+      </span>
+    );
+  });
+  newLine = list.length > 0 ? <br /> : "";
+  if (droppedCount === 1) {
+    list.push(<span key={`dropped`}>{newLine}[dropped index]</span>);
+  } else if (droppedCount > 1) {
+    list.push(
+      <span key={`dropped`}>
+        {newLine}[{droppedCount} dropped indexes]
+      </span>,
+    );
+  }
+
+  return intersperse<ReactNode>(list, ",");
+}
 
 export function makeExplainPlanColumns(
   handleDetails: (plan: PlanHashStats) => void,
@@ -137,20 +265,38 @@ export function makeExplainPlanColumns(
   const count = (v: number) => v.toFixed(1);
   return [
     {
-      name: "planID",
-      title: planDetailsTableTitles.planID(),
+      name: "planGist",
+      title: planDetailsTableTitles.planGist(),
       cell: (item: PlanHashStats) => (
-        <a onClick={() => handleDetails(item)}>{longToInt(item.plan_hash)}</a>
+        <Tooltip placement="bottom" content={item.stats.plan_gists[0]}>
+          <a onClick={() => handleDetails(item)}>
+            {limitText(item.stats.plan_gists[0], 25)}
+          </a>
+        </Tooltip>
       ),
-      sort: (item: PlanHashStats) => longToInt(item.plan_hash),
+      sort: (item: PlanHashStats) => item.stats.plan_gists[0],
       alwaysShow: true,
+    },
+    {
+      name: "indexes",
+      title: planDetailsTableTitles.indexes(),
+      cell: (item: PlanHashStats) =>
+        formatIndexes(item.stats.indexes, item.metadata.databases[0]),
+      sort: (item: PlanHashStats) => item.stats.indexes?.join(""),
+    },
+    {
+      name: "insights",
+      title: planDetailsTableTitles.insights(),
+      cell: (item: PlanHashStats) =>
+        formatInsights(item.stats.index_recommendations),
+      sort: (item: PlanHashStats) => item.stats.index_recommendations?.length,
     },
     {
       name: "lastExecTime",
       title: planDetailsTableTitles.lastExecTime(),
       cell: (item: PlanHashStats) =>
         TimestampToMoment(item.stats.last_exec_timestamp).format(
-          "MMM DD, YYYY HH:MM",
+          DATE_FORMAT_24_UTC,
         ),
       sort: (item: PlanHashStats) =>
         TimestampToMoment(item.stats.last_exec_timestamp).unix(),
@@ -165,7 +311,7 @@ export function makeExplainPlanColumns(
     {
       name: "execCount",
       title: planDetailsTableTitles.execCount(),
-      cell: (item: PlanHashStats) => longToInt(item.stats.count),
+      cell: (item: PlanHashStats) => Count(longToInt(item.stats.count)),
       sort: (item: PlanHashStats) => longToInt(item.stats.count),
     },
     {

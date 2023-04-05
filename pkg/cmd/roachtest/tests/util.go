@@ -14,10 +14,13 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -34,7 +37,7 @@ func WaitFor3XReplication(ctx context.Context, t test.Test, db *gosql.DB) error 
 func WaitForReplication(
 	ctx context.Context, t test.Test, db *gosql.DB, replicationFactor int,
 ) error {
-	t.L().Printf("waiting for initial up-replication...")
+	t.L().Printf("waiting for initial up-replication... (<%s)", 2*time.Minute)
 	tStart := timeutil.Now()
 	var oldN int
 	for {
@@ -102,20 +105,59 @@ func WaitForUpdatedReplicationReport(ctx context.Context, t test.Test, db *gosql
 	}
 }
 
-// SetAdmissionControl sets the admission control cluster settings on the
+// setAdmissionControl sets the admission control cluster settings on the
 // given cluster.
-func SetAdmissionControl(ctx context.Context, t test.Test, c cluster.Cluster, enabled bool) {
+func setAdmissionControl(ctx context.Context, t test.Test, c cluster.Cluster, enabled bool) {
 	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
 	val := "true"
 	if !enabled {
 		val = "false"
 	}
-	for _, setting := range []string{"admission.kv.enabled", "admission.sql_kv_response.enabled",
-		"admission.sql_sql_response.enabled"} {
+	for _, setting := range []string{
+		"admission.kv.enabled",
+		"admission.sql_kv_response.enabled",
+		"admission.sql_sql_response.enabled",
+		"admission.elastic_cpu.enabled",
+	} {
 		if _, err := db.ExecContext(
 			ctx, "SET CLUSTER SETTING "+setting+" = '"+val+"'"); err != nil {
 			t.Fatalf("failed to set admission control to %t: %v", enabled, err)
 		}
 	}
+	if !enabled {
+		if _, err := db.ExecContext(
+			ctx, "SET CLUSTER SETTING admission.kv.pause_replication_io_threshold = 0.0"); err != nil {
+			t.Fatalf("failed to set admission control to %t: %v", enabled, err)
+		}
+	}
+}
+
+// maybeUseBuildWithEnabledAssertions stages the cockroach-short binary with
+// enabled assertions with eaProb probability if that binary is available,
+// otherwise stages the regular cockroach binary, and starts the cluster.
+func maybeUseBuildWithEnabledAssertions(
+	ctx context.Context, t test.Test, c cluster.Cluster, rng *rand.Rand, eaProb float64,
+) {
+	if rng.Float64() < eaProb {
+		// Check whether the cockroach-short binary is available.
+		if t.CockroachShort() != "" {
+			randomSeed := rng.Int63()
+			t.Status(
+				"using cockroach-short binary compiled with --crdb_test "+
+					"build tag and COCKROACH_RANDOM_SEED=", randomSeed,
+			)
+			c.Put(ctx, t.CockroachShort(), "./cockroach")
+			// We need to ensure that all nodes in the cluster start with the
+			// same random seed (if not, some assumptions can be violated - for
+			// example that coldata.BatchSize() values are the same on all
+			// nodes).
+			settings := install.MakeClusterSettings()
+			settings.Env = append(settings.Env, fmt.Sprintf("COCKROACH_RANDOM_SEED=%d", randomSeed))
+			c.Start(ctx, t.L(), option.DefaultStartOpts(), settings)
+			return
+		}
+	}
+	c.Put(ctx, t.Cockroach(), "./cockroach")
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 }

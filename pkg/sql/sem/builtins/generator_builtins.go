@@ -13,17 +13,21 @@ package builtins
 import (
 	"bytes"
 	"context"
+	gojson "encoding/json"
+	"math/rand"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
@@ -34,6 +38,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/cockroach/pkg/util/randident"
+	"github.com/cockroachdb/cockroach/pkg/util/randident/randidentcfg"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
@@ -45,34 +53,36 @@ import (
 var _ eval.ValueGenerator = &seriesValueGenerator{}
 var _ eval.ValueGenerator = &arrayValueGenerator{}
 
-func initGeneratorBuiltins() {
+func init() {
 	// Add all windows to the builtins map after a few sanity checks.
 	for k, v := range generators {
-		if _, exists := builtins[k]; exists {
-			panic("duplicate builtin: " + k)
+		for _, g := range v.overloads {
+			if g.Class != tree.GeneratorClass {
+				panic(errors.AssertionFailedf("generator functions should be marked with the tree.GeneratorClass "+
+					"function class, found %v", v))
+			}
 		}
-
-		if v.props.Class != tree.GeneratorClass {
-			panic(errors.AssertionFailedf("generator functions should be marked with the tree.GeneratorClass "+
-				"function class, found %v", v))
-		}
-
-		builtins[k] = v
+		registerBuiltin(k, v)
 	}
 }
 
 func genProps() tree.FunctionProperties {
 	return tree.FunctionProperties{
-		Class:    tree.GeneratorClass,
-		Category: categoryGenerator,
+		Category: builtinconstants.CategoryGenerator,
 	}
 }
 
-func genPropsWithLabels(returnLabels []string) tree.FunctionProperties {
+func jsonGenPropsWithLabels(returnLabels []string) tree.FunctionProperties {
 	return tree.FunctionProperties{
-		Class:        tree.GeneratorClass,
-		Category:     categoryGenerator,
+		Category:     builtinconstants.CategoryJSON,
 		ReturnLabels: returnLabels,
+	}
+}
+
+func recordGenProps() tree.FunctionProperties {
+	return tree.FunctionProperties{
+		Category:          builtinconstants.CategoryGenerator,
+		ReturnsRecordType: true,
 	}
 }
 
@@ -99,9 +109,9 @@ var generators = map[string]builtinDefinition{
 	// See https://www.postgresql.org/docs/9.6/static/functions-info.html.
 	"aclexplode": makeBuiltin(genProps(),
 		makeGeneratorOverload(
-			tree.ArgTypes{{"aclitems", types.StringArray}},
+			tree.ParamTypes{{Name: "aclitems", Typ: types.StringArray}},
 			aclexplodeGeneratorType,
-			func(ctx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+			func(_ context.Context, _ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
 				return aclexplodeGenerator{}, nil
 			},
 			"Produces a virtual table containing aclitem stuff ("+
@@ -109,31 +119,84 @@ var generators = map[string]builtinDefinition{
 			volatility.Stable,
 		),
 	),
+	"crdb_internal.scan": makeBuiltin(genProps(),
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "start_key", Typ: types.Bytes},
+				{Name: "end_key", Typ: types.Bytes},
+			},
+			spanKeyIteratorType,
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, errors.New("crdb_internal.scan() requires admin privilege")
+				}
+				startKey := []byte(tree.MustBeDBytes(args[0]))
+				endKey := []byte(tree.MustBeDBytes(args[1]))
+				return newSpanKeyIterator(evalCtx, roachpb.Span{
+					Key:    startKey,
+					EndKey: endKey,
+				}), nil
+			},
+			"Returns the raw keys and values with their timestamp from the specified span",
+			volatility.Stable,
+		),
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "span", Typ: types.BytesArray},
+			},
+			spanKeyIteratorType,
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, errors.New("crdb_internal.scan() requires admin privilege")
+				}
+				arr := tree.MustBeDArray(args[0])
+				if arr.Len() != 2 {
+					return nil, errors.New("expected an array of two elements")
+				}
+				startKey := []byte(tree.MustBeDBytes(arr.Array[0]))
+				endKey := []byte(tree.MustBeDBytes(arr.Array[1]))
+				return newSpanKeyIterator(evalCtx, roachpb.Span{
+					Key:    startKey,
+					EndKey: endKey,
+				}), nil
+			},
+			"Returns the raw keys and values from the specified span",
+			volatility.Stable,
+		),
+	),
 	"generate_series": makeBuiltin(genProps(),
 		// See https://www.postgresql.org/docs/current/static/functions-srf.html#FUNCTIONS-SRF-SERIES
 		makeGeneratorOverload(
-			tree.ArgTypes{{"start", types.Int}, {"end", types.Int}},
+			tree.ParamTypes{{Name: "start", Typ: types.Int}, {Name: "end", Typ: types.Int}},
 			seriesValueGeneratorType,
 			makeSeriesGenerator,
 			"Produces a virtual table containing the integer values from `start` to `end`, inclusive.",
 			volatility.Immutable,
 		),
 		makeGeneratorOverload(
-			tree.ArgTypes{{"start", types.Int}, {"end", types.Int}, {"step", types.Int}},
+			tree.ParamTypes{{Name: "start", Typ: types.Int}, {Name: "end", Typ: types.Int}, {Name: "step", Typ: types.Int}},
 			seriesValueGeneratorType,
 			makeSeriesGenerator,
 			"Produces a virtual table containing the integer values from `start` to `end`, inclusive, by increment of `step`.",
 			volatility.Immutable,
 		),
 		makeGeneratorOverload(
-			tree.ArgTypes{{"start", types.Timestamp}, {"end", types.Timestamp}, {"step", types.Interval}},
+			tree.ParamTypes{{Name: "start", Typ: types.Timestamp}, {Name: "end", Typ: types.Timestamp}, {Name: "step", Typ: types.Interval}},
 			seriesTSValueGeneratorType,
 			makeTSSeriesGenerator,
 			"Produces a virtual table containing the timestamp values from `start` to `end`, inclusive, by increment of `step`.",
 			volatility.Immutable,
 		),
 		makeGeneratorOverload(
-			tree.ArgTypes{{"start", types.TimestampTZ}, {"end", types.TimestampTZ}, {"step", types.Interval}},
+			tree.ParamTypes{{Name: "start", Typ: types.TimestampTZ}, {Name: "end", Typ: types.TimestampTZ}, {Name: "step", Typ: types.Interval}},
 			seriesTSTZValueGeneratorType,
 			makeTSTZSeriesGenerator,
 			"Produces a virtual table containing the timestampTZ values from `start` to `end`, inclusive, by increment of `step`.",
@@ -145,15 +208,15 @@ var generators = map[string]builtinDefinition{
 	// on a TestServer through its eval.TestingKnobs.CallbackGenerators.
 	"crdb_internal.testing_callback": makeBuiltin(genProps(),
 		makeGeneratorOverload(
-			tree.ArgTypes{{"name", types.String}},
+			tree.ParamTypes{{Name: "name", Typ: types.String}},
 			types.Int,
-			func(ctx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
 				s, ok := tree.AsDString(args[0])
 				if !ok {
 					return nil, errors.Newf("expected string value, got %T", args[0])
 				}
 				name := string(s)
-				gen, ok := ctx.TestingKnobs.CallbackGenerators[name]
+				gen, ok := evalCtx.TestingKnobs.CallbackGenerators[name]
 				if !ok {
 					return nil, errors.Errorf("callback %q not registered", name)
 				}
@@ -169,7 +232,7 @@ var generators = map[string]builtinDefinition{
 	"pg_get_keywords": makeBuiltin(genProps(),
 		// See https://www.postgresql.org/docs/10/static/functions-info.html#FUNCTIONS-INFO-CATALOG-TABLE
 		makeGeneratorOverload(
-			tree.ArgTypes{},
+			tree.ParamTypes{},
 			keywordsValueGeneratorType,
 			makeKeywordsGenerator,
 			"Produces a virtual table containing the keywords known to the SQL parser.",
@@ -179,8 +242,8 @@ var generators = map[string]builtinDefinition{
 	`pg_options_to_table`: makeBuiltin(
 		genProps(),
 		makeGeneratorOverload(
-			tree.ArgTypes{
-				{"options", types.MakeArray(types.String)},
+			tree.ParamTypes{
+				{Name: "options", Typ: types.MakeArray(types.String)},
 			},
 			optionsToOverloadGeneratorType,
 			makeOptionsToTableGenerator,
@@ -194,9 +257,9 @@ var generators = map[string]builtinDefinition{
 	"regexp_split_to_table": makeBuiltin(
 		genProps(),
 		makeGeneratorOverload(
-			tree.ArgTypes{
-				{"string", types.String},
-				{"pattern", types.String},
+			tree.ParamTypes{
+				{Name: "string", Typ: types.String},
+				{Name: "pattern", Typ: types.String},
 			},
 			types.String,
 			makeRegexpSplitToTableGeneratorFactory(false /* hasFlags */),
@@ -204,10 +267,10 @@ var generators = map[string]builtinDefinition{
 			volatility.Immutable,
 		),
 		makeGeneratorOverload(
-			tree.ArgTypes{
-				{"string", types.String},
-				{"pattern", types.String},
-				{"flags", types.String},
+			tree.ParamTypes{
+				{Name: "string", Typ: types.String},
+				{Name: "pattern", Typ: types.String},
+				{Name: "flags", Typ: types.String},
 			},
 			types.String,
 			makeRegexpSplitToTableGeneratorFactory(true /* hasFlags */),
@@ -219,7 +282,7 @@ var generators = map[string]builtinDefinition{
 	"unnest": makeBuiltin(genProps(),
 		// See https://www.postgresql.org/docs/current/static/functions-array.html
 		makeGeneratorOverloadWithReturnType(
-			tree.ArgTypes{{"input", types.AnyArray}},
+			tree.ParamTypes{{Name: "input", Typ: types.AnyArray}},
 			func(args []tree.TypedExpr) *types.T {
 				if len(args) == 0 || args[0].ResolvedType().Family() == types.UnknownFamily {
 					return tree.UnknownReturnType
@@ -257,7 +320,7 @@ var generators = map[string]builtinDefinition{
 
 	"information_schema._pg_expandarray": makeBuiltin(genProps(),
 		makeGeneratorOverloadWithReturnType(
-			tree.ArgTypes{{"input", types.AnyArray}},
+			tree.ParamTypes{{Name: "input", Typ: types.AnyArray}},
 			func(args []tree.TypedExpr) *types.T {
 				if len(args) == 0 || args[0].ResolvedType().Family() == types.UnknownFamily {
 					return tree.UnknownReturnType
@@ -273,7 +336,7 @@ var generators = map[string]builtinDefinition{
 
 	"crdb_internal.unary_table": makeBuiltin(genProps(),
 		makeGeneratorOverload(
-			tree.ArgTypes{},
+			tree.ParamTypes{},
 			unaryValueGeneratorType,
 			makeUnaryGenerator,
 			"Produces a virtual table containing a single row with no values.\n\n"+
@@ -285,21 +348,21 @@ var generators = map[string]builtinDefinition{
 	"generate_subscripts": makeBuiltin(genProps(),
 		// See https://www.postgresql.org/docs/current/static/functions-srf.html#FUNCTIONS-SRF-SUBSCRIPTS
 		makeGeneratorOverload(
-			tree.ArgTypes{{"array", types.AnyArray}},
+			tree.ParamTypes{{Name: "array", Typ: types.AnyArray}},
 			subscriptsValueGeneratorType,
 			makeGenerateSubscriptsGenerator,
 			"Returns a series comprising the given array's subscripts.",
 			volatility.Immutable,
 		),
 		makeGeneratorOverload(
-			tree.ArgTypes{{"array", types.AnyArray}, {"dim", types.Int}},
+			tree.ParamTypes{{Name: "array", Typ: types.AnyArray}, {Name: "dim", Typ: types.Int}},
 			subscriptsValueGeneratorType,
 			makeGenerateSubscriptsGenerator,
 			"Returns a series comprising the given array's subscripts.",
 			volatility.Immutable,
 		),
 		makeGeneratorOverload(
-			tree.ArgTypes{{"array", types.AnyArray}, {"dim", types.Int}, {"reverse", types.Bool}},
+			tree.ParamTypes{{Name: "array", Typ: types.AnyArray}, {Name: "dim", Typ: types.Int}, {Name: "reverse", Typ: types.Bool}},
 			subscriptsValueGeneratorType,
 			makeGenerateSubscriptsGenerator,
 			"Returns a series comprising the given array's subscripts.\n\n"+
@@ -308,16 +371,16 @@ var generators = map[string]builtinDefinition{
 		),
 	),
 
-	"json_array_elements":       makeBuiltin(genPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsImpl),
-	"jsonb_array_elements":      makeBuiltin(genPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsImpl),
-	"json_array_elements_text":  makeBuiltin(genPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsTextImpl),
-	"jsonb_array_elements_text": makeBuiltin(genPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsTextImpl),
+	"json_array_elements":       makeBuiltin(jsonGenPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsImpl),
+	"jsonb_array_elements":      makeBuiltin(jsonGenPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsImpl),
+	"json_array_elements_text":  makeBuiltin(jsonGenPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsTextImpl),
+	"jsonb_array_elements_text": makeBuiltin(jsonGenPropsWithLabels(jsonArrayGeneratorLabels), jsonArrayElementsTextImpl),
 	"json_object_keys":          makeBuiltin(genProps(), jsonObjectKeysImpl),
 	"jsonb_object_keys":         makeBuiltin(genProps(), jsonObjectKeysImpl),
-	"json_each":                 makeBuiltin(genPropsWithLabels(jsonEachGeneratorLabels), jsonEachImpl),
-	"jsonb_each":                makeBuiltin(genPropsWithLabels(jsonEachGeneratorLabels), jsonEachImpl),
-	"json_each_text":            makeBuiltin(genPropsWithLabels(jsonEachGeneratorLabels), jsonEachTextImpl),
-	"jsonb_each_text":           makeBuiltin(genPropsWithLabels(jsonEachGeneratorLabels), jsonEachTextImpl),
+	"json_each":                 makeBuiltin(jsonGenPropsWithLabels(jsonEachGeneratorLabels), jsonEachImpl),
+	"jsonb_each":                makeBuiltin(jsonGenPropsWithLabels(jsonEachGeneratorLabels), jsonEachImpl),
+	"json_each_text":            makeBuiltin(jsonGenPropsWithLabels(jsonEachGeneratorLabels), jsonEachTextImpl),
+	"jsonb_each_text":           makeBuiltin(jsonGenPropsWithLabels(jsonEachGeneratorLabels), jsonEachTextImpl),
 	"json_populate_record": makeBuiltin(jsonPopulateProps, makeJSONPopulateImpl(makeJSONPopulateRecordGenerator,
 		"Expands the object in from_json to a row whose columns match the record type defined by base.",
 	)),
@@ -329,13 +392,18 @@ var generators = map[string]builtinDefinition{
 	"jsonb_populate_recordset": makeBuiltin(jsonPopulateProps, makeJSONPopulateImpl(makeJSONPopulateRecordSetGenerator,
 		"Expands the outermost array of objects in from_json to a set of rows whose columns match the record type defined by base")),
 
+	"json_to_record":     makeBuiltin(recordGenProps(), jsonToRecordImpl),
+	"jsonb_to_record":    makeBuiltin(recordGenProps(), jsonToRecordImpl),
+	"json_to_recordset":  makeBuiltin(recordGenProps(), jsonToRecordSetImpl),
+	"jsonb_to_recordset": makeBuiltin(recordGenProps(), jsonToRecordSetImpl),
+
 	"crdb_internal.check_consistency": makeBuiltin(
 		tree.FunctionProperties{
-			Class:    tree.GeneratorClass,
-			Category: categorySystemInfo,
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // see #88222
 		},
 		makeGeneratorOverload(
-			tree.ArgTypes{
+			tree.ParamTypes{
 				{Name: "stats_only", Typ: types.Bool},
 				{Name: "start_key", Typ: types.Bytes},
 				{Name: "end_key", Typ: types.Bytes},
@@ -348,19 +416,18 @@ var generators = map[string]builtinDefinition{
 				"small number of ranges to avoid overloading the cluster. Each returned row "+
 				"contains the range ID, the status (a roachpb.CheckConsistencyResponse_Status), "+
 				"and verbose detail.\n\n"+
-				"Example usage:\n"+
-				"SELECT * FROM crdb_internal.check_consistency(true, '\\x02', '\\x04')",
+				"Example usage:\n\n"+
+				"`SELECT * FROM crdb_internal.check_consistency(true, b'\\x02', b'\\x04')`",
 			volatility.Volatile,
 		),
 	),
 
 	"crdb_internal.list_sql_keys_in_range": makeBuiltin(
 		tree.FunctionProperties{
-			Class:    tree.GeneratorClass,
-			Category: categorySystemInfo,
+			Category: builtinconstants.CategorySystemInfo,
 		},
 		makeGeneratorOverload(
-			tree.ArgTypes{
+			tree.ParamTypes{
 				{Name: "range_id", Typ: types.Int},
 			},
 			rangeKeyIteratorType,
@@ -372,11 +439,10 @@ var generators = map[string]builtinDefinition{
 
 	"crdb_internal.payloads_for_span": makeBuiltin(
 		tree.FunctionProperties{
-			Class:    tree.GeneratorClass,
-			Category: categorySystemInfo,
+			Category: builtinconstants.CategorySystemInfo,
 		},
 		makeGeneratorOverload(
-			tree.ArgTypes{
+			tree.ParamTypes{
 				{Name: "span_id", Typ: types.Int},
 			},
 			payloadsForSpanGeneratorType,
@@ -387,11 +453,10 @@ var generators = map[string]builtinDefinition{
 	),
 	"crdb_internal.payloads_for_trace": makeBuiltin(
 		tree.FunctionProperties{
-			Class:    tree.GeneratorClass,
-			Category: categorySystemInfo,
+			Category: builtinconstants.CategorySystemInfo,
 		},
 		makeGeneratorOverload(
-			tree.ArgTypes{
+			tree.ParamTypes{
 				{Name: "trace_id", Typ: types.Int},
 			},
 			payloadsForTraceGeneratorType,
@@ -401,36 +466,32 @@ var generators = map[string]builtinDefinition{
 		),
 	),
 	"crdb_internal.show_create_all_schemas": makeBuiltin(
-		tree.FunctionProperties{
-			Class: tree.GeneratorClass,
-		},
+		tree.FunctionProperties{},
 		makeGeneratorOverload(
-			tree.ArgTypes{
-				{"database_name", types.String},
+			tree.ParamTypes{
+				{Name: "database_name", Typ: types.String},
 			},
 			showCreateAllSchemasGeneratorType,
 			makeShowCreateAllSchemasGenerator,
-			`Returns rows of CREATE schema statements. 
+			`Returns rows of CREATE schema statements.
 The output can be used to recreate a database.'
 `,
 			volatility.Volatile,
 		),
 	),
 	"crdb_internal.show_create_all_tables": makeBuiltin(
-		tree.FunctionProperties{
-			Class: tree.GeneratorClass,
-		},
+		tree.FunctionProperties{},
 		makeGeneratorOverload(
-			tree.ArgTypes{
-				{"database_name", types.String},
+			tree.ParamTypes{
+				{Name: "database_name", Typ: types.String},
 			},
 			showCreateAllTablesGeneratorType,
 			makeShowCreateAllTablesGenerator,
-			`Returns rows of CREATE table statements followed by 
+			`Returns rows of CREATE table statements followed by
 ALTER table statements that add table constraints. The rows are ordered
 by dependencies. All foreign keys are added after the creation of the table
 in the alter statements.
-It is not recommended to perform this operation on a database with many 
+It is not recommended to perform this operation on a database with many
 tables.
 The output can be used to recreate a database.'
 `,
@@ -438,28 +499,24 @@ The output can be used to recreate a database.'
 		),
 	),
 	"crdb_internal.show_create_all_types": makeBuiltin(
-		tree.FunctionProperties{
-			Class: tree.GeneratorClass,
-		},
+		tree.FunctionProperties{},
 		makeGeneratorOverload(
-			tree.ArgTypes{
-				{"database_name", types.String},
+			tree.ParamTypes{
+				{Name: "database_name", Typ: types.String},
 			},
 			showCreateAllTypesGeneratorType,
 			makeShowCreateAllTypesGenerator,
-			`Returns rows of CREATE type statements. 
+			`Returns rows of CREATE type statements.
 The output can be used to recreate a database.'
 `,
 			volatility.Volatile,
 		),
 	),
 	"crdb_internal.decode_plan_gist": makeBuiltin(
-		tree.FunctionProperties{
-			Class: tree.GeneratorClass,
-		},
+		tree.FunctionProperties{},
 		makeGeneratorOverload(
-			tree.ArgTypes{
-				{"gist", types.String},
+			tree.ParamTypes{
+				{Name: "gist", Typ: types.String},
 			},
 			decodePlanGistGeneratorType,
 			makeDecodePlanGistGenerator,
@@ -468,15 +525,98 @@ The output can be used to recreate a database.'
 			volatility.Volatile,
 		),
 	),
+	"crdb_internal.decode_external_plan_gist": makeBuiltin(
+		tree.FunctionProperties{},
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "gist", Typ: types.String},
+			},
+			decodePlanGistGeneratorType,
+			makeDecodeExternalPlanGistGenerator,
+			`Returns rows of output similar to EXPLAIN from a gist such as those found in planGists element of the statistics column of the statement_statistics table without attempting to resolve tables or indexes.
+			`,
+			volatility.Volatile,
+		),
+	),
+	"crdb_internal.gen_rand_ident": makeBuiltin(
+		tree.FunctionProperties{},
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "name_pattern", Typ: types.String},
+				{Name: "count", Typ: types.Int},
+			},
+			types.String,
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+			) (eval.ValueGenerator, error) {
+				return makeIdentGenerator(ctx, evalCtx, args[0], args[1], nil)
+			},
+			`Returns random SQL identifiers.
+
+gen_rand_ident(pattern, count) is an alias for gen_rand_ident(pattern, count, '').
+See the documentation of the other gen_rand_ident overload for details.
+`,
+			volatility.Volatile,
+		),
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "name_pattern", Typ: types.String},
+				{Name: "count", Typ: types.Int},
+				{Name: "parameters", Typ: types.Jsonb},
+			},
+			types.String,
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+			) (eval.ValueGenerator, error) {
+				return makeIdentGenerator(ctx, evalCtx, args[0], args[1], args[2])
+			},
+			`Returns count random SQL identifiers that resemble the name_pattern.
+
+The last argument is a JSONB object containing the following optional fields:
+- "seed": the seed to use for the pseudo-random generator (default: random).`+
+				randidentcfg.ConfigDoc,
+			volatility.Volatile,
+		),
+	),
+	"crdb_internal.tenant_span_stats": makeBuiltin(genProps(),
+		// Tenant overload
+		makeGeneratorOverload(
+			tree.ParamTypes{},
+			tableSpanStatsGeneratorType,
+			makeTableSpanStatsGenerator,
+			"Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for all of the tenant's tables.",
+			volatility.Stable,
+		),
+		// Database overload
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "database_id", Typ: types.Int},
+			},
+			tableSpanStatsGeneratorType,
+			makeTableSpanStatsGenerator,
+			"Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for tables of the provided database id.",
+			volatility.Stable,
+		),
+		// Table overload
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "database_id", Typ: types.Int},
+				{Name: "table_id", Typ: types.Int},
+			},
+			tableSpanStatsGeneratorType,
+			makeTableSpanStatsGenerator,
+			"Returns statistics (range count, disk size, live range bytes, total range bytes, live range byte percentage) for the provided table id.",
+			volatility.Stable,
+		),
+	),
 }
 
 var decodePlanGistGeneratorType = types.String
 
 type gistPlanGenerator struct {
-	gist  string
-	index int
-	rows  []string
-	p     eval.Planner
+	gist     string
+	index    int
+	rows     []string
+	evalCtx  *eval.Context
+	external bool
 }
 
 var _ eval.ValueGenerator = &gistPlanGenerator{}
@@ -486,7 +626,7 @@ func (g *gistPlanGenerator) ResolvedType() *types.T {
 }
 
 func (g *gistPlanGenerator) Start(_ context.Context, _ *kv.Txn) error {
-	rows, err := g.p.DecodeGist(g.gist)
+	rows, err := g.evalCtx.Planner.DecodeGist(g.gist, g.external)
 	if err != nil {
 		return err
 	}
@@ -507,9 +647,18 @@ func (g *gistPlanGenerator) Values() (tree.Datums, error) {
 	return tree.Datums{tree.NewDString(g.rows[g.index])}, nil
 }
 
-func makeDecodePlanGistGenerator(ctx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeDecodePlanGistGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	gist := string(tree.MustBeDString(args[0]))
-	return &gistPlanGenerator{gist: gist, p: ctx.Planner}, nil
+	return &gistPlanGenerator{gist: gist, evalCtx: evalCtx, external: false}, nil
+}
+
+func makeDecodeExternalPlanGistGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	gist := string(tree.MustBeDString(args[0]))
+	return &gistPlanGenerator{gist: gist, evalCtx: evalCtx, external: true}, nil
 }
 
 func makeGeneratorOverload(
@@ -518,12 +667,12 @@ func makeGeneratorOverload(
 	return makeGeneratorOverloadWithReturnType(in, tree.FixedReturnType(ret), g, info, volatility)
 }
 
-var unsuitableUseOfGeneratorFn = func(_ *eval.Context, _ tree.Datums) (tree.Datum, error) {
+var unsuitableUseOfGeneratorFn = func(_ context.Context, _ *eval.Context, _ tree.Datums) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("generator functions cannot be evaluated as scalars")
 }
 
 var unsuitableUseOfGeneratorFnWithExprs eval.FnWithExprsOverload = func(
-	_ *eval.Context, _ tree.Exprs,
+	_ context.Context, _ *eval.Context, _ tree.Exprs,
 ) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("generator functions cannot be evaluated as scalars")
 }
@@ -539,6 +688,7 @@ func makeGeneratorOverloadWithReturnType(
 		Types:      in,
 		ReturnType: retType,
 		Generator:  g,
+		Class:      tree.GeneratorClass,
 		Info:       info,
 		Volatility: volatility,
 	}
@@ -552,9 +702,9 @@ type regexpSplitToTableGenerator struct {
 
 func makeRegexpSplitToTableGeneratorFactory(hasFlags bool) eval.GeneratorOverload {
 	return func(
-		ctx *eval.Context, args tree.Datums,
+		ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 	) (eval.ValueGenerator, error) {
-		words, err := regexpSplit(ctx, args, hasFlags)
+		words, err := regexpSplit(evalCtx, args, hasFlags)
 		if err != nil {
 			return nil, err
 		}
@@ -593,7 +743,9 @@ type optionsToTableGenerator struct {
 	idx int
 }
 
-func makeOptionsToTableGenerator(_ *eval.Context, d tree.Datums) (eval.ValueGenerator, error) {
+func makeOptionsToTableGenerator(
+	_ context.Context, _ *eval.Context, d tree.Datums,
+) (eval.ValueGenerator, error) {
 	arr := tree.MustBeDArray(d[0])
 	return &optionsToTableGenerator{arr: arr, idx: -1}, nil
 }
@@ -658,7 +810,9 @@ var keywordsValueGeneratorType = types.MakeLabeledTuple(
 	[]string{"word", "catcode", "catdesc"},
 )
 
-func makeKeywordsGenerator(_ *eval.Context, _ tree.Datums) (eval.ValueGenerator, error) {
+func makeKeywordsGenerator(
+	_ context.Context, _ *eval.Context, _ tree.Datums,
+) (eval.ValueGenerator, error) {
 	return &keywordsValueGenerator{}, nil
 }
 
@@ -775,7 +929,9 @@ func seriesGenTSTZValue(s *seriesValueGenerator) (tree.Datums, error) {
 	return tree.Datums{ts}, nil
 }
 
-func makeSeriesGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeSeriesGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	start := int64(tree.MustBeDInt(args[0]))
 	stop := int64(tree.MustBeDInt(args[1]))
 	step := int64(1)
@@ -795,7 +951,9 @@ func makeSeriesGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator
 	}, nil
 }
 
-func makeTSSeriesGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeTSSeriesGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	start := args[0].(*tree.DTimestamp).Time
 	stop := args[1].(*tree.DTimestamp).Time
 	step := args[2].(*tree.DInterval).Duration
@@ -814,7 +972,9 @@ func makeTSSeriesGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerat
 	}, nil
 }
 
-func makeTSTZSeriesGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeTSTZSeriesGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	start := args[0].(*tree.DTimestampTZ).Time
 	stop := args[1].(*tree.DTimestampTZ).Time
 	step := args[2].(*tree.DInterval).Duration
@@ -859,7 +1019,9 @@ func (s *seriesValueGenerator) Values() (tree.Datums, error) {
 	return s.genValue(s)
 }
 
-func makeVariadicUnnestGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeVariadicUnnestGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	var arrays []*tree.DArray
 	for _, a := range args {
 		arrays = append(arrays, tree.MustBeDArray(a))
@@ -921,7 +1083,9 @@ func (s *multipleArrayValueGenerator) Values() (tree.Datums, error) {
 	return s.datums, nil
 }
 
-func makeArrayGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeArrayGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	arr := tree.MustBeDArray(args[0])
 	return &arrayValueGenerator{array: arr}, nil
 }
@@ -962,7 +1126,7 @@ func (s *arrayValueGenerator) Values() (tree.Datums, error) {
 }
 
 func makeExpandArrayGenerator(
-	evalCtx *eval.Context, args tree.Datums,
+	_ context.Context, _ *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
 	arr := tree.MustBeDArray(args[0])
 	g := &expandArrayValueGenerator{avg: arrayValueGenerator{array: arr}}
@@ -1011,7 +1175,7 @@ func (s *expandArrayValueGenerator) Values() (tree.Datums, error) {
 }
 
 func makeGenerateSubscriptsGenerator(
-	evalCtx *eval.Context, args tree.Datums,
+	_ context.Context, _ *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
 	var arr *tree.DArray
 	dim := 1
@@ -1098,7 +1262,9 @@ type unaryValueGenerator struct {
 
 var unaryValueGeneratorType = types.EmptyTuple
 
-func makeUnaryGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeUnaryGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	return &unaryValueGenerator{}, nil
 }
 
@@ -1147,7 +1313,7 @@ var (
 )
 
 var jsonArrayElementsImpl = makeGeneratorOverload(
-	tree.ArgTypes{{"input", types.Jsonb}},
+	tree.ParamTypes{{Name: "input", Typ: types.Jsonb}},
 	jsonArrayGeneratorType,
 	makeJSONArrayAsJSONGenerator,
 	"Expands a JSON array to a set of JSON values.",
@@ -1155,7 +1321,7 @@ var jsonArrayElementsImpl = makeGeneratorOverload(
 )
 
 var jsonArrayElementsTextImpl = makeGeneratorOverload(
-	tree.ArgTypes{{"input", types.Jsonb}},
+	tree.ParamTypes{{Name: "input", Typ: types.Jsonb}},
 	jsonArrayTextGeneratorType,
 	makeJSONArrayAsTextGenerator,
 	"Expands a JSON array to a set of text values.",
@@ -1177,11 +1343,15 @@ type jsonArrayGenerator struct {
 var errJSONCallOnNonArray = pgerror.New(pgcode.InvalidParameterValue,
 	"cannot be called on a non-array")
 
-func makeJSONArrayAsJSONGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeJSONArrayAsJSONGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	return makeJSONArrayGenerator(args, false)
 }
 
-func makeJSONArrayAsTextGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeJSONArrayAsTextGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	return makeJSONArrayGenerator(args, true)
 }
 
@@ -1239,7 +1409,7 @@ func (g *jsonArrayGenerator) Values() (tree.Datums, error) {
 
 // jsonObjectKeysImpl is a key generator of a JSON object.
 var jsonObjectKeysImpl = makeGeneratorOverload(
-	tree.ArgTypes{{"input", types.Jsonb}},
+	tree.ParamTypes{{Name: "input", Typ: types.Jsonb}},
 	jsonObjectKeysGeneratorType,
 	makeJSONObjectKeysGenerator,
 	"Returns sorted set of keys in the outermost JSON object.",
@@ -1252,7 +1422,9 @@ type jsonObjectKeysGenerator struct {
 	iter *json.ObjectIterator
 }
 
-func makeJSONObjectKeysGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeJSONObjectKeysGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	target := tree.MustBeDJSON(args[0])
 	iter, err := target.ObjectIter()
 	if err != nil {
@@ -1293,7 +1465,7 @@ func (g *jsonObjectKeysGenerator) Values() (tree.Datums, error) {
 }
 
 var jsonEachImpl = makeGeneratorOverload(
-	tree.ArgTypes{{"input", types.Jsonb}},
+	tree.ParamTypes{{Name: "input", Typ: types.Jsonb}},
 	jsonEachGeneratorType,
 	makeJSONEachImplGenerator,
 	"Expands the outermost JSON or JSONB object into a set of key/value pairs.",
@@ -1301,12 +1473,32 @@ var jsonEachImpl = makeGeneratorOverload(
 )
 
 var jsonEachTextImpl = makeGeneratorOverload(
-	tree.ArgTypes{{"input", types.Jsonb}},
+	tree.ParamTypes{{Name: "input", Typ: types.Jsonb}},
 	jsonEachTextGeneratorType,
 	makeJSONEachTextImplGenerator,
 	"Expands the outermost JSON or JSONB object into a set of key/value pairs. "+
 		"The returned values will be of type text.",
 	volatility.Immutable,
+)
+
+var jsonToRecordImpl = makeGeneratorOverload(
+	tree.ParamTypes{{Name: "input", Typ: types.Jsonb}},
+	// NOTE: this type will never actually get used. It is replaced in the
+	// optimizer by looking at the most recent AS alias clause.
+	types.EmptyTuple,
+	makeJSONRecordGenerator,
+	"Builds an arbitrary record from a JSON object.",
+	volatility.Stable,
+)
+
+var jsonToRecordSetImpl = makeGeneratorOverload(
+	tree.ParamTypes{{Name: "input", Typ: types.Jsonb}},
+	// NOTE: this type will never actually get used. It is replaced in the
+	// optimizer by looking at the most recent AS alias clause.
+	types.EmptyTuple,
+	makeJSONRecordSetGenerator,
+	"Builds an arbitrary set of records from a JSON array of objects.",
+	volatility.Stable,
 )
 
 var jsonEachGeneratorLabels = []string{"key", "value"}
@@ -1329,11 +1521,15 @@ type jsonEachGenerator struct {
 	asText bool
 }
 
-func makeJSONEachImplGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeJSONEachImplGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	return makeJSONEachGenerator(args, false)
 }
 
-func makeJSONEachTextImplGenerator(_ *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeJSONEachTextImplGenerator(
+	_ context.Context, _ *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	return makeJSONEachGenerator(args, true)
 }
 
@@ -1399,11 +1595,7 @@ func (g *jsonEachGenerator) Values() (tree.Datums, error) {
 }
 
 var jsonPopulateProps = tree.FunctionProperties{
-	Class:    tree.GeneratorClass,
-	Category: categoryGenerator,
-	// The typical way to call json_populate_record is to send NULL::atype as the
-	// first argument, so we have to accept nullable args.
-	NullableArgs: true,
+	Category: builtinconstants.CategoryJSON,
 }
 
 func makeJSONPopulateImpl(gen eval.GeneratorWithExprsOverload, info string) tree.Overload {
@@ -1423,18 +1615,23 @@ func makeJSONPopulateImpl(gen eval.GeneratorWithExprsOverload, info string) tree
 		// the default values of each field will be NULL.
 		// The second argument can also be null, in which case the first argument
 		// is returned as-is.
-		Types:              tree.ArgTypes{{"base", types.Any}, {"from_json", types.Jsonb}},
+		Types:              tree.ParamTypes{{Name: "base", Typ: types.Any}, {Name: "from_json", Typ: types.Jsonb}},
 		ReturnType:         tree.IdentityReturnType(0),
 		GeneratorWithExprs: gen,
+		Class:              tree.GeneratorClass,
 		Info:               info,
 		Volatility:         volatility.Stable,
+		// The typical way to call json_populate_record is to send NULL::atype
+		// as the first argument, so we have to call the function with NULL
+		// inputs.
+		CalledOnNullInput: true,
 	}
 }
 
 func makeJSONPopulateRecordGenerator(
-	evalCtx *eval.Context, args tree.Exprs,
+	ctx context.Context, evalCtx *eval.Context, args tree.Exprs,
 ) (eval.ValueGenerator, error) {
-	tuple, j, err := jsonPopulateRecordEvalArgs(evalCtx, args)
+	tuple, j, err := jsonPopulateRecordEvalArgs(ctx, evalCtx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -1457,12 +1654,12 @@ func makeJSONPopulateRecordGenerator(
 // one of the jsonPopulateRecord variants, and returns the correctly-typed
 // tuple of default values, and the JSON input or nil if it was SQL NULL.
 func jsonPopulateRecordEvalArgs(
-	evalCtx *eval.Context, args tree.Exprs,
+	ctx context.Context, evalCtx *eval.Context, args tree.Exprs,
 ) (tuple *tree.DTuple, jsonInputOrNil json.JSON, err error) {
 	evalled := make(tree.Datums, len(args))
 	for i := range args {
 		var err error
-		evalled[i], err = eval.Expr(evalCtx, args[i].(tree.TypedExpr))
+		evalled[i], err = eval.Expr(ctx, evalCtx, args[i].(tree.TypedExpr))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1495,6 +1692,7 @@ type jsonPopulateRecordGenerator struct {
 	target json.JSON
 
 	wasCalled bool
+	ctx       context.Context
 	evalCtx   *eval.Context
 }
 
@@ -1504,13 +1702,17 @@ func (j jsonPopulateRecordGenerator) ResolvedType() *types.T {
 }
 
 // Start is part of the tree.ValueGenerator interface.
-func (j *jsonPopulateRecordGenerator) Start(_ context.Context, _ *kv.Txn) error { return nil }
+func (j *jsonPopulateRecordGenerator) Start(ctx context.Context, _ *kv.Txn) error {
+	j.ctx = ctx
+	return nil
+}
 
 // Close is part of the tree.ValueGenerator interface.
 func (j *jsonPopulateRecordGenerator) Close(_ context.Context) {}
 
 // Next is part of the tree.ValueGenerator interface.
-func (j *jsonPopulateRecordGenerator) Next(_ context.Context) (bool, error) {
+func (j *jsonPopulateRecordGenerator) Next(ctx context.Context) (bool, error) {
+	j.ctx = ctx
 	if !j.wasCalled {
 		j.wasCalled = true
 		return true, nil
@@ -1520,16 +1722,16 @@ func (j *jsonPopulateRecordGenerator) Next(_ context.Context) (bool, error) {
 
 // Values is part of the tree.ValueGenerator interface.
 func (j jsonPopulateRecordGenerator) Values() (tree.Datums, error) {
-	if err := eval.PopulateRecordWithJSON(j.evalCtx, j.target, j.input.ResolvedType(), j.input); err != nil {
+	if err := eval.PopulateRecordWithJSON(j.ctx, j.evalCtx, j.target, j.input.ResolvedType(), j.input); err != nil {
 		return nil, err
 	}
 	return j.input.D, nil
 }
 
 func makeJSONPopulateRecordSetGenerator(
-	evalCtx *eval.Context, args tree.Exprs,
+	ctx context.Context, evalCtx *eval.Context, args tree.Exprs,
 ) (eval.ValueGenerator, error) {
-	tuple, j, err := jsonPopulateRecordEvalArgs(evalCtx, args)
+	tuple, j, err := jsonPopulateRecordEvalArgs(ctx, evalCtx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -1561,13 +1763,17 @@ type jsonPopulateRecordSetGenerator struct {
 func (j jsonPopulateRecordSetGenerator) ResolvedType() *types.T { return j.input.ResolvedType() }
 
 // Start is part of the tree.ValueGenerator interface.
-func (j jsonPopulateRecordSetGenerator) Start(_ context.Context, _ *kv.Txn) error { return nil }
+func (j jsonPopulateRecordSetGenerator) Start(ctx context.Context, _ *kv.Txn) error {
+	j.ctx = ctx
+	return nil
+}
 
 // Close is part of the tree.ValueGenerator interface.
 func (j jsonPopulateRecordSetGenerator) Close(_ context.Context) {}
 
 // Next is part of the tree.ValueGenerator interface.
-func (j *jsonPopulateRecordSetGenerator) Next(_ context.Context) (bool, error) {
+func (j *jsonPopulateRecordSetGenerator) Next(ctx context.Context) (bool, error) {
+	j.ctx = ctx
 	if j.nextIdx >= j.target.Len() {
 		return false, nil
 	}
@@ -1585,47 +1791,200 @@ func (j *jsonPopulateRecordSetGenerator) Values() (tree.Datums, error) {
 		return nil, pgerror.Newf(pgcode.InvalidParameterValue, "argument of json_populate_recordset must be an array of objects")
 	}
 	output := tree.NewDTupleWithLen(j.input.ResolvedType(), j.input.D.Len())
-	for i := range j.input.D {
-		output.D[i] = j.input.D[i]
-	}
-	if err := eval.PopulateRecordWithJSON(j.evalCtx, obj, j.input.ResolvedType(), output); err != nil {
+	copy(output.D, j.input.D)
+	if err := eval.PopulateRecordWithJSON(j.ctx, j.evalCtx, obj, j.input.ResolvedType(), output); err != nil {
 		return nil, err
 	}
 	return output.D, nil
 }
 
+func makeJSONRecordGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	target := tree.MustBeDJSON(args[0])
+	return &jsonRecordGenerator{
+		evalCtx: evalCtx,
+		target:  target.JSON,
+	}, nil
+}
+
+type jsonRecordGenerator struct {
+	evalCtx *eval.Context
+	target  json.JSON
+
+	wasCalled bool
+	values    tree.Datums
+	types     []*types.T
+	labels    []string
+	// labelToRowIndexMap maps the column label to its position within the row.
+	labelToRowIndexMap map[string]int
+}
+
+func (j *jsonRecordGenerator) SetAlias(types []*types.T, labels []string) error {
+	j.types = types
+	j.labels = labels
+	j.labelToRowIndexMap = make(map[string]int)
+	for i := range types {
+		j.labelToRowIndexMap[j.labels[i]] = i
+	}
+	if len(types) != len(labels) {
+		return errors.AssertionFailedf("unexpected mismatched types/labels list in json record generator %v %v", types, labels)
+	}
+	return nil
+}
+
+func (j jsonRecordGenerator) ResolvedType() *types.T {
+	return types.AnyTuple
+}
+
+func (j *jsonRecordGenerator) Start(ctx context.Context, _ *kv.Txn) error {
+	j.values = make(tree.Datums, len(j.types))
+	if j.target.Type() != json.ObjectJSONType {
+		return pgerror.Newf(pgcode.InvalidParameterValue,
+			"invalid non-object argument to json_to_record")
+	}
+	return nil
+}
+
+func (j *jsonRecordGenerator) Next(ctx context.Context) (bool, error) {
+	if j.wasCalled {
+		return false, nil
+	}
+	for i := range j.values {
+		j.values[i] = tree.DNull
+	}
+	iter, err := j.target.ObjectIter()
+	if err != nil {
+		return false, err
+	}
+	for iter.Next() {
+		idx, ok := j.labelToRowIndexMap[iter.Key()]
+		if !ok {
+			continue
+		}
+		v := iter.Value()
+		datum, err := eval.PopulateDatumWithJSON(ctx, j.evalCtx, v, j.types[idx])
+		if err != nil {
+			return false, err
+		}
+		j.values[idx] = datum
+	}
+
+	j.wasCalled = true
+	return true, nil
+}
+
+func (j jsonRecordGenerator) Values() (tree.Datums, error) {
+	return j.values, nil
+}
+
+func (j jsonRecordGenerator) Close(ctx context.Context) {}
+
+type jsonRecordSetGenerator struct {
+	jsonRecordGenerator
+
+	arr       tree.DJSON
+	nextIndex int
+}
+
+func makeJSONRecordSetGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	arr := tree.MustBeDJSON(args[0])
+	return &jsonRecordSetGenerator{
+		arr: arr,
+		jsonRecordGenerator: jsonRecordGenerator{
+			evalCtx: evalCtx,
+		},
+	}, nil
+}
+
+func (j *jsonRecordSetGenerator) Start(ctx context.Context, _ *kv.Txn) error {
+	j.values = make(tree.Datums, len(j.types))
+	if j.arr.Type() != json.ArrayJSONType {
+		return pgerror.Newf(pgcode.InvalidParameterValue,
+			"argument to json_to_recordset must be an array of objects")
+	}
+	j.nextIndex = -1
+	return nil
+}
+
+func (j *jsonRecordSetGenerator) Next(ctx context.Context) (bool, error) {
+	j.nextIndex++
+	next, err := j.arr.FetchValIdx(j.nextIndex)
+	if err != nil || next == nil {
+		return false, err
+	}
+	if next.Type() != json.ObjectJSONType {
+		return false, pgerror.Newf(pgcode.InvalidParameterValue,
+			"argument to json_to_recordset must be an array of objects")
+	}
+	j.target = next
+	j.wasCalled = false
+	_, err = j.jsonRecordGenerator.Next(ctx)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 type checkConsistencyGenerator struct {
+	txn                *kv.Txn // to load range descriptors
 	consistencyChecker eval.ConsistencyCheckRunner
 	from, to           roachpb.Key
-	mode               roachpb.ChecksumMode
-	// remainingRows is populated by Start(). Each Next() call peels of the first
-	// row and moves it to curRow.
-	remainingRows []roachpb.CheckConsistencyResponse_Result
-	curRow        roachpb.CheckConsistencyResponse_Result
+	mode               kvpb.ChecksumMode
+
+	// The descriptors for which we haven't yet emitted rows. Rows are consumed
+	// from this field and produce one (or more, in the case of splits not reflected
+	// in the descriptor) rows in `next`.
+	descs []roachpb.RangeDescriptor
+	// The current row, emitted by Values().
+	cur kvpb.CheckConsistencyResponse_Result
+	// The time it took to produce the current row, i.e. how long it took to run
+	// the consistency check that produced the row. When a consistency check
+	// produces more than one row (i.e. after a split), all of the duration will
+	// be attributed to the first row.
+	dur time.Duration
+	// next are the potentially prefetched subsequent rows. This is usually empty
+	// (as one consistency check produces one result which immediately moves to
+	// `cur`) except when a descriptor we use doesn't reflect subsequent splits.
+	next []kvpb.CheckConsistencyResponse_Result
 }
 
 var _ eval.ValueGenerator = &checkConsistencyGenerator{}
 
 func makeCheckConsistencyGenerator(
-	ctx *eval.Context, args tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
-	if !ctx.Codec.ForSystemTenant() {
+	if !evalCtx.Codec.ForSystemTenant() {
 		return nil, errorutil.UnsupportedWithMultiTenancy(
 			errorutil.FeatureNotAvailableToNonSystemTenantsIssue)
+	}
+
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !isAdmin {
+		return nil, pgerror.New(pgcode.InsufficientPrivilege, "crdb_internal.check_consistency requires admin privileges")
 	}
 
 	keyFrom := roachpb.Key(*args[1].(*tree.DBytes))
 	keyTo := roachpb.Key(*args[2].(*tree.DBytes))
 
 	if len(keyFrom) == 0 {
-		keyFrom = keys.LocalMax
+		// NB: you'd expect LocalMax here but when we go and call ScanMetaKVs, it
+		// would interpret LocalMax as Meta1Prefix and translate that to KeyMin,
+		// then fail on the scan. That method should really handle this better
+		// but also we should use IterateRangeDescriptors instead.
+		keyFrom = keys.Meta2Prefix
 	}
 	if len(keyTo) == 0 {
 		keyTo = roachpb.KeyMax
 	}
 
-	if bytes.Compare(keyFrom, keys.LocalMax) < 0 {
-		return nil, errors.Errorf("start key must be >= %q", []byte(keys.LocalMax))
+	if bytes.Compare(keyFrom, keys.LocalMax) <= 0 {
+		return nil, errors.Errorf("start key must be > %q", []byte(keys.LocalMax))
 	}
 	if bytes.Compare(keyTo, roachpb.KeyMax) > 0 {
 		return nil, errors.Errorf("end key must be < %q", []byte(roachpb.KeyMax))
@@ -1634,13 +1993,21 @@ func makeCheckConsistencyGenerator(
 		return nil, errors.New("start key must be less than end key")
 	}
 
-	mode := roachpb.ChecksumMode_CHECK_FULL
+	mode := kvpb.ChecksumMode_CHECK_FULL
 	if statsOnly := bool(*args[0].(*tree.DBool)); statsOnly {
-		mode = roachpb.ChecksumMode_CHECK_STATS
+		mode = kvpb.ChecksumMode_CHECK_STATS
+	}
+
+	if evalCtx.ConsistencyChecker == nil {
+		return nil, errors.WithIssueLink(
+			errors.AssertionFailedf("no consistency checker configured"),
+			errors.IssueLink{IssueURL: "https://github.com/cockroachdb/cockroach/issues/88222"},
+		)
 	}
 
 	return &checkConsistencyGenerator{
-		consistencyChecker: ctx.ConsistencyChecker,
+		txn:                evalCtx.Txn,
+		consistencyChecker: evalCtx.ConsistencyChecker,
 		from:               keyFrom,
 		to:                 keyTo,
 		mode:               mode,
@@ -1648,8 +2015,8 @@ func makeCheckConsistencyGenerator(
 }
 
 var checkConsistencyGeneratorType = types.MakeLabeledTuple(
-	[]*types.T{types.Int, types.Bytes, types.String, types.String, types.String},
-	[]string{"range_id", "start_key", "start_key_pretty", "status", "detail"},
+	[]*types.T{types.Int, types.Bytes, types.String, types.String, types.String, types.Interval},
+	[]string{"range_id", "start_key", "start_key_pretty", "status", "detail", "duration"},
 )
 
 // ResolvedType is part of the tree.ValueGenerator interface.
@@ -1659,89 +2026,263 @@ func (*checkConsistencyGenerator) ResolvedType() *types.T {
 
 // Start is part of the tree.ValueGenerator interface.
 func (c *checkConsistencyGenerator) Start(ctx context.Context, _ *kv.Txn) error {
-	resp, err := c.consistencyChecker.CheckConsistency(ctx, c.from, c.to, c.mode)
+	span := roachpb.Span{Key: c.from, EndKey: c.to}
+	// NB: should use IterateRangeDescriptors here which is in the 'upgrade'
+	// package to avoid pulling all into memory. That needs a refactor, though.
+	// kvprober also has some code to iterate in batches.
+	descs, err := kvclient.ScanMetaKVs(ctx, c.txn, span)
 	if err != nil {
 		return err
 	}
-	c.remainingRows = resp.Result
+	for _, v := range descs {
+		var desc roachpb.RangeDescriptor
+		if err := v.ValueProto(&desc); err != nil {
+			return err
+		}
+		if len(desc.StartKey) == 0 {
+			desc.StartKey = keys.MustAddr(keys.LocalMax)
+			// Elide potential second copy we might be getting for r1
+			// if meta1 and meta2 haven't split.
+			// This too should no longer be necessary with IterateRangeDescriptors.
+			if len(c.descs) == 1 {
+				continue
+			}
+		}
+		c.descs = append(c.descs, desc)
+	}
 	return nil
 }
 
+// maybeRefillRows checks whether c.next is empty and if so, consumes the first
+// element of c.descs for a consistency check. This populates c.next with at
+// least one result (even on error). Returns the duration of the consistency
+// check, if any, and zero otherwise.
+func (c *checkConsistencyGenerator) maybeRefillRows(ctx context.Context) time.Duration {
+	if len(c.next) > 0 || len(c.descs) == 0 {
+		// We have a row to produce or no more ranges to check, so we're done
+		// for now or for good, respectively.
+		return 0
+	}
+	tBegin := timeutil.Now()
+	// NB: peeling off the spans one by one allows this generator to produce
+	// rows in a streaming manner. If we called CheckConsistency(c.from, c.to)
+	// we would only get the result once all checks have completed and it will
+	// generally be a lot more brittle since an error will completely wipe out
+	// the result set.
+	desc := c.descs[0]
+	c.descs = c.descs[1:]
+	resp, err := c.consistencyChecker.CheckConsistency(
+		ctx, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey(), c.mode,
+	)
+	if err != nil {
+		resp = &kvpb.CheckConsistencyResponse{Result: []kvpb.CheckConsistencyResponse_Result{{
+			RangeID:  desc.RangeID,
+			StartKey: desc.StartKey,
+			Status:   kvpb.CheckConsistencyResponse_RANGE_INDETERMINATE,
+			Detail:   err.Error(),
+		}}}
+	}
+
+	// NB: this could have more than one entry, if a range split in the
+	// meantime.
+	c.next = resp.Result
+	return timeutil.Since(tBegin)
+}
+
 // Next is part of the tree.ValueGenerator interface.
-func (c *checkConsistencyGenerator) Next(_ context.Context) (bool, error) {
-	if len(c.remainingRows) == 0 {
+func (c *checkConsistencyGenerator) Next(ctx context.Context) (bool, error) {
+	dur := c.maybeRefillRows(ctx)
+	if len(c.next) == 0 {
 		return false, nil
 	}
-	c.curRow = c.remainingRows[0]
-	c.remainingRows = c.remainingRows[1:]
+	c.dur, c.cur, c.next = dur, c.next[0], c.next[1:]
 	return true, nil
 }
 
 // Values is part of the tree.ValueGenerator interface.
 func (c *checkConsistencyGenerator) Values() (tree.Datums, error) {
+	row := c.cur
+	intervalMeta := types.IntervalTypeMetadata{
+		DurationField: types.IntervalDurationField{
+			DurationType: types.IntervalDurationType_MILLISECOND,
+		},
+	}
 	return tree.Datums{
-		tree.NewDInt(tree.DInt(c.curRow.RangeID)),
-		tree.NewDBytes(tree.DBytes(c.curRow.StartKey)),
-		tree.NewDString(roachpb.Key(c.curRow.StartKey).String()),
-		tree.NewDString(c.curRow.Status.String()),
-		tree.NewDString(c.curRow.Detail),
+		tree.NewDInt(tree.DInt(row.RangeID)),
+		tree.NewDBytes(tree.DBytes(row.StartKey)),
+		tree.NewDString(roachpb.Key(row.StartKey).String()),
+		tree.NewDString(row.Status.String()),
+		tree.NewDString(row.Detail),
+		tree.NewDInterval(duration.MakeDuration(c.dur.Nanoseconds(), 0 /* days */, 0 /* months */), intervalMeta),
 	}, nil
 }
 
 // Close is part of the tree.ValueGenerator interface.
 func (c *checkConsistencyGenerator) Close(_ context.Context) {}
 
-// rangeKeyIteratorChunkSize is the number of K/V pairs that the
-// rangeKeyIterator requests at a time. If this changes, make sure
+// spanKeyIteratorChunkKeys is the number of K/V pairs that the
+// keyIterator requests at a time. If this changes, make sure
 // to update the test in sql_keys.
-// TODO(kv): The current KV API only supports a maxRows limitation
-//  on the amount of data returned from Scan. In the future, there will
-//  be a maxBytes limitation which should be used instead here.
-const rangeKeyIteratorChunkSize = 256
+//
+// TODO(ssd): I increased this from 256, but it still seems a bit low.
+const spanKeyIteratorChunkKeys = 2048
+
+// spanKeyIteratorChunkBytes is the maximum size in bytes that a
+// keyIterator will request at a time.
+const spanKeyIteratorChunkBytes = 8 << 20 // 8MiB
 
 var rangeKeyIteratorType = types.MakeLabeledTuple(
 	// TODO(rohany): These could be bytes if we don't want to display the
 	//  prettified versions of the key and value.
-	[]*types.T{types.String, types.String},
-	[]string{"key", "value"},
+	[]*types.T{types.String, types.String, types.String},
+	[]string{"key", "value", "ts"},
 )
 
-// rangeKeyIterator is a ValueGenerator that iterates over all
-// SQL keys in a target range.
+var spanKeyIteratorType = types.MakeLabeledTuple(
+	[]*types.T{types.Bytes, types.Bytes, types.String},
+	[]string{"key", "value", "ts"},
+)
+
+// spanKeyIterator is a ValueGenerator that iterates over all
+// SQL keys in a target span.
+type spanKeyIterator struct {
+	// The span to iterate
+	span roachpb.Span
+
+	// The transaction to use.
+	txn *kv.Txn
+	acc mon.BoundAccount
+
+	// kvs is a set of K/V pairs currently accessed by the iterator.
+	// It is not all of the K/V pairs in the target span. Instead,
+	// the iterator maintains a small set of K/V pairs in the span,
+	// and accesses more in a streaming fashion.
+	kvs []roachpb.KeyValue
+
+	// resumeSpan is the resume span from the last ScanRequest.
+	resumeSpan *roachpb.Span
+
+	// index maintains the current position of the iterator in kvs.
+	index int
+	// A buffer to avoid allocating an array on every call to Values().
+	buf [3]tree.Datum
+}
+
+func newSpanKeyIterator(evalCtx *eval.Context, span roachpb.Span) *spanKeyIterator {
+	return &spanKeyIterator{
+		acc:  evalCtx.Planner.Mon().MakeBoundAccount(),
+		span: span,
+	}
+}
+
+// Start implements the tree.ValueGenerator interface.
+func (sp *spanKeyIterator) Start(ctx context.Context, txn *kv.Txn) error {
+	if err := sp.acc.Grow(ctx, spanKeyIteratorChunkBytes); err != nil {
+		return err
+	}
+	sp.txn = txn
+	return sp.scan(ctx, sp.span.Key, sp.span.EndKey)
+}
+
+// Next implements the tree.ValueGenerator interface.
+func (sp *spanKeyIterator) Next(ctx context.Context) (bool, error) {
+	sp.index++
+	// If index is within rk.kvs, then we have buffered K/V pairs to return.
+	// Otherwise, we might have to request another chunk of K/V pairs.
+	if sp.index < len(sp.kvs) {
+		return true, nil
+	}
+
+	// If we don't have a resume span, then we're out of results.
+	if sp.resumeSpan == nil {
+		return false, nil
+	}
+
+	// If we had some K/V pairs already, use the last key to constrain
+	// the result of the next scan.
+	err := sp.scan(ctx, sp.resumeSpan.Key, sp.span.EndKey)
+	if err != nil {
+		return false, err
+	}
+
+	return sp.Next(ctx)
+}
+
+func (sp *spanKeyIterator) scan(
+	ctx context.Context, startKey roachpb.Key, endKey roachpb.Key,
+) error {
+	ba := &kvpb.BatchRequest{}
+	ba.TargetBytes = spanKeyIteratorChunkBytes
+	ba.MaxSpanRequestKeys = spanKeyIteratorChunkKeys
+	ba.Add(&kvpb.ScanRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key:    startKey,
+			EndKey: endKey,
+		},
+		ScanFormat: kvpb.KEY_VALUES,
+	})
+	br, pErr := sp.txn.Send(ctx, ba)
+	if pErr != nil {
+		return pErr.GoError()
+	}
+	resp := br.Responses[0].GetScan()
+	sp.kvs = resp.Rows
+	sp.resumeSpan = resp.ResumeSpan
+	// The user of the generator first calls Next(), then Values(), so the index
+	// managing the iterator's position needs to start at -1 instead of 0.
+	sp.index = -1
+	return nil
+}
+
+// Values implements the tree.ValueGenerator interface.
+func (sp *spanKeyIterator) Values() (tree.Datums, error) {
+	kv := sp.kvs[sp.index]
+	sp.buf[0] = tree.NewDBytes(tree.DBytes(kv.Key))
+	sp.buf[1] = tree.NewDBytes(tree.DBytes(kv.Value.RawBytes))
+	sp.buf[2] = tree.NewDString(kv.Value.Timestamp.String())
+	return sp.buf[:], nil
+}
+
+// Close implements the tree.ValueGenerator interface.
+func (sp *spanKeyIterator) Close(ctx context.Context) {
+	sp.acc.Close(ctx)
+}
+
+// ResolvedType implements the tree.ValueGenerator interface.
+func (sp *spanKeyIterator) ResolvedType() *types.T {
+	return spanKeyIteratorType
+}
+
 type rangeKeyIterator struct {
 	// rangeID is the ID of the range to iterate over. rangeID is set
 	// by the constructor of the rangeKeyIterator.
 	rangeID roachpb.RangeID
-
-	// The transaction to use.
-	txn *kv.Txn
-	// kvs is a set of K/V pairs currently accessed by the iterator.
-	// It is not all of the K/V pairs in the target range. Instead,
-	// the iterator maintains a small set of K/V pairs in the range,
-	// and accesses more in a streaming fashion.
-	kvs []kv.KeyValue
-	// index maintains the current position of the iterator in kvs.
-	index int
-	// A buffer to avoid allocating an array on every call to Values().
-	buf [2]tree.Datum
-	// endKey is the end key of the target range.
-	endKey roachpb.RKey
+	spanKeyIterator
+	planner eval.Planner
 }
 
 var _ eval.ValueGenerator = &rangeKeyIterator{}
+var _ eval.ValueGenerator = &spanKeyIterator{}
 
-func makeRangeKeyIterator(ctx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+func makeRangeKeyIterator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
 	// The user must be an admin to use this builtin.
-	isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if !isAdmin {
 		return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "user needs the admin role to view range data")
 	}
+	planner := evalCtx.Planner
 	rangeID := roachpb.RangeID(tree.MustBeDInt(args[0]))
 	return &rangeKeyIterator{
+		spanKeyIterator: spanKeyIterator{
+			acc: planner.Mon().MakeBoundAccount(),
+		},
 		rangeID: rangeID,
+		planner: planner,
 	}, nil
 }
 
@@ -1751,67 +2292,25 @@ func (rk *rangeKeyIterator) ResolvedType() *types.T {
 }
 
 // Start implements the tree.ValueGenerator interface.
-func (rk *rangeKeyIterator) Start(ctx context.Context, txn *kv.Txn) error {
-	rk.txn = txn
+func (rk *rangeKeyIterator) Start(ctx context.Context, txn *kv.Txn) (err error) {
 	// Scan the range meta K/V's to find the target range. We do this in a
 	// chunk-wise fashion to avoid loading all ranges into memory.
-	rangeDesc, err := kvclient.GetRangeWithID(ctx, txn, rk.rangeID)
+	rangeDesc, err := rk.planner.GetRangeDescByID(ctx, rk.rangeID)
 	if err != nil {
 		return err
 	}
-	if rangeDesc == nil {
-		return errors.Newf("range with ID %d not found", rk.rangeID)
-	}
-
-	rk.endKey = rangeDesc.EndKey
-	// Scan the first chunk of K/V pairs.
-	kvs, err := txn.Scan(ctx, rangeDesc.StartKey, rk.endKey, rangeKeyIteratorChunkSize)
-	if err != nil {
-		return err
-	}
-	rk.kvs = kvs
-	// The user of the generator first calls Next(), then Values(), so the index
-	// managing the iterator's position needs to start at -1 instead of 0.
-	rk.index = -1
-	return nil
-}
-
-// Next implements the tree.ValueGenerator interface.
-func (rk *rangeKeyIterator) Next(ctx context.Context) (bool, error) {
-	rk.index++
-	// If index is within rk.kvs, then we have buffered K/V pairs to return.
-	// Otherwise, we might have to request another chunk of K/V pairs.
-	if rk.index < len(rk.kvs) {
-		return true, nil
-	}
-
-	// If we don't have any K/V pairs at all, then we're out of results.
-	if len(rk.kvs) == 0 {
-		return false, nil
-	}
-
-	// If we had some K/V pairs already, use the last key to constrain
-	// the result of the next scan.
-	startKey := rk.kvs[len(rk.kvs)-1].Key.Next()
-	kvs, err := rk.txn.Scan(ctx, startKey, rk.endKey, rangeKeyIteratorChunkSize)
-	if err != nil {
-		return false, err
-	}
-	rk.kvs = kvs
-	rk.index = -1
-	return rk.Next(ctx)
+	rk.span = rangeDesc.KeySpan().AsRawSpanWithNoLocals()
+	return rk.spanKeyIterator.Start(ctx, txn)
 }
 
 // Values implements the tree.ValueGenerator interface.
 func (rk *rangeKeyIterator) Values() (tree.Datums, error) {
 	kv := rk.kvs[rk.index]
 	rk.buf[0] = tree.NewDString(kv.Key.String())
-	rk.buf[1] = tree.NewDString(kv.PrettyValue())
+	rk.buf[1] = tree.NewDString(kv.Value.PrettyPrint())
+	rk.buf[2] = tree.NewDString(kv.Value.Timestamp.String())
 	return rk.buf[:], nil
 }
-
-// Close implements the tree.ValueGenerator interface.
-func (rk *rangeKeyIterator) Close(_ context.Context) {}
 
 var payloadsForSpanGeneratorLabels = []string{"payload_type", "payload_jsonb"}
 
@@ -1836,10 +2335,10 @@ type payloadsForSpanGenerator struct {
 }
 
 func makePayloadsForSpanGenerator(
-	ctx *eval.Context, args tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
 	// The user must be an admin to use this builtin.
-	isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1850,7 +2349,7 @@ func makePayloadsForSpanGenerator(
 		)
 	}
 	spanID := tracingpb.SpanID(*(args[0].(*tree.DInt)))
-	span := ctx.Tracer.GetActiveSpanByID(spanID)
+	span := evalCtx.Tracer.GetActiveSpanByID(spanID)
 	if span == nil {
 		return nil, nil
 	}
@@ -1869,13 +2368,13 @@ func (p *payloadsForSpanGenerator) Start(_ context.Context, _ *kv.Txn) error {
 	// managing the iterator's position needs to start at -1 instead of 0.
 	p.payloadIndex = -1
 
-	rec := p.span.GetFullRecording(tracing.RecordingStructured)
-	if rec == nil {
+	rec := p.span.GetFullRecording(tracingpb.RecordingStructured)
+	if rec.Empty() {
 		// No structured records.
 		return nil
 	}
-	p.payloads = make([]json.JSON, len(rec[0].StructuredRecords))
-	for i, sr := range rec[0].StructuredRecords {
+	p.payloads = make([]json.JSON, len(rec.Root.StructuredRecords))
+	for i, sr := range rec.Root.StructuredRecords {
 		var err error
 		p.payloads[i], err = protoreflect.MessageToJSON(sr.Payload, protoreflect.FmtFlags{EmitDefaults: true})
 		if err != nil {
@@ -1931,16 +2430,18 @@ var payloadsForTraceGeneratorType = types.MakeLabeledTuple(
 // payloadsForTraceGenerator is a value generator that iterates over all payloads
 // of a given Trace.
 type payloadsForTraceGenerator struct {
+	traceID uint64
+	planner eval.Planner
 	// Iterator over all internal rows of a query that retrieves all payloads
 	// of a trace.
 	it eval.InternalRows
 }
 
 func makePayloadsForTraceGenerator(
-	ctx *eval.Context, args tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
 	// The user must be an admin to use this builtin.
-	isAdmin, err := ctx.SessionAccessor.HasAdminRole(ctx.Context)
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1951,26 +2452,7 @@ func makePayloadsForTraceGenerator(
 		)
 	}
 	traceID := uint64(*(args[0].(*tree.DInt)))
-
-	const query = `WITH spans AS(
-									SELECT span_id
-  	 							FROM crdb_internal.node_inflight_trace_spans
- 		 							WHERE trace_id = $1
-									) SELECT * 
-										FROM spans, LATERAL crdb_internal.payloads_for_span(spans.span_id)`
-
-	it, err := ctx.Planner.QueryIteratorEx(
-		ctx.Ctx(),
-		"crdb_internal.payloads_for_trace",
-		sessiondata.NoSessionDataOverride,
-		query,
-		traceID,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return &payloadsForTraceGenerator{it: it}, nil
+	return &payloadsForTraceGenerator{traceID: traceID, planner: evalCtx.Planner}, nil
 }
 
 // ResolvedType implements the tree.ValueGenerator interface.
@@ -1979,26 +2461,52 @@ func (p *payloadsForTraceGenerator) ResolvedType() *types.T {
 }
 
 // Start implements the tree.ValueGenerator interface.
-func (p *payloadsForTraceGenerator) Start(_ context.Context, _ *kv.Txn) error {
+func (p *payloadsForTraceGenerator) Start(ctx context.Context, _ *kv.Txn) error {
+	const query = `WITH spans AS(
+									SELECT span_id
+  	 							FROM crdb_internal.node_inflight_trace_spans
+ 		 							WHERE trace_id = $1
+									) SELECT *
+										FROM spans, LATERAL crdb_internal.payloads_for_span(spans.span_id)`
+
+	it, err := p.planner.QueryIteratorEx(
+		ctx,
+		"crdb_internal.payloads_for_trace",
+		sessiondata.NoSessionDataOverride,
+		query,
+		p.traceID,
+	)
+	if err != nil {
+		return err
+	}
+	p.it = it
 	return nil
 }
 
 // Next implements the tree.ValueGenerator interface.
 func (p *payloadsForTraceGenerator) Next(ctx context.Context) (bool, error) {
+	if p.it == nil {
+		return false, errors.AssertionFailedf("Start must be called before Next")
+	}
 	return p.it.Next(ctx)
 }
 
 // Values implements the tree.ValueGenerator interface.
 func (p *payloadsForTraceGenerator) Values() (tree.Datums, error) {
+	if p.it == nil {
+		return nil, errors.AssertionFailedf("Start must be called before Values")
+	}
 	return p.it.Cur(), nil
 }
 
 // Close implements the tree.ValueGenerator interface.
 func (p *payloadsForTraceGenerator) Close(_ context.Context) {
-	err := p.it.Close()
-	if err != nil {
-		// TODO(angelapwen, yuzefovich): The iterator's error should be surfaced here.
-		return
+	if p.it != nil {
+		err := p.it.Close()
+		if err != nil {
+			// TODO(angelapwen, yuzefovich): The iterator's error should be surfaced here.
+			return
+		}
 	}
 }
 
@@ -2086,13 +2594,13 @@ func (s *showCreateAllSchemasGenerator) Close(ctx context.Context) {
 // We use the timestamp of when the generator is created as the
 // timestamp to pass to AS OF SYSTEM TIME for looking up the create schema
 func makeShowCreateAllSchemasGenerator(
-	ctx *eval.Context, args tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
 	dbName := string(tree.MustBeDString(args[0]))
 	return &showCreateAllSchemasGenerator{
-		evalPlanner: ctx.Planner,
+		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         ctx.Mon.MakeBoundAccount(),
+		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
 	}, nil
 }
 
@@ -2242,14 +2750,14 @@ func (s *showCreateAllTablesGenerator) Close(ctx context.Context) {
 // timestamp to pass to AS OF SYSTEM TIME for looking up the create table
 // and alter table statements.
 func makeShowCreateAllTablesGenerator(
-	ctx *eval.Context, args tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
 	dbName := string(tree.MustBeDString(args[0]))
 	return &showCreateAllTablesGenerator{
-		evalPlanner: ctx.Planner,
+		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         ctx.Mon.MakeBoundAccount(),
-		sessionData: ctx.SessionData(),
+		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
+		sessionData: evalCtx.SessionData(),
 	}, nil
 }
 
@@ -2323,12 +2831,209 @@ func (s *showCreateAllTypesGenerator) Close(ctx context.Context) {
 // We use the timestamp of when the generator is created as the
 // timestamp to pass to AS OF SYSTEM TIME for looking up the create type
 func makeShowCreateAllTypesGenerator(
-	ctx *eval.Context, args tree.Datums,
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
 ) (eval.ValueGenerator, error) {
 	dbName := string(tree.MustBeDString(args[0]))
 	return &showCreateAllTypesGenerator{
-		evalPlanner: ctx.Planner,
+		evalPlanner: evalCtx.Planner,
 		dbName:      dbName,
-		acc:         ctx.Mon.MakeBoundAccount(),
+		acc:         evalCtx.Planner.Mon().MakeBoundAccount(),
 	}, nil
+}
+
+// identGenerator supports the execution of
+// crdb_internal.gen_rand_ident().
+type identGenerator struct {
+	gen randident.NameGenerator
+	acc mon.BoundAccount
+
+	// The following variables are updated during
+	// calls to Next() and change throughout the lifecycle of
+	// identGenerator.
+	curr  tree.Datum
+	idx   int
+	count int
+}
+
+// ResolvedType implements the tree.ValueGenerator interface.
+func (s *identGenerator) ResolvedType() *types.T {
+	return types.String
+}
+
+// Start implements the tree.ValueGenerator interface.
+func (s *identGenerator) Start(ctx context.Context, txn *kv.Txn) error {
+	return nil
+}
+
+func (s *identGenerator) Next(ctx context.Context) (bool, error) {
+	s.idx++
+	if s.idx > s.count {
+		return false, nil
+	}
+
+	name := s.gen.GenerateOne(s.idx)
+	if err := s.acc.Grow(ctx, int64(len(name))); err != nil {
+		return false, err
+	}
+	s.curr = tree.NewDString(name)
+
+	return true, nil
+}
+
+// Values implements the tree.ValueGenerator interface.
+func (s *identGenerator) Values() (tree.Datums, error) {
+	return tree.Datums{s.curr}, nil
+}
+
+// Close implements the tree.ValueGenerator interface.
+func (s *identGenerator) Close(ctx context.Context) {
+	s.acc.Close(ctx)
+}
+
+// makeIdentGenerator creates a generator to support the
+// crdb_internal.gen_rand_ident() builtin.
+func makeIdentGenerator(
+	ctx context.Context, evalCtx *eval.Context, namePatDatum, countDatum, cfgDatum tree.Datum,
+) (eval.ValueGenerator, error) {
+	pattern := string(tree.MustBeDString(namePatDatum))
+	count := int(tree.MustBeDInt(countDatum))
+	cfg := randident.DefaultNameGeneratorConfig()
+	seed := randutil.NewPseudoSeed()
+	if cfgDatum != nil {
+		customCfg := struct {
+			// Seed is the random seed to use. We expose this so that tests
+			// can use this function and obtain deterministic output.
+			Seed *int64
+
+			// The other name config parameters.
+			randidentcfg.Config `json:",inline"`
+		}{
+			Seed:   nil,
+			Config: cfg,
+		}
+		userInputCfg := cfgDatum.(*tree.DJSON).JSON.String()
+		d := gojson.NewDecoder(strings.NewReader(userInputCfg))
+		d.DisallowUnknownFields()
+		if err := d.Decode(&customCfg); err != nil {
+			return nil, pgerror.WithCandidateCode(err, pgcode.Syntax)
+		}
+		if customCfg.Seed != nil {
+			seed = *customCfg.Seed
+		}
+		cfg = customCfg.Config
+	}
+	cfg.Finalize()
+	rand := rand.New(rand.NewSource(seed))
+	return &identGenerator{
+		gen:   randident.NewNameGenerator(&cfg, rand, pattern),
+		acc:   evalCtx.Planner.Mon().MakeBoundAccount(),
+		count: count,
+	}, nil
+}
+
+type tableSpanStatsIterator struct {
+	it                eval.InternalRows
+	codec             keys.SQLCodec
+	p                 eval.Planner
+	currDbId          int
+	currTableId       int
+	currStatsResponse *roachpb.SpanStatsResponse
+	singleTableReq    bool
+}
+
+func newTableSpanStatsIterator(eval *eval.Context, dbId int, tableId int) *tableSpanStatsIterator {
+	return &tableSpanStatsIterator{codec: eval.Codec, p: eval.Planner, currDbId: dbId, currTableId: tableId, singleTableReq: tableId != 0}
+}
+
+// Start implements the tree.ValueGenerator interface.
+func (tssi *tableSpanStatsIterator) Start(ctx context.Context, _ *kv.Txn) error {
+	var err error = nil
+	tssi.it, err = tssi.p.GetDetailsForSpanStats(ctx, tssi.currDbId, tssi.currTableId)
+	return err
+}
+
+// Next implements the tree.ValueGenerator interface.
+func (tssi *tableSpanStatsIterator) Next(ctx context.Context) (bool, error) {
+	if tssi.it == nil {
+		return false, errors.AssertionFailedf("Start must be called before Next")
+	}
+	next, err := tssi.it.Next(ctx)
+	if err != nil || !next {
+		return false, err
+	}
+	// Pull the current row.
+	row := tssi.it.Cur()
+	tssi.currDbId = int(tree.MustBeDInt(row[0]))
+	tssi.currTableId = int(tree.MustBeDInt(row[1]))
+
+	// Set our current stats response.
+	startKey := roachpb.RKey(tssi.codec.TablePrefix(uint32(tssi.currTableId)))
+	tssi.currStatsResponse, err = tssi.p.SpanStats(ctx, startKey, startKey.PrefixEnd())
+	if err != nil {
+		return false, err
+	}
+	return next, err
+}
+
+// Values implements the tree.ValueGenerator interface.
+func (tssi *tableSpanStatsIterator) Values() (tree.Datums, error) {
+	liveBytes := tssi.currStatsResponse.TotalStats.LiveBytes
+	totalBytes := tssi.currStatsResponse.TotalStats.KeyBytes +
+		tssi.currStatsResponse.TotalStats.ValBytes +
+		tssi.currStatsResponse.TotalStats.RangeKeyBytes +
+		tssi.currStatsResponse.TotalStats.RangeValBytes
+	livePercentage := float64(0)
+	if totalBytes > 0 {
+		livePercentage = float64(liveBytes) / float64(totalBytes)
+	}
+	return []tree.Datum{
+		tree.NewDInt(tree.DInt(tssi.currDbId)),
+		tree.NewDInt(tree.DInt(tssi.currTableId)),
+		tree.NewDInt(tree.DInt(tssi.currStatsResponse.RangeCount)),
+		tree.NewDInt(tree.DInt(tssi.currStatsResponse.ApproximateDiskBytes)),
+		tree.NewDInt(tree.DInt(liveBytes)),
+		tree.NewDInt(tree.DInt(totalBytes)),
+		tree.NewDFloat(tree.DFloat(livePercentage)),
+	}, nil
+}
+
+// Close implements the tree.ValueGenerator interface.
+func (tssi *tableSpanStatsIterator) Close(_ context.Context) {}
+
+// ResolvedType implements the tree.ValueGenerator interface.
+func (tssi *tableSpanStatsIterator) ResolvedType() *types.T {
+	return tableSpanStatsGeneratorType
+}
+
+var tableSpanStatsGeneratorType = types.MakeLabeledTuple(
+	[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, types.Float},
+	[]string{"database_id", "table_id", "range_count", "approximate_disk_bytes", "live_bytes", "total_bytes", "live_percentage"},
+)
+
+func makeTableSpanStatsGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	// The user must have ADMIN role or VIEWACTIVITY/VIEWACTIVITYREDACTED permission to use this builtin.
+	hasViewActivity, err := evalCtx.SessionAccessor.HasViewActivityOrViewActivityRedactedRole(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !hasViewActivity {
+		return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "user needs ADMIN role or the VIEWACTIVITY/VIEWACTIVITYREDACTED permission to view span statistics")
+	}
+	dbId := 0
+	tableId := 0
+	if len(args) > 0 {
+		dbId = int(tree.MustBeDInt(args[0]))
+		if dbId <= 0 {
+			return nil, errors.New("provided database id must be greater than or equal to 1")
+		}
+	}
+	if len(args) > 1 {
+		tableId = int(tree.MustBeDInt(args[1]))
+		if tableId <= 0 {
+			return nil, errors.New("provided table id must be greater than or equal to 1")
+		}
+	}
+	return newTableSpanStatsIterator(evalCtx, dbId, tableId), nil
 }

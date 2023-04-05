@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -32,15 +31,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/importer"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -49,10 +47,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
@@ -151,12 +149,12 @@ func (pt *partitioningTest) parse() error {
 		st := cluster.MakeTestingClusterSettings()
 		parentID, tableID := descpb.ID(bootstrap.TestingUserDescID(0)), descpb.ID(bootstrap.TestingUserDescID(1))
 		mutDesc, err := importer.MakeTestingSimpleTableDescriptor(
-			ctx, &semaCtx, st, createTable, parentID, keys.PublicSchemaID, tableID, importer.NoFKs, hlc.UnixNano())
+			ctx, &semaCtx, st, createTable, parentID, keys.PublicSchemaID, tableID, importer.NoFKs, timeutil.Now().UnixNano())
 		if err != nil {
 			return err
 		}
 		pt.parsed.tableDesc = mutDesc
-		if err := descbuilder.ValidateSelf(pt.parsed.tableDesc, clusterversion.TestingClusterVersion); err != nil {
+		if err := desctestutils.TestingValidateSelf(pt.parsed.tableDesc); err != nil {
 			return err
 		}
 	}
@@ -207,7 +205,7 @@ func (pt *partitioningTest) parse() error {
 		if !strings.HasPrefix(indexName, "@") {
 			panic(errors.Errorf("unsupported config: %s", c))
 		}
-		idx, err := pt.parsed.tableDesc.FindIndexWithName(indexName[1:])
+		idx, err := catalog.MustFindIndexByName(pt.parsed.tableDesc, indexName[1:])
 		if err != nil {
 			return errors.Wrapf(err, "could not find index %s", indexName)
 		}
@@ -1241,85 +1239,6 @@ func TestInitialPartitioning(t *testing.T) {
 	}
 }
 
-func TestSelectPartitionExprs(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// TODO(dan): PartitionExprs for range partitions is waiting on the new
-	// range partitioning syntax.
-	testData := partitioningTest{
-		name: `partition exprs`,
-		schema: `CREATE TABLE %s (
-			a INT, b INT, c INT, PRIMARY KEY (a, b, c)
-		) PARTITION BY LIST (a, b) (
-			PARTITION p33p44 VALUES IN ((3, 3), (4, 4)) PARTITION BY LIST (c) (
-				PARTITION p335p445 VALUES IN (5),
-				PARTITION p33dp44d VALUES IN (DEFAULT)
-			),
-			PARTITION p6d VALUES IN ((6, DEFAULT)),
-			PARTITION pdd VALUES IN ((DEFAULT, DEFAULT))
-		)`,
-	}
-	if err := testData.parse(); err != nil {
-		t.Fatalf("%+v", err)
-	}
-
-	tests := []struct {
-		// partitions is a comma-separated list of input partitions
-		partitions string
-		// expr is the expected output
-		expr string
-	}{
-		{`p33p44`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
-		{`p335p445`, `((a, b, c) = (3, 3, 5)) OR ((a, b, c) = (4, 4, 5))`},
-		{`p33dp44d`, `(((a, b) = (3, 3)) AND (NOT ((a, b, c) = (3, 3, 5)))) OR (((a, b) = (4, 4)) AND (NOT ((a, b, c) = (4, 4, 5))))`},
-		// NB See the TODO in the impl for why this next case has some clearly
-		// unrelated `!=`s.
-		{`p6d`, `((a,) = (6,)) AND (NOT (((a, b) = (3, 3)) OR ((a, b) = (4, 4))))`},
-		{`pdd`, `NOT ((((a, b) = (3, 3)) OR ((a, b) = (4, 4))) OR ((a,) = (6,)))`},
-
-		{`p335p445,p6d`, `(((a, b, c) = (3, 3, 5)) OR ((a, b, c) = (4, 4, 5))) OR (((a,) = (6,)) AND (NOT (((a, b) = (3, 3)) OR ((a, b) = (4, 4)))))`},
-
-		// TODO(dan): The expression simplification in this method is all done
-		// by our normal SQL expression simplification code. Seems like it could
-		// use some targeted work to clean these up. Ideally the following would
-		// all simplyify to  `(a, b) IN ((3, 3), (4, 4))`. Some of them work
-		// because for every requested partition, all descendent partitions are
-		// omitted, which is an optimization to save a little work with the side
-		// benefit of making more of these what we want.
-		{`p335p445,p33dp44d`, `(((a, b, c) = (3, 3, 5)) OR ((a, b, c) = (4, 4, 5))) OR ((((a, b) = (3, 3)) AND (NOT ((a, b, c) = (3, 3, 5)))) OR (((a, b) = (4, 4)) AND (NOT ((a, b, c) = (4, 4, 5)))))`},
-		{`p33p44,p335p445`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
-		{`p33p44,p335p445,p33dp44d`, `((a, b) = (3, 3)) OR ((a, b) = (4, 4))`},
-	}
-
-	evalCtx := &eval.Context{
-		Codec:    keys.SystemSQLCodec,
-		Settings: cluster.MakeTestingClusterSettings(),
-	}
-	for _, test := range tests {
-		t.Run(test.partitions, func(t *testing.T) {
-			var partNames tree.NameList
-			for _, p := range strings.Split(test.partitions, `,`) {
-				partNames = append(partNames, tree.Name(p))
-			}
-			expr, err := selectPartitionExprs(evalCtx, testData.parsed.tableDesc, partNames)
-			if err != nil {
-				t.Fatalf("%+v", err)
-			}
-			if exprStr := expr.String(); exprStr != test.expr {
-				t.Errorf("got\n%s\nexpected\n%s", exprStr, test.expr)
-			}
-		})
-	}
-	t.Run("error", func(t *testing.T) {
-		partNames := tree.NameList{`p33p44`, `nope`}
-		_, err := selectPartitionExprs(evalCtx, testData.parsed.tableDesc, partNames)
-		if !testutils.IsError(err, `unknown partition`) {
-			t.Errorf(`expected "unknown partition" error got: %+v`, err)
-		}
-	})
-}
-
 func TestRepartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1362,7 +1281,7 @@ func TestRepartitioning(t *testing.T) {
 				}
 				sqlDB.Exec(t, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", test.old.parsed.tableName, test.new.parsed.tableName))
 
-				testIndex, err := test.new.parsed.tableDesc.FindIndexWithName(test.index)
+				testIndex, err := catalog.MustFindIndexByName(test.new.parsed.tableDesc, test.index)
 				if err != nil {
 					t.Fatalf("%+v", err)
 				}
@@ -1373,12 +1292,13 @@ func TestRepartitioning(t *testing.T) {
 				} else {
 					fmt.Fprintf(&repartition, `ALTER INDEX %s@%s `, test.new.parsed.tableName, testIndex.GetName())
 				}
-				if testIndex.GetPartitioning().NumColumns() == 0 {
+				if testIndex.PartitioningColumnCount() == 0 {
 					repartition.WriteString(`PARTITION BY NOTHING`)
 				} else {
 					if err := sql.ShowCreatePartitioning(
 						&tree.DatumAlloc{}, keys.SystemSQLCodec, test.new.parsed.tableDesc, testIndex,
 						testIndex.GetPartitioning(), &repartition, 0 /* indent */, 0, /* colOffset */
+						false, /* redactableValues */
 					); err != nil {
 						t.Fatalf("%+v", err)
 					}
@@ -1498,7 +1418,8 @@ func TestRemovePartitioningExpiredLicense(t *testing.T) {
 
 	ctx := context.Background()
 	s, sqlDBRaw, _ := serverutils.StartServer(t, base.TestServerArgs{
-		UseDatabase: "d",
+		UseDatabase:       "d",
+		DefaultTestTenant: base.TestTenantDisabled,
 	})
 	defer s.Stopper().Stop(ctx)
 

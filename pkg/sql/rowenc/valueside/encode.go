@@ -12,10 +12,10 @@ package valueside
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
+	"github.com/cockroachdb/cockroach/pkg/util/tsearch"
 	"github.com/cockroachdb/errors"
 )
 
@@ -36,7 +36,7 @@ func Encode(appendTo []byte, colID ColumnIDDelta, val tree.Datum, scratch []byte
 	if val == tree.DNull {
 		return encoding.EncodeNullValue(appendTo, uint32(colID)), nil
 	}
-	switch t := eval.UnwrapDatum(nil, val).(type) {
+	switch t := tree.UnwrapDOidWrapper(val).(type) {
 	case *tree.DBitArray:
 		return encoding.EncodeBitArrayValue(appendTo, uint32(colID), t.BitArray), nil
 	case *tree.DBool:
@@ -81,6 +81,18 @@ func Encode(appendTo []byte, colID ColumnIDDelta, val tree.Datum, scratch []byte
 			return nil, err
 		}
 		return encoding.EncodeJSONValue(appendTo, uint32(colID), encoded), nil
+	case *tree.DTSQuery:
+		encoded, err := tsearch.EncodeTSQuery(scratch, t.TSQuery)
+		if err != nil {
+			return nil, err
+		}
+		return encoding.EncodeTSQueryValue(appendTo, uint32(colID), encoded), nil
+	case *tree.DTSVector:
+		encoded, err := tsearch.EncodeTSVector(scratch, t.TSVector)
+		if err != nil {
+			return nil, err
+		}
+		return encoding.EncodeTSVectorValue(appendTo, uint32(colID), encoded), nil
 	case *tree.DArray:
 		a, err := encodeArray(t, scratch)
 		if err != nil {
@@ -92,7 +104,7 @@ func Encode(appendTo []byte, colID ColumnIDDelta, val tree.Datum, scratch []byte
 	case *tree.DCollatedString:
 		return encoding.EncodeBytesValue(appendTo, uint32(colID), []byte(t.Contents)), nil
 	case *tree.DOid:
-		return encoding.EncodeIntValue(appendTo, uint32(colID), int64(t.DInt)), nil
+		return encoding.EncodeIntValue(appendTo, uint32(colID), int64(t.Oid)), nil
 	case *tree.DEnum:
 		return encoding.EncodeBytesValue(appendTo, uint32(colID), t.PhysicalRep), nil
 	case *tree.DVoid:

@@ -11,28 +11,33 @@
 package eval
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
 // Expr evaluates a TypedExpr into a Datum.
-func Expr(ctx *Context, n tree.TypedExpr) (tree.Datum, error) {
-	return n.Eval((*evaluator)(ctx))
+func Expr(ctx context.Context, evalCtx *Context, n tree.TypedExpr) (tree.Datum, error) {
+	return n.Eval(ctx, (*evaluator)(evalCtx))
 }
 
 type evaluator Context
 
 func (e *evaluator) ctx() *Context { return (*Context)(e) }
 
-func (e *evaluator) EvalAllColumnsSelector(selector *tree.AllColumnsSelector) (tree.Datum, error) {
+func (e *evaluator) EvalAllColumnsSelector(
+	ctx context.Context, selector *tree.AllColumnsSelector,
+) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", selector)
 }
 
-func (e *evaluator) EvalAndExpr(expr *tree.AndExpr) (tree.Datum, error) {
-	left, err := expr.Left.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalAndExpr(ctx context.Context, expr *tree.AndExpr) (tree.Datum, error) {
+	left, err := expr.Left.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +48,7 @@ func (e *evaluator) EvalAndExpr(expr *tree.AndExpr) (tree.Datum, error) {
 			return left, nil
 		}
 	}
-	right, err := expr.Right.(tree.TypedExpr).Eval(e)
+	right, err := expr.Right.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -58,14 +63,14 @@ func (e *evaluator) EvalAndExpr(expr *tree.AndExpr) (tree.Datum, error) {
 	return left, nil
 }
 
-func (e *evaluator) EvalArray(t *tree.Array) (tree.Datum, error) {
+func (e *evaluator) EvalArray(ctx context.Context, t *tree.Array) (tree.Datum, error) {
 	array, err := arrayOfType(t.ResolvedType())
 	if err != nil {
 		return nil, err
 	}
 
 	for _, ae := range t.Exprs {
-		d, err := ae.(tree.TypedExpr).Eval(e)
+		d, err := ae.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
 			return nil, err
 		}
@@ -76,13 +81,15 @@ func (e *evaluator) EvalArray(t *tree.Array) (tree.Datum, error) {
 	return array, nil
 }
 
-func (e *evaluator) EvalArrayFlatten(t *tree.ArrayFlatten) (tree.Datum, error) {
+func (e *evaluator) EvalArrayFlatten(
+	ctx context.Context, t *tree.ArrayFlatten,
+) (tree.Datum, error) {
 	array, err := arrayOfType(t.ResolvedType())
 	if err != nil {
 		return nil, err
 	}
 
-	d, err := t.Subquery.(tree.TypedExpr).Eval(e)
+	d, err := t.Subquery.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -95,22 +102,22 @@ func (e *evaluator) EvalArrayFlatten(t *tree.ArrayFlatten) (tree.Datum, error) {
 	return array, nil
 }
 
-func (e *evaluator) EvalBinaryExpr(expr *tree.BinaryExpr) (tree.Datum, error) {
-	left, err := expr.Left.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalBinaryExpr(ctx context.Context, expr *tree.BinaryExpr) (tree.Datum, error) {
+	left, err := expr.Left.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
-	if left == tree.DNull && !expr.Op.NullableArgs {
+	if left == tree.DNull && !expr.Op.CalledOnNullInput {
 		return tree.DNull, nil
 	}
-	right, err := expr.Right.(tree.TypedExpr).Eval(e)
+	right, err := expr.Right.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
-	if right == tree.DNull && !expr.Op.NullableArgs {
+	if right == tree.DNull && !expr.Op.CalledOnNullInput {
 		return tree.DNull, nil
 	}
-	res, err := expr.Op.EvalOp.Eval(e, left, right)
+	res, err := expr.Op.EvalOp.Eval(ctx, e, left, right)
 	if err != nil {
 		return nil, err
 	}
@@ -123,54 +130,54 @@ func (e *evaluator) EvalBinaryExpr(expr *tree.BinaryExpr) (tree.Datum, error) {
 	return res, err
 }
 
-func (e *evaluator) EvalCaseExpr(expr *tree.CaseExpr) (tree.Datum, error) {
+func (e *evaluator) EvalCaseExpr(ctx context.Context, expr *tree.CaseExpr) (tree.Datum, error) {
 	if expr.Expr != nil {
 		// CASE <val> WHEN <expr> THEN ...
 		//
 		// For each "when" expression we compare for equality to <val>.
-		val, err := expr.Expr.(tree.TypedExpr).Eval(e)
+		val, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
 			return nil, err
 		}
 
 		for _, when := range expr.Whens {
-			arg, err := when.Cond.(tree.TypedExpr).Eval(e)
+			arg, err := when.Cond.(tree.TypedExpr).Eval(ctx, e)
 			if err != nil {
 				return nil, err
 			}
-			d, err := evalComparison(e.ctx(), treecmp.MakeComparisonOperator(treecmp.EQ), val, arg)
+			d, err := evalComparison(ctx, e.ctx(), treecmp.MakeComparisonOperator(treecmp.EQ), val, arg)
 			if err != nil {
 				return nil, err
 			}
 			if db, err := tree.GetBool(d); err != nil {
 				return nil, err
 			} else if db {
-				return when.Val.(tree.TypedExpr).Eval(e)
+				return when.Val.(tree.TypedExpr).Eval(ctx, e)
 			}
 		}
 	} else {
 		// CASE WHEN <bool-expr> THEN ...
 		for _, when := range expr.Whens {
-			d, err := when.Cond.(tree.TypedExpr).Eval(e)
+			d, err := when.Cond.(tree.TypedExpr).Eval(ctx, e)
 			if err != nil {
 				return nil, err
 			}
 			if db, err := tree.GetBool(d); err != nil {
 				return nil, err
 			} else if db {
-				return when.Val.(tree.TypedExpr).Eval(e)
+				return when.Val.(tree.TypedExpr).Eval(ctx, e)
 			}
 		}
 	}
 
 	if expr.Else != nil {
-		return expr.Else.(tree.TypedExpr).Eval(e)
+		return expr.Else.(tree.TypedExpr).Eval(ctx, e)
 	}
 	return tree.DNull, nil
 }
 
-func (e *evaluator) EvalCastExpr(expr *tree.CastExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalCastExpr(ctx context.Context, expr *tree.CastExpr) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -179,13 +186,15 @@ func (e *evaluator) EvalCastExpr(expr *tree.CastExpr) (tree.Datum, error) {
 	if d == tree.DNull {
 		return d, nil
 	}
-	d = UnwrapDatum(e.ctx(), d)
-	return PerformCast(e.ctx(), d, expr.ResolvedType())
+	d = UnwrapDatum(ctx, e.ctx(), d)
+	return PerformCast(ctx, e.ctx(), d, expr.ResolvedType())
 }
 
-func (e *evaluator) EvalCoalesceExpr(expr *tree.CoalesceExpr) (tree.Datum, error) {
+func (e *evaluator) EvalCoalesceExpr(
+	ctx context.Context, expr *tree.CoalesceExpr,
+) (tree.Datum, error) {
 	for _, ex := range expr.Exprs {
-		d, err := ex.(tree.TypedExpr).Eval(e)
+		d, err := ex.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
 			return nil, err
 		}
@@ -196,12 +205,14 @@ func (e *evaluator) EvalCoalesceExpr(expr *tree.CoalesceExpr) (tree.Datum, error
 	return tree.DNull, nil
 }
 
-func (e *evaluator) EvalCollateExpr(expr *tree.CollateExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalCollateExpr(
+	ctx context.Context, expr *tree.CollateExpr,
+) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
-	unwrapped := UnwrapDatum(e.ctx(), d)
+	unwrapped := UnwrapDatum(ctx, e.ctx(), d)
 	if unwrapped == tree.DNull {
 		return tree.DNull, nil
 	}
@@ -215,8 +226,10 @@ func (e *evaluator) EvalCollateExpr(expr *tree.CollateExpr) (tree.Datum, error) 
 	}
 }
 
-func (e *evaluator) EvalColumnAccessExpr(expr *tree.ColumnAccessExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalColumnAccessExpr(
+	ctx context.Context, expr *tree.ColumnAccessExpr,
+) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -226,30 +239,32 @@ func (e *evaluator) EvalColumnAccessExpr(expr *tree.ColumnAccessExpr) (tree.Datu
 	return d.(*tree.DTuple).D[expr.ColIndex], nil
 }
 
-func (e *evaluator) EvalColumnItem(expr *tree.ColumnItem) (tree.Datum, error) {
+func (e *evaluator) EvalColumnItem(ctx context.Context, expr *tree.ColumnItem) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
-func (e *evaluator) EvalComparisonExpr(expr *tree.ComparisonExpr) (tree.Datum, error) {
-	left, err := expr.Left.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalComparisonExpr(
+	ctx context.Context, expr *tree.ComparisonExpr,
+) (tree.Datum, error) {
+	left, err := expr.Left.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
-	right, err := expr.Right.(tree.TypedExpr).Eval(e)
+	right, err := expr.Right.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
 
 	op := expr.Operator
 	if op.Symbol.HasSubOperator() {
-		return ComparisonExprWithSubOperator(e.ctx(), expr, left, right)
+		return ComparisonExprWithSubOperator(ctx, e.ctx(), expr, left, right)
 	}
 
-	_, newLeft, newRight, _, not := tree.FoldComparisonExpr(op, left, right)
-	if !expr.Op.NullableArgs && (newLeft == tree.DNull || newRight == tree.DNull) {
+	_, newLeft, newRight, _, not := tree.FoldComparisonExprWithDatums(op, left, right)
+	if !expr.Op.CalledOnNullInput && (newLeft == tree.DNull || newRight == tree.DNull) {
 		return tree.DNull, nil
 	}
-	d, err := expr.Op.EvalOp.Eval(e, newLeft.(tree.Datum), newRight.(tree.Datum))
+	d, err := expr.Op.EvalOp.Eval(ctx, e, newLeft, newRight)
 	if d == tree.DNull || err != nil {
 		return d, err
 	}
@@ -260,7 +275,7 @@ func (e *evaluator) EvalComparisonExpr(expr *tree.ComparisonExpr) (tree.Datum, e
 	return tree.MakeDBool(*b != tree.DBool(not)), nil
 }
 
-func (e *evaluator) EvalIndexedVar(iv *tree.IndexedVar) (tree.Datum, error) {
+func (e *evaluator) EvalIndexedVar(ctx context.Context, iv *tree.IndexedVar) (tree.Datum, error) {
 	if e.IVarContainer == nil {
 		return nil, errors.AssertionFailedf(
 			"indexed var must be bound to a container before evaluation")
@@ -270,27 +285,15 @@ func (e *evaluator) EvalIndexedVar(iv *tree.IndexedVar) (tree.Datum, error) {
 		return nil, errors.AssertionFailedf(
 			"indexed var container of type %T may not be evaluated", e.IVarContainer)
 	}
-	return eivc.IndexedVarEval(iv.Idx, e)
+	return eivc.IndexedVarEval(ctx, iv.Idx, e)
 }
 
-func (e *evaluator) EvalIndirectionExpr(expr *tree.IndirectionExpr) (tree.Datum, error) {
+func (e *evaluator) EvalIndirectionExpr(
+	ctx context.Context, expr *tree.IndirectionExpr,
+) (tree.Datum, error) {
 	var subscriptIdx int
-	for i, t := range expr.Indirection {
-		if t.Slice || i > 0 {
-			return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
-		}
 
-		d, err := t.Begin.(tree.TypedExpr).Eval(e)
-		if err != nil {
-			return nil, err
-		}
-		if d == tree.DNull {
-			return d, nil
-		}
-		subscriptIdx = int(tree.MustBeDInt(d))
-	}
-
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -298,25 +301,78 @@ func (e *evaluator) EvalIndirectionExpr(expr *tree.IndirectionExpr) (tree.Datum,
 		return d, nil
 	}
 
-	// Index into the DArray, using 1-indexing.
-	arr := tree.MustBeDArray(d)
+	switch d.ResolvedType().Family() {
+	case types.ArrayFamily:
+		for i, t := range expr.Indirection {
+			if t.Slice || i > 0 {
+				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
 
-	// VECTOR types use 0-indexing.
-	if arr.FirstIndex() == 0 {
-		subscriptIdx++
+			beginDatum, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if beginDatum == tree.DNull {
+				return tree.DNull, nil
+			}
+			subscriptIdx = int(tree.MustBeDInt(beginDatum))
+		}
+
+		// Index into the DArray, using 1-indexing.
+		arr := tree.MustBeDArray(d)
+
+		// VECTOR types use 0-indexing.
+		if arr.FirstIndex() == 0 {
+			subscriptIdx++
+		}
+		if subscriptIdx < 1 || subscriptIdx > arr.Len() {
+			return tree.DNull, nil
+		}
+		return arr.Array[subscriptIdx-1], nil
+	case types.JsonFamily:
+		j := tree.MustBeDJSON(d)
+		curr := j.JSON
+		for _, t := range expr.Indirection {
+			if t.Slice {
+				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
+
+			field, err := t.Begin.(tree.TypedExpr).Eval(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+			if field == tree.DNull {
+				return tree.DNull, nil
+			}
+			switch field.ResolvedType().Family() {
+			case types.StringFamily:
+				if curr, err = curr.FetchValKeyOrIdx(string(tree.MustBeDString(field))); err != nil {
+					return nil, err
+				}
+			case types.IntFamily:
+				if curr, err = curr.FetchValIdx(int(tree.MustBeDInt(field))); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
+			}
+			if curr == nil {
+				return tree.DNull, nil
+			}
+		}
+		return tree.NewDJSON(curr), nil
 	}
-	if subscriptIdx < 1 || subscriptIdx > arr.Len() {
-		return tree.DNull, nil
-	}
-	return arr.Array[subscriptIdx-1], nil
+	return nil, errors.AssertionFailedf("unsupported feature should have been rejected during planning")
 }
 
-func (e *evaluator) EvalDefaultVal(expr *tree.DefaultVal) (tree.Datum, error) {
+func (e *evaluator) EvalDefaultVal(ctx context.Context, expr *tree.DefaultVal) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", expr)
 }
 
-func (e *evaluator) EvalIsNotNullExpr(expr *tree.IsNotNullExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalIsNotNullExpr(
+	ctx context.Context, expr *tree.IsNotNullExpr,
+) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -335,8 +391,8 @@ func (e *evaluator) EvalIsNotNullExpr(expr *tree.IsNotNullExpr) (tree.Datum, err
 	return tree.MakeDBool(true), nil
 }
 
-func (e *evaluator) EvalIsNullExpr(expr *tree.IsNullExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalIsNullExpr(ctx context.Context, expr *tree.IsNullExpr) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -355,8 +411,10 @@ func (e *evaluator) EvalIsNullExpr(expr *tree.IsNullExpr) (tree.Datum, error) {
 	return tree.MakeDBool(false), nil
 }
 
-func (e *evaluator) EvalIsOfTypeExpr(expr *tree.IsOfTypeExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalIsOfTypeExpr(
+	ctx context.Context, expr *tree.IsOfTypeExpr,
+) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -370,8 +428,8 @@ func (e *evaluator) EvalIsOfTypeExpr(expr *tree.IsOfTypeExpr) (tree.Datum, error
 	return tree.MakeDBool(tree.DBool(expr.Not)), nil
 }
 
-func (e *evaluator) EvalNotExpr(expr *tree.NotExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalNotExpr(ctx context.Context, expr *tree.NotExpr) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -385,16 +443,16 @@ func (e *evaluator) EvalNotExpr(expr *tree.NotExpr) (tree.Datum, error) {
 	return tree.MakeDBool(!got), nil
 }
 
-func (e *evaluator) EvalNullIfExpr(expr *tree.NullIfExpr) (tree.Datum, error) {
-	expr1, err := expr.Expr1.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalNullIfExpr(ctx context.Context, expr *tree.NullIfExpr) (tree.Datum, error) {
+	expr1, err := expr.Expr1.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
-	expr2, err := expr.Expr2.(tree.TypedExpr).Eval(e)
+	expr2, err := expr.Expr2.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
-	cond, err := evalComparison(e.ctx(), treecmp.MakeComparisonOperator(treecmp.EQ), expr1, expr2)
+	cond, err := evalComparison(ctx, e.ctx(), treecmp.MakeComparisonOperator(treecmp.EQ), expr1, expr2)
 	if err != nil {
 		return nil, err
 	}
@@ -404,13 +462,13 @@ func (e *evaluator) EvalNullIfExpr(expr *tree.NullIfExpr) (tree.Datum, error) {
 	return expr1, nil
 }
 
-func (e *evaluator) EvalFuncExpr(expr *tree.FuncExpr) (tree.Datum, error) {
+func (e *evaluator) EvalFuncExpr(ctx context.Context, expr *tree.FuncExpr) (tree.Datum, error) {
 	fn := expr.ResolvedOverload()
 	if fn.FnWithExprs != nil {
-		return fn.FnWithExprs.(FnWithExprsOverload)(e.ctx(), expr.Exprs)
+		return fn.FnWithExprs.(FnWithExprsOverload)(ctx, e.ctx(), expr.Exprs)
 	}
 
-	nullResult, args, err := e.evalFuncArgs(expr)
+	nullResult, args, err := e.evalFuncArgs(ctx, expr)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +476,7 @@ func (e *evaluator) EvalFuncExpr(expr *tree.FuncExpr) (tree.Datum, error) {
 		return tree.DNull, err
 	}
 
-	res, err := fn.Fn.(FnOverload)(e.ctx(), args)
+	res, err := fn.Fn.(FnOverload)(ctx, e.ctx(), args)
 	if err != nil {
 		return nil, expr.MaybeWrapError(err)
 	}
@@ -431,15 +489,15 @@ func (e *evaluator) EvalFuncExpr(expr *tree.FuncExpr) (tree.Datum, error) {
 }
 
 func (e *evaluator) evalFuncArgs(
-	expr *tree.FuncExpr,
+	ctx context.Context, expr *tree.FuncExpr,
 ) (propagateNulls bool, args tree.Datums, _ error) {
 	args = make(tree.Datums, len(expr.Exprs))
 	for i, argExpr := range expr.Exprs {
-		arg, err := argExpr.(tree.TypedExpr).Eval(e)
+		arg, err := argExpr.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
 			return false, nil, err
 		}
-		if arg == tree.DNull && !expr.CanHandleNulls() {
+		if arg == tree.DNull && !expr.ResolvedOverload().CalledOnNullInput {
 			return true, nil, nil
 		}
 		args[i] = arg
@@ -447,8 +505,8 @@ func (e *evaluator) evalFuncArgs(
 	return false, args, nil
 }
 
-func (e *evaluator) EvalIfErrExpr(expr *tree.IfErrExpr) (tree.Datum, error) {
-	cond, evalErr := expr.Cond.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalIfErrExpr(ctx context.Context, expr *tree.IfErrExpr) (tree.Datum, error) {
+	cond, evalErr := expr.Cond.(tree.TypedExpr).Eval(ctx, e)
 	if evalErr == nil {
 		if expr.Else == nil {
 			return tree.DBoolFalse, nil
@@ -456,7 +514,7 @@ func (e *evaluator) EvalIfErrExpr(expr *tree.IfErrExpr) (tree.Datum, error) {
 		return cond, nil
 	}
 	if expr.ErrCode != nil {
-		errpat, err := expr.ErrCode.(tree.TypedExpr).Eval(e)
+		errpat, err := expr.ErrCode.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
 			return nil, err
 		}
@@ -471,22 +529,22 @@ func (e *evaluator) EvalIfErrExpr(expr *tree.IfErrExpr) (tree.Datum, error) {
 	if expr.Else == nil {
 		return tree.DBoolTrue, nil
 	}
-	return expr.Else.(tree.TypedExpr).Eval(e)
+	return expr.Else.(tree.TypedExpr).Eval(ctx, e)
 }
 
-func (e *evaluator) EvalIfExpr(expr *tree.IfExpr) (tree.Datum, error) {
-	cond, err := expr.Cond.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalIfExpr(ctx context.Context, expr *tree.IfExpr) (tree.Datum, error) {
+	cond, err := expr.Cond.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
 	if cond == tree.DBoolTrue {
-		return expr.True.(tree.TypedExpr).Eval(e)
+		return expr.True.(tree.TypedExpr).Eval(ctx, e)
 	}
-	return expr.Else.(tree.TypedExpr).Eval(e)
+	return expr.Else.(tree.TypedExpr).Eval(ctx, e)
 }
 
-func (e *evaluator) EvalOrExpr(expr *tree.OrExpr) (tree.Datum, error) {
-	left, err := expr.Left.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalOrExpr(ctx context.Context, expr *tree.OrExpr) (tree.Datum, error) {
+	left, err := expr.Left.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -497,7 +555,7 @@ func (e *evaluator) EvalOrExpr(expr *tree.OrExpr) (tree.Datum, error) {
 			return left, nil
 		}
 	}
-	right, err := expr.Right.(tree.TypedExpr).Eval(e)
+	right, err := expr.Right.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -515,11 +573,11 @@ func (e *evaluator) EvalOrExpr(expr *tree.OrExpr) (tree.Datum, error) {
 	return tree.DBoolFalse, nil
 }
 
-func (e *evaluator) EvalParenExpr(expr *tree.ParenExpr) (tree.Datum, error) {
-	return expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalParenExpr(ctx context.Context, expr *tree.ParenExpr) (tree.Datum, error) {
+	return expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 }
 
-func (e *evaluator) EvalPlaceholder(t *tree.Placeholder) (tree.Datum, error) {
+func (e *evaluator) EvalPlaceholder(ctx context.Context, t *tree.Placeholder) (tree.Datum, error) {
 	if !e.ctx().HasPlaceholders() {
 		// While preparing a query, there will be no available placeholders. A
 		// placeholder evaluates to itself at this point.
@@ -544,23 +602,51 @@ func (e *evaluator) EvalPlaceholder(t *tree.Placeholder) (tree.Datum, error) {
 		// TODO(jordan,mgartner): Introduce a restriction on what casts are
 		// allowed here. Most likely, only implicit casts should be allowed.
 		cast := tree.NewTypedCastExpr(ex, typ)
-		return cast.Eval(e)
+		return cast.Eval(ctx, e)
 	}
-	return ex.Eval(e)
+	return ex.Eval(ctx, e)
 }
 
-func (e *evaluator) EvalRangeCond(cond *tree.RangeCond) (tree.Datum, error) {
+func (e *evaluator) EvalRangeCond(ctx context.Context, cond *tree.RangeCond) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", cond)
 }
 
-func (e *evaluator) EvalSubquery(subquery *tree.Subquery) (tree.Datum, error) {
+func (e *evaluator) EvalSubquery(ctx context.Context, subquery *tree.Subquery) (tree.Datum, error) {
 	return e.Planner.EvalSubquery(subquery)
 }
 
-func (e *evaluator) EvalTuple(t *tree.Tuple) (tree.Datum, error) {
+func (e *evaluator) EvalRoutineExpr(
+	ctx context.Context, routine *tree.RoutineExpr,
+) (tree.Datum, error) {
+	args, err := e.evalRoutineArgs(ctx, routine)
+	if err != nil {
+		return nil, err
+	}
+	return e.Planner.EvalRoutineExpr(ctx, routine, args)
+}
+
+func (e *evaluator) evalRoutineArgs(
+	ctx context.Context, expr *tree.RoutineExpr,
+) (args tree.Datums, err error) {
+	if len(expr.Args) > 0 {
+		// Evaluate each argument expression.
+		// TODO(mgartner): Use a scratch tree.Datums to avoid allocation on
+		// every invocation.
+		args = make(tree.Datums, len(expr.Args))
+		for i := range expr.Args {
+			args[i], err = expr.Args[i].Eval(ctx, e)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return args, nil
+}
+
+func (e *evaluator) EvalTuple(ctx context.Context, t *tree.Tuple) (tree.Datum, error) {
 	tuple := tree.NewDTupleWithLen(t.ResolvedType(), len(t.Exprs))
 	for i, expr := range t.Exprs {
-		d, err := expr.(tree.TypedExpr).Eval(e)
+		d, err := expr.(tree.TypedExpr).Eval(ctx, e)
 		if err != nil {
 			return nil, err
 		}
@@ -569,16 +655,16 @@ func (e *evaluator) EvalTuple(t *tree.Tuple) (tree.Datum, error) {
 	return tuple, nil
 }
 
-func (e *evaluator) EvalTupleStar(star *tree.TupleStar) (tree.Datum, error) {
+func (e *evaluator) EvalTupleStar(ctx context.Context, star *tree.TupleStar) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", star)
 }
 
-func (e *evaluator) EvalTypedDummy(*tree.TypedDummy) (tree.Datum, error) {
+func (e *evaluator) EvalTypedDummy(context.Context, *tree.TypedDummy) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("should not eval typed dummy")
 }
 
-func (e *evaluator) EvalUnaryExpr(expr *tree.UnaryExpr) (tree.Datum, error) {
-	d, err := expr.Expr.(tree.TypedExpr).Eval(e)
+func (e *evaluator) EvalUnaryExpr(ctx context.Context, expr *tree.UnaryExpr) (tree.Datum, error) {
+	d, err := expr.Expr.(tree.TypedExpr).Eval(ctx, e)
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +672,7 @@ func (e *evaluator) EvalUnaryExpr(expr *tree.UnaryExpr) (tree.Datum, error) {
 		return d, nil
 	}
 	op := expr.GetOp()
-	res, err := op.EvalOp.Eval(e, d)
+	res, err := op.EvalOp.Eval(ctx, e, d)
 	if err != nil {
 		return nil, err
 	}
@@ -598,11 +684,15 @@ func (e *evaluator) EvalUnaryExpr(expr *tree.UnaryExpr) (tree.Datum, error) {
 	return res, err
 }
 
-func (e *evaluator) EvalUnresolvedName(name *tree.UnresolvedName) (tree.Datum, error) {
+func (e *evaluator) EvalUnresolvedName(
+	ctx context.Context, name *tree.UnresolvedName,
+) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", name)
 }
 
-func (e *evaluator) EvalUnqualifiedStar(star tree.UnqualifiedStar) (tree.Datum, error) {
+func (e *evaluator) EvalUnqualifiedStar(
+	ctx context.Context, star tree.UnqualifiedStar,
+) (tree.Datum, error) {
 	return nil, errors.AssertionFailedf("unhandled type %T", star)
 }
 

@@ -15,6 +15,7 @@ import (
 	"container/heap"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -142,9 +143,13 @@ func (rts *resolvedTimestamp) consumeLogicalOp(op enginepb.MVCCLogicalOp) bool {
 		rts.assertOpAboveRTS(op, t.Timestamp)
 		return false
 
+	case *enginepb.MVCCDeleteRangeOp:
+		rts.assertOpAboveRTS(op, t.Timestamp)
+		return false
+
 	case *enginepb.MVCCWriteIntentOp:
 		rts.assertOpAboveRTS(op, t.Timestamp)
-		return rts.intentQ.IncRef(t.TxnID, t.TxnKey, t.TxnMinTimestamp, t.Timestamp)
+		return rts.intentQ.IncRef(t.TxnID, t.TxnKey, t.TxnIsoLevel, t.TxnMinTimestamp, t.Timestamp)
 
 	case *enginepb.MVCCUpdateIntentOp:
 		return rts.intentQ.UpdateTS(t.TxnID, t.Timestamp)
@@ -271,10 +276,11 @@ func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS h
 // that may at some point in the future result in a RangeFeedValue publication.
 // Based on this definition, there are three possible states that an extent
 // intent can be in while fitting the requirement to be an "unresolved intent":
-// 1. part of a PENDING transaction
-// 2. part of a STAGING transaction that has not been explicitly committed yet
-// 3. part of a COMMITTED transaction but not yet resolved due to the asynchronous
-//    nature of intent resolution
+//  1. part of a PENDING transaction
+//  2. part of a STAGING transaction that has not been explicitly committed yet
+//  3. part of a COMMITTED transaction but not yet resolved due to the asynchronous
+//     nature of intent resolution
+//
 // Notably, this means that an intent that exists but that is known to be part
 // of an ABORTED transaction is not considered "unresolved", even if it has yet
 // to be cleaned up. In the context of rangefeeds, the intent's fate is resolved
@@ -283,11 +289,11 @@ func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS h
 // Defining unresolved intents in this way presents two paths for an unresolved
 // intent to become resolved (and thus decrement the unresolvedTxn's ref count).
 // An unresolved intent can become resolved if:
-// 1. it is COMMITTED or ABORTED through the traditional intent resolution
-//    process.
-// 2. it's transaction is observed to be ABORTED, meaning that it is by
-//    definition resolved even if it has yet to be cleaned up by the intent
-//    resolution process.
+//  1. it is COMMITTED or ABORTED through the traditional intent resolution
+//     process.
+//  2. it's transaction is observed to be ABORTED, meaning that it is by
+//     definition resolved even if it has yet to be cleaned up by the intent
+//     resolution process.
 //
 // An unresolvedTxn is a transaction that has one or more unresolved intents on
 // a given range. The structure itself maintains metadata about the transaction
@@ -295,8 +301,9 @@ func (rts *resolvedTimestamp) assertOpAboveRTS(op enginepb.MVCCLogicalOp, opTS h
 // the transaction on a given range.
 type unresolvedTxn struct {
 	txnID           uuid.UUID
-	txnKey          roachpb.Key
-	txnMinTimestamp hlc.Timestamp
+	txnKey          roachpb.Key     // unset if refCount < 0
+	txnIsoLevel     isolation.Level // unset if refCount < 0
+	txnMinTimestamp hlc.Timestamp   // unset if refCount < 0
 	timestamp       hlc.Timestamp
 	refCount        int // count of unresolved intents
 
@@ -307,9 +314,16 @@ type unresolvedTxn struct {
 
 // asTxnMeta returns a TxnMeta representation of the unresolved transaction.
 func (t *unresolvedTxn) asTxnMeta() enginepb.TxnMeta {
+	if t.refCount <= 0 {
+		// An unresolvedTxn with a non-positive reference count may have an
+		// uninitialized txnKey, txnIsoLevel, and txnMinTimestamp. When in this
+		// state, we disallow the construction of a TxnMeta.
+		panic("asTxnMeta called on unresolvedTxn with negative reference count")
+	}
 	return enginepb.TxnMeta{
 		ID:             t.txnID,
 		Key:            t.txnKey,
+		IsoLevel:       t.txnIsoLevel,
 		MinTimestamp:   t.txnMinTimestamp,
 		WriteTimestamp: t.timestamp,
 	}
@@ -417,27 +431,31 @@ func (uiq *unresolvedIntentQueue) Before(ts hlc.Timestamp) []*unresolvedTxn {
 // returns whether the update advanced the timestamp of the oldest transaction
 // in the queue.
 func (uiq *unresolvedIntentQueue) IncRef(
-	txnID uuid.UUID, txnKey roachpb.Key, txnMinTS, ts hlc.Timestamp,
+	txnID uuid.UUID, txnKey roachpb.Key, txnIsoLevel isolation.Level, txnMinTS, ts hlc.Timestamp,
 ) bool {
-	return uiq.updateTxn(txnID, txnKey, txnMinTS, ts, +1)
+	return uiq.updateTxn(txnID, txnKey, txnIsoLevel, txnMinTS, ts, +1)
 }
 
 // DecrRef decrements the reference count of the specified transaction. It
 // returns whether the update advanced the timestamp of the oldest transaction
 // in the queue.
 func (uiq *unresolvedIntentQueue) DecrRef(txnID uuid.UUID, ts hlc.Timestamp) bool {
-	return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, ts, -1)
+	return uiq.updateTxn(txnID, nil, 0, hlc.Timestamp{}, ts, -1)
 }
 
 // UpdateTS updates the timestamp of the specified transaction without modifying
 // its intent reference count. It returns whether the update advanced the
 // timestamp of the oldest transaction in the queue.
 func (uiq *unresolvedIntentQueue) UpdateTS(txnID uuid.UUID, ts hlc.Timestamp) bool {
-	return uiq.updateTxn(txnID, nil, hlc.Timestamp{}, ts, 0)
+	return uiq.updateTxn(txnID, nil, 0, hlc.Timestamp{}, ts, 0)
 }
 
 func (uiq *unresolvedIntentQueue) updateTxn(
-	txnID uuid.UUID, txnKey roachpb.Key, txnMinTS, ts hlc.Timestamp, delta int,
+	txnID uuid.UUID,
+	txnKey roachpb.Key,
+	txnIsoLevel isolation.Level,
+	txnMinTS, ts hlc.Timestamp,
+	delta int,
 ) bool {
 	txn, ok := uiq.txns[txnID]
 	if !ok {
@@ -450,6 +468,7 @@ func (uiq *unresolvedIntentQueue) updateTxn(
 		txn = &unresolvedTxn{
 			txnID:           txnID,
 			txnKey:          txnKey,
+			txnIsoLevel:     txnIsoLevel,
 			txnMinTimestamp: txnMinTS,
 			timestamp:       ts,
 			refCount:        delta,
@@ -464,12 +483,17 @@ func (uiq *unresolvedIntentQueue) updateTxn(
 	// Will changes to the txn advance the queue's earliest timestamp?
 	wasMin := txn.index == 0
 
+	if delta < -1 || delta > 1 {
+		// Require that |delta| <= 1, which simplifies the logic here because it
+		// ensures that negative reference counts never switch to positive without
+		// passing through zero and positive reference counts never switch to
+		// negative without passing through zero. Passing through zero ensures that
+		// we hit the `!ok` branch above.
+		panic("unsupported reference count delta")
+	}
 	txn.refCount += delta
-	if txn.refCount == 0 || (txn.refCount < 0 && !uiq.allowNegRefCount) {
+	if txn.refCount == 0 {
 		// Remove txn from the queue.
-		// NB: the txn.refCount < 0 case is not exercised by the external
-		// interface of this type because currently |delta| <= 1, but it
-		// is included for robustness.
 		delete(uiq.txns, txn.txnID)
 		heap.Remove(&uiq.minHeap, txn.index)
 		return wasMin

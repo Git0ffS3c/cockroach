@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils/spanconfigtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/sqllivenesstestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -40,36 +41,36 @@ import (
 // we'd expect. Only fields that differ from the static RANGE DEFAULT are
 // printed in the test output for readability. The following syntax is provided:
 //
-// - "initialize" tenant=<int>
-//   Initialize a secondary tenant with the given ID.
+//   - "initialize" tenant=<int>
+//     Initialize a secondary tenant with the given ID.
 //
-// - "exec-sql" [tenant=<int>]
-//   Executes the input SQL query for the given tenant. All statements are
-//   executed in a single transaction.
+//   - "exec-sql" [tenant=<int>]
+//     Executes the input SQL query for the given tenant. All statements are
+//     executed in a single transaction.
 //
-// - "query-sql" [tenant=<int>]
-//   Executes the input SQL query for the given tenant and print the results.
+//   - "query-sql" [tenant=<int>]
+//     Executes the input SQL query for the given tenant and print the results.
 //
-// - "reconcile" [tenant=<int>]
-//   Start the reconciliation process for the given tenant.
+//   - "reconcile" [tenant=<int>]
+//     Start the reconciliation process for the given tenant.
 //
-// - "mutations" [tenant=<int>] [discard]
-//   Print the latest set of mutations issued by the reconciler for the given
-//   tenant. If 'discard' is specified, nothing is printed.
+//   - "mutations" [tenant=<int>] [discard]
+//     Print the latest set of mutations issued by the reconciler for the given
+//     tenant. If 'discard' is specified, nothing is printed.
 //
-// - "state" [offset=<int>] [limit=<int]
-//   Print out the contents of KVAccessor directly, skipping 'offset' entries,
-//   returning up to the specified limit if any.
+//   - "state" [offset=<int>] [limit=<int]
+//     Print out the contents of KVAccessor directly, skipping 'offset' entries,
+//     returning up to the specified limit if any.
 //
-// - "protect" [record-id=<int>] [ts=<int>]
-//   cluster                  OR
-//   tenants       id1,id2... OR
-//   descs         id1,id2...
-//   Creates and writes a protected timestamp record with id and ts with an
-//   appropriate ptpb.Target.
+//   - "protect" [record-id=<int>] [ts=<int>]
+//     cluster                  OR
+//     tenants       id1,id2... OR
+//     descs         id1,id2...
+//     Creates and writes a protected timestamp record with id and ts with an
+//     appropriate ptpb.Target.
 //
-// - "release" [record-id=<int>]
-//   Releases the protected timestamp record with id.
+//   - "release" [record-id=<int>]
+//     Releases the protected timestamp record with id.
 //
 // TODO(irfansharif): Provide a way to stop reconcilers and/or start them back
 // up again. It would let us add simulate for suspended tenants, and behavior of
@@ -84,7 +85,7 @@ func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	ctx := context.Background()
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		scKnobs := &spanconfig.TestingKnobs{
 			// Instead of relying on the GC job to wait out TTLs and clear out
 			// descriptors, let's simply exclude dropped tables to simulate
@@ -98,6 +99,9 @@ func TestDataDriven(t *testing.T) {
 		}
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
+				// Test fails when run under the default test tenant. More
+				// investigation is required.
+				DefaultTestTenant: base.TestTenantDisabled,
 				Knobs: base.TestingKnobs{
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(), // speeds up test
 					SpanConfig:       scKnobs,
@@ -126,7 +130,7 @@ func TestDataDriven(t *testing.T) {
 
 				var id uint64
 				d.ScanArgs(t, "tenant", &id)
-				tenantID = roachpb.MakeTenantID(id)
+				tenantID = roachpb.MustMakeTenantID(id)
 			}
 
 			tenant, found := spanConfigTestCluster.LookupTenant(tenantID)

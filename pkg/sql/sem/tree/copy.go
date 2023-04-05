@@ -23,6 +23,36 @@ type CopyFrom struct {
 	Options CopyOptions
 }
 
+// CopyTo represents a COPY TO statement.
+type CopyTo struct {
+	Table     TableName
+	Columns   NameList
+	Statement Statement
+	Options   CopyOptions
+}
+
+// Format implements the NodeFormatter interface.
+func (node *CopyTo) Format(ctx *FmtCtx) {
+	ctx.WriteString("COPY ")
+	if node.Statement != nil {
+		ctx.WriteString("(")
+		ctx.FormatNode(node.Statement)
+		ctx.WriteString(")")
+	} else {
+		ctx.FormatNode(&node.Table)
+		if len(node.Columns) > 0 {
+			ctx.WriteString(" (")
+			ctx.FormatNode(&node.Columns)
+			ctx.WriteString(")")
+		}
+	}
+	ctx.WriteString(" TO STDOUT")
+	if !node.Options.IsDefault() {
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(&node.Options)
+	}
+}
+
 // CopyOptions describes options for COPY execution.
 type CopyOptions struct {
 	Destination Expr
@@ -30,6 +60,13 @@ type CopyOptions struct {
 	Delimiter   Expr
 	Null        Expr
 	Escape      *StrVal
+	Header      bool
+	Quote       *StrVal
+
+	// Additional flags are needed to keep track of whether explicit default
+	// values were already set.
+	HasFormat bool
+	HasHeader bool
 }
 
 var _ NodeFormatter = &CopyOptions{}
@@ -58,17 +95,20 @@ func (o *CopyOptions) Format(ctx *FmtCtx) {
 	var addSep bool
 	maybeAddSep := func() {
 		if addSep {
-			ctx.WriteString(" ")
+			ctx.WriteString(", ")
 		}
 		addSep = true
 	}
-	if o.CopyFormat != CopyFormatText {
+	ctx.WriteString("(")
+	if o.HasFormat {
 		maybeAddSep()
 		switch o.CopyFormat {
 		case CopyFormatBinary:
-			ctx.WriteString("BINARY")
+			ctx.WriteString("FORMAT BINARY")
 		case CopyFormatCSV:
-			ctx.WriteString("CSV")
+			ctx.WriteString("FORMAT CSV")
+		case CopyFormatText:
+			ctx.WriteString("FORMAT TEXT")
 		}
 	}
 	if o.Delimiter != nil {
@@ -88,7 +128,7 @@ func (o *CopyOptions) Format(ctx *FmtCtx) {
 		// Lowercase because that's what has historically been produced
 		// by copy_file_upload.go, so this will provide backward
 		// compatibility with older servers.
-		ctx.WriteString("destination = ")
+		ctx.WriteString("DESTINATION ")
 		ctx.FormatNode(o.Destination)
 		addSep = true
 	}
@@ -97,6 +137,21 @@ func (o *CopyOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("ESCAPE ")
 		ctx.FormatNode(o.Escape)
 	}
+	if o.HasHeader {
+		maybeAddSep()
+		ctx.WriteString("HEADER ")
+		if o.Header {
+			ctx.WriteString("true")
+		} else {
+			ctx.WriteString("false")
+		}
+	}
+	if o.Quote != nil {
+		maybeAddSep()
+		ctx.WriteString("QUOTE ")
+		ctx.FormatNode(o.Quote)
+	}
+	ctx.WriteString(")")
 }
 
 // IsDefault returns true if this struct has default value.
@@ -113,11 +168,12 @@ func (o *CopyOptions) CombineWith(other *CopyOptions) error {
 		}
 		o.Destination = other.Destination
 	}
-	if other.CopyFormat != CopyFormatText {
-		if o.CopyFormat != CopyFormatText {
+	if other.HasFormat {
+		if o.HasFormat {
 			return pgerror.Newf(pgcode.Syntax, "format option specified multiple times")
 		}
 		o.CopyFormat = other.CopyFormat
+		o.HasFormat = true
 	}
 	if other.Delimiter != nil {
 		if o.Delimiter != nil {
@@ -136,6 +192,19 @@ func (o *CopyOptions) CombineWith(other *CopyOptions) error {
 			return pgerror.Newf(pgcode.Syntax, "escape option specified multiple times")
 		}
 		o.Escape = other.Escape
+	}
+	if other.HasHeader {
+		if o.HasHeader {
+			return pgerror.Newf(pgcode.Syntax, "header option specified multiple times")
+		}
+		o.Header = other.Header
+		o.HasHeader = true
+	}
+	if other.Quote != nil {
+		if o.Quote != nil {
+			return pgerror.Newf(pgcode.Syntax, "quote option specified multiple times")
+		}
+		o.Quote = other.Quote
 	}
 	return nil
 }

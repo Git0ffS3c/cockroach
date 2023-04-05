@@ -1,6 +1,7 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@build_bazel_rules_nodejs//:index.bzl", "nodejs_binary")
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "ui",
@@ -10,9 +11,9 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/build",
+        "//pkg/server/serverpb",
         "//pkg/util/httputil",
         "//pkg/util/log",
-        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -48,7 +49,24 @@ EOF
 test_suite(
     name = "lint",
     tests = [
+        "//pkg/cmd/mirror/npm:are_lockfiles_updated",
         "//pkg/ui/workspaces/cluster-ui:lint",
         "//pkg/ui/workspaces/db-console:lint",
+        "//pkg/ui/workspaces/e2e-tests:lint",
     ],
 )
+
+go_test(
+    name = "ui_test",
+    srcs = ["ui_test.go"],
+    args = ["-test.timeout=295s"],
+    embed = [":ui"],
+    deps = [
+        "//pkg/base",
+        "//pkg/util/leaktest",
+        "//pkg/util/log",
+        "@com_github_stretchr_testify//require",
+    ],
+)
+
+get_x_data(name = "get_x_data")

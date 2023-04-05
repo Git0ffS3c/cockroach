@@ -64,7 +64,9 @@ func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	wantInt := tree.NumValAvailInteger
+	wantIntNoOid := tree.NumValAvailIntegerNoOid
 	wantDecButCanBeInt := tree.NumValAvailDecimalNoFraction
+	wantDecButCanBeIntNoOid := tree.NumValAvailDecimalNoFractionNoOid
 	wantDec := tree.NumValAvailDecimalWithFraction
 
 	testCases := []struct {
@@ -74,11 +76,11 @@ func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
 		{"1", wantInt},
 		{"0", wantInt},
 		{"-1", wantInt},
-		{"9223372036854775807", wantInt},
+		{"9223372036854775807", wantIntNoOid},
 		{"1.0", wantDecButCanBeInt},
 		{"-1234.0000", wantDecButCanBeInt},
-		{"1e10", wantDecButCanBeInt},
-		{"1E10", wantDecButCanBeInt},
+		{"1e10", wantDecButCanBeIntNoOid},
+		{"1E10", wantDecButCanBeIntNoOid},
 		{"1.1", wantDec},
 		{"1e-10", wantDec},
 		{"1E-10", wantDec},
@@ -351,6 +353,20 @@ func mustParseDVarBit(t *testing.T, s string) tree.Datum {
 	}
 	return d
 }
+func mustParseDTSVector(t *testing.T, s string) tree.Datum {
+	d, err := tree.ParseDTSVector(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+func mustParseDTSQuery(t *testing.T, s string) tree.Datum {
+	d, err := tree.ParseDTSQuery(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
 func mustParseDArrayOfType(typ *types.T) func(t *testing.T, s string) tree.Datum {
 	return func(t *testing.T, s string) tree.Datum {
 		evalContext := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
@@ -382,6 +398,8 @@ var parseFuncs = map[*types.T]func(*testing.T, string) tree.Datum{
 	types.Geometry:         mustParseDGeometry,
 	types.INet:             mustParseDINet,
 	types.VarBit:           mustParseDVarBit,
+	types.TSQuery:          mustParseDTSQuery,
+	types.TSVector:         mustParseDTSVector,
 	types.BytesArray:       mustParseDArrayOfType(types.Bytes),
 	types.DecimalArray:     mustParseDArrayOfType(types.Decimal),
 	types.FloatArray:       mustParseDArrayOfType(types.Float),
@@ -421,15 +439,15 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 	}{
 		{
 			c:            tree.NewStrVal("abc 世界"),
-			parseOptions: typeSet(types.String, types.Bytes),
+			parseOptions: typeSet(types.String, types.Bytes, types.TSVector),
 		},
 		{
 			c:            tree.NewStrVal("true"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Bool, types.Jsonb),
+			parseOptions: typeSet(types.String, types.Bytes, types.Bool, types.Jsonb, types.TSVector, types.TSQuery),
 		},
 		{
 			c:            tree.NewStrVal("2010-09-28"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Date, types.Timestamp, types.TimestampTZ),
+			parseOptions: typeSet(types.String, types.Bytes, types.Date, types.Timestamp, types.TimestampTZ, types.TSVector, types.TSQuery),
 		},
 		{
 			c:            tree.NewStrVal("2010-09-28 12:00:00.1"),
@@ -441,7 +459,7 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		},
 		{
 			c:            tree.NewStrVal("PT12H2M"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Interval),
+			parseOptions: typeSet(types.String, types.Bytes, types.Interval, types.TSVector, types.TSQuery),
 		},
 		{
 			c:            tree.NewBytesStrVal("abc 世界"),
@@ -465,15 +483,15 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		},
 		{
 			c:            tree.NewStrVal("box(0 0, 1 1)"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Box2D),
+			parseOptions: typeSet(types.String, types.Bytes, types.Box2D, types.TSVector),
 		},
 		{
 			c:            tree.NewStrVal("POINT(-100.59 42.94)"),
-			parseOptions: typeSet(types.String, types.Bytes, types.Geography, types.Geometry),
+			parseOptions: typeSet(types.String, types.Bytes, types.Geography, types.Geometry, types.TSVector),
 		},
 		{
 			c:            tree.NewStrVal("192.168.100.128/25"),
-			parseOptions: typeSet(types.String, types.Bytes, types.INet),
+			parseOptions: typeSet(types.String, types.Bytes, types.INet, types.TSVector, types.TSQuery),
 		},
 		{
 			c: tree.NewStrVal("111000110101"),
@@ -485,7 +503,10 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 				types.Float,
 				types.Decimal,
 				types.Interval,
-				types.Jsonb),
+				types.Jsonb,
+				types.TSVector,
+				types.TSQuery,
+			),
 		},
 		{
 			c:            tree.NewStrVal(`{"a": 1}`),
@@ -501,7 +522,10 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 				types.IntArray,
 				types.FloatArray,
 				types.DecimalArray,
-				types.IntervalArray),
+				types.IntervalArray,
+				types.TSVector,
+				types.TSQuery,
+			),
 		},
 		{
 			c: tree.NewStrVal(`{1.5,2.0}`),
@@ -512,11 +536,14 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 				types.StringArray,
 				types.FloatArray,
 				types.DecimalArray,
-				types.IntervalArray),
+				types.IntervalArray,
+				types.TSVector,
+				types.TSQuery,
+			),
 		},
 		{
 			c:            tree.NewStrVal(`{a,b}`),
-			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray),
+			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray, types.TSVector, types.TSQuery),
 		},
 		{
 			c:            tree.NewBytesStrVal(string([]byte{0xff, 0xfe, 0xfd})),
@@ -524,19 +551,20 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 		},
 		{
 			c:            tree.NewStrVal(`18e7b17e-4ead-4e27-bfd5-bb6d11261bb6`),
-			parseOptions: typeSet(types.String, types.Bytes, types.Uuid),
+			parseOptions: typeSet(types.String, types.Bytes, types.Uuid, types.TSVector, types.TSQuery),
 		},
 		{
 			c:            tree.NewStrVal(`{18e7b17e-4ead-4e27-bfd5-bb6d11261bb6, 18e7b17e-4ead-4e27-bfd5-bb6d11261bb7}`),
-			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray, types.UUIDArray),
+			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray, types.UUIDArray, types.TSVector),
 		},
 		{
 			c:            tree.NewStrVal("{true, false}"),
-			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray, types.BoolArray),
+			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray, types.BoolArray, types.TSVector),
 		},
 		{
-			c:            tree.NewStrVal("{2010-09-28, 2010-09-29}"),
-			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray, types.DateArray, types.TimestampArray, types.TimestampTZArray),
+			c: tree.NewStrVal("{2010-09-28, 2010-09-29}"),
+			parseOptions: typeSet(types.String, types.Bytes, types.BytesArray, types.StringArray, types.DateArray,
+				types.TimestampArray, types.TimestampTZArray, types.TSVector),
 		},
 		{
 			c: tree.NewStrVal("{2010-09-28 12:00:00.1, 2010-09-29 12:00:00.1}"),
@@ -583,13 +611,16 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 				types.FloatArray,
 				types.DecimalArray,
 				types.IntervalArray,
-				types.VarBitArray),
+				types.VarBitArray,
+				types.TSVector,
+			),
 		},
 	}
 
 	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	for i, test := range testCases {
+		t.Log(test.c.String())
 		parseableCount := 0
 
 		// Make sure it can be resolved as each of those types or throws a parsing error.
@@ -606,7 +637,7 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 			typedExpr, err := test.c.ResolveAsType(context.Background(), &semaCtx, availType)
 			var res tree.Datum
 			if err == nil {
-				res, err = eval.Expr(evalCtx, typedExpr)
+				res, err = eval.Expr(context.Background(), evalCtx, typedExpr)
 			}
 			if err != nil {
 				if !strings.Contains(err.Error(), "could not parse") &&

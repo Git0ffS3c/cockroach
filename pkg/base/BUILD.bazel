@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
 
@@ -11,6 +12,7 @@ go_library(
         "license.go",
         "node_id.go",
         "store_spec.go",
+        "test_cluster_replication_mode.go",
         "test_server_args.go",
         "testing_knobs.go",
         "zone.go",
@@ -50,26 +52,34 @@ go_test(
     srcs = [
         "addr_validation_test.go",
         "cluster_id_test.go",
+        "config_test.go",
         "main_test.go",
         "node_id_test.go",
         "store_spec_test.go",
     ],
+    args = ["-test.timeout=55s"],
+    data = glob(["testdata/**"]),
     deps = [
         ":base",
         "//pkg/roachpb",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
+        "//pkg/testutils/echotest",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_davecgh_go_spew//spew",
         "@com_github_stretchr_testify//require",
     ],
 )
 
 stringer(
     name = "gen-clusterreplication-stringer",
-    src = "test_server_args.go",
+    src = "test_cluster_replication_mode.go",
     typ = "TestClusterReplicationMode",
 )
+
+get_x_data(name = "get_x_data")

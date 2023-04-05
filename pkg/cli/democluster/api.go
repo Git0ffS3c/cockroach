@@ -16,8 +16,6 @@ import (
 
 	democlusterapi "github.com/cockroachdb/cockroach/pkg/cli/democluster/api"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // DemoCluster represents a demo cluster.
@@ -29,7 +27,6 @@ type DemoCluster interface {
 	// before the initialization completes.
 	Start(
 		ctx context.Context,
-		runInitialSQL func(ctx context.Context, s *server.Server, startSingleNode bool, adminUser, adminPassword string) error,
 	) error
 
 	// GetConnURL retrieves the connection URL to the first node.
@@ -45,16 +42,25 @@ type DemoCluster interface {
 	// Close shuts down the demo cluster.
 	Close(ctx context.Context)
 
-	// AcquireDemoLicense acquires the demo license if configured,
-	// otherwise does nothing. In any case, if there is no error, it
-	// returns a channel that will either produce an error or a nil
-	// value.
-	AcquireDemoLicense(ctx context.Context) (chan error, error)
+	// EnableEnterprise enables enterprise features for this demo,
+	// if available in this build. The returned callback should be called
+	// before terminating the demo.
+	EnableEnterprise(ctx context.Context) (func(), error)
 
 	// SetupWorkload initializes the workload generator if defined.
-	SetupWorkload(ctx context.Context, licenseDone <-chan error) error
+	SetupWorkload(ctx context.Context) error
+
+	// SetClusterSetting overrides a default cluster setting at system level
+	// and for all tenants.
+	SetClusterSetting(ctx context.Context, setting string, value interface{}) error
+
+	// SetSimulatedLatency is used to enable or disable simulated latency.
+	SetSimulatedLatency(on bool)
+
+	// TenantName returns the tenant name that the default connection is for.
+	TenantName() string
 }
 
-// GetAndApplyLicense is not implemented in order to keep OSS/BSL builds successful.
+// EnableEnterprise is not implemented here in order to keep OSS/BSL builds successful.
 // The cliccl package sets this function if enterprise features are available to demo.
-var GetAndApplyLicense func(dbConn *gosql.DB, clusterID uuid.UUID, org string) (bool, error)
+var EnableEnterprise func(db *gosql.DB, org string) (func(), error)

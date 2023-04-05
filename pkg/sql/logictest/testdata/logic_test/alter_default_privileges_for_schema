@@ -29,7 +29,7 @@ SHOW GRANTS ON SCHEMA testuser_s;
 database_name  schema_name  grantee   privilege_type  is_grantable
 d              testuser_s   admin     ALL             true
 d              testuser_s   root      ALL             true
-d              testuser_s   testuser  ALL             false
+d              testuser_s   testuser  ALL             true
 
 statement ok
 ALTER DEFAULT PRIVILEGES REVOKE ALL ON SCHEMAS FROM testuser;
@@ -43,9 +43,10 @@ CREATE SCHEMA testuser_s2;
 query TTTTB colnames
 SHOW GRANTS ON SCHEMA testuser_s2
 ----
-database_name  schema_name  grantee  privilege_type  is_grantable
-d              testuser_s2  admin    ALL             true
-d              testuser_s2  root     ALL             true
+database_name  schema_name  grantee   privilege_type  is_grantable
+d              testuser_s2  admin     ALL             true
+d              testuser_s2  root      ALL             true
+d              testuser_s2  testuser  ALL             true
 
 user root
 
@@ -67,8 +68,8 @@ SHOW GRANTS ON SCHEMA s
 database_name  schema_name  grantee    privilege_type  is_grantable
 test           s            admin      ALL             true
 test           s            root       ALL             true
-test           s            testuser   ALL             true
-test           s            testuser2  ALL             true
+test           s            testuser   ALL             false
+test           s            testuser2  ALL             false
 
 statement ok
 ALTER DEFAULT PRIVILEGES REVOKE USAGE ON SCHEMAS FROM testuser, testuser2
@@ -82,10 +83,8 @@ SHOW GRANTS ON SCHEMA s2
 database_name  schema_name  grantee    privilege_type  is_grantable
 test           s2           admin      ALL             true
 test           s2           root       ALL             true
-test           s2           testuser   CREATE          true
-test           s2           testuser   GRANT           true
-test           s2           testuser2  CREATE          true
-test           s2           testuser2  GRANT           true
+test           s2           testuser   CREATE          false
+test           s2           testuser2  CREATE          false
 
 statement ok
 ALTER DEFAULT PRIVILEGES REVOKE ALL ON SCHEMAS FROM testuser, testuser2
@@ -117,9 +116,10 @@ CREATE SCHEMA s4
 query TTTTB colnames
 SHOW GRANTS ON SCHEMA s4
 ----
-database_name  schema_name  grantee  privilege_type  is_grantable
-d              s4           admin    ALL             true
-d              s4           root     ALL             true
+database_name  schema_name  grantee   privilege_type  is_grantable
+d              s4           admin     ALL             true
+d              s4           root      ALL             true
+d              s4           testuser  ALL             true
 
 user root
 statement ok
@@ -143,9 +143,10 @@ CREATE SCHEMA s5
 query TTTTB colnames
 SHOW GRANTS ON SCHEMA s5
 ----
-database_name  schema_name  grantee  privilege_type  is_grantable
-d              s5           admin    ALL             true
-d              s5           root     ALL             true
+database_name  schema_name  grantee   privilege_type  is_grantable
+d              s5           admin     ALL             true
+d              s5           root      ALL             true
+d              s5           testuser  ALL             true
 
 statement ok
 ALTER DEFAULT PRIVILEGES GRANT ALL ON SCHEMAS TO testuser, testuser2

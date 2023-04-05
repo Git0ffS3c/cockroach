@@ -13,6 +13,7 @@ package tests
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -99,6 +100,10 @@ func TestTruncateWithConcurrentMutations(t *testing.T) {
 
 		db := tc.ServerConn(0)
 		tdb := sqlutils.MakeSQLRunner(db)
+		tdb.ExecMultiple(t, strings.Split(`
+SET use_declarative_schema_changer = 'off';
+SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';
+`, `;`)...)
 
 		// Support setup schema changes.
 		close(unblock)
@@ -416,7 +421,7 @@ ALTER INDEX a_b_idx SPLIT AT VALUES(1000), (2000), (3000), (4000), (5000), (6000
 			// succeeds-soon block here and below.
 			testutils.SucceedsSoon(t, func() error {
 				row := tc.Conns[0].QueryRowContext(ctx, `
-SELECT count(*) FROM crdb_internal.ranges_no_leases WHERE table_id = 'a'::regclass`)
+SELECT count(*) FROM [SHOW RANGES FROM TABLE a]`)
 				assert.NoError(t, row.Err())
 
 				var nRanges int
@@ -438,7 +443,7 @@ SELECT count(*) FROM crdb_internal.ranges_no_leases WHERE table_id = 'a'::regcla
 
 			testutils.SucceedsSoon(t, func() error {
 				row := tc.Conns[0].QueryRowContext(ctx, `
-SELECT count(*) FROM crdb_internal.ranges_no_leases WHERE table_id = 'a'::regclass`)
+SELECT count(*) FROM [SHOW RANGES FROM TABLE a]`)
 				assert.NoError(t, row.Err())
 
 				var nRanges int

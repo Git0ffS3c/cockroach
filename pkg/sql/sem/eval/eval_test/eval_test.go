@@ -145,6 +145,7 @@ func TestEval(t *testing.T) {
 			flowCtx := &execinfra.FlowCtx{
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: evalCtx,
+				Mon:     evalCtx.TestingMon,
 			}
 			memMonitor := execinfra.NewTestMemMonitor(ctx, st)
 			defer memMonitor.Stop(ctx)
@@ -189,8 +190,8 @@ func TestEval(t *testing.T) {
 							batchesReturned++
 							return batch
 						}},
-				},
-				},
+				}},
+				StreamingMemAccount: &acc,
 				// Unsupported post processing specs are wrapped and run through the
 				// row execution engine.
 				ProcessorConstructor: rowexec.NewProcessor,
@@ -200,6 +201,7 @@ func TestEval(t *testing.T) {
 			require.NoError(t, err)
 
 			mat := colexec.NewMaterializer(
+				nil, /* allocator */
 				flowCtx,
 				0, /* processorID */
 				result.OpWithMetaInfo,

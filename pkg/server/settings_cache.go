@@ -27,6 +27,8 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// settingsCacheWriter is responsible for persisting the cluster
+// settings on KV nodes across restarts.
 type settingsCacheWriter struct {
 	stopper *stop.Stopper
 	eng     storage.Engine
@@ -100,7 +102,7 @@ func storeCachedSettingsKVs(ctx context.Context, eng storage.Engine, kvs []roach
 	for _, kv := range kvs {
 		kv.Value.Timestamp = hlc.Timestamp{} // nb: Timestamp is not part of checksum
 		if err := storage.MVCCPut(
-			ctx, batch, nil, keys.StoreCachedSettingsKey(kv.Key), hlc.Timestamp{}, kv.Value, nil,
+			ctx, batch, nil, keys.StoreCachedSettingsKey(kv.Key), hlc.Timestamp{}, hlc.ClockTimestamp{}, kv.Value, nil,
 		); err != nil {
 			return err
 		}
@@ -115,7 +117,8 @@ func loadCachedSettingsKVs(_ context.Context, eng storage.Engine) ([]roachpb.Key
 		keys.LocalStoreCachedSettingsKeyMin,
 		keys.LocalStoreCachedSettingsKeyMax,
 		storage.MVCCKeyAndIntentsIterKind,
-		func(kv storage.MVCCKeyValue) error {
+		storage.IterKeyTypePointsOnly,
+		func(kv storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
 			settingKey, err := keys.DecodeStoreCachedSettingsKey(kv.Key.Key)
 			if err != nil {
 				return err
@@ -141,7 +144,7 @@ func initializeCachedSettings(
 ) error {
 	dec := settingswatcher.MakeRowDecoder(codec)
 	for _, kv := range kvs {
-		settings, val, _, err := dec.DecodeRow(kv)
+		settings, val, _, err := dec.DecodeRow(kv, nil /* alloc */)
 		if err != nil {
 			return errors.Wrap(err, `while decoding settings data
 -this likely indicates the settings table structure or encoding has been altered;

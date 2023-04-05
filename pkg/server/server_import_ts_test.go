@@ -12,7 +12,6 @@ package server_test
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
+	"github.com/cockroachdb/cockroach/pkg/ts/tsutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -42,7 +42,7 @@ func TestServerWithTimeseriesImport(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "dump.raw")
 	require.NoError(t,
-		ioutil.WriteFile(path+".yaml", []byte("1: 1"), 0644),
+		os.WriteFile(path+".yaml", []byte("1: 1"), 0644),
 	)
 
 	var bytesDumped int64
@@ -84,7 +84,7 @@ func dumpTSNonempty(t *testing.T, cc *grpc.ClientConn, dest string) (bytes int64
 
 	f, err := os.Create(dest)
 	require.NoError(t, err)
-	require.NoError(t, ts.DumpRawTo(c, f))
+	require.NoError(t, tsutil.DumpRawTo(c, f))
 	require.NoError(t, f.Close())
 	info, err := os.Stat(dest)
 	require.NoError(t, err)

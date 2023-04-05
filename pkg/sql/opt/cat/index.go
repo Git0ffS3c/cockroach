@@ -48,13 +48,16 @@ type Index interface {
 
 	// Ordinal returns the ordinal of this index within the context of its Table.
 	// Specifically idx = Table().Index(idx.Ordinal).
-	Ordinal() int
+	Ordinal() IndexOrdinal
 
 	// IsUnique returns true if this index is declared as UNIQUE in the schema.
 	IsUnique() bool
 
 	// IsInverted returns true if this is an inverted index.
 	IsInverted() bool
+
+	// IsNotVisible returns true if this index is not visible.
+	IsNotVisible() bool
 
 	// ColumnCount returns the number of columns in the index. This includes
 	// columns that were part of the index definition (including the STORING

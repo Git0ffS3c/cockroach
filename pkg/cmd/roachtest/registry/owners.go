@@ -16,16 +16,18 @@ type Owner string
 
 // The allowable values of Owner.
 const (
-	OwnerSQLExperience Owner = `sql-experience`
-	OwnerBulkIO        Owner = `bulk-io`
-	OwnerCDC           Owner = `cdc`
-	OwnerKV            Owner = `kv`
-	OwnerMultiRegion   Owner = `multiregion`
-	OwnerObsInf        Owner = `obs-inf-prs`
-	OwnerServer        Owner = `server`
-	OwnerSQLQueries    Owner = `sql-queries`
-	OwnerSQLSchema     Owner = `sql-schema`
-	OwnerStorage       Owner = `storage`
-	OwnerTestEng       Owner = `test-eng`
-	OwnerDevInf        Owner = `dev-inf`
+	OwnerSQLSessions      Owner = `sql-sessions`
+	OwnerDisasterRecovery Owner = `disaster-recovery`
+	OwnerCDC              Owner = `cdc`
+	OwnerKV               Owner = `kv`
+	OwnerReplication      Owner = `replication`
+	OwnerAdmissionControl Owner = `admission-control`
+	OwnerObsInf           Owner = `obs-inf-prs`
+	OwnerServer           Owner = `server` // not currently staffed
+	OwnerSQLQueries       Owner = `sql-queries`
+	OwnerSQLSchema        Owner = `sql-schema`
+	OwnerStorage          Owner = `storage`
+	OwnerTestEng          Owner = `test-eng`
+	OwnerDevInf           Owner = `dev-inf`
+	OwnerMultiTenant      Owner = `multi-tenant`
 )

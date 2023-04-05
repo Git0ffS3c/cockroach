@@ -19,11 +19,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descidgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -158,12 +157,11 @@ func TestParallelCreateTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Get the id descriptor generator count.
-	kvDB := tc.Servers[0].DB()
-	var descIDStart descpb.ID
-	if descID, err := kvDB.Get(context.Background(), keys.SystemSQLCodec.DescIDSequenceKey()); err != nil {
+	s := tc.Servers[0]
+	idgen := descidgen.NewGenerator(s.ClusterSettings(), keys.SystemSQLCodec, s.DB())
+	descIDStart, err := idgen.PeekNextUniqueDescID(context.Background())
+	if err != nil {
 		t.Fatal(err)
-	} else {
-		descIDStart = descpb.ID(descID.ValueInt())
 	}
 
 	var wgStart sync.WaitGroup
@@ -213,12 +211,11 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 	}
 
 	// Get the id descriptor generator count.
-	kvDB := tc.Servers[0].DB()
-	var descIDStart descpb.ID
-	if descID, err := kvDB.Get(context.Background(), keys.SystemSQLCodec.DescIDSequenceKey()); err != nil {
+	s := tc.Servers[0]
+	idgen := descidgen.NewGenerator(s.ClusterSettings(), keys.SystemSQLCodec, s.DB())
+	descIDStart, err := idgen.PeekNextUniqueDescID(context.Background())
+	if err != nil {
 		t.Fatal(err)
-	} else {
-		descIDStart = descpb.ID(descID.ValueInt())
 	}
 
 	var wgStart sync.WaitGroup
@@ -412,47 +409,4 @@ func TestSetUserPasswordInsecure(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestAutoStatsTableSettingsDisallowedOnOldCluster(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	serverArgs := base.TestServerArgs{
-		Insecure: true,
-		Knobs: base.TestingKnobs{
-			Server: &server.TestingKnobs{
-				DisableAutomaticVersionUpgrade: make(chan struct{}),
-				BinaryVersionOverride:          clusterversion.ByKey(clusterversion.ClusterLocksVirtualTable),
-			},
-		},
-	}
-
-	var (
-		ctx        = context.Background()
-		s, conn, _ = serverutils.StartServer(t, serverArgs)
-		sqlDB      = sqlutils.MakeSQLRunner(conn)
-	)
-	defer conn.Close()
-	defer s.Stopper().Stop(ctx)
-
-	sqlDB.Exec(t,
-		`CREATE DATABASE t;`)
-
-	sqlDB.ExpectErr(t, "pq: auto stats table settings are only available once the cluster is fully upgraded", "CREATE TABLE t1 (a int) WITH (sql_stats_automatic_collection_enabled = true)")
-
-	sqlDB.Exec(t,
-		`CREATE TABLE t2 (a int)`)
-
-	sqlDB.ExpectErr(t, "pq: auto stats table settings are only available once the cluster is fully upgraded", "ALTER TABLE t2 SET (sql_stats_automatic_collection_enabled = true)")
-
-	// Run the migration.
-	sqlDB.Exec(t, "SET CLUSTER SETTING version = $1", clusterversion.ByKey(clusterversion.AutoStatsTableSettings).String())
-
-	sqlDB.Exec(t,
-		`CREATE TABLE t1 (a int) WITH (sql_stats_automatic_collection_enabled = true)`)
-
-	sqlDB.Exec(t,
-		`ALTER TABLE t2 SET (sql_stats_automatic_collection_enabled = true)`)
-
 }

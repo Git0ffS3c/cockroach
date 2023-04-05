@@ -72,7 +72,7 @@ func (p *planner) addColumnImpl(
 	}
 	d = newDef
 
-	cdd, err := tabledesc.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext())
+	cdd, err := tabledesc.MakeColumnDefDescs(params.ctx, d, &params.p.semaCtx, params.EvalContext(), tree.ColumnDefaultExprInAddColumn)
 	if err != nil {
 		return err
 	}
@@ -124,7 +124,7 @@ func (p *planner) addColumnImpl(
 
 	n.tableDesc.AddColumnMutation(col, descpb.DescriptorMutation_ADD)
 	if idx != nil {
-		if err := n.tableDesc.AddIndexMutation(params.ctx, idx, descpb.DescriptorMutation_ADD, params.p.ExecCfg().Settings); err != nil {
+		if err := n.tableDesc.AddIndexMutationMaybeWithTempIndex(idx, descpb.DescriptorMutation_ADD); err != nil {
 			return err
 		}
 	}
@@ -139,7 +139,8 @@ func (p *planner) addColumnImpl(
 
 	if d.IsComputed() {
 		serializedExpr, _, err := schemaexpr.ValidateComputedColumnExpression(
-			params.ctx, n.tableDesc, d, tn, "computed column", params.p.SemaCtx(),
+			params.ctx, n.tableDesc, d, tn, tree.ComputedColumnExprContext(d.IsVirtual()), params.p.SemaCtx(),
+			params.ExecCfg().Settings.Version.ActiveVersion(params.ctx),
 		)
 		if err != nil {
 			return err
@@ -164,9 +165,9 @@ func (p *planner) addColumnImpl(
 
 	// If the new column has a DEFAULT or an ON UPDATE expression that uses a
 	// sequence, add references between its descriptor and this column descriptor.
-	if err := cdd.ForEachTypedExpr(func(expr tree.TypedExpr) error {
+	if err := cdd.ForEachTypedExpr(func(expr tree.TypedExpr, colExprKind tabledesc.ColExprKind) error {
 		changedSeqDescs, err := maybeAddSequenceDependencies(
-			params.ctx, params.ExecCfg().Settings, params.p, n.tableDesc, col, expr, nil,
+			params.ctx, params.ExecCfg().Settings, params.p, n.tableDesc, col, expr, nil, colExprKind,
 		)
 		if err != nil {
 			return err
@@ -206,13 +207,23 @@ func (p *planner) addColumnImpl(
 		}
 	}
 
+	if col.Virtual && !col.Nullable {
+		newCol, err := catalog.MustFindColumnByName(n.tableDesc, col.Name)
+		if err != nil {
+			return errors.NewAssertionErrorWithWrappedErrf(err, "failed to find newly added column %v", col.Name)
+		}
+		if err := addNotNullConstraintMutationForCol(n.tableDesc, newCol); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 func checkColumnDoesNotExist(
 	tableDesc catalog.TableDescriptor, name tree.Name,
 ) (isPublic bool, err error) {
-	col, _ := tableDesc.FindColumnWithName(name)
+	col := catalog.FindColumnByTreeName(tableDesc, name)
 	if col == nil {
 		return false, nil
 	}

@@ -63,39 +63,39 @@ CREATE TABLE c (
 statement ok
 COMMENT ON INDEX c_foo_idx IS 'index_comment'
 
-query TTBITTBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM c
 ----
-table_name  index_name     non_unique  seq_in_index  column_name  direction  storing  implicit
-c           c_bar_key      false       1             bar          ASC        false    false
-c           c_bar_key      false       2             id           ASC        true     true
-c           c_foo_bar_idx  true        1             foo          ASC        false    false
-c           c_foo_bar_idx  true        2             bar          DESC       false    false
-c           c_foo_bar_idx  true        3             id           ASC        false    true
-c           c_foo_idx      true        1             foo          ASC        false    false
-c           c_foo_idx      true        2             id           ASC        false    true
-c           c_foo_idx1     true        1             foo          ASC        false    false
-c           c_foo_idx1     true        2             id           ASC        false    true
-c           c_pkey         false       1             id           ASC        false    false
-c           c_pkey         false       2             foo          N/A        true     false
-c           c_pkey         false       3             bar          N/A        true     false
+table_name  index_name     non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+c           c_bar_key      false       1             bar          bar         ASC        false    false     true
+c           c_bar_key      false       2             id           id          ASC        true     true      true
+c           c_foo_bar_idx  true        1             foo          foo         ASC        false    false     true
+c           c_foo_bar_idx  true        2             bar          bar         DESC       false    false     true
+c           c_foo_bar_idx  true        3             id           id          ASC        false    true      true
+c           c_foo_idx      true        1             foo          foo         ASC        false    false     true
+c           c_foo_idx      true        2             id           id          ASC        false    true      true
+c           c_foo_idx1     true        1             foo          foo         ASC        false    false     true
+c           c_foo_idx1     true        2             id           id          ASC        false    true      true
+c           c_pkey         false       1             id           id          ASC        false    false     true
+c           c_pkey         false       2             foo          foo         N/A        true     false     true
+c           c_pkey         false       3             bar          bar         N/A        true     false     true
 
-query TTBITTBBT colnames
+query TTBITTTBBBT colnames
 SHOW INDEXES FROM c WITH COMMENT
 ----
-table_name  index_name     non_unique  seq_in_index  column_name  direction  storing  implicit  comment
-c           c_bar_key      false       1             bar          ASC        false    false     NULL
-c           c_bar_key      false       2             id           ASC        true     true      NULL
-c           c_foo_bar_idx  true        1             foo          ASC        false    false     NULL
-c           c_foo_bar_idx  true        2             bar          DESC       false    false     NULL
-c           c_foo_bar_idx  true        3             id           ASC        false    true      NULL
-c           c_foo_idx      true        1             foo          ASC        false    false     index_comment
-c           c_foo_idx      true        2             id           ASC        false    true      index_comment
-c           c_foo_idx1     true        1             foo          ASC        false    false     NULL
-c           c_foo_idx1     true        2             id           ASC        false    true      NULL
-c           c_pkey         false       1             id           ASC        false    false     NULL
-c           c_pkey         false       2             foo          N/A        true     false     NULL
-c           c_pkey         false       3             bar          N/A        true     false     NULL
+table_name  index_name     non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible  comment
+c           c_bar_key      false       1             bar          bar         ASC        false    false     true     NULL
+c           c_bar_key      false       2             id           id          ASC        true     true      true     NULL
+c           c_foo_bar_idx  true        1             foo          foo         ASC        false    false     true     NULL
+c           c_foo_bar_idx  true        2             bar          bar         DESC       false    false     true     NULL
+c           c_foo_bar_idx  true        3             id           id          ASC        false    true      true     NULL
+c           c_foo_idx      true        1             foo          foo         ASC        false    false     true     index_comment
+c           c_foo_idx      true        2             id           id          ASC        false    true      true     index_comment
+c           c_foo_idx1     true        1             foo          foo         ASC        false    false     true     NULL
+c           c_foo_idx1     true        2             id           id          ASC        false    true      true     NULL
+c           c_pkey         false       1             id           id          ASC        false    false     true     NULL
+c           c_pkey         false       2             foo          foo         N/A        true     false     true     NULL
+c           c_pkey         false       3             bar          bar         N/A        true     false     true     NULL
 
 # primary keys can never be null
 
@@ -199,20 +199,20 @@ nickname     STRING        true         NULL            ·                      
 username     STRING(10)    true         NULL            ·                      {users_pkey}          false
 email        VARCHAR(100)  true         NULL            ·                      {users_pkey}          false
 
-query TTBITTBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM test.users
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
-users       bar         false       1             id           ASC        false    false
-users       bar         false       2             name         ASC        false    false
-users       foo         true        1             name         ASC        false    false
-users       foo         true        2             id           ASC        false    true
-users       users_pkey  false       1             id           ASC        false    false
-users       users_pkey  false       2             name         N/A        true     false
-users       users_pkey  false       3             title        N/A        true     false
-users       users_pkey  false       4             nickname     N/A        true     false
-users       users_pkey  false       5             username     N/A        true     false
-users       users_pkey  false       6             email        N/A        true     false
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+users       bar         false       1             id           id          ASC        false    false     true
+users       bar         false       2             name         name        ASC        false    false     true
+users       foo         true        1             name         name        ASC        false    false     true
+users       foo         true        2             id           id          ASC        false    true      true
+users       users_pkey  false       1             id           id          ASC        false    false     true
+users       users_pkey  false       2             name         name        N/A        true     false     true
+users       users_pkey  false       3             title        title       N/A        true     false     true
+users       users_pkey  false       4             nickname     nickname    N/A        true     false     true
+users       users_pkey  false       5             username     username    N/A        true     false     true
+users       users_pkey  false       6             email        email       N/A        true     false     true
 
 statement error precision for type float must be at least 1 bit
 CREATE TABLE test.precision (x FLOAT(0))
@@ -227,22 +227,22 @@ query TT
 SHOW CREATE TABLE test.users
 ----
 test.public.users  CREATE TABLE public.users (
-                   id INT8 NOT NULL,
-                   name VARCHAR NOT NULL,
-                   title VARCHAR NULL,
-                   nickname STRING NULL,
-                   username STRING(10) NULL,
-                   email VARCHAR(100) NULL,
-                   CONSTRAINT users_pkey PRIMARY KEY (id ASC),
-                   INDEX foo (name ASC),
-                   UNIQUE INDEX bar (id ASC, name ASC),
-                   FAMILY "primary" (id, name),
-                   FAMILY fam_1_title (title),
-                   FAMILY fam_2_nickname (nickname),
-                   FAMILY fam_3_username_email (username, email),
-                   CONSTRAINT check_nickname_name CHECK (length(nickname) < length(name)),
-                   CONSTRAINT check_nickname CHECK (length(nickname) < 10:::INT8)
-)
+                     id INT8 NOT NULL,
+                     name VARCHAR NOT NULL,
+                     title VARCHAR NULL,
+                     nickname STRING NULL,
+                     username STRING(10) NULL,
+                     email VARCHAR(100) NULL,
+                     CONSTRAINT users_pkey PRIMARY KEY (id ASC),
+                     INDEX foo (name ASC),
+                     UNIQUE INDEX bar (id ASC, name ASC),
+                     FAMILY "primary" (id, name),
+                     FAMILY fam_1_title (title),
+                     FAMILY fam_2_nickname (nickname),
+                     FAMILY fam_3_username_email (username, email),
+                     CONSTRAINT check_nickname_name CHECK (length(nickname) < length(name)),
+                     CONSTRAINT check_nickname CHECK (length(nickname) < 10:::INT8)
+                   )
 
 statement ok
 CREATE TABLE test.dupe_generated (
@@ -284,24 +284,24 @@ query TT
 SHOW CREATE TABLE test.named_constraints
 ----
 test.public.named_constraints  CREATE TABLE public.named_constraints (
-                               id INT8 NOT NULL,
-                               name VARCHAR NOT NULL,
-                               title VARCHAR NULL DEFAULT 'VP of Something':::STRING,
-                               nickname STRING NULL,
-                               username STRING(10) NULL,
-                               email VARCHAR(100) NULL,
-                               CONSTRAINT pk PRIMARY KEY (id ASC),
-                               UNIQUE INDEX uq (email ASC),
-                               INDEX foo (name ASC),
-                               UNIQUE INDEX uq2 (username ASC),
-                               UNIQUE INDEX bar (id ASC, name ASC),
-                               FAMILY "primary" (id, name),
-                               FAMILY fam_1_title (title),
-                               FAMILY fam_2_nickname (nickname),
-                               FAMILY fam_3_username_email (username, email),
-                               CONSTRAINT ck2 CHECK (length(nickname) < length(name)),
-                               CONSTRAINT ck1 CHECK (length(nickname) < 10:::INT8)
-)
+                                 id INT8 NOT NULL,
+                                 name VARCHAR NOT NULL,
+                                 title VARCHAR NULL DEFAULT 'VP of Something':::STRING,
+                                 nickname STRING NULL,
+                                 username STRING(10) NULL,
+                                 email VARCHAR(100) NULL,
+                                 CONSTRAINT pk PRIMARY KEY (id ASC),
+                                 UNIQUE INDEX uq (email ASC),
+                                 INDEX foo (name ASC),
+                                 UNIQUE INDEX uq2 (username ASC),
+                                 UNIQUE INDEX bar (id ASC, name ASC),
+                                 FAMILY "primary" (id, name),
+                                 FAMILY fam_1_title (title),
+                                 FAMILY fam_2_nickname (nickname),
+                                 FAMILY fam_3_username_email (username, email),
+                                 CONSTRAINT ck2 CHECK (length(nickname) < length(name)),
+                                 CONSTRAINT ck1 CHECK (length(nickname) < 10:::INT8)
+                               )
 
 query TTTTB colnames
 SHOW CONSTRAINTS FROM test.named_constraints
@@ -498,10 +498,10 @@ query TT
 SHOW CREATE TABLE test.null_default
 ----
 test.public.null_default  CREATE TABLE public.null_default (
-                          ts TIMESTAMP NULL,
-                          rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-                          CONSTRAINT null_default_pkey PRIMARY KEY (rowid ASC)
-)
+                            ts TIMESTAMP NULL,
+                            rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+                            CONSTRAINT null_default_pkey PRIMARY KEY (rowid ASC)
+                          )
 
 # Issue #13873: don't permit invalid default columns
 statement error could not parse "blah" as type decimal
@@ -561,6 +561,7 @@ cluster_contended_tables               NULL
 cluster_contention_events              NULL
 cluster_database_privileges            NULL
 cluster_distsql_flows                  NULL
+cluster_execution_insights             NULL
 cluster_inflight_traces                NULL
 cluster_locks                          NULL
 cluster_queries                        NULL
@@ -569,6 +570,8 @@ cluster_settings                       NULL
 cluster_statement_statistics           NULL
 cluster_transaction_statistics         NULL
 cluster_transactions                   NULL
+cluster_txn_execution_insights         NULL
+create_function_statements             NULL
 create_schema_statements               NULL
 create_statements                      NULL
 create_type_statements                 NULL
@@ -582,9 +585,15 @@ gossip_liveness                        NULL
 gossip_network                         NULL
 gossip_nodes                           NULL
 index_columns                          NULL
+index_spans                            NULL
 index_usage_statistics                 NULL
 invalid_objects                        NULL
 jobs                                   NULL
+kv_catalog_comments                    NULL
+kv_catalog_descriptor                  NULL
+kv_catalog_namespace                   NULL
+kv_catalog_zones                       NULL
+kv_dropped_relations                   NULL
 kv_node_liveness                       NULL
 kv_node_status                         NULL
 kv_store_status                        NULL
@@ -593,19 +602,21 @@ lost_descriptors_with_data             NULL
 node_build_info                        NULL
 node_contention_events                 NULL
 node_distsql_flows                     NULL
-node_execution_outliers                NULL
+node_execution_insights                NULL
 node_inflight_trace_spans              NULL
+node_memory_monitors                   NULL
 node_metrics                           NULL
 node_queries                           NULL
 node_runtime_info                      NULL
 node_sessions                          NULL
 node_statement_statistics              NULL
+node_tenant_capabilities_cache         NULL
 node_transaction_statistics            NULL
 node_transactions                      NULL
+node_txn_execution_insights            NULL
 node_txn_stats                         NULL
 partitions                             NULL
 pg_catalog_table_is_implemented        NULL
-predefined_comments                    NULL
 ranges                                 NULL
 ranges_no_leases                       NULL
 regions                                NULL
@@ -613,14 +624,18 @@ schema_changes                         NULL
 session_trace                          NULL
 session_variables                      NULL
 statement_statistics                   NULL
+statement_statistics_persisted         NULL
 super_regions                          NULL
+system_jobs                            NULL
 table_columns                          NULL
 table_indexes                          NULL
 table_row_statistics                   NULL
+table_spans                            NULL
 tables                                 NULL
 tenant_usage_details                   NULL
 transaction_contention_events          NULL
 transaction_statistics                 NULL
+transaction_statistics_persisted       NULL
 zones                                  NULL
 administrable_role_authorizations      NULL
 applicable_roles                       NULL

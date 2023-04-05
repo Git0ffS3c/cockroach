@@ -14,13 +14,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -30,8 +30,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -39,11 +41,14 @@ import (
 // TODO(marc): open questions:
 // - should we have root always allowed and not present in the permissions list?
 // Privileges: GRANT on database/table/view.
-//   Notes: postgres requires the object owner.
-//          mysql requires the "grant option" and the same privileges, and sometimes superuser.
+//
+//	Notes: postgres requires the object owner.
+//	       mysql requires the "grant option" and the same privileges, and sometimes superuser.
 func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
-	grantOn := getGrantOnObject(n.Targets, sqltelemetry.IncIAMGrantPrivilegesCounter)
-
+	grantOn, err := p.getGrantOnObject(ctx, n.Targets, sqltelemetry.IncIAMGrantPrivilegesCounter)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot get the privileges on the grant targets")
+	}
 	if err := privilege.ValidatePrivileges(n.Privileges, grantOn); err != nil {
 		return nil, err
 	}
@@ -55,17 +60,38 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 		return nil, err
 	}
 
-	return &changePrivilegesNode{
-		isGrant:         true,
-		withGrantOption: n.WithGrantOption,
-		targets:         n.Targets,
-		grantees:        grantees,
-		desiredprivs:    n.Privileges,
-		changePrivilege: func(privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername) {
-			privDesc.Grant(grantee, privileges, n.WithGrantOption)
+	if !grantOn.IsDescriptorBacked() {
+		return &changeNonDescriptorBackedPrivilegesNode{
+			changePrivilegesNode: changePrivilegesNode{
+				isGrant:         true,
+				withGrantOption: n.WithGrantOption,
+				targets:         n.Targets,
+				grantees:        grantees,
+				desiredprivs:    n.Privileges,
+				grantOn:         grantOn,
+			},
+		}, nil
+	}
+
+	return &changeDescriptorBackedPrivilegesNode{
+		changePrivilegesNode: changePrivilegesNode{
+			isGrant:         true,
+			withGrantOption: n.WithGrantOption,
+			targets:         n.Targets,
+			grantees:        grantees,
+			desiredprivs:    n.Privileges,
+			grantOn:         grantOn,
 		},
-		grantOn:          grantOn,
-		granteesNameList: n.Grantees,
+		changePrivilege: func(
+			privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername,
+		) (changed bool, retErr error) {
+			// Grant the desired privileges to grantee, and return true
+			// if privileges have actually been changed due to this `GRANT``.
+			granteePrivsBeforeGrant := *(privDesc.FindOrCreateUser(grantee))
+			privDesc.Grant(grantee, privileges, n.WithGrantOption)
+			granteePrivsAfterGrant := *(privDesc.FindOrCreateUser(grantee))
+			return granteePrivsBeforeGrant != granteePrivsAfterGrant, nil
+		},
 	}, nil
 }
 
@@ -73,10 +99,14 @@ func (p *planner) Grant(ctx context.Context, n *tree.Grant) (planNode, error) {
 // TODO(marc): open questions:
 // - should we have root always allowed and not present in the permissions list?
 // Privileges: GRANT on database/table/view.
-//   Notes: postgres requires the object owner.
-//          mysql requires the "grant option" and the same privileges, and sometimes superuser.
+//
+//	Notes: postgres requires the object owner.
+//	       mysql requires the "grant option" and the same privileges, and sometimes superuser.
 func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) {
-	grantOn := getGrantOnObject(n.Targets, sqltelemetry.IncIAMRevokePrivilegesCounter)
+	grantOn, err := p.getGrantOnObject(ctx, n.Targets, sqltelemetry.IncIAMRevokePrivilegesCounter)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot get the privileges on the grant targets")
+	}
 
 	if err := privilege.ValidatePrivileges(n.Privileges, grantOn); err != nil {
 		return nil, err
@@ -88,56 +118,82 @@ func (p *planner) Revoke(ctx context.Context, n *tree.Revoke) (planNode, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &changePrivilegesNode{
-		isGrant:         false,
-		withGrantOption: n.GrantOptionFor,
-		targets:         n.Targets,
-		grantees:        grantees,
-		desiredprivs:    n.Privileges,
-		changePrivilege: func(privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername) {
-			privDesc.Revoke(grantee, privileges, grantOn, n.GrantOptionFor)
+
+	if !grantOn.IsDescriptorBacked() {
+		return &changeNonDescriptorBackedPrivilegesNode{
+			changePrivilegesNode: changePrivilegesNode{
+				isGrant:         false,
+				withGrantOption: n.GrantOptionFor,
+				targets:         n.Targets,
+				grantees:        grantees,
+				desiredprivs:    n.Privileges,
+				grantOn:         grantOn,
+			},
+		}, nil
+	}
+
+	return &changeDescriptorBackedPrivilegesNode{
+		changePrivilegesNode: changePrivilegesNode{
+			isGrant:         false,
+			withGrantOption: n.GrantOptionFor,
+			targets:         n.Targets,
+			grantees:        grantees,
+			desiredprivs:    n.Privileges,
+			grantOn:         grantOn,
 		},
-		grantOn:          grantOn,
-		granteesNameList: n.Grantees,
+		changePrivilege: func(
+			privDesc *catpb.PrivilegeDescriptor, privileges privilege.List, grantee username.SQLUsername,
+		) (changed bool, retErr error) {
+			granteePrivs, ok := privDesc.FindUser(grantee)
+			if !ok {
+				return false, nil
+			}
+			granteePrivsBeforeGrant := *granteePrivs // Make a copy of the grantee's privileges before revoke.
+			if err := privDesc.Revoke(grantee, privileges, grantOn, n.GrantOptionFor); err != nil {
+				return false, err
+			}
+			granteePrivs, ok = privDesc.FindUser(grantee)
+			// Revoke results in any privilege changes if
+			//   1. grantee's entry is removed from the privilege descriptor, or
+			//   2. grantee's entry is changed in its content.
+			privsChanges := !ok || granteePrivsBeforeGrant != *granteePrivs
+			return privsChanges, nil
+		},
 	}, nil
 }
 
 type changePrivilegesNode struct {
 	isGrant         bool
 	withGrantOption bool
-	targets         tree.TargetList
 	grantees        []username.SQLUsername
 	desiredprivs    privilege.List
-	changePrivilege func(*catpb.PrivilegeDescriptor, privilege.List, username.SQLUsername)
+	targets         tree.GrantTargetList
 	grantOn         privilege.ObjectType
+}
 
-	// granteesNameList is used for creating an AST node for alter default
-	// privileges inside changePrivilegesNode's startExec.
-	// This is required for getting the pre-normalized name to construct the AST.
-	granteesNameList tree.RoleSpecList
+type changeDescriptorBackedPrivilegesNode struct {
+	changePrivilegesNode
+	changePrivilege func(*catpb.PrivilegeDescriptor, privilege.List, username.SQLUsername) (changed bool, retErr error)
+}
+
+type changeNonDescriptorBackedPrivilegesNode struct {
+	changePrivilegesNode
 }
 
 // ReadingOwnWrites implements the planNodeReadingOwnWrites interface.
 // This is because GRANT/REVOKE performs multiple KV operations on descriptors
 // and expects to see its own writes.
-func (n *changePrivilegesNode) ReadingOwnWrites() {}
+func (n *changeDescriptorBackedPrivilegesNode) ReadingOwnWrites() {}
 
-func (n *changePrivilegesNode) startExec(params runParams) error {
-	ctx := params.ctx
-	p := params.p
-
-	if n.withGrantOption && !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-		return pgerror.Newf(pgcode.FeatureNotSupported,
-			"version %v must be finalized to use grant options",
-			clusterversion.ByKey(clusterversion.ValidateGrantOption))
-	}
-
-	if err := p.validateRoles(ctx, n.grantees, true /* isPublicValid */); err != nil {
+func (p *planner) preChangePrivilegesValidation(
+	ctx context.Context, grantees []username.SQLUsername, withGrantOption, isGrant bool,
+) error {
+	if err := p.validateRoles(ctx, grantees, true /* isPublicValid */); err != nil {
 		return err
 	}
 	// The public role is not allowed to have grant options.
-	if n.isGrant && n.withGrantOption {
-		for _, grantee := range n.grantees {
+	if isGrant && withGrantOption {
+		for _, grantee := range grantees {
 			if grantee.IsPublicRole() {
 				return pgerror.Newf(
 					pgcode.InvalidGrantOperation,
@@ -147,99 +203,108 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			}
 		}
 	}
+	return nil
+}
+
+func (n *changeDescriptorBackedPrivilegesNode) startExec(params runParams) error {
+	ctx := params.ctx
+	p := params.p
+
+	if err := params.p.preChangePrivilegesValidation(params.ctx, n.grantees, n.withGrantOption, n.isGrant); err != nil {
+		return err
+	}
 
 	var err error
-	var descriptors []catalog.Descriptor
+	var descriptorsWithTypes []DescriptorWithObjectType
 	// DDL statements avoid the cache to avoid leases, and can view non-public descriptors.
 	// TODO(vivek): check if the cache can be used.
 	p.runWithOptions(resolveFlags{skipCache: true}, func() {
-		descriptors, err = getDescriptorsFromTargetListForPrivilegeChange(ctx, p, n.targets)
+		descriptorsWithTypes, err = p.getDescriptorsFromTargetListForPrivilegeChange(ctx, n.targets)
 	})
 	if err != nil {
 		return err
 	}
 
-	if len(descriptors) == 0 {
+	if len(descriptorsWithTypes) == 0 {
 		return nil
 	}
 
-	var events []eventLogEntry
+	var events []logpb.EventPayload
 
 	// First, update the descriptors. We want to catch all errors before
 	// we update them in KV below.
 	b := p.txn.NewBatch()
-	for _, descriptor := range descriptors {
+	for _, descriptorWithType := range descriptorsWithTypes {
 		// Disallow privilege changes on system objects. For more context, see #43842.
-		op := "REVOKE"
-		if n.isGrant {
-			op = "GRANT"
-		}
+		descriptor := descriptorWithType.descriptor
+		objType := descriptorWithType.objectType
+
 		if catalog.IsSystemDescriptor(descriptor) {
+
+			op := "REVOKE"
+			if n.isGrant {
+				op = "GRANT"
+			}
 			return pgerror.Newf(pgcode.InsufficientPrivilege, "cannot %s on system object", op)
 		}
 
-		// The check for GRANT is only needed before the v22.1 upgrade is finalized.
-		// Otherwise, we check grant options later in this function.
-		if !p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-			if err := p.CheckPrivilege(ctx, descriptor, privilege.GRANT); err != nil {
-				return err
-			}
-		}
+		// descPrivsChanged is true if any privileges are changed on `descriptor` as a result of
+		// the `GRANT` or `REVOKE` query. This allows us to no-op the `GRANT` or `REVOKE` if
+		// it does not actually result in any privilege change.
+		descPrivsChanged := false
 
 		if len(n.desiredprivs) > 0 {
-			grantPresent, allPresent := false, false
+			var sequencePrivilegesNoOp privilege.List
 			for _, priv := range n.desiredprivs {
 				// Only allow granting/revoking privileges that the requesting
 				// user themselves have on the descriptor.
 				if err := p.CheckPrivilege(ctx, descriptor, priv); err != nil {
 					return err
 				}
-				grantPresent = grantPresent || priv == privilege.GRANT
-				allPresent = allPresent || priv == privilege.ALL
-			}
-			privileges := descriptor.GetPrivileges()
 
-			noticeMessage := ""
-			if p.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.ValidateGrantOption) {
-				err := p.CheckGrantOptionsForUser(ctx, descriptor, n.desiredprivs, p.User(), n.isGrant)
-				if err != nil {
-					return err
-				}
-
-				// We only output the message for ALL privilege if it is being granted
-				// without the WITH GRANT OPTION flag if GRANT privilege is involved, we
-				// must always output the message
-				if allPresent && n.isGrant && !n.withGrantOption {
-					noticeMessage = "grant options were automatically applied but this behavior is deprecated"
-				} else if grantPresent {
-					noticeMessage = "the GRANT privilege is deprecated"
-				}
-			}
-
-			for _, grantee := range n.grantees {
-				n.changePrivilege(privileges, n.desiredprivs, grantee)
-
-				// TODO (sql-exp): remove the rest of this loop in 22.2.
-				granteeHasGrantPriv := privileges.CheckPrivilege(grantee, privilege.GRANT)
-
-				if granteeHasGrantPriv && n.isGrant && !n.withGrantOption && len(noticeMessage) == 0 {
-					noticeMessage = "grant options were automatically applied but this behavior is deprecated"
-				}
-				if !n.withGrantOption && (grantPresent || allPresent || (granteeHasGrantPriv && n.isGrant)) {
-					if n.isGrant {
-						privileges.GrantPrivilegeToGrantOptions(grantee, true /*isGrant*/)
-					} else {
-						privileges.GrantPrivilegeToGrantOptions(grantee, false /*isGrant*/)
+				if objType == privilege.Sequence {
+					switch priv {
+					case privilege.ALL,
+						privilege.USAGE,
+						privilege.UPDATE,
+						privilege.SELECT,
+						privilege.DROP:
+					default:
+						sequencePrivilegesNoOp = append(sequencePrivilegesNoOp, priv)
 					}
 				}
 			}
 
-			if len(noticeMessage) > 0 {
+			err := p.MustCheckGrantOptionsForUser(ctx, descriptor.GetPrivileges(), descriptor, n.desiredprivs, p.User(), n.isGrant)
+			if err != nil {
+				return err
+			}
+
+			privileges := descriptor.GetPrivileges()
+			for _, grantee := range n.grantees {
+				changed, err := n.changePrivilege(privileges, n.desiredprivs, grantee)
+				if err != nil {
+					return err
+				}
+				descPrivsChanged = descPrivsChanged || changed
+				if !n.isGrant && grantee == privileges.Owner() {
+					params.p.BufferClientNotice(
+						ctx,
+						pgnotice.Newf(
+							"%s is the owner of %s and still has all privileges implicitly",
+							privileges.Owner(),
+							descriptor.GetName(),
+						),
+					)
+				}
+			}
+
+			if len(sequencePrivilegesNoOp) > 0 {
 				params.p.BufferClientNotice(
 					ctx,
-					errors.WithHint(
-						pgnotice.Newf("%s", noticeMessage),
-						"please use WITH GRANT OPTION",
+					pgnotice.Newf(
+						"some privileges have no effect on sequences: %s",
+						sequencePrivilegesNoOp.SortedNames(),
 					),
 				)
 			}
@@ -248,17 +313,22 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			// Postgres does not actually enforce this, instead of checking that
 			// superusers have all the privileges, Postgres allows superusers to
 			// bypass privilege checks.
-			err = catprivilege.ValidateSuperuserPrivileges(*privileges, descriptor, n.grantOn)
+			err = catprivilege.ValidateSuperuserPrivileges(*privileges, descriptor, objType)
 			if err != nil {
 				return err
 			}
 
 			// Validate privilege descriptors directly as the db/table level Validate
 			// may fix up the descriptor.
-			err = catprivilege.Validate(*privileges, descriptor, n.grantOn)
+			err = catprivilege.Validate(*privileges, descriptor, objType)
 			if err != nil {
 				return err
 			}
+		}
+
+		if !descPrivsChanged {
+			// no privileges will be changed from this 'GRANT' or 'REVOKE', skip it.
+			continue
 		}
 
 		eventDetails := eventpb.CommonSQLPrivilegeEventDetails{}
@@ -273,19 +343,17 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			if err := p.writeDatabaseChangeToBatch(ctx, d, b); err != nil {
 				return err
 			}
-			if err := p.createNonDropDatabaseChangeJob(ctx, d.ID,
-				fmt.Sprintf("updating privileges for database %d", d.ID)); err != nil {
-				return err
-			}
+			p.createNonDropDatabaseChangeJob(ctx, d.ID, fmt.Sprintf("updating privileges for database %d", d.ID))
 			for _, grantee := range n.grantees {
 				privs := eventDetails // copy the granted/revoked privilege list.
 				privs.Grantee = grantee.Normalized()
-				events = append(events, eventLogEntry{
-					targetID: int32(d.ID),
-					event: &eventpb.ChangeDatabasePrivilege{
-						CommonSQLPrivilegeEventDetails: privs,
-						DatabaseName:                   (*tree.Name)(&d.Name).String(),
-					}})
+				events = append(events, &eventpb.ChangeDatabasePrivilege{
+					CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+						DescriptorID: uint32(d.ID),
+					},
+					CommonSQLPrivilegeEventDetails: privs,
+					DatabaseName:                   (*tree.Name)(&d.Name).String(),
+				})
 			}
 
 		case *tabledesc.Mutable:
@@ -306,12 +374,13 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			for _, grantee := range n.grantees {
 				privs := eventDetails // copy the granted/revoked privilege list.
 				privs.Grantee = grantee.Normalized()
-				events = append(events, eventLogEntry{
-					targetID: int32(d.ID),
-					event: &eventpb.ChangeTablePrivilege{
-						CommonSQLPrivilegeEventDetails: privs,
-						TableName:                      d.Name, // FIXME
-					}})
+				events = append(events, &eventpb.ChangeTablePrivilege{
+					CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+						DescriptorID: uint32(d.ID),
+					},
+					CommonSQLPrivilegeEventDetails: privs,
+					TableName:                      d.Name, // FIXME
+				})
 			}
 		case *typedesc.Mutable:
 			err := p.writeTypeSchemaChange(ctx, d, fmt.Sprintf("updating privileges for type %d", d.ID))
@@ -321,12 +390,13 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			for _, grantee := range n.grantees {
 				privs := eventDetails // copy the granted/revoked privilege list.
 				privs.Grantee = grantee.Normalized()
-				events = append(events, eventLogEntry{
-					targetID: int32(d.ID),
-					event: &eventpb.ChangeTypePrivilege{
-						CommonSQLPrivilegeEventDetails: privs,
-						TypeName:                       d.Name, // FIXME
-					}})
+				events = append(events, &eventpb.ChangeTypePrivilege{
+					CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+						DescriptorID: uint32(d.ID),
+					},
+					CommonSQLPrivilegeEventDetails: privs,
+					TypeName:                       d.Name, // FIXME
+				})
 			}
 		case *schemadesc.Mutable:
 			if err := p.writeSchemaDescChange(
@@ -339,12 +409,28 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 			for _, grantee := range n.grantees {
 				privs := eventDetails // copy the granted/revoked privilege list.
 				privs.Grantee = grantee.Normalized()
-				events = append(events, eventLogEntry{
-					targetID: int32(d.ID),
-					event: &eventpb.ChangeSchemaPrivilege{
-						CommonSQLPrivilegeEventDetails: privs,
-						SchemaName:                     d.Name, // FIXME
-					}})
+				events = append(events, &eventpb.ChangeSchemaPrivilege{
+					CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+						DescriptorID: uint32(d.ID),
+					},
+					CommonSQLPrivilegeEventDetails: privs,
+					SchemaName:                     d.Name, // FIXME
+				})
+			}
+		case *funcdesc.Mutable:
+			if err := p.writeFuncSchemaChange(ctx, d); err != nil {
+				return err
+			}
+			for _, grantee := range n.grantees {
+				privs := eventDetails // copy the granted/revoked privilege list.
+				privs.Grantee = grantee.Normalized()
+				events = append(events, &eventpb.ChangeFunctionPrivilege{
+					CommonSQLEventDetails: eventpb.CommonSQLEventDetails{
+						DescriptorID: uint32(d.ID),
+					},
+					CommonSQLPrivilegeEventDetails: privs,
+					FuncName:                       d.Name, // FIXME
+				})
 			}
 		}
 	}
@@ -357,36 +443,169 @@ func (n *changePrivilegesNode) startExec(params runParams) error {
 	// Record the privilege changes in the event log. This is an
 	// auditable log event and is recorded in the same transaction as
 	// the table descriptor update.
-	if err := params.p.logEvents(params.ctx, events...); err != nil {
-		return err
+	if events != nil {
+		if err := params.p.logEvents(params.ctx, events...); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (*changePrivilegesNode) Next(runParams) (bool, error) { return false, nil }
-func (*changePrivilegesNode) Values() tree.Datums          { return tree.Datums{} }
-func (*changePrivilegesNode) Close(context.Context)        {}
+func (*changeDescriptorBackedPrivilegesNode) Next(runParams) (bool, error) { return false, nil }
+func (*changeDescriptorBackedPrivilegesNode) Values() tree.Datums          { return tree.Datums{} }
+func (*changeDescriptorBackedPrivilegesNode) Close(context.Context)        {}
 
-// getGrantOnObject returns the type of object being granted on based on the TargetList.
+// getGrantOnObject returns the type of object being granted on based on the
+// TargetList.
 // getGrantOnObject also calls incIAMFunc with the object type name.
-func getGrantOnObject(targets tree.TargetList, incIAMFunc func(on string)) privilege.ObjectType {
+// Note that the "GRANT ... ON obj_names" syntax supports both sequence name
+// and table name in the "obj_names" field.
+// If the target list contains a table, this function always returns
+// privilege.Table. Only when all objects in the target list are sequence, it
+// returns the privilege.Sequence.
+func (p *planner) getGrantOnObject(
+	ctx context.Context, targets tree.GrantTargetList, incIAMFunc func(on string),
+) (privilege.ObjectType, error) {
 	switch {
 	case targets.Databases != nil:
 		incIAMFunc(sqltelemetry.OnDatabase)
-		return privilege.Database
+		return privilege.Database, nil
+	case targets.AllSequencesInSchema:
+		incIAMFunc(sqltelemetry.OnAllSequencesInSchema)
+		return privilege.Sequence, nil
 	case targets.AllTablesInSchema:
 		incIAMFunc(sqltelemetry.OnAllTablesInSchema)
-		return privilege.Table
+		return privilege.Table, nil
+	case targets.AllFunctionsInSchema:
+		incIAMFunc(sqltelemetry.OnAllFunctionsInSchema)
+		return privilege.Function, nil
 	case targets.Schemas != nil:
 		incIAMFunc(sqltelemetry.OnSchema)
-		return privilege.Schema
+		return privilege.Schema, nil
 	case targets.Types != nil:
 		incIAMFunc(sqltelemetry.OnType)
-		return privilege.Type
+		return privilege.Type, nil
+	case targets.Functions != nil:
+		incIAMFunc(sqltelemetry.OnFunction)
+		return privilege.Function, nil
+	case targets.System:
+		incIAMFunc(sqltelemetry.OnSystem)
+		return privilege.Global, nil
+	case targets.ExternalConnections != nil:
+		incIAMFunc(sqltelemetry.OnExternalConnection)
+		return privilege.ExternalConnection, nil
 	default:
-		incIAMFunc(sqltelemetry.OnTable)
-		return privilege.Table
+		composition, err := p.getTablePatternsComposition(ctx, targets)
+		if err != nil {
+			return privilege.Any, errors.Wrap(
+				err,
+				"cannot determine the target type of the GRANT statement",
+			)
+		}
+		if composition == containsTable {
+			incIAMFunc(sqltelemetry.OnTable)
+			return privilege.Table, nil
+		}
+		if composition == virtualTablesOnly {
+			return privilege.VirtualTable, nil
+		}
+		incIAMFunc(sqltelemetry.OnSequence)
+		return privilege.Sequence, nil
 	}
+}
+
+// tablePatternsComposition is an enum to mark the composition of the
+// TablePatterns in the GRANT/REVOKE statement's target list.
+
+type tablePatternsComposition int8
+
+const (
+	unknownComposition tablePatternsComposition = iota
+	// If all targets are sequences.
+	sequenceOnly
+	// If there's any table in the target list.
+	containsTable
+	// If all targets are virtual tables.
+	virtualTablesOnly
+)
+
+// getTablePatternsComposition gets the given grant target list's
+// object type composition. This is used to determine the privilege list for
+// the targets.
+// If all targets are of type sequence, then we should use the sequence
+// privilege list; if any target is of type table, we should use the table
+// privilege.
+// This is because the table privilege is the subset of sequence privilege.
+func (p *planner) getTablePatternsComposition(
+	ctx context.Context, targets tree.GrantTargetList,
+) (tablePatternsComposition, error) {
+	if targets.Tables.SequenceOnly {
+		return sequenceOnly, nil
+	}
+	var allObjectIDs []descpb.ID
+	for _, tableTarget := range targets.Tables.TablePatterns {
+		tableGlob, err := tableTarget.NormalizeTablePattern()
+		if err != nil {
+			return unknownComposition, err
+		}
+		_, objectIDs, err := p.ExpandTableGlob(ctx, tableGlob)
+		if err != nil {
+			return unknownComposition, err
+		}
+		allObjectIDs = append(allObjectIDs, objectIDs...)
+	}
+
+	if len(allObjectIDs) == 0 {
+		return unknownComposition, nil
+	}
+
+	// Check if the table is a virtual table.
+	var virtualIDs descpb.IDs
+	var nonVirtualIDs descpb.IDs
+	for _, objectID := range allObjectIDs {
+		isVirtual := false
+		for _, vs := range virtualSchemas {
+			if _, ok := vs.tableDefs[objectID]; ok {
+				isVirtual = true
+				break
+			}
+		}
+
+		if isVirtual {
+			virtualIDs = append(nonVirtualIDs, objectID)
+		} else {
+			nonVirtualIDs = append(virtualIDs, objectID)
+		}
+	}
+	haveVirtualTables := virtualIDs.Len() > 0
+	haveNonVirtualTables := nonVirtualIDs.Len() > 0
+	if haveVirtualTables && haveNonVirtualTables {
+		return unknownComposition, pgerror.Newf(
+			pgcode.FeatureNotSupported, "cannot mix grants between virtual and non-virtual tables",
+		)
+	}
+	if !haveNonVirtualTables {
+		return virtualTablesOnly, nil
+	}
+	// Note that part of the reason the code is structured this way is that
+	// resolving mutable descriptors for virtual table IDs results in an error.
+	muts, err := p.Descriptors().MutableByID(p.txn).Descs(ctx, nonVirtualIDs)
+	if err != nil {
+		return unknownComposition, err
+	}
+
+	for _, mut := range muts {
+		if mut != nil && mut.DescriptorType() == catalog.Table {
+			tableDesc, err := catalog.AsTableDescriptor(mut)
+			if err != nil {
+				return unknownComposition, err
+			}
+			if !tableDesc.IsSequence() {
+				return containsTable, nil
+			}
+		}
+	}
+	return sequenceOnly, nil
 }
 
 // validateRoles checks that all the roles are valid users.
@@ -403,8 +622,7 @@ func (p *planner) validateRoles(
 	}
 	for i, grantee := range roles {
 		if _, ok := users[grantee]; !ok {
-			sqlName := tree.Name(roles[i].Normalized())
-			return errors.Errorf("user or role %s does not exist", &sqlName)
+			return sqlerrors.NewUndefinedUserError(roles[i])
 		}
 	}
 

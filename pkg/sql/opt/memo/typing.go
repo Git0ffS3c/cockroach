@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -37,17 +38,21 @@ func InferType(mem *Memo, e opt.ScalarExpr) *types.T {
 
 // InferUnaryType infers the return type of a unary operator, given the type of
 // its input.
-func InferUnaryType(op opt.Operator, inputType *types.T) *types.T {
+func InferUnaryType(op opt.Operator, inputType *types.T) (ret *types.T) {
 	unaryOp := opt.UnaryOpReverseMap[op]
 
 	// Find the unary op that matches the type of the expression's child.
-	for _, op := range tree.UnaryOps[unaryOp] {
-		o := op.(*tree.UnaryOp)
+	_ = tree.UnaryOps[unaryOp].ForEachUnaryOp(func(o *tree.UnaryOp) error {
 		if inputType.Equivalent(o.Typ) {
-			return o.ReturnType
+			ret = o.ReturnType
+			return iterutil.StopIteration()
 		}
+		return nil
+	})
+	if ret == nil {
+		panic(errors.AssertionFailedf("could not find type for unary expression %s", redact.Safe(op)))
 	}
-	panic(errors.AssertionFailedf("could not find type for unary expression %s", redact.Safe(op)))
+	return ret
 }
 
 // InferBinaryType infers the return type of a binary expression, given the type
@@ -62,11 +67,13 @@ func InferBinaryType(op opt.Operator, leftType, rightType *types.T) *types.T {
 
 // InferWhensType returns the type of a CASE expression, which is
 // of the form:
-//   CASE [ <cond> ]
-//       WHEN <condval1> THEN <expr1>
-//     [ WHEN <condval2> THEN <expr2> ] ...
-//     [ ELSE <expr> ]
-//   END
+//
+//	CASE [ <cond> ]
+//	    WHEN <condval1> THEN <expr1>
+//	  [ WHEN <condval2> THEN <expr2> ] ...
+//	  [ ELSE <expr> ]
+//	END
+//
 // All possible values should have the same type, and that is the type of the
 // case.
 func InferWhensType(whens ScalarListExpr, orElse opt.ScalarExpr) *types.T {
@@ -94,10 +101,10 @@ func BinaryAllowsNullArgs(op opt.Operator, leftType, rightType *types.T) bool {
 	if !ok {
 		panic(errors.AssertionFailedf("could not find overload for binary expression %s", redact.Safe(op)))
 	}
-	return o.NullableArgs
+	return o.CalledOnNullInput
 }
 
-// GetBuiltinProperties is set to builtins.GetBuiltinProperties in an init
+// GetBuiltinProperties is set to builtinsregistry.GetBuiltinProperties in an init
 // function in the norm package. This allows the memo package to resolve builtin
 // functions without importing the builtins package.
 var GetBuiltinProperties func(name string) (*tree.FunctionProperties, []tree.Overload)
@@ -189,6 +196,7 @@ func init() {
 	// a large number of possible overloads or where ReturnType depends on
 	// argument types.
 	typingFuncMap[opt.ArrayAggOp] = typeArrayAgg
+	typingFuncMap[opt.ArrayCatAggOp] = typeAsFirstArg
 	typingFuncMap[opt.MaxOp] = typeAsFirstArg
 	typingFuncMap[opt.MinOp] = typeAsFirstArg
 	typingFuncMap[opt.ConstAggOp] = typeAsFirstArg
@@ -247,9 +255,18 @@ func typeArrayAgg(e opt.ScalarExpr) *types.T {
 	return types.MakeArray(typ)
 }
 
-// typeIndirection returns the type of the element of the array.
+// typeIndirection returns the type of the element after the indirection
+// is applied.
 func typeIndirection(e opt.ScalarExpr) *types.T {
-	return e.Child(0).(opt.ScalarExpr).DataType().ArrayContents()
+	t := e.Child(0).(opt.ScalarExpr).DataType()
+	switch t.Family() {
+	case types.JsonFamily:
+		return t
+	case types.ArrayFamily:
+		return t.ArrayContents()
+	default:
+		panic(errors.AssertionFailedf("unknown type indirection type %s", t.SQLString()))
+	}
 }
 
 // typeCollate returns the collated string typed with the given locale.
@@ -339,11 +356,13 @@ func typeCoalesce(e opt.ScalarExpr) *types.T {
 
 // typeCase returns the type of a CASE expression, which is
 // of the form:
-//   CASE [ <cond> ]
-//       WHEN <condval1> THEN <expr1>
-//     [ WHEN <condval2> THEN <expr2> ] ...
-//     [ ELSE <expr> ]
-//   END
+//
+//	CASE [ <cond> ]
+//	    WHEN <condval1> THEN <expr1>
+//	  [ WHEN <condval2> THEN <expr2> ] ...
+//	  [ ELSE <expr> ]
+//	END
+//
 // The type is equal to the type of the WHEN <condval> THEN <expr> clauses, or
 // the type of the ELSE <expr> value if all the previous types are unknown.
 func typeCase(e opt.ScalarExpr) *types.T {
@@ -382,45 +401,24 @@ func typeColumnAccess(e opt.ScalarExpr) *types.T {
 // If an overload is not found, FindBinaryOverload returns false.
 func FindBinaryOverload(op opt.Operator, leftType, rightType *types.T) (_ *tree.BinOp, ok bool) {
 	bin := opt.BinaryOpReverseMap[op]
-
-	// Find the binary op that matches the type of the expression's left and
-	// right children. No more than one match should ever be found. The
-	// TestTypingBinaryAssumptions test ensures this will be the case even if
-	// new operators or overloads are added.
-	for _, binOverloads := range tree.BinOps[bin] {
-		o := binOverloads.(*tree.BinOp)
-
-		if leftType.Family() == types.UnknownFamily {
-			if rightType.Equivalent(o.RightType) {
-				return o, true
-			}
-		} else if rightType.Family() == types.UnknownFamily {
-			if leftType.Equivalent(o.LeftType) {
-				return o, true
-			}
-		} else {
-			if leftType.Equivalent(o.LeftType) && rightType.Equivalent(o.RightType) {
-				return o, true
-			}
-		}
-	}
-	return nil, false
+	return tree.FindBinaryOverload(bin, leftType, rightType)
 }
 
 // FindUnaryOverload finds the correct type signature overload for the
 // specified unary operator, given the type of its input. If an overload is
 // found, FindUnaryOverload returns true, plus a pointer to the overload.
 // If an overload is not found, FindUnaryOverload returns false.
-func FindUnaryOverload(op opt.Operator, typ *types.T) (_ *tree.UnaryOp, ok bool) {
+func FindUnaryOverload(op opt.Operator, typ *types.T) (ret *tree.UnaryOp, ok bool) {
 	unary := opt.UnaryOpReverseMap[op]
 
-	for _, unaryOverloads := range tree.UnaryOps[unary] {
-		o := unaryOverloads.(*tree.UnaryOp)
-		if o.Typ.Equivalent(typ) {
-			return o, true
+	_ = tree.UnaryOps[unary].ForEachUnaryOp(func(op *tree.UnaryOp) error {
+		if ok = op.Typ.Equivalent(typ); ok {
+			ret = op
+			return iterutil.StopIteration()
 		}
-	}
-	return nil, false
+		return nil
+	})
+	return ret, ok
 }
 
 // FindComparisonOverload finds the correct type signature overload for the
@@ -433,7 +431,7 @@ func FindUnaryOverload(op opt.Operator, typ *types.T) (_ *tree.UnaryOp, ok bool)
 // FindComparisonOverload returns ok=false.
 func FindComparisonOverload(
 	op opt.Operator, leftType, rightType *types.T,
-) (_ *tree.CmpOp, flipped, not, ok bool) {
+) (cmpOp *tree.CmpOp, flipped, not, ok bool) {
 	op, flipped, not = NormalizeComparison(op)
 	comp := opt.ComparisonOpReverseMap[op]
 
@@ -445,24 +443,25 @@ func FindComparisonOverload(
 	// right children. No more than one match should ever be found. The
 	// TestTypingComparisonAssumptions test ensures this will be the case even if
 	// new operators or overloads are added.
-	for _, cmpOverloads := range tree.CmpOps[comp] {
-		o := cmpOverloads.(*tree.CmpOp)
-
+	_ = tree.CmpOps[comp].ForEachCmpOp(func(o *tree.CmpOp) error {
 		if leftType.Family() == types.UnknownFamily {
-			if rightType.Equivalent(o.RightType) {
-				return o, flipped, not, true
-			}
+			ok = rightType.Equivalent(o.RightType)
 		} else if rightType.Family() == types.UnknownFamily {
-			if leftType.Equivalent(o.LeftType) {
-				return o, flipped, not, true
-			}
+			ok = leftType.Equivalent(o.LeftType)
 		} else {
-			if leftType.Equivalent(o.LeftType) && rightType.Equivalent(o.RightType) {
-				return o, flipped, not, true
-			}
+			ok = leftType.Equivalent(o.LeftType) && rightType.Equivalent(o.RightType)
 		}
+		if !ok {
+			return nil
+		}
+		cmpOp = o
+		return iterutil.StopIteration()
+	})
+	if !ok {
+		return nil, false, false, false
 	}
-	return nil, false, false, false
+	return cmpOp, flipped, not, true
+
 }
 
 // NormalizeComparison maps a given comparison operator into an equivalent

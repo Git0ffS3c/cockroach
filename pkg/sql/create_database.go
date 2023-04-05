@@ -98,7 +98,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 	if n.Placement != tree.DataPlacementUnspecified {
 		if !p.EvalContext().SessionData().PlacementEnabled {
 			return nil, errors.WithHint(pgerror.New(
-				pgcode.FeatureNotSupported,
+				pgcode.ExperimentalFeature,
 				"PLACEMENT requires that the session setting enable_multiregion_placement_policy "+
 					"is enabled",
 			),
@@ -124,18 +124,41 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 		}
 	}
 
-	hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
-	if err != nil {
+	if err := p.CanCreateDatabase(ctx); err != nil {
 		return nil, err
 	}
-	if !hasCreateDB {
+
+	if n.PrimaryRegion == tree.PrimaryRegionNotSpecifiedName && n.SecondaryRegion != tree.SecondaryRegionNotSpecifiedName {
 		return nil, pgerror.New(
-			pgcode.InsufficientPrivilege,
-			"permission denied to create database",
+			pgcode.InvalidDatabaseDefinition,
+			"PRIMARY REGION must be specified when using SECONDARY REGION",
+		)
+	}
+
+	if n.PrimaryRegion != tree.PrimaryRegionNotSpecifiedName && n.SecondaryRegion == n.PrimaryRegion {
+		return nil, pgerror.New(
+			pgcode.InvalidDatabaseDefinition,
+			"SECONDARY REGION can not be the same as the PRIMARY REGION",
 		)
 	}
 
 	return &createDatabaseNode{n: n}, nil
+}
+
+// CanCreateDatabase verifies that the current user has the CREATEDB
+// role option.
+func (p *planner) CanCreateDatabase(ctx context.Context) error {
+	hasCreateDB, err := p.HasRoleOption(ctx, roleoption.CREATEDB)
+	if err != nil {
+		return err
+	}
+	if !hasCreateDB {
+		return pgerror.New(
+			pgcode.InsufficientPrivilege,
+			"permission denied to create database",
+		)
+	}
+	return nil
 }
 
 func (n *createDatabaseNode) startExec(params runParams) error {

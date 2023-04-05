@@ -15,12 +15,14 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"testing/quick"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/gc"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -34,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
@@ -110,7 +113,9 @@ func TestMVCCGCQueueMakeGCScoreInvariantQuick(t *testing.T) {
 		now := initialNow.Add(timePassed.Nanoseconds(), 0)
 		r := makeMVCCGCQueueScoreImpl(
 			ctx, int64(seed), now, ms, time.Duration(ttlSec)*time.Second, hlc.Timestamp{},
-			true /* canAdvanceGCThreshold */)
+			true,                        /* canAdvanceGCThreshold */
+			roachpb.GCHint{}, time.Hour, /* txnCleanupThreshold */
+		)
 		wouldHaveToDeleteSomething := gcBytes*int64(ttlSec) < ms.GCByteAge(now.WallTime)
 		result := !r.ShouldQueue || wouldHaveToDeleteSomething
 		if !result {
@@ -132,7 +137,9 @@ func TestMVCCGCQueueMakeGCScoreAnomalousStats(t *testing.T) {
 			LiveBytes:         int64(liveBytes),
 			ValBytes:          int64(valBytes),
 			KeyBytes:          int64(keyBytes),
-		}, 60*time.Second, hlc.Timestamp{}, true /* canAdvanceGCThreshold */)
+		}, 60*time.Second, hlc.Timestamp{}, true, /* canAdvanceGCThreshold */
+			roachpb.GCHint{}, time.Hour, /* txnCleanupThreshold */
+		)
 		return r.DeadFraction >= 0 && r.DeadFraction <= 1
 	}, &quick.Config{MaxCount: 1000}); err != nil {
 		t.Fatal(err)
@@ -148,7 +155,7 @@ func TestMVCCGCQueueMakeGCScoreLargeAbortSpan(t *testing.T) {
 	ms.SysBytes += largeAbortSpanBytesThreshold
 	ms.SysCount++
 
-	expiration := kvserverbase.TxnCleanupThreshold.Nanoseconds() + 1
+	expiration := gc.TxnCleanupThreshold.Default().Nanoseconds() + 1
 
 	// GC triggered if abort span should all be gc'able and it's large.
 	{
@@ -156,7 +163,10 @@ func TestMVCCGCQueueMakeGCScoreLargeAbortSpan(t *testing.T) {
 			context.Background(), seed,
 			hlc.Timestamp{WallTime: expiration + 1},
 			ms, 10000*time.Second,
-			hlc.Timestamp{}, true, /* canAdvanceGCThreshold */
+			hlc.Timestamp{},
+			true, /* canAdvanceGCThreshold */
+			roachpb.GCHint{},
+			time.Hour, /* txnCleanupThreshold */
 		)
 		require.True(t, r.ShouldQueue)
 		require.NotZero(t, r.FinalScore)
@@ -171,7 +181,10 @@ func TestMVCCGCQueueMakeGCScoreLargeAbortSpan(t *testing.T) {
 			context.Background(), seed,
 			hlc.Timestamp{WallTime: expiration + 1},
 			ms, 10000*time.Second,
-			hlc.Timestamp{}, true, /* canAdvanceGCThreshold */
+			hlc.Timestamp{},
+			true, /* canAdvanceGCThreshold */
+			roachpb.GCHint{},
+			time.Hour, /* txnCleanupThreshold */
 		)
 		require.True(t, r.ShouldQueue)
 		require.NotZero(t, r.FinalScore)
@@ -182,7 +195,10 @@ func TestMVCCGCQueueMakeGCScoreLargeAbortSpan(t *testing.T) {
 		r := makeMVCCGCQueueScoreImpl(context.Background(), seed,
 			hlc.Timestamp{WallTime: expiration},
 			ms, 10000*time.Second,
-			hlc.Timestamp{WallTime: expiration - 100}, true, /* canAdvanceGCThreshold */
+			hlc.Timestamp{WallTime: expiration - 100},
+			true, /* canAdvanceGCThreshold */
+			roachpb.GCHint{},
+			time.Hour, /* txnCleanupThreshold */
 		)
 		require.False(t, r.ShouldQueue)
 		require.Zero(t, r.FinalScore)
@@ -222,7 +238,9 @@ func TestMVCCGCQueueMakeGCScoreIntentCooldown(t *testing.T) {
 			}
 
 			r := makeMVCCGCQueueScoreImpl(
-				ctx, seed, now, ms, gcTTL, tc.lastGC, true /* canAdvanceGCThreshold */)
+				ctx, seed, now, ms, gcTTL, tc.lastGC, true, /* canAdvanceGCThreshold */
+				roachpb.GCHint{}, time.Hour, /* txnCleanupThreshold */
+			)
 			require.Equal(t, tc.expectGC, r.ShouldQueue)
 		})
 	}
@@ -282,7 +300,7 @@ func (cws *cachedWriteSimulator) multiKey(
 	ts := hlc.Timestamp{}.Add(ms.LastUpdateNanos, 0)
 	key, value := []byte("multikey"), cws.value(size)
 	var eachMS enginepb.MVCCStats
-	if err := storage.MVCCPut(ctx, eng, &eachMS, key, ts, value, txn); err != nil {
+	if err := storage.MVCCPut(ctx, eng, &eachMS, key, ts, hlc.ClockTimestamp{}, value, txn); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i < numOps; i++ {
@@ -311,7 +329,7 @@ func (cws *cachedWriteSimulator) singleKeySteady(
 		for i := 0; i < qps; i++ {
 			now := initialNow.Add(elapsed.Nanoseconds(), int32(i))
 
-			if err := storage.MVCCPut(ctx, eng, ms, key, now, value, nil /* txn */); err != nil {
+			if err := storage.MVCCPut(ctx, eng, ms, key, now, hlc.ClockTimestamp{}, value, nil); err != nil {
 				t.Fatal(err)
 			}
 			if len(firstSl) < cacheFirstLen {
@@ -337,12 +355,23 @@ func (cws *cachedWriteSimulator) singleKeySteady(
 }
 
 func (cws *cachedWriteSimulator) shouldQueue(
-	b bool, prio float64, after time.Duration, ttl time.Duration, ms enginepb.MVCCStats,
+	b bool,
+	prio float64,
+	after time.Duration,
+	ttl time.Duration,
+	ms enginepb.MVCCStats,
+	timeSinceGC time.Duration,
 ) {
 	cws.t.Helper()
 	ts := hlc.Timestamp{}.Add(ms.LastUpdateNanos+after.Nanoseconds(), 0)
+	prevGCTs := hlc.Timestamp{}
+	if timeSinceGC > 0 {
+		prevGCTs = prevGCTs.Add(ms.LastUpdateNanos+(after-timeSinceGC).Nanoseconds(), 0)
+	}
 	r := makeMVCCGCQueueScoreImpl(context.Background(), 0 /* seed */, ts, ms, ttl,
-		hlc.Timestamp{}, true /* canAdvanceGCThreshold */)
+		prevGCTs, true, /* canAdvanceGCThreshold */
+		roachpb.GCHint{}, time.Hour, /* txnCleanupThreshold */
+	)
 	if fmt.Sprintf("%.2f", r.FinalScore) != fmt.Sprintf("%.2f", prio) || b != r.ShouldQueue {
 		cws.t.Errorf("expected queued=%t (is %t), prio=%.2f, got %.2f: after=%s, ttl=%s:\nms: %+v\nscore: %s",
 			b, r.ShouldQueue, prio, r.FinalScore, after, ttl, ms, r)
@@ -356,6 +385,7 @@ func (cws *cachedWriteSimulator) shouldQueue(
 func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	storage.DisableMetamorphicSimpleValueEncoding(t)
 
 	cws := newCachedWriteSimulator(t)
 
@@ -366,6 +396,7 @@ func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 	}
 
 	minuteTTL, hourTTL := time.Minute, time.Hour
+	const never = time.Duration(0)
 
 	{
 		// Hammer a key with 1MB blobs for a (simulated) minute. Logically, at
@@ -380,32 +411,39 @@ func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 		//
 		// Since at the time of this check the data is already 30s old on
 		// average (i.e. ~30x the TTL), we expect to *really* want GC.
-		cws.shouldQueue(true, 28.94, time.Duration(0), 0, ms)
-		cws.shouldQueue(true, 28.94, time.Duration(0), 0, ms)
+		cws.shouldQueue(true, 28.94, time.Duration(0), 0, ms, never)
+		cws.shouldQueue(true, 28.94, time.Duration(0), 0, ms, never)
 
 		// Right after we finished writing, we don't want to GC yet with a one-minute TTL.
-		cws.shouldQueue(false, 0.48, time.Duration(0), minuteTTL, ms)
+		cws.shouldQueue(false, 0.48, time.Duration(0), minuteTTL, ms, never)
 
-		// Neither after a minute. The first values are about to become GC'able, though.
-		cws.shouldQueue(false, 1.46, time.Minute, minuteTTL, ms)
+		// After a minute score is already above minimum threshold and some data is
+		// GC able so it triggers shouldQueue if there were no GC runs recently
+		// enough, but not queueable if GC run recently.
+		cws.shouldQueue(true, 1.46, time.Minute, minuteTTL, ms, never)
+		cws.shouldQueue(false, 1.46, time.Minute, minuteTTL, ms, 30*time.Second)
 		// 90 seconds in it's really close, but still just shy of GC. Half of the
 		// values could be deleted now (remember that we wrote them over a one
 		// minute period).
-		cws.shouldQueue(false, 1.95, 3*time.Minute/2, minuteTTL, ms)
+		// We are close to high threshold, so cooldown time shrunk to just under 6
+		// minutes.
+		cws.shouldQueue(true, 1.95, 3*time.Minute/2, minuteTTL, ms, 6*time.Minute)
+		cws.shouldQueue(false, 1.95, 3*time.Minute/2, minuteTTL, ms, 5*time.Minute)
 		// Advancing another 1/4 minute does the trick.
-		cws.shouldQueue(true, 2.20, 7*time.Minute/4, minuteTTL, ms)
+		cws.shouldQueue(true, 2.20, 7*time.Minute/4, minuteTTL, ms, never)
 		// After an hour, that's (of course) still true with a very high priority.
-		cws.shouldQueue(true, 59.34, time.Hour, minuteTTL, ms)
+		cws.shouldQueue(true, 59.34, time.Hour, minuteTTL, ms, never)
 
 		// Let's see what the same would look like with a 1h TTL.
 		// Can't delete anything until 59min have passed, and indeed the score is low.
-		cws.shouldQueue(false, 0.01, time.Duration(0), hourTTL, ms)
-		cws.shouldQueue(false, 0.02, time.Minute, hourTTL, ms)
-		cws.shouldQueue(false, 0.99, time.Hour, hourTTL, ms)
+		cws.shouldQueue(false, 0.01, time.Duration(0), hourTTL, ms, never)
+		cws.shouldQueue(false, 0.02, time.Minute, hourTTL, ms, never)
+		cws.shouldQueue(false, 0.99, time.Hour, hourTTL, ms, never)
 		// After 90 minutes, we're getting closer. After just over two hours,
 		// definitely ripe for GC (and this would delete all the values).
-		cws.shouldQueue(false, 1.48, 90*time.Minute, hourTTL, ms)
-		cws.shouldQueue(true, 2.05, 125*time.Minute, hourTTL, ms)
+		cws.shouldQueue(true, 1.48, 90*time.Minute, hourTTL, ms, never)
+		cws.shouldQueue(false, 1.48, 90*time.Minute, hourTTL, ms, 5*time.Minute)
+		cws.shouldQueue(true, 2.05, 125*time.Minute, hourTTL, ms, never)
 	}
 
 	{
@@ -415,7 +453,7 @@ func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 		cws.multiKey(999, valSize, nil /* no txn */, &ms)
 
 		// GC shouldn't move at all, even after a long time and short TTL.
-		cws.shouldQueue(false, 0, 24*time.Hour, minuteTTL, ms)
+		cws.shouldQueue(false, 0, 24*time.Hour, minuteTTL, ms, never)
 
 		// Write a single key twice.
 		cws.singleKeySteady(2, 0, valSize, &ms)
@@ -426,24 +464,25 @@ func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 
 		// If the fact that 99.9% of the replica is live were not taken into
 		// account, this would get us at least close to GC.
-		cws.shouldQueue(false, 0.00, 5*time.Minute, minuteTTL, ms)
+		cws.shouldQueue(false, 0.00, 5*time.Minute, minuteTTL, ms, never)
 
 		// 12 hours in the score becomes relevant, but not yet large enough.
 		// The key is of course GC'able and has been for a long time, but
 		// to find it we'd have to scan all the other kv pairs as well.
-		cws.shouldQueue(false, 0.71, 12*time.Hour, minuteTTL, ms)
+		cws.shouldQueue(false, 0.71, 12*time.Hour, minuteTTL, ms, never)
 
 		// Two days in we're more than ready to go, would queue for GC, and
 		// delete.
-		cws.shouldQueue(true, 2.85, 48*time.Hour, minuteTTL, ms)
+		cws.shouldQueue(true, 2.85, 48*time.Hour, minuteTTL, ms, never)
 	}
 
 	{
 		irrelevantTTL := 24 * time.Hour * 365
 		ms, valSize := initialMS(), 1<<10
+		mc := timeutil.NewManualTime(timeutil.Unix(0, ms.LastUpdateNanos))
 		txn := newTransaction(
 			"txn", roachpb.Key("key"), roachpb.NormalUserPriority,
-			hlc.NewClock(func() int64 { return ms.LastUpdateNanos }, time.Millisecond))
+			hlc.NewClockForTesting(mc))
 
 		// Write 1000 distinct 1kb intents at the initial timestamp. This means that
 		// the average intent age is just the time elapsed from now, and this is roughly
@@ -451,9 +490,169 @@ func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 		// doesn't matter. In reality, the value-based GC score will often strike first.
 		cws.multiKey(100, valSize, txn, &ms)
 
-		cws.shouldQueue(false, 0.12, 1*time.Hour, irrelevantTTL, ms)
-		cws.shouldQueue(false, 0.87, 7*time.Hour, irrelevantTTL, ms)
-		cws.shouldQueue(true, 1.12, 9*time.Hour, irrelevantTTL, ms)
+		cws.shouldQueue(false, 0.12, 1*time.Hour, irrelevantTTL, ms, never)
+		cws.shouldQueue(false, 0.87, 7*time.Hour, irrelevantTTL, ms, never)
+		cws.shouldQueue(true, 1.12, 9*time.Hour, irrelevantTTL, ms, never)
+		// Check if cooldown policy protects us from too frequent runs based on
+		// intents alone.
+		cws.shouldQueue(false, 1.12, 9*time.Hour, irrelevantTTL, ms, time.Hour)
+	}
+}
+
+// TestFullRangeDeleteHeuristic verifies that deleting all data with range
+// tombstone will lower time threshold needed to enable GC of data.
+func TestFullRangeDeleteHeuristic(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	eng := storage.NewDefaultInMemForTesting()
+	defer eng.Close()
+
+	rng, _ := randutil.NewTestRand()
+	localMax, maxKey := keys.LocalMax, keys.MaxKey
+
+	var keys []roachpb.Key
+	fillDataForStats := func(rw storage.ReadWriter, keyCount, valCount int) (enginepb.MVCCStats, hlc.Timestamp) {
+		for i := 0; i < keyCount; i++ {
+			stringKey := randutil.RandString(rng, 20, randutil.PrintableKeyAlphabet)
+			keys = append(keys, roachpb.Key(stringKey))
+		}
+		var ms enginepb.MVCCStats
+		for i := 1; i < valCount; i++ {
+			key := keys[rng.Intn(keyCount)]
+			var value roachpb.Value
+			if rng.Float32() > 0.5 {
+				value.SetBytes(make([]byte, 20))
+			}
+			require.NoError(t, storage.MVCCPut(ctx, rw, &ms, key,
+				hlc.Timestamp{WallTime: time.Millisecond.Nanoseconds() * int64(i)}, hlc.ClockTimestamp{},
+				value, nil))
+		}
+		return ms, hlc.Timestamp{WallTime: time.Millisecond.Nanoseconds() * int64(valCount)}
+	}
+
+	deleteWithTombstone := func(rw storage.ReadWriter, delTime hlc.Timestamp, ms *enginepb.MVCCStats) {
+		require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(
+			ctx, rw, ms, localMax, maxKey, delTime, hlc.ClockTimestamp{}, nil, nil, false, 1, nil))
+	}
+	deleteWithPoints := func(rw storage.ReadWriter, delTime hlc.Timestamp, ms *enginepb.MVCCStats) {
+		for _, key := range keys {
+			require.NoError(t, storage.MVCCPut(ctx, rw, ms, key, delTime, hlc.ClockTimestamp{}, roachpb.Value{}, nil))
+		}
+	}
+
+	ms, deletionTime := fillDataForStats(eng, 100, 10000)
+
+	shouldQueueAfter := func(ms enginepb.MVCCStats, delay time.Duration, gcTTL time.Duration) bool {
+		now := deletionTime.Add(delay.Nanoseconds(), 0)
+		r := makeMVCCGCQueueScoreImpl(ctx, 0 /* seed */, now, ms, gcTTL, now.Add(-time.Hour.Nanoseconds(), 0), true,
+			roachpb.GCHint{}, time.Hour)
+		return r.ShouldQueue
+	}
+
+	rangeMs := ms
+	pointMs := ms
+	withBatch(eng, func(b storage.Batch) { deleteWithTombstone(b, deletionTime, &rangeMs) })
+	withBatch(eng, func(b storage.Batch) { deleteWithPoints(b, deletionTime, &pointMs) })
+
+	gcTTL := time.Minute * 30
+	for _, d := range []struct {
+		delayMin           int
+		pointDel, rangeDel bool
+	}{
+		{delayMin: 20, pointDel: false, rangeDel: false},
+		{delayMin: 30, pointDel: false, rangeDel: true},
+		{delayMin: 61, pointDel: true, rangeDel: true},
+	} {
+		t.Run(fmt.Sprintf("delay=%d", d.delayMin), func(t *testing.T) {
+			delay := time.Minute * time.Duration(d.delayMin)
+			dr := shouldQueueAfter(rangeMs, delay, gcTTL)
+			dp := shouldQueueAfter(pointMs, delay, gcTTL)
+			fmt.Printf("Delay min: %f, Queue del points: %t Queue del range: %t\n", delay.Minutes(), dp,
+				dr)
+			require.Equal(t, d.pointDel, dp, "expect enqueue metric for point deletion")
+			require.Equal(t, d.rangeDel, dr, "expect enqueue metric for range deletion")
+		})
+	}
+}
+
+func withBatch(eng storage.Engine, fn func(b storage.Batch)) {
+	b := eng.NewBatch()
+	defer b.Close()
+	fn(b)
+}
+
+func TestGCScoreWithHint(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	now := hlc.Timestamp{WallTime: time.Hour.Nanoseconds()}
+	ttl := time.Minute
+
+	for _, d := range []struct {
+		name string
+
+		rangeKeys int
+		liveData  int
+		garbage   int
+		estimates int
+		hintTs    hlc.Timestamp
+
+		shouldGC bool
+		priority float64
+	}{
+		{
+			name:      "hint_not_reached",
+			liveData:  0,
+			garbage:   1000,
+			rangeKeys: 1,
+			hintTs:    now.Add(-ttl.Nanoseconds()+1000, 0),
+			shouldGC:  true,
+			priority:  60.441670451764324,
+		},
+		{
+			name:      "hint_reached",
+			liveData:  0,
+			garbage:   100,
+			rangeKeys: 1,
+			hintTs:    now.Add(-ttl.Nanoseconds()-1, 0),
+			shouldGC:  true,
+			priority:  deleteRangePriority,
+		},
+		{
+			name:      "hint_with_estimates",
+			estimates: 1,
+			hintTs:    now.Add(-ttl.Nanoseconds()-1, 0),
+			shouldGC:  true,
+			priority:  deleteRangePriority,
+		},
+		{
+			name:     "hint_with_live_data",
+			liveData: 1000,
+			garbage:  10,
+			hintTs:   now.Add(-ttl.Nanoseconds()-1, 0),
+			shouldGC: false,
+		},
+	} {
+		t.Run(d.name, func(t *testing.T) {
+			ms := enginepb.MVCCStats{
+				KeyCount:          int64(d.liveData + d.garbage),
+				KeyBytes:          int64((d.liveData + d.garbage) * 10),
+				RangeKeyCount:     int64(d.rangeKeys),
+				RangeKeyBytes:     int64(d.rangeKeys * 20),
+				LiveCount:         int64(d.liveData),
+				LiveBytes:         int64(d.liveData * 10),
+				ContainsEstimates: int64(d.estimates),
+				GCBytesAge:        int64((d.garbage + d.rangeKeys*2) * 10 * 100),
+			}
+			score := makeMVCCGCQueueScoreImpl(ctx, 1, now, ms, time.Minute, hlc.Timestamp{}, true,
+				roachpb.GCHint{LatestRangeDeleteTimestamp: d.hintTs}, time.Hour)
+			require.Equal(t, d.shouldGC, score.ShouldQueue)
+			if d.shouldGC {
+				require.Equal(t, d.priority, score.FinalScore)
+			}
+		})
 	}
 }
 
@@ -462,6 +661,7 @@ func TestMVCCGCQueueMakeGCScoreRealistic(t *testing.T) {
 func TestMVCCGCQueueProcess(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	storage.DisableMetamorphicSimpleValueEncoding(t)
 	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
@@ -469,8 +669,9 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 	tc.Start(ctx, t, stopper)
 
 	const intentAgeThreshold = 2 * time.Hour
+	const txnCleanupThreshold = time.Hour
 
-	tc.manualClock.Increment(48 * 60 * 60 * 1e9) // 2d past the epoch
+	tc.manualClock.Advance(48 * 60 * 60 * 1e9) // 2d past the epoch
 	now := tc.Clock().Now().WallTime
 
 	ts1 := makeTS(now-2*24*60*60*1e9+1, 0)                     // 2d old (add one nanosecond so we're not using zero timestamp)
@@ -496,55 +697,99 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 	key9 := mkKey("i")
 	key10 := mkKey("j")
 	key11 := mkKey("k")
+	key12 := mkKey("l")
+	key13 := mkKey("m")
+	key14 := mkKey("n")
+	key15 := mkKey("o")
 
-	data := []struct {
-		key roachpb.Key
-		ts  hlc.Timestamp
-		del bool
-		txn bool
-	}{
-		// For key1, we expect first value to GC.
-		{key1, ts1, false, false},
-		{key1, ts2, false, false},
-		{key1, ts5, false, false},
-		// For key2, we expect values to GC, even though most recent is deletion.
-		{key2, ts1, false, false},
-		{key2, ts2m1, false, false}, // use a value < the GC time to verify it's kept
-		{key2, ts5, true, false},
-		// For key3, we expect just ts1 to GC, because most recent deletion is intent.
-		{key3, ts1, false, false},
-		{key3, ts2, false, false},
-		{key3, ts5, true, true},
-		// For key4, expect oldest value to GC.
-		{key4, ts1, false, false},
-		{key4, ts2, false, false},
-		// For key5, expect all values to GC (most recent value deleted).
-		{key5, ts1, false, false},
-		{key5, ts2, true, false}, // deleted, so GC
-		// For key6, expect no values to GC because most recent value is intent.
-		{key6, ts1, false, false},
-		{key6, ts5, false, true},
-		// For key7, expect no values to GC because intent is exactly 2h old.
-		{key7, ts2, false, false},
-		{key7, ts4, false, true},
-		// For key8, expect most recent value to resolve by aborting, which will clean it up.
-		{key8, ts2, false, false},
-		{key8, ts3, true, true},
-		// For key9, resolve naked intent with no remaining values.
-		{key9, ts3, false, true},
-		// For key10, GC ts1 because it's a delete but not ts3 because it's above the threshold.
-		{key10, ts1, true, false},
-		{key10, ts3, true, false},
-		{key10, ts4, false, false},
-		{key10, ts5, false, false},
-		// For key11, we can't GC anything because ts1 isn't a delete.
-		{key11, ts1, false, false},
-		{key11, ts3, true, false},
-		{key11, ts4, true, false},
-		{key11, ts5, true, false},
+	type kvData struct {
+		key    roachpb.Key
+		endKey roachpb.Key
+		ts     hlc.Timestamp
+		del    bool
+		txn    bool
 	}
 
+	mkVal := func(key roachpb.Key, ts hlc.Timestamp) kvData {
+		return kvData{key: key, ts: ts}
+	}
+	mkDel := func(key roachpb.Key, ts hlc.Timestamp) kvData {
+		return kvData{key: key, ts: ts, del: true}
+	}
+	mkTxn := func(data kvData) kvData {
+		data.txn = true
+		return data
+	}
+	mkRng := func(key, endKey roachpb.Key, ts hlc.Timestamp) kvData {
+		return kvData{key: key, endKey: endKey, ts: ts, del: true}
+	}
+
+	data := []kvData{
+		// For key1, we expect first value to GC.
+		mkVal(key1, ts1),
+		mkVal(key1, ts2),
+		mkVal(key1, ts5),
+		// For key2, we expect values to GC, even though most recent is deletion.
+		mkVal(key2, ts1),
+		mkVal(key2, ts2m1), // use a value < the GC time to verify it's kept
+		mkDel(key2, ts5),
+		// For key3, we expect just ts1 to GC, because most recent deletion is intent.
+		mkVal(key3, ts1),
+		mkVal(key3, ts2),
+		mkTxn(mkDel(key3, ts5)),
+		// For key4, expect oldest value to GC.
+		mkVal(key4, ts1),
+		mkVal(key4, ts2),
+		// For key5, expect all values to GC (most recent value deleted).
+		mkVal(key5, ts1),
+		mkDel(key5, ts2), // deleted, so GC
+		// For key6, expect no values to GC because most recent value is intent.
+		mkVal(key6, ts1),
+		mkTxn(mkVal(key6, ts5)),
+		// For key7, expect no values to GC because intent is exactly 2h old.
+		mkVal(key7, ts2),
+		mkTxn(mkVal(key7, ts4)),
+		// For key8, expect most recent value to resolve by aborting, which will clean it up.
+		mkVal(key8, ts2),
+		mkTxn(mkDel(key8, ts3)),
+		// For key9, resolve naked intent with no remaining values.
+		mkTxn(mkVal(key9, ts3)),
+		// For key10, GC ts1 because it's a delete but not ts3 because it's above the threshold.
+		mkDel(key10, ts1),
+		mkDel(key10, ts3),
+		mkVal(key10, ts4),
+		mkVal(key10, ts5),
+		// For key11, we can't GC anything because ts1 isn't a delete.
+		mkVal(key11, ts1),
+		mkDel(key11, ts3),
+		mkDel(key11, ts4),
+		mkDel(key11, ts5),
+		// key12 has its older version covered by range tombstone and should be GCd
+		mkVal(key12, ts1),
+		mkVal(key12, ts5),
+		// key13 has all versions covered by range tombstone
+		mkVal(key13, ts1),
+		// This is old range tombstone below gc threshold
+		mkRng(key12, key14, ts2),
+		// This is newer range tombstone above gc threshold
+		mkRng(key13, key15, ts3),
+	}
+
+	sort.Slice(data, func(i, j int) bool {
+		return data[i].ts.Less(data[j].ts)
+	})
+
 	for i, datum := range data {
+		if len(datum.endKey) > 0 {
+			drArgs := deleteRangeArgs(datum.key, datum.endKey)
+			drArgs.UseRangeTombstone = true
+			if _, err := tc.SendWrappedWith(kvpb.Header{
+				Timestamp: datum.ts,
+			}, &drArgs); err != nil {
+				t.Fatalf("%d: could not delete data: %+v", i, err)
+			}
+			continue
+		}
 		if datum.del {
 			dArgs := deleteArgs(datum.key)
 			var txn *roachpb.Transaction
@@ -556,53 +801,65 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 				txn.MinTimestamp = datum.ts
 				assignSeqNumsForReqs(txn, &dArgs)
 			}
-			if _, err := tc.SendWrappedWith(roachpb.Header{
+			if _, err := tc.SendWrappedWith(kvpb.Header{
 				Timestamp: datum.ts,
 				Txn:       txn,
 			}, &dArgs); err != nil {
 				t.Fatalf("%d: could not delete data: %+v", i, err)
 			}
-		} else {
-			pArgs := putArgs(datum.key, []byte("value"))
-			var txn *roachpb.Transaction
-			if datum.txn {
-				txn = newTransaction("test", datum.key, 1, tc.Clock())
-				// Overwrite the timestamps set by newTransaction().
-				txn.ReadTimestamp = datum.ts
-				txn.WriteTimestamp = datum.ts
-				txn.MinTimestamp = datum.ts
-				assignSeqNumsForReqs(txn, &pArgs)
-			}
-			if _, err := tc.SendWrappedWith(roachpb.Header{
-				Timestamp: datum.ts,
-				Txn:       txn,
-			}, &pArgs); err != nil {
-				t.Fatalf("%d: could not put data: %+v", i, err)
-			}
+			continue
+		}
+		pArgs := putArgs(datum.key, []byte("value"))
+		var txn *roachpb.Transaction
+		if datum.txn {
+			txn = newTransaction("test", datum.key, 1, tc.Clock())
+			// Overwrite the timestamps set by newTransaction().
+			txn.ReadTimestamp = datum.ts
+			txn.WriteTimestamp = datum.ts
+			txn.MinTimestamp = datum.ts
+			assignSeqNumsForReqs(txn, &pArgs)
+		}
+		if _, err := tc.SendWrappedWith(kvpb.Header{
+			Timestamp: datum.ts,
+			Txn:       txn,
+		}, &pArgs); err != nil {
+			t.Fatalf("%d: could not put data: %+v", i, err)
 		}
 	}
 
-	cfg := tc.gossip.DeprecatedGetSystemConfig()
-	if cfg == nil {
-		t.Fatal("config not set")
+	cfg, err := tc.store.GetConfReader(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// The total size of the GC'able versions of the keys and values in Info.
-	// Key size: len(scratch+"a") + MVCCVersionTimestampSize (13 bytes) = 15 bytes.
-	// Value size: len("value") + headerSize (5 bytes) = 10 bytes.
-	// key1 at ts1  (15 bytes) => "value" (10 bytes)
-	// key2 at ts1  (15 bytes) => "value" (10 bytes)
-	// key3 at ts1  (15 bytes) => "value" (10 bytes)
-	// key4 at ts1  (15 bytes) => "value" (10 bytes)
-	// key5 at ts1  (15 bytes) => "value" (10 bytes)
-	// key5 at ts2  (15 bytes) => delete (0 bytes)
-	// key10 at ts1 (15 bytes) => delete (0 bytes)
-	var expectedVersionsKeyBytes int64 = 7 * 15
-	var expectedVersionsValBytes int64 = 5 * 10
+	// TODO: following computations should take care of new local timestamp
+	// for tombstones as they can be non-zero in size.
+	var (
+		// The total size of the GC'able versions of the keys and values in Info.
+		// Key size: len(scratch+"a") + 1 + MVCCVersionTimestampSize (12 bytes) = 15 bytes.
+		// Value size: len("value") + headerSize (5 bytes) = 10 bytes.
+		// key1 at ts1  (15 bytes) => "value" (10 bytes)
+		// key2 at ts1  (15 bytes) => "value" (10 bytes)
+		// key3 at ts1  (15 bytes) => "value" (10 bytes)
+		// key4 at ts1  (15 bytes) => "value" (10 bytes)
+		// key5 at ts1  (15 bytes) => "value" (10 bytes)
+		// key5 at ts2  (15 bytes) => delete (0 bytes)
+		// key10 at ts1 (15 bytes) => delete (0 bytes)
+		// key12 at ts1 (15 bytes) => "value" (10 bytes)
+		// key13 at ts1 (15 bytes) => "value" (10 bytes)
+		expectedVersionsKeyBytes int64 = 9 * 15
+		expectedVersionsValBytes int64 = 7 * 10
+		// Range Key size: len(scratch + "x") * 2 + timestamp (12)
+		// Range Value size: 0 for deletion
+		// key13, key14 at ts1 (12) => delete (0 bytes)
+		// key14, key15 at ts1 (16) => delete (0 bytes)
+		expectedVersionsRangeKeyBytes int64 = 12 + 16
+		expectedVersionsRangeValBytes int64 = 0
+	)
 
 	// Call Run with dummy functions to get current Info.
 	gcInfo, err := func() (gc.Info, error) {
-		snap := tc.repl.store.Engine().NewSnapshot()
+		snap := tc.repl.store.TODOEngine().NewSnapshot()
 		desc := tc.repl.Desc()
 		defer snap.Close()
 
@@ -613,7 +870,10 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 
 		now := tc.Clock().Now()
 		newThreshold := gc.CalculateThreshold(now, conf.TTL())
-		return gc.Run(ctx, desc, snap, now, newThreshold, gc.RunOptions{IntentAgeThreshold: intentAgeThreshold},
+		return gc.Run(ctx, desc, snap, now, newThreshold, gc.RunOptions{
+			IntentAgeThreshold:  intentAgeThreshold,
+			TxnCleanupThreshold: txnCleanupThreshold,
+		},
 			conf.TTL(), gc.NoopGCer{},
 			func(ctx context.Context, intents []roachpb.Intent) error {
 				return nil
@@ -626,10 +886,20 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	if gcInfo.AffectedVersionsKeyBytes != expectedVersionsKeyBytes {
-		t.Errorf("expected total keys size: %d bytes; got %d bytes", expectedVersionsKeyBytes, gcInfo.AffectedVersionsKeyBytes)
+		t.Errorf("expected total keys size: %d bytes; got %d bytes", expectedVersionsKeyBytes,
+			gcInfo.AffectedVersionsKeyBytes)
 	}
 	if gcInfo.AffectedVersionsValBytes != expectedVersionsValBytes {
-		t.Errorf("expected total values size: %d bytes; got %d bytes", expectedVersionsValBytes, gcInfo.AffectedVersionsValBytes)
+		t.Errorf("expected total values size: %d bytes; got %d bytes", expectedVersionsValBytes,
+			gcInfo.AffectedVersionsValBytes)
+	}
+	if gcInfo.AffectedVersionsRangeKeyBytes != expectedVersionsRangeKeyBytes {
+		t.Errorf("expected total range key size: %d bytes; got %d bytes", expectedVersionsRangeKeyBytes,
+			gcInfo.AffectedVersionsRangeKeyBytes)
+	}
+	if gcInfo.AffectedVersionsRangeValBytes != expectedVersionsRangeValBytes {
+		t.Errorf("expected total range value size: %d bytes; got %d bytes", expectedVersionsRangeValBytes,
+			gcInfo.AffectedVersionsRangeValBytes)
 	}
 
 	// Process through a scan queue.
@@ -666,12 +936,13 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 		{key11, ts4},
 		{key11, ts3},
 		{key11, ts1},
+		{key12, ts5},
 	}
 	// Read data directly from engine to avoid intent errors from MVCC.
 	// However, because the GC processing pushes transactions and
 	// resolves intents asynchronously, we use a SucceedsSoon loop.
 	testutils.SucceedsSoon(t, func() error {
-		kvs, err := storage.Scan(tc.store.Engine(), key1, keys.MaxKey, 0)
+		kvs, err := storage.Scan(tc.store.TODOEngine(), key1, keys.MaxKey, 0)
 		if err != nil {
 			return err
 		}
@@ -690,6 +961,7 @@ func TestMVCCGCQueueProcess(t *testing.T) {
 			}
 			log.VEventf(ctx, 2, "%d: %s", i, kv.Key)
 		}
+		t.Log("success")
 		return nil
 	})
 }
@@ -699,17 +971,17 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	manual := hlc.NewManualClock(123)
-	tsc := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
-	manual.Set(3 * 24 * time.Hour.Nanoseconds())
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	tsc := TestStoreConfig(hlc.NewClockForTesting(manual))
+	manual.MustAdvanceTo(timeutil.Unix(0, 3*24*time.Hour.Nanoseconds()))
 
-	testTime := manual.UnixNano() + 2*time.Hour.Nanoseconds()
-	gcExpiration := testTime - kvserverbase.TxnCleanupThreshold.Nanoseconds()
+	testTime := manual.Now().Add(2 * time.Hour)
+	gcExpiration := testTime.Add(-gc.TxnCleanupThreshold.Default())
 
 	type spec struct {
 		status      roachpb.TransactionStatus
-		orig        int64
-		hb          int64                     // last heartbeat (none if Timestamp{})
+		orig        time.Time
+		hb          time.Time                 // last heartbeat (zero if Timestamp{})
 		newStatus   roachpb.TransactionStatus // -1 for GCed
 		failResolve bool                      // do we want to fail resolves in this trial?
 		expResolve  bool                      // expect attempt at removing txn-persisted intents?
@@ -722,15 +994,15 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 		// Too young, should not touch.
 		"a": {
 			status:    roachpb.PENDING,
-			orig:      gcExpiration + 1,
+			orig:      gcExpiration.Add(1),
 			newStatus: roachpb.PENDING,
 		},
 		// Old and pending, but still heartbeat (so no Push attempted; it
 		// would not succeed).
 		"b": {
 			status:    roachpb.PENDING,
-			orig:      1, // immaterial
-			hb:        gcExpiration + 1,
+			orig:      timeutil.Unix(0, 1), // immaterial
+			hb:        gcExpiration.Add(1),
 			newStatus: roachpb.PENDING,
 		},
 		// Old, pending, and abandoned. Should push and abort it
@@ -738,7 +1010,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 		// AbortSpan is also cleaned up.
 		"c": {
 			status:     roachpb.PENDING,
-			orig:       gcExpiration - 1,
+			orig:       gcExpiration.Add(-1),
 			newStatus:  -1,
 			expResolve: true,
 			expAbortGC: true,
@@ -746,15 +1018,15 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 		// Staging and fresh, so no action.
 		"d": {
 			status:    roachpb.STAGING,
-			orig:      gcExpiration + 1,
+			orig:      gcExpiration.Add(1),
 			newStatus: roachpb.STAGING,
 		},
 		// Old and staging, but still heartbeat (so no Push attempted; it
 		// would not succeed).
 		"e": {
 			status:    roachpb.STAGING,
-			orig:      1, // immaterial
-			hb:        gcExpiration + 1,
+			orig:      timeutil.Unix(0, 1), // immaterial
+			hb:        gcExpiration.Add(1),
 			newStatus: roachpb.STAGING,
 		},
 		// Old, staging, and abandoned. Should push it and hit an indeterminate
@@ -762,7 +1034,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 		// along with resolving the intent.
 		"f": {
 			status:     roachpb.STAGING,
-			orig:       gcExpiration - 1,
+			orig:       gcExpiration.Add(-1),
 			newStatus:  -1,
 			expResolve: true,
 			expAbortGC: true,
@@ -770,7 +1042,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 		// Old and aborted, should delete.
 		"g": {
 			status:     roachpb.ABORTED,
-			orig:       gcExpiration - 1,
+			orig:       gcExpiration.Add(-1),
 			newStatus:  -1,
 			expResolve: true,
 			expAbortGC: true,
@@ -778,14 +1050,14 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 		// Committed and fresh, so no action.
 		"h": {
 			status:    roachpb.COMMITTED,
-			orig:      gcExpiration + 1,
+			orig:      gcExpiration.Add(1),
 			newStatus: roachpb.COMMITTED,
 		},
 		// Committed and old. It has an intent (like all tests here), which is
 		// resolvable and hence we can GC.
 		"i": {
 			status:     roachpb.COMMITTED,
-			orig:       gcExpiration - 1,
+			orig:       gcExpiration.Add(-1),
 			newStatus:  -1,
 			expResolve: true,
 			expAbortGC: true,
@@ -794,7 +1066,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 		// resolution here will fail and consequently no GC is expected.
 		"j": {
 			status:      roachpb.COMMITTED,
-			orig:        gcExpiration - 1,
+			orig:        gcExpiration.Add(-1),
 			newStatus:   roachpb.COMMITTED,
 			failResolve: true,
 			expResolve:  true,
@@ -809,8 +1081,8 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	// intent resolution.
 	tsc.TestingKnobs.IntentResolverKnobs.MaxIntentResolutionBatchSize = 1
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			if resArgs, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest); ok {
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			if resArgs, ok := filterArgs.Req.(*kvpb.ResolveIntentRequest); ok {
 				id := string(resArgs.IntentTxn.Key)
 				// Only count finalizing intent resolution attempts in `resolved`.
 				if resArgs.Status != roachpb.PENDING {
@@ -828,7 +1100,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 				// We've special cased one test case. Note that the intent is still
 				// counted in `resolved`.
 				if testCases[id].failResolve {
-					return roachpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
+					return kvpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
 				}
 			}
 			return nil
@@ -837,7 +1109,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
-	manual.Set(testTime)
+	manual.MustAdvanceTo(testTime)
 
 	outsideKey := tc.repl.Desc().EndKey.Next().AsRawKey()
 	testIntents := []roachpb.Span{{Key: roachpb.Key("intent")}}
@@ -845,17 +1117,17 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	txns := map[string]roachpb.Transaction{}
 	for strKey, test := range testCases {
 		baseKey := roachpb.Key(strKey)
-		txnClock := hlc.NewClock(hlc.NewManualClock(test.orig).UnixNano, time.Nanosecond)
+		txnClock := hlc.NewClockForTesting(timeutil.NewManualTime(test.orig))
 		txn := newTransaction("txn1", baseKey, 1, txnClock)
 		txn.Status = test.status
 		txn.LockSpans = testIntents
-		if test.hb > 0 {
-			txn.LastHeartbeat = hlc.Timestamp{WallTime: test.hb}
+		if !test.hb.IsZero() {
+			txn.LastHeartbeat = hlc.Timestamp{WallTime: test.hb.UnixNano()}
 		}
 		txns[strKey] = *txn
 		for _, addrKey := range []roachpb.Key{baseKey, outsideKey} {
 			key := keys.TransactionKey(addrKey, txn.ID)
-			if err := storage.MVCCPutProto(ctx, tc.engine, nil, key, hlc.Timestamp{}, nil, txn); err != nil {
+			if err := storage.MVCCPutProto(ctx, tc.engine, nil, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, txn); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -867,9 +1139,9 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 
 	// Run GC.
 	mgcq := newMVCCGCQueue(tc.store)
-	cfg := tc.gossip.DeprecatedGetSystemConfig()
-	if cfg == nil {
-		t.Fatal("config not set")
+	cfg, err := tc.store.GetConfReader(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	processed, err := mgcq.process(ctx, tc.repl, cfg)
@@ -901,7 +1173,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 				if !sp.status.IsFinalized() {
 					tombstoneTimestamp, _ := tc.store.tsCache.GetMax(
 						txnTombstoneTSCacheKey, nil /* end */)
-					if min := (hlc.Timestamp{WallTime: sp.orig}); tombstoneTimestamp.Less(min) {
+					if min := (hlc.Timestamp{WallTime: sp.orig.UnixNano()}); tombstoneTimestamp.Less(min) {
 						return fmt.Errorf("%s: expected tscache entry for tombstone key to be >= %s, "+
 							"but found %s", strKey, min, tombstoneTimestamp)
 					}
@@ -922,7 +1194,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 				return fmt.Errorf("%s: unexpected intent resolutions:\nexpected: %s\nobserved: %s", strKey, expIntents, spans)
 			}
 			entry := &roachpb.AbortSpanEntry{}
-			abortExists, err := tc.repl.abortSpan.Get(ctx, tc.store.Engine(), txns[strKey].ID, entry)
+			abortExists, err := tc.repl.abortSpan.Get(ctx, tc.store.TODOEngine(), txns[strKey].ID, entry)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -936,7 +1208,7 @@ func TestMVCCGCQueueTransactionTable(t *testing.T) {
 	outsideTxnPrefix := keys.TransactionKey(outsideKey, uuid.UUID{})
 	outsideTxnPrefixEnd := keys.TransactionKey(outsideKey.Next(), uuid.UUID{})
 	var count int
-	if _, err := storage.MVCCIterate(ctx, tc.store.Engine(), outsideTxnPrefix, outsideTxnPrefixEnd, hlc.Timestamp{},
+	if _, err := storage.MVCCIterate(ctx, tc.store.TODOEngine(), outsideTxnPrefix, outsideTxnPrefixEnd, hlc.Timestamp{},
 		storage.MVCCScanOptions{}, func(roachpb.KeyValue) error {
 			count++
 			return nil
@@ -968,7 +1240,7 @@ func TestMVCCGCQueueIntentResolution(t *testing.T) {
 	defer stopper.Stop(ctx)
 	tc.Start(ctx, t, stopper)
 
-	tc.manualClock.Set(48 * 60 * 60 * 1e9) // 2d past the epoch
+	tc.manualClock.MustAdvanceTo(timeutil.Unix(48*60*60, 0)) // 2d past the epoch
 	now := tc.Clock().Now().WallTime
 
 	txns := []*roachpb.Transaction{
@@ -992,7 +1264,7 @@ func TestMVCCGCQueueIntentResolution(t *testing.T) {
 		for j := 0; j < 5; j++ {
 			pArgs := putArgs(roachpb.Key(fmt.Sprintf("%d-%d", i, j)), []byte("value"))
 			assignSeqNumsForReqs(txns[i], &pArgs)
-			if _, err := tc.SendWrappedWith(roachpb.Header{
+			if _, err := tc.SendWrappedWith(kvpb.Header{
 				Txn: txns[i],
 			}, &pArgs); err != nil {
 				t.Fatalf("%d: could not put data: %+v", i, err)
@@ -1019,17 +1291,19 @@ func TestMVCCGCQueueIntentResolution(t *testing.T) {
 		meta := &enginepb.MVCCMetadata{}
 		// The range is specified using only global keys, since the implementation
 		// may use an intentInterleavingIter.
-		return tc.store.Engine().MVCCIterate(keys.LocalMax, roachpb.KeyMax, storage.MVCCKeyAndIntentsIterKind, func(kv storage.MVCCKeyValue) error {
-			if !kv.Key.IsValue() {
-				if err := protoutil.Unmarshal(kv.Value, meta); err != nil {
-					return err
+		return tc.store.TODOEngine().MVCCIterate(
+			keys.LocalMax, roachpb.KeyMax, storage.MVCCKeyAndIntentsIterKind, storage.IterKeyTypePointsOnly,
+			func(kv storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+				if !kv.Key.IsValue() {
+					if err := protoutil.Unmarshal(kv.Value, meta); err != nil {
+						return err
+					}
+					if meta.Txn != nil {
+						return errors.Errorf("non-nil Txn after GC for key %s", kv.Key)
+					}
 				}
-				if meta.Txn != nil {
-					return errors.Errorf("non-nil Txn after GC for key %s", kv.Key)
-				}
-			}
-			return nil
-		})
+				return nil
+			})
 	})
 }
 
@@ -1057,7 +1331,7 @@ func TestMVCCGCQueueLastProcessedTimestamps(t *testing.T) {
 
 	ts := tc.Clock().Now()
 	for _, lpv := range lastProcessedVals {
-		if err := storage.MVCCPutProto(ctx, tc.engine, nil, lpv.key, hlc.Timestamp{}, nil, &ts); err != nil {
+		if err := storage.MVCCPutProto(ctx, tc.engine, nil, lpv.key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &ts); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1100,11 +1374,11 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 	ctx := context.Background()
 
 	var gcRequests int32
-	manual := hlc.NewManualClock(123)
-	tsc := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	tsc := TestStoreConfig(hlc.NewClockForTesting(manual))
 	tsc.TestingKnobs.EvalKnobs.TestingEvalFilter =
-		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-			if _, ok := filterArgs.Req.(*roachpb.GCRequest); ok {
+		func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+			if _, ok := filterArgs.Req.(*kvpb.GCRequest); ok {
 				atomic.AddInt32(&gcRequests, 1)
 				return nil
 			}
@@ -1127,7 +1401,7 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 	fmtStr := fmt.Sprintf("%%0%dd", keySize)
 
 	// First write 2 * gcKeyVersionChunkBytes different keys (each with two versions).
-	ba1, ba2 := roachpb.BatchRequest{}, roachpb.BatchRequest{}
+	ba1, ba2 := &kvpb.BatchRequest{}, &kvpb.BatchRequest{}
 	for i := 0; i < 2*keyCount; i++ {
 		// Create keys which are
 		key := roachpb.Key(fmt.Sprintf(fmtStr, i))
@@ -1136,11 +1410,11 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 		pArgs = putArgs(key, []byte("value2"))
 		ba2.Add(&pArgs)
 	}
-	ba1.Header = roachpb.Header{Timestamp: tc.Clock().Now()}
+	ba1.Header = kvpb.Header{Timestamp: tc.Clock().Now()}
 	if _, pErr := tc.Sender().Send(ctx, ba1); pErr != nil {
 		t.Fatal(pErr)
 	}
-	ba2.Header = roachpb.Header{Timestamp: tc.Clock().Now()}
+	ba2.Header = kvpb.Header{Timestamp: tc.Clock().Now()}
 	if _, pErr := tc.Sender().Send(ctx, ba2); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1150,7 +1424,7 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 	key1 := roachpb.Key(fmt.Sprintf(fmtStr, 2*keyCount))
 	key2 := roachpb.Key(fmt.Sprintf(fmtStr, 2*keyCount+1))
 	for i := 0; i < 2*keyCount+1; i++ {
-		ba := roachpb.BatchRequest{}
+		ba := &kvpb.BatchRequest{}
 		// Only write keyCount+1 versions of key1.
 		if i < keyCount+1 {
 			pArgs1 := putArgs(key1, []byte(fmt.Sprintf("value%04d", i)))
@@ -1160,7 +1434,7 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 		// tackle key2 in two separate batches.
 		pArgs2 := putArgs(key2, []byte(fmt.Sprintf("value%04d", i)))
 		ba.Add(&pArgs2)
-		ba.Header = roachpb.Header{Timestamp: tc.Clock().Now()}
+		ba.Header = kvpb.Header{Timestamp: tc.Clock().Now()}
 		if _, pErr := tc.Sender().Send(ctx, ba); pErr != nil {
 			t.Fatal(pErr)
 		}
@@ -1175,7 +1449,7 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("could not find span config for range %s", err)
 	}
-	tc.manualClock.Increment(conf.TTL().Nanoseconds() + 1)
+	tc.manualClock.Advance(conf.TTL() + 1)
 	mgcq := newMVCCGCQueue(tc.store)
 	processed, err := mgcq.process(ctx, tc.repl, confReader)
 	if err != nil {
@@ -1190,4 +1464,77 @@ func TestMVCCGCQueueChunkRequests(t *testing.T) {
 	if a, e := atomic.LoadInt32(&gcRequests), int32(6); a != e {
 		t.Errorf("expected %d gc requests; got %d", e, a)
 	}
+}
+
+func TestMVCCGCQueueGroupsRangeDeletions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	key := func(k string) roachpb.RKey {
+		return testutils.MakeKey(keys.ScratchRangeMin, []byte(k))
+	}
+
+	var leaseError = true
+
+	// Create store and prepare by removing default range.
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	cfg := TestStoreConfig(hlc.NewClockForTesting(clock))
+	cfg.TestingKnobs.MVCCGCQueueLeaseCheckInterceptor = func(ctx context.Context, replica *Replica, now hlc.ClockTimestamp,
+	) bool {
+		return leaseError
+	}
+	store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{createSystemRanges: false}, &cfg)
+	r, err := store.GetReplica(roachpb.RangeID(1))
+	require.NoError(t, err)
+	require.NoError(t, store.RemoveReplica(ctx, r, r.Desc().NextReplicaID, RemoveOptions{DestroyData: true}))
+	// Add replica without hint.
+	r1 := createReplica(store, roachpb.RangeID(100), key("a"), key("b"))
+	require.NoError(t, store.AddReplica(r1))
+	// Add replica with hint and GC ttl.
+	r2 := createReplica(store, roachpb.RangeID(101), key("b"), key("c"))
+	require.NoError(t, store.AddReplica(r2))
+	r2.RaftStatus()
+	r2.handleGCHintResult(ctx, &roachpb.GCHint{LatestRangeDeleteTimestamp: hlc.Timestamp{WallTime: 1}})
+	r2.SetSpanConfig(roachpb.SpanConfig{GCPolicy: roachpb.GCPolicy{TTLSeconds: 100}})
+
+	gcQueue := newMVCCGCQueue(store)
+
+	// Check that low priority replicas doesn't cause hint scan.
+	gcQueue.postProcessScheduled(ctx, r1, 1)
+	qr, _ := gcQueue.pop()
+	require.Nil(t, qr, "unexpected enqueued replica")
+
+	// Check that high priority replica is not added if GC hint time didn't exceed
+	// ttl.
+	gcQueue.postProcessScheduled(ctx, r1, deleteRangePriority)
+	qr, _ = gcQueue.pop()
+	require.Nil(t, qr, "unexpected enqueued replica")
+
+	// Check that replica is not queued if sequence of hi-pri replicas are being
+	// processed.
+	clock.Advance(200 * time.Second)
+	gcQueue.postProcessScheduled(ctx, r1, deleteRangePriority)
+	qr, _ = gcQueue.pop()
+	require.Nil(t, qr, "unexpected enqueued replica")
+
+	// Reset sequence by running a lo pri replica.
+	gcQueue.postProcessScheduled(ctx, r1, 1)
+	qr, _ = gcQueue.pop()
+	require.Nil(t, qr, "unexpected enqueued replica")
+
+	// Check that replica is processed when hint criteria is met.
+	gcQueue.postProcessScheduled(ctx, r1, deleteRangePriority)
+	qr, prio := gcQueue.pop()
+	require.NotNil(t, qr, "unexpected nil replica")
+	require.Equal(t, deleteRangePriority, prio, "expected high priority")
+
+	// Check that non leaseholder replicas are ignored.
+	leaseError = false
+	gcQueue.postProcessScheduled(ctx, r1, deleteRangePriority)
+	qr, _ = gcQueue.pop()
+	require.Nil(t, qr, "unexpected nil replica")
 }

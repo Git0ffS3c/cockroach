@@ -1,3 +1,16 @@
+# HEY! DON'T edit this file unless you really want to change a configuration for
+# everyone building cockroach ever.
+# This file is checked into tree and is not auto-generated.
+# If you are following directions from `dev doctor`, you probably want to put
+# your configurations in ~/.bazelrc or .bazelrc.user instead.
+# Configurations in ~/.bazelrc apply to all Bazel builds across all projects on
+# your machine. Configurations in .bazelrc.user apply only to builds in this
+# workspace. Take a closer look to see which one `dev doctor` is talking about.
+# Note that .bazelrc.user should be in your checkout (next to this file), not
+# your home directory.
+
+build --enable_platform_specific_config
+
 # Define a set up flag aliases, so people can use `--cross` instead of the
 # longer `//build/toolchains:cross_flag`.
 build --flag_alias=crdb_test=//build/toolchains:crdb_test_flag
@@ -25,26 +38,31 @@ build --define gotags=bazel,gss
 build --experimental_proto_descriptor_sets_include_source_info
 build --incompatible_strict_action_env --incompatible_enable_cc_toolchain_resolution
 build --symlink_prefix=_bazel/
+common --experimental_allow_tags_propagation
 test --config=test --experimental_ui_max_stdouterr_bytes=10485760
 build --ui_event_filters=-DEBUG
 query --ui_event_filters=-DEBUG
 clean --ui_event_filters=-WARNING
 info --ui_event_filters=-WARNING
 
-build:race --@io_bazel_rules_go//go/config:race --test_env=GORACE=halt_on_error=1 --test_sharding_strategy=disabled
+build:race --@io_bazel_rules_go//go/config:race "--test_env=GORACE=halt_on_error=1 log_path=stdout" --test_sharding_strategy=disabled
 test:test --test_env=TZ=
+# Note: these timeout values are used indirectly in `build/teamcity/cockroach/ci/tests/testrace_impl.sh`.
+# If those values are updated, the script should be updated accordingly.
 test:race --test_timeout=1200,6000,18000,72000
 
-# CI should always run with `--config=ci`.
-build:ci --experimental_convenience_symlinks=ignore
+# CI should always run with `--config=ci` or `--config=cinolint`.
+# Prefer the first to the second unless some other job will handle linting the
+# same code you're building.
+build:ci --config=cinolint
 build:ci --lintonbuild
 # Set `-test.v` in Go tests.
 # Ref: https://github.com/bazelbuild/rules_go/pull/2456
-test:ci --test_env=GO_TEST_WRAP_TESTV=1
+test:cinolint --test_env=GO_TEST_WRAP_TESTV=1
 # Dump all output for failed tests to the build log.
-test:ci --test_output=errors
+test:cinolint --test_output=errors
 # Put all tmp artifacts in /artifacts/tmp.
-test:ci --test_tmpdir=/artifacts/tmp
+build:cinolint --test_tmpdir=/artifacts/tmp
 
 build:cross --stamp
 
@@ -58,6 +76,11 @@ build:crosslinux '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-p
 build:crosslinux --config=crosslinuxbase
 build:crosslinuxbase --platforms=//build/toolchains:cross_linux
 build:crosslinuxbase --config=cross
+build:crosslinuxfips '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-pc-linux-gnu'
+build:crosslinuxfips --config=crosslinuxfipsbase
+build:crosslinuxfipsbase --platforms=//build/toolchains:cross_linux
+build:crosslinuxfipsbase --config=cross
+build:crosslinuxfipsbase --@io_bazel_rules_go//go/toolchain:sdk_version=1.19.5fips
 build:crosswindows '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-w64-mingw32'
 build:crosswindows --config=crosswindowsbase
 build:crosswindowsbase --platforms=//build/toolchains:cross_windows
@@ -79,13 +102,16 @@ build:crosslinuxs390x --config=crosslinuxs390xbase
 build:crosslinuxs390xbase --platforms=//build/toolchains:cross_linux_s390x
 build:crosslinuxs390xbase --config=cross
 
-# Developer configurations. Add e.g. --config=devdarwinx86_64 to turn these on.
-# NB: This is consumed in `BUILD` files (see build/toolchains/BUILD.bazel).
-build:devdarwinx86_64 --platforms=//build/toolchains:darwin_x86_64
+# devdarwinx86_64 is a legacy setting that implies `--config=dev`.
 build:devdarwinx86_64 --config=dev
-build:dev --stamp --workspace_status_command=./build/bazelutil/stamp.sh
-build:dev --action_env=PATH
-build:dev --host_action_env=PATH
+build:macos --action_env=PATH=/opt/homebrew/bin:/opt/local/bin:/usr/local/bin:/usr/bin:/bin
+build:macos --host_action_env=PATH=/opt/homebrew/bin:/opt/local/bin:/usr/local/bin:/usr/bin:/bin
+
+# --config=simplestamp configures the build to stamp the build with inferred
+# information about the configuration.
+# All `dev` builds will use this configuration; all `cross` builds will use a
+# more precise --workspace_status_command option.
+build:simplestamp --stamp --workspace_status_command=./build/bazelutil/stamp.sh
 
 try-import %workspace%/.bazelrc.user
 

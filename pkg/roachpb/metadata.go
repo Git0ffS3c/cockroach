@@ -11,12 +11,12 @@
 package roachpb
 
 import (
-	"bytes"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -36,6 +36,13 @@ func (n NodeID) String() string {
 
 // SafeValue implements the redact.SafeValue interface.
 func (n NodeID) SafeValue() {}
+
+// NodeIDSlice implements sort.Interface.
+type NodeIDSlice []NodeID
+
+func (s NodeIDSlice) Len() int           { return len(s) }
+func (s NodeIDSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s NodeIDSlice) Less(i, j int) bool { return s[i] < s[j] }
 
 // StoreID is a custom type for a cockroach store ID.
 type StoreID int32
@@ -144,44 +151,6 @@ func NewRangeDescriptor(rangeID RangeID, start, end RKey, replicas ReplicaSet) *
 	return desc
 }
 
-// Equal compares two descriptors for equality. This was copied over from the
-// gogoproto generated version in order to ignore deprecated fields.
-func (r *RangeDescriptor) Equal(other *RangeDescriptor) bool {
-	if other == nil {
-		return r == nil
-	}
-	if r == nil {
-		return false
-	}
-	if r.RangeID != other.RangeID {
-		return false
-	}
-	if r.Generation != other.Generation {
-		return false
-	}
-	if !bytes.Equal(r.StartKey, other.StartKey) {
-		return false
-	}
-	if !bytes.Equal(r.EndKey, other.EndKey) {
-		return false
-	}
-	if len(r.InternalReplicas) != len(other.InternalReplicas) {
-		return false
-	}
-	for i := range r.InternalReplicas {
-		if !r.InternalReplicas[i].Equal(&other.InternalReplicas[i]) {
-			return false
-		}
-	}
-	if r.NextReplicaID != other.NextReplicaID {
-		return false
-	}
-	if !r.StickyBit.Equal(other.StickyBit) {
-		return false
-	}
-	return true
-}
-
 // GetRangeID returns the RangeDescriptor's ID.
 // The method implements the batcheval.ImmutableRangeState interface.
 func (r *RangeDescriptor) GetRangeID() RangeID {
@@ -200,23 +169,11 @@ func (r *RangeDescriptor) RSpan() RSpan {
 }
 
 // KeySpan returns the keys covered by this range. Local keys are not included.
+// This is identical to RSpan(), but for r1 the StartKey is forwarded to LocalMax.
 //
-// TODO(andrei): Consider if this logic should be lifted to
-// RangeDescriptor.RSpan(). Or better yet, see if we can changes things such
-// that the first range starts at LocalMax instead at starting at an empty key.
+// See: https://github.com/cockroachdb/cockroach/issues/95055
 func (r *RangeDescriptor) KeySpan() RSpan {
-	start := r.StartKey
-	if r.StartKey.Equal(RKeyMin) {
-		// The first range in the keyspace is declared to start at KeyMin (the
-		// lowest possible key). That is a lie, however, since the local key space
-		// ([LocalMin,LocalMax)) doesn't belong to this range; it doesn't belong to
-		// any range in particular.
-		start = RKey(LocalMax)
-	}
-	return RSpan{
-		Key:    start,
-		EndKey: r.EndKey,
-	}
+	return r.RSpan().KeySpan()
 }
 
 // ContainsKey returns whether this RangeDescriptor contains the specified key.
@@ -258,13 +215,8 @@ func (r *RangeDescriptor) SetReplicaType(
 	for i := range r.InternalReplicas {
 		desc := &r.InternalReplicas[i]
 		if desc.StoreID == storeID && desc.NodeID == nodeID {
-			prevTyp := desc.GetType()
-			if typ != VOTER_FULL {
-				desc.Type = &typ
-			} else {
-				// For 19.1 compatibility.
-				desc.Type = nil
-			}
+			prevTyp := desc.Type
+			desc.Type = typ
 			return *desc, prevTyp, true
 		}
 	}
@@ -276,16 +228,11 @@ func (r *RangeDescriptor) SetReplicaType(
 func (r *RangeDescriptor) AddReplica(
 	nodeID NodeID, storeID StoreID, typ ReplicaType,
 ) ReplicaDescriptor {
-	var typPtr *ReplicaType
-	// For 19.1 compatibility, use nil instead of VOTER_FULL.
-	if typ != VOTER_FULL {
-		typPtr = &typ
-	}
 	toAdd := ReplicaDescriptor{
 		NodeID:    nodeID,
 		StoreID:   storeID,
 		ReplicaID: r.NextReplicaID,
-		Type:      typPtr,
+		Type:      typ,
 	}
 	rs := r.Replicas()
 	rs.AddReplica(toAdd)
@@ -316,25 +263,10 @@ func (r *RangeDescriptor) GetReplicaDescriptor(storeID StoreID) (ReplicaDescript
 	return ReplicaDescriptor{}, false
 }
 
-// GetReplicaDescriptorByID returns the replica which matches the specified store
-// ID.
+// GetReplicaDescriptorByID returns the replica which matches the specified
+// replica ID.
 func (r *RangeDescriptor) GetReplicaDescriptorByID(replicaID ReplicaID) (ReplicaDescriptor, bool) {
-	for _, repDesc := range r.Replicas().Descriptors() {
-		if repDesc.ReplicaID == replicaID {
-			return repDesc, true
-		}
-	}
-	return ReplicaDescriptor{}, false
-}
-
-// ContainsVoterIncoming returns true if the descriptor contains a VOTER_INCOMING replica.
-func (r *RangeDescriptor) ContainsVoterIncoming() bool {
-	for _, repDesc := range r.Replicas().Descriptors() {
-		if repDesc.GetType() == VOTER_INCOMING {
-			return true
-		}
-	}
-	return false
+	return r.Replicas().GetReplicaDescriptorByID(replicaID)
 }
 
 // IsInitialized returns false if this descriptor represents an
@@ -348,14 +280,6 @@ func (r *RangeDescriptor) IsInitialized() bool {
 // This method mutates the receiver; do not call it with shared RangeDescriptors.
 func (r *RangeDescriptor) IncrementGeneration() {
 	r.Generation++
-}
-
-// GetStickyBit returns the sticky bit of this RangeDescriptor.
-func (r *RangeDescriptor) GetStickyBit() hlc.Timestamp {
-	if r.StickyBit == nil {
-		return hlc.Timestamp{}
-	}
-	return *r.StickyBit
 }
 
 // Validate performs some basic validation of the contents of a range descriptor.
@@ -412,8 +336,8 @@ func (r RangeDescriptor) SafeFormat(w redact.SafePrinter, _ rune) {
 		w.SafeString("<no replicas>")
 	}
 	w.Printf(", next=%d, gen=%d", r.NextReplicaID, r.Generation)
-	if s := r.GetStickyBit(); !s.IsEmpty() {
-		w.Printf(", sticky=%s", s)
+	if !r.StickyBit.IsEmpty() {
+		w.Printf(", sticky=%s", r.StickyBit)
 	}
 	w.SafeString("]")
 }
@@ -431,6 +355,12 @@ func (r ReplicaDescriptor) String() string {
 	return redact.StringWithoutMarkers(r)
 }
 
+// IsSame returns true if the two replica descriptors refer to the same replica,
+// ignoring the replica type.
+func (r ReplicaDescriptor) IsSame(o ReplicaDescriptor) bool {
+	return r.NodeID == o.NodeID && r.StoreID == o.StoreID && r.ReplicaID == o.ReplicaID
+}
+
 // SafeFormat implements the redact.SafeFormatter interface.
 func (r ReplicaDescriptor) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("(n%d,s%d):", r.NodeID, r.StoreID)
@@ -439,8 +369,8 @@ func (r ReplicaDescriptor) SafeFormat(w redact.SafePrinter, _ rune) {
 	} else {
 		w.Print(r.ReplicaID)
 	}
-	if typ := r.GetType(); typ != VOTER_FULL {
-		w.Print(typ)
+	if r.Type != VOTER_FULL {
+		w.Print(r.Type)
 	}
 }
 
@@ -458,23 +388,26 @@ func (r ReplicaDescriptor) Validate() error {
 	return nil
 }
 
-// GetType returns the type of this ReplicaDescriptor.
-func (r ReplicaDescriptor) GetType() ReplicaType {
-	if r.Type == nil {
-		return VOTER_FULL
-	}
-	return *r.Type
-}
-
 // SafeValue implements the redact.SafeValue interface.
 func (r ReplicaType) SafeValue() {}
+
+// GetReplicaDescriptorByID returns the replica which matches the specified
+// replica ID.
+func (r ReplicaSet) GetReplicaDescriptorByID(id ReplicaID) (repDesc ReplicaDescriptor, found bool) {
+	for i := range r.wrapped {
+		if r.wrapped[i].ReplicaID == id {
+			return r.wrapped[i], true
+		}
+	}
+	return ReplicaDescriptor{}, false
+}
 
 // IsVoterOldConfig returns true if the replica is a voter in the outgoing
 // config (or, simply is a voter if the range is not in a joint-config state).
 // Can be used as a filter for
 // ReplicaDescriptors.Filter(ReplicaDescriptor.IsVoterOldConfig).
 func (r ReplicaDescriptor) IsVoterOldConfig() bool {
-	switch r.GetType() {
+	switch r.Type {
 	case VOTER_FULL, VOTER_OUTGOING, VOTER_DEMOTING_NON_VOTER, VOTER_DEMOTING_LEARNER:
 		return true
 	default:
@@ -487,7 +420,7 @@ func (r ReplicaDescriptor) IsVoterOldConfig() bool {
 // Can be used as a filter for
 // ReplicaDescriptors.Filter(ReplicaDescriptor.IsVoterOldConfig).
 func (r ReplicaDescriptor) IsVoterNewConfig() bool {
-	switch r.GetType() {
+	switch r.Type {
 	case VOTER_FULL, VOTER_INCOMING:
 		return true
 	default:
@@ -499,8 +432,19 @@ func (r ReplicaDescriptor) IsVoterNewConfig() bool {
 // config (pre-reconfiguration) or the incoming config. Can be used as a filter
 // for ReplicaDescriptors.Filter(ReplicaDescriptor.IsVoterOldConfig).
 func (r ReplicaDescriptor) IsAnyVoter() bool {
-	switch r.GetType() {
+	switch r.Type {
 	case VOTER_FULL, VOTER_INCOMING, VOTER_OUTGOING, VOTER_DEMOTING_NON_VOTER, VOTER_DEMOTING_LEARNER:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsNonVoter returns true if the replica is a non-voter. Can be used as a
+// filter for ReplicaDescriptors.Filter.
+func (r ReplicaDescriptor) IsNonVoter() bool {
+	switch r.Type {
+	case NON_VOTER:
 		return true
 	default:
 		return false
@@ -571,11 +515,11 @@ func (sc StoreCapacity) String() string {
 func (sc StoreCapacity) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("disk (capacity=%s, available=%s, used=%s, logicalBytes=%s), "+
 		"ranges=%d, leases=%d, queries=%.2f, writes=%.2f, "+
-		"l0Sublevels=%d, bytesPerReplica={%s}, writesPerReplica={%s}",
+		"ioThreshold={%v} bytesPerReplica={%s}, writesPerReplica={%s}",
 		humanizeutil.IBytes(sc.Capacity), humanizeutil.IBytes(sc.Available),
 		humanizeutil.IBytes(sc.Used), humanizeutil.IBytes(sc.LogicalBytes),
 		sc.RangeCount, sc.LeaseCount, sc.QueriesPerSecond, sc.WritesPerSecond,
-		sc.L0Sublevels, sc.BytesPerReplica, sc.WritesPerReplica)
+		sc.IOThreshold, sc.BytesPerReplica, sc.WritesPerReplica)
 }
 
 // FractionUsed computes the fraction of storage capacity that is in use.
@@ -596,24 +540,23 @@ func (sc StoreCapacity) FractionUsed() float64 {
 	return float64(sc.Used) / float64(sc.Available+sc.Used)
 }
 
+// Load returns an allocator load representation of the store capacity.
+func (sc StoreCapacity) Load() load.Load {
+	dims := load.Vector{}
+	dims[load.Queries] = sc.QueriesPerSecond
+	dims[load.CPU] = sc.CPUPerSecond
+	return dims
+
+}
+
 // AddressForLocality returns the network address that nodes in the specified
 // locality should use when connecting to the node described by the descriptor.
 func (n *NodeDescriptor) AddressForLocality(loc Locality) *util.UnresolvedAddr {
-	// If the provided locality has any tiers that are an exact exact match (key
+	// If the provided locality has any tiers that are an exact match (key
 	// and value) with a tier in the node descriptor's custom LocalityAddress
 	// list, return the corresponding address. Otherwise, return the default
 	// address.
-	//
-	// O(n^2), but we expect very few locality tiers in practice.
-	for i := range n.LocalityAddress {
-		nLoc := &n.LocalityAddress[i]
-		for _, loc := range loc.Tiers {
-			if loc == nLoc.LocalityTier {
-				return &nLoc.Address
-			}
-		}
-	}
-	return &n.Address
+	return loc.LookupAddress(n.LocalityAddress, &n.Address)
 }
 
 // CheckedSQLAddress returns the value of SQLAddress if set. If not, either
@@ -652,6 +595,39 @@ func (l Locality) String() string {
 	return strings.Join(tiers, ",")
 }
 
+// Empty returns true if the tiers are empty.
+func (l Locality) Empty() bool {
+	return len(l.Tiers) == 0
+}
+
+// NonEmpty returns true if the tiers are non-empty.
+func (l Locality) NonEmpty() bool {
+	return len(l.Tiers) > 0
+}
+
+// Matches checks if this locality has a tier with a matching value for each
+// tier of the passed filter, returning true if so or false if not along with
+// the first tier of the filters that did not matched.
+func (l Locality) Matches(filter Locality) (bool, Tier) {
+	for _, t := range filter.Tiers {
+		if v, ok := l.Find(t.Key); !ok || v != t.Value {
+			return false, t
+		}
+	}
+	return true, Tier{}
+}
+
+// SharedPrefix returns the number of this locality's tiers which match those of
+// the passed locality.
+func (l Locality) SharedPrefix(other Locality) int {
+	for i := range l.Tiers {
+		if i >= len(other.Tiers) || l.Tiers[i] != other.Tiers[i] {
+			return i
+		}
+	}
+	return len(l.Tiers)
+}
+
 // Type returns the underlying type in string form. This is part of pflag's
 // value interface.
 func (Locality) Type() string {
@@ -672,6 +648,23 @@ func (l Locality) Equals(r Locality) bool {
 		}
 	}
 	return true
+}
+
+// LookupAddress is given a set of LocalityAddresses and finds the one that
+// exactly matches my Locality. O(n^2), but we expect very few locality tiers in
+// practice.
+func (l Locality) LookupAddress(
+	address []LocalityAddress, base *util.UnresolvedAddr,
+) *util.UnresolvedAddr {
+	for i := range address {
+		nLoc := &address[i]
+		for _, loc := range l.Tiers {
+			if loc == nLoc.LocalityTier {
+				return &nLoc.Address
+			}
+		}
+	}
+	return base
 }
 
 // MaxDiversityScore is the largest possible diversity score, indicating that
@@ -736,6 +729,19 @@ func (l *Locality) Set(value string) error {
 	return nil
 }
 
+// CopyReplaceKeyValue makes a copy of this locality, replacing any tier in the
+// copy having the specified `key` with the new specified `value`.
+func (l *Locality) CopyReplaceKeyValue(key, value string) Locality {
+	tiers := make([]Tier, len(l.Tiers))
+	for i := range l.Tiers {
+		tiers[i] = l.Tiers[i]
+		if tiers[i].Key == key {
+			tiers[i].Value = value
+		}
+	}
+	return Locality{Tiers: tiers}
+}
+
 // Find searches the locality's tiers for the input key, returning its value if
 // present.
 func (l *Locality) Find(key string) (value string, ok bool) {
@@ -797,4 +803,41 @@ func (l Locality) AddTier(tier Tier) Locality {
 		return Locality{Tiers: tiers}
 	}
 	return Locality{Tiers: []Tier{tier}}
+}
+
+// IsEmpty returns true if hint contains no data.
+func (h *GCHint) IsEmpty() bool {
+	return h.LatestRangeDeleteTimestamp.IsEmpty()
+}
+
+// Merge combines GC hints of two ranges. The result is either a hint that
+// covers both ranges or empty hint if it is not possible to merge hints.
+// leftEmpty and rightEmpty arguments are set based on MVCCStats.HasNoUserData
+// of receiver hint (leftEmpty) and argument hint (rightEmpty).
+// Returns true if receiver state was changed.
+func (h *GCHint) Merge(rhs *GCHint, leftEmpty, rightEmpty bool) bool {
+	// If either side has data but no hint, merged range can't have a hint.
+	if (rhs.LatestRangeDeleteTimestamp.IsEmpty() && !rightEmpty) ||
+		(h.LatestRangeDeleteTimestamp.IsEmpty() && !leftEmpty) {
+		updated := h.LatestRangeDeleteTimestamp.IsSet()
+		h.LatestRangeDeleteTimestamp = hlc.Timestamp{}
+		return updated
+	}
+	// Otherwise, use the newest hint.
+	return h.ForwardLatestRangeDeleteTimestamp(rhs.LatestRangeDeleteTimestamp)
+}
+
+// ForwardLatestRangeDeleteTimestamp bumps LatestDeleteRangeTimestamp in GC hint
+// if it is greater than previously set.
+func (h *GCHint) ForwardLatestRangeDeleteTimestamp(ts hlc.Timestamp) bool {
+	if h.LatestRangeDeleteTimestamp.Less(ts) {
+		h.LatestRangeDeleteTimestamp = ts
+		return true
+	}
+	return false
+}
+
+// ResetLatestRangeDeleteTimestamp resets delete range timestamp.
+func (h *GCHint) ResetLatestRangeDeleteTimestamp() {
+	h.LatestRangeDeleteTimestamp = hlc.Timestamp{}
 }

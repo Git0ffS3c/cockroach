@@ -13,7 +13,6 @@ package importer
 import (
 	gosql "database/sql"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -24,7 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	_ "github.com/lib/pq"
@@ -70,7 +69,7 @@ var simplePostgresTestRows = func() []simpleTestRow {
 }()
 
 func getSimplePostgresDumpTestdata(t *testing.T) ([]simpleTestRow, string) {
-	dest := testutils.TestDataPath(t, "pgdump", "simple.sql")
+	dest := datapathutils.TestDataPath(t, "pgdump", "simple.sql")
 	if rewritePostgresTestData {
 		genSimplePostgresTestdata(t, func() { pgdump(t, dest, "simple") })
 	}
@@ -78,7 +77,7 @@ func getSimplePostgresDumpTestdata(t *testing.T) ([]simpleTestRow, string) {
 }
 
 func getSecondPostgresDumpTestdata(t *testing.T) (int, string) {
-	dest := testutils.TestDataPath(t, "pgdump", "second.sql")
+	dest := datapathutils.TestDataPath(t, "pgdump", "second.sql")
 	if rewritePostgresTestData {
 		genSecondPostgresTestdata(t, func() { pgdump(t, dest, "second") })
 	}
@@ -86,7 +85,7 @@ func getSecondPostgresDumpTestdata(t *testing.T) (int, string) {
 }
 
 func getMultiTablePostgresDumpTestdata(t *testing.T) string {
-	dest := testutils.TestDataPath(t, "pgdump", "db.sql")
+	dest := datapathutils.TestDataPath(t, "pgdump", "db.sql")
 	if rewritePostgresTestData {
 		genSequencePostgresTestdata(t, func() {
 			genSecondPostgresTestdata(t, func() {
@@ -122,12 +121,12 @@ func getPgCopyTestdata(t *testing.T) ([]simpleTestRow, []pgCopyDumpCfg) {
 	}
 
 	for i := range configs {
-		configs[i].filename = testutils.TestDataPath(t, `pgcopy`, configs[i].name, `test.txt`)
+		configs[i].filename = datapathutils.TestDataPath(t, `pgcopy`, configs[i].name, `test.txt`)
 	}
 
 	if rewritePostgresTestData {
 		genSimplePostgresTestdata(t, func() {
-			if err := os.RemoveAll(testutils.TestDataPath(t, `pgcopy`)); err != nil {
+			if err := os.RemoveAll(datapathutils.TestDataPath(t, `pgcopy`)); err != nil {
 				t.Fatal(err)
 			}
 			for _, cfg := range configs {
@@ -150,7 +149,7 @@ func getPgCopyTestdata(t *testing.T) ([]simpleTestRow, []pgCopyDumpCfg) {
 					`psql`, flags...,
 				).CombinedOutput(); err != nil {
 					t.Fatal(err, string(res))
-				} else if err := ioutil.WriteFile(cfg.filename, res, 0666); err != nil {
+				} else if err := os.WriteFile(cfg.filename, res, 0666); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -269,7 +268,7 @@ func pgdump(t *testing.T, dest string, tables ...string) {
 	if err != nil {
 		t.Fatalf("%s: %s", err, out)
 	}
-	if err := ioutil.WriteFile(dest, out, 0666); err != nil {
+	if err := os.WriteFile(dest, out, 0666); err != nil {
 		t.Fatal(err)
 	}
 }

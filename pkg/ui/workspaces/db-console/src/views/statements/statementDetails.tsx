@@ -18,45 +18,41 @@ import {
   refreshStatementDiagnosticsRequests,
   refreshStatementDetails,
   refreshUserSQLRoles,
+  refreshStatementFingerprintInsights,
 } from "src/redux/apiReducers";
 import { RouteComponentProps } from "react-router";
-import {
-  nodeDisplayNameByIDSelector,
-  nodeRegionsByIDSelector,
-} from "src/redux/nodes";
+import { nodeRegionsByIDSelector } from "src/redux/nodes";
 import { AdminUIState, AppDispatch } from "src/redux/state";
 import { selectDiagnosticsReportsByStatementFingerprint } from "src/redux/statements/statementsSelectors";
 import {
   StatementDetails,
   StatementDetailsDispatchProps,
   StatementDetailsStateProps,
-  TimeScale,
   toRoundedDateRange,
   util,
 } from "@cockroachlabs/cluster-ui";
 import {
   cancelStatementDiagnosticsReportAction,
   createStatementDiagnosticsReportAction,
-  setCombinedStatementsTimeScaleAction,
+  setGlobalTimeScaleAction,
 } from "src/redux/statements";
 import { createStatementDiagnosticsAlertLocalSetting } from "src/redux/alerts";
-import { statementsTimeScaleLocalSetting } from "src/redux/statementsTimeScale";
-import { selectHasViewActivityRedactedRole } from "src/redux/user";
+import {
+  selectHasAdminRole,
+  selectHasViewActivityRedactedRole,
+} from "src/redux/user";
 import {
   trackCancelDiagnosticsBundleAction,
   trackDownloadDiagnosticsBundleAction,
   trackStatementDetailsSubnavSelectionAction,
 } from "src/redux/analyticsActions";
-import * as protos from "src/js/protos";
 import { StatementDetailsResponseMessage } from "src/util/api";
 import { getMatchParamByName, queryByName } from "src/util/query";
 
 import { appNamesAttr, statementAttr } from "src/util/constants";
-import {
-  statementDetailsLatestQueryAction,
-  statementDetailsLatestFormattedQueryAction,
-} from "src/redux/sqlActivity";
-type IStatementDiagnosticsReport = protos.cockroach.server.serverpb.IStatementDiagnosticsReport;
+import { selectTimeScale } from "src/redux/timeScale";
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
+import moment from "moment";
 
 const { generateStmtDetailsToID } = util;
 
@@ -65,8 +61,7 @@ export const selectStatementDetails = createSelector(
     getMatchParamByName(props.match, statementAttr),
   (_state: AdminUIState, props: RouteComponentProps): string =>
     queryByName(props.location, appNamesAttr),
-  (state: AdminUIState): TimeScale =>
-    statementsTimeScaleLocalSetting.selector(state),
+  selectTimeScale,
   (state: AdminUIState) => state.cachedData.statementDetails,
   (
     fingerprintID,
@@ -76,6 +71,8 @@ export const selectStatementDetails = createSelector(
   ): {
     statementDetails: StatementDetailsResponseMessage;
     isLoading: boolean;
+    lastError: Error;
+    lastUpdated: moment.Moment | null;
   } => {
     // Since the aggregation interval is 1h, we want to round the selected timeScale to include
     // the full hour. If a timeScale is between 14:32 - 15:17 we want to search for values
@@ -93,9 +90,25 @@ export const selectStatementDetails = createSelector(
       return {
         statementDetails: statementDetailsStats[key].data,
         isLoading: statementDetailsStats[key].inFlight,
+        lastError: statementDetailsStats[key].lastError,
+        lastUpdated: statementDetailsStats[key]?.setAt?.utc(),
       };
     }
-    return { statementDetails: null, isLoading: true };
+    return {
+      statementDetails: null,
+      isLoading: true,
+      lastError: null,
+      lastUpdated: null,
+    };
+  },
+);
+
+const selectStatementFingerprintInsights = createSelector(
+  (state: AdminUIState) => state.cachedData.statementFingerprintInsights,
+  (_state: AdminUIState, props: RouteComponentProps): string =>
+    getMatchParamByName(props.match, statementAttr),
+  (cachedFingerprintInsights, fingerprintID) => {
+    return cachedFingerprintInsights[fingerprintID]?.data?.results;
   },
 );
 
@@ -103,23 +116,27 @@ const mapStateToProps = (
   state: AdminUIState,
   props: RouteComponentProps,
 ): StatementDetailsStateProps => {
-  const { statementDetails, isLoading } = selectStatementDetails(state, props);
+  const { statementDetails, isLoading, lastError, lastUpdated } =
+    selectStatementDetails(state, props);
+  const statementFingerprint = statementDetails?.statement.metadata.query;
   return {
     statementFingerprintID: getMatchParamByName(props.match, statementAttr),
     statementDetails,
     isLoading: isLoading,
-    latestQuery: state.sqlActivity.statementDetailsLatestQuery,
-    latestFormattedQuery:
-      state.sqlActivity.statementDetailsLatestFormattedQuery,
-    statementsError: state.cachedData.statements.lastError,
-    timeScale: statementsTimeScaleLocalSetting.selector(state),
-    nodeNames: nodeDisplayNameByIDSelector(state),
+    statementsError: lastError,
+    lastUpdated: lastUpdated,
+    timeScale: selectTimeScale(state),
     nodeRegions: nodeRegionsByIDSelector(state),
     diagnosticsReports: selectDiagnosticsReportsByStatementFingerprint(
       state,
-      state.sqlActivity.statementDetailsLatestQuery,
+      statementFingerprint,
     ),
     hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
+    hasAdminRole: selectHasAdminRole(state),
+    statementFingerprintInsights: selectStatementFingerprintInsights(
+      state,
+      props,
+    ),
   };
 };
 
@@ -128,23 +145,37 @@ const mapDispatchToProps: StatementDetailsDispatchProps = {
   refreshStatementDiagnosticsRequests,
   dismissStatementDiagnosticsAlertMessage: () =>
     createStatementDiagnosticsAlertLocalSetting.set({ show: false }),
-  createStatementDiagnosticsReport: createStatementDiagnosticsReportAction,
-  onTabChanged: trackStatementDetailsSubnavSelectionAction,
-  onTimeScaleChange: setCombinedStatementsTimeScaleAction,
-  onDiagnosticBundleDownload: trackDownloadDiagnosticsBundleAction,
-  onDiagnosticCancelRequest: (report: IStatementDiagnosticsReport) => {
+  createStatementDiagnosticsReport: (
+    insertStatementDiagnosticsRequest: clusterUiApi.InsertStmtDiagnosticRequest,
+  ) => {
     return (dispatch: AppDispatch) => {
-      dispatch(cancelStatementDiagnosticsReportAction(report.id));
+      dispatch(
+        createStatementDiagnosticsReportAction(
+          insertStatementDiagnosticsRequest,
+        ),
+      );
+    };
+  },
+  onTabChanged: trackStatementDetailsSubnavSelectionAction,
+  onTimeScaleChange: setGlobalTimeScaleAction,
+  onDiagnosticBundleDownload: trackDownloadDiagnosticsBundleAction,
+  onDiagnosticCancelRequest: (
+    report: clusterUiApi.StatementDiagnosticsReport,
+  ) => {
+    return (dispatch: AppDispatch) => {
+      dispatch(
+        cancelStatementDiagnosticsReportAction({ requestId: report.id }),
+      );
       dispatch(
         trackCancelDiagnosticsBundleAction(report.statement_fingerprint),
       );
     };
   },
-  onStatementDetailsQueryChange: statementDetailsLatestQueryAction,
-  onStatementDetailsFormattedQueryChange: statementDetailsLatestFormattedQueryAction,
   refreshNodes: refreshNodes,
   refreshNodesLiveness: refreshLiveness,
   refreshUserSQLRoles: refreshUserSQLRoles,
+  refreshStatementFingerprintInsights: (req: clusterUiApi.StmtInsightsReq) =>
+    refreshStatementFingerprintInsights(req),
 };
 
 export default withRouter(

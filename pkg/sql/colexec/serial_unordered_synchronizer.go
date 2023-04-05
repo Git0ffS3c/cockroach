@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
@@ -30,11 +31,23 @@ import (
 // we want to run it in the RootTxn.
 type SerialUnorderedSynchronizer struct {
 	colexecop.InitHelper
-	span *tracing.Span
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
+	span        *tracing.Span
 
 	inputs []colexecargs.OpWithMetaInfo
 	// curSerialInputIdx indicates the index of the current input being consumed.
 	curSerialInputIdx int
+
+	// serialInputIdxExclusiveUpperBound indicates the InputIdx to error out on
+	// should execution fail to halt prior to this input. This is only valid if
+	// non-zero.
+	serialInputIdxExclusiveUpperBound uint32
+
+	// exceedsInputIdxExclusiveUpperBoundError is the error to return when
+	// curSerialInputIdx has incremented to match
+	// serialInputIdxExclusiveUpperBound.
+	exceedsInputIdxExclusiveUpperBoundError error
 }
 
 var (
@@ -55,10 +68,18 @@ func (s *SerialUnorderedSynchronizer) Child(nth int, verbose bool) execopnode.Op
 
 // NewSerialUnorderedSynchronizer creates a new SerialUnorderedSynchronizer.
 func NewSerialUnorderedSynchronizer(
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	inputs []colexecargs.OpWithMetaInfo,
+	serialInputIdxExclusiveUpperBound uint32,
+	exceedsInputIdxExclusiveUpperBoundError error,
 ) *SerialUnorderedSynchronizer {
 	return &SerialUnorderedSynchronizer{
-		inputs: inputs,
+		flowCtx:                                 flowCtx,
+		processorID:                             processorID,
+		inputs:                                  inputs,
+		serialInputIdxExclusiveUpperBound:       serialInputIdxExclusiveUpperBound,
+		exceedsInputIdxExclusiveUpperBoundError: exceedsInputIdxExclusiveUpperBoundError,
 	}
 }
 
@@ -67,7 +88,7 @@ func (s *SerialUnorderedSynchronizer) Init(ctx context.Context) {
 	if !s.InitHelper.Init(ctx) {
 		return
 	}
-	s.Ctx, s.span = execinfra.ProcessorSpan(s.Ctx, "serial unordered sync")
+	s.Ctx, s.span = execinfra.ProcessorSpan(s.Ctx, s.flowCtx, "serial unordered sync", s.processorID)
 	for _, input := range s.inputs {
 		input.Root.Init(s.Ctx)
 	}
@@ -82,6 +103,9 @@ func (s *SerialUnorderedSynchronizer) Next() coldata.Batch {
 		b := s.inputs[s.curSerialInputIdx].Root.Next()
 		if b.Length() == 0 {
 			s.curSerialInputIdx++
+			if s.serialInputIdxExclusiveUpperBound > 0 && s.curSerialInputIdx >= int(s.serialInputIdxExclusiveUpperBound) {
+				colexecerror.ExpectedError(s.exceedsInputIdxExclusiveUpperBoundError)
+			}
 		} else {
 			return b
 		}
@@ -97,7 +121,7 @@ func (s *SerialUnorderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetadata
 				s.span.RecordStructured(stats.GetStats())
 			}
 		}
-		if meta := execinfra.GetTraceDataAsMetadata(s.span); meta != nil {
+		if meta := execinfra.GetTraceDataAsMetadata(s.flowCtx, s.span); meta != nil {
 			bufferedMeta = append(bufferedMeta, *meta)
 		}
 	}
@@ -109,18 +133,9 @@ func (s *SerialUnorderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetadata
 
 // Close is part of the colexecop.ClosableOperator interface.
 func (s *SerialUnorderedSynchronizer) Close(context.Context) error {
-	// Note that we're using the context of the synchronizer rather than the
-	// argument of Close() because the synchronizer derives its own tracing
-	// span.
-	ctx := s.EnsureCtx()
-	var lastErr error
-	for _, input := range s.inputs {
-		if err := input.ToClose.Close(ctx); err != nil {
-			lastErr = err
-		}
-	}
 	if s.span != nil {
 		s.span.Finish()
+		s.span = nil
 	}
-	return lastErr
+	return nil
 }

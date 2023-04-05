@@ -17,14 +17,14 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
 import "gogoproto/gogo.proto";
 import "roachpb/data.proto";
 import "sql/catalog/descpb/structured.proto";
 import "sql/catalog/descpb/join_type.proto";
 import "sql/catalog/descpb/locking.proto";
-import "sql/catalog/descpb/index_fetch.proto";
+import "sql/catalog/fetchpb/index_fetch.proto";
 import "sql/types/types.proto";
 import "sql/execinfrapb/data.proto";
 import "sql/execinfrapb/processors_base.proto";
@@ -388,6 +388,20 @@ message JoinReaderSpec {
   // Not used if there is a limit set in the PostProcessSpec of this processor
   // (that value will be used for sizing batches instead).
   optional int64 limit_hint = 21 [(gogoproto.nullable) = false];
+
+  // Indicates that for each input row, the join reader should return looked-up
+  // rows in sorted order. This is only applicable to lookup joins for which
+  // more than one lookup row may be associated with a given input row. It can
+  // only be set to true if maintain_ordering is also true.
+  // maintain_lookup_ordering can be used if the output needs to be ordered by
+  // a prefix of input columns followed by index (lookup) columns without
+  // requiring a (buffered) sort.
+  optional bool maintain_lookup_ordering = 22 [(gogoproto.nullable) = false];
+
+  // RemoteOnlyLookups is true when this join is defined with only lookups
+  // that read into remote regions, though the lookups are defined in
+  // LookupExpr, not RemoteLookupExpr.
+  optional bool remote_only_lookups = 23 [(gogoproto.nullable) = false];
 }
 
 // SorterSpec is the specification for a "sorting aggregator". A sorting
@@ -843,6 +857,7 @@ message AggregatorSpec {
     FINAL_COVAR_SAMP = 58;
     FINAL_CORR = 59;
     FINAL_SQRDIFF = 60;
+    ARRAY_CAT_AGG = 61;
   }
 
   enum Type {
@@ -914,6 +929,10 @@ message ProjectSetSpec {
 
   // The number of columns each expression returns. Same length as exprs.
   repeated uint32 num_cols_per_gen = 3;
+
+  // Column labels for the generated values. Needed for some builtin functions
+  // (like record_to_json) that require the column labels to do their jobs.
+  repeated string generated_column_labels = 4;
 }
 
 // WindowerSpec is the specification of a processor that performs computations
@@ -1028,4 +1047,58 @@ message WindowerSpec {
   repeated uint32 partitionBy = 1;
   // WindowFns is the specification of all window functions to be computed.
   repeated WindowFn windowFns = 2 [(gogoproto.nullable) = false];
+}
+
+// HashGroupJoinerSpec is the specification for a hash group-join processor. It
+// has two inputs and one output.
+//
+// The processor combines two operations (the hash join followed by the hash
+// aggregation) into one when the join's equality columns are exactly the same
+// as the aggregation's grouping columns. The hash join cannot have an ON
+// expression and the PostProcessSpec on top of the hash join is only allowed to
+// to have a projection set (meaning that rendering, limits, and offsets are
+// prohibited).
+//
+// The processor works by reading the entire right input and putting it in a
+// hash table. All rows in the hash table are split into buckets according to
+// the equality columns. Then it reads the data from the left input in a
+// streaming fashion and probes it against the hash table determining which
+// bucket (if any) each "joined" row belongs to and performs the aggregation
+// accordingly, without fully materializing the result of the join.
+//
+// At the moment, only INNER, LEFT_OUTER, RIGHT_OUTER, and FULL_OUTER joins are
+// supported with non-empty equality columns (i.e. no cross joins).
+// TODO(yuzefovich): support other join types.
+// TODO(yuzefovich): think through whether we can support cross joins. Probably
+// it will be more similar to merge group-join.
+// TODO(yuzefovich): consider implementing streaming merge group-join.
+//
+// There is no guarantee on the ordering of results.
+//
+// The "internal columns" of a HashGroupJoiner (see ProcessorSpec) are the same
+// as of its AggregatorSpec.
+message HashGroupJoinerSpec {
+  optional HashJoinerSpec hash_joiner_spec = 1 [(gogoproto.nullable) = false];
+
+  // The join output columns describe a projection on the internal set of
+  // columns of the hash joiner; only the columns in this list will be needed
+  // by the aggregator.
+  repeated uint32 join_output_columns = 2 [packed = true];
+
+  optional AggregatorSpec aggregator_spec = 3 [(gogoproto.nullable) = false];
+}
+
+// InsertSpec is a limited insert processor that can only handle vectorized 
+// batch inserts for rows affected insert queries (ie doesn't support returning
+// rows or inserts from select).
+message InsertSpec {
+  optional sqlbase.TableDescriptor table = 1 [(gogoproto.nullable) = false];
+  repeated uint32 column_ids = 2 [
+    (gogoproto.customname) = "ColumnIDs",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb.ColumnID"
+  ];
+  // The serialized bytes from intsets.Fast.Encode. 
+  optional bytes check_ords = 3;
+  // Whether the insert should be autocommitted.
+  optional bool auto_commit = 4 [(gogoproto.nullable) = false];
 }

@@ -10,7 +10,7 @@
 
 syntax = "proto3";
 package cockroach.sql.schemachanger.scpb;
-option go_package = "scpb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb";
 
 import "sql/schemachanger/scpb/elements.proto";
 import "gogoproto/gogo.proto";
@@ -26,29 +26,51 @@ message Target {
 enum Status {
   UNKNOWN = 0;
 
-  // Target states are ABSENT, PUBLIC or TRANSIENT.
+  // OFFLINE exists only as a part of decomposition to detect importing
+  // descriptors.
+  OFFLINE = 15;
+
+  // Target states are ABSENT, PUBLIC or TRANSIENT_ABSENT.
   // These are the desired final end states of a schema change.
-  //
   ABSENT = 1;
   PUBLIC = 2;
-  // TRANSIENT is like PUBLIC except the element is not expected to
-  // persist once the schema change involving it is complete.
-  TRANSIENT = 3;
+  // TRANSIENT_ABSENT is like ABSENT->TRANSIENT_ABSENT; the element is not
+  // persisted once the schema change involving it is complete.
+  TRANSIENT_ABSENT = 3;
 
   // Intermediate states on the descriptor dropping path.
-  TXN_DROPPED = 4;
   DROPPED = 5;
+  // TXN_DROPPED only exists to service the 22.2 rule set.
+  // Deprecated.
+  TXN_DROPPED = 4 [deprecated = true];
 
   // Intermediate states on the column and index dropping and adding paths.
+  // WRITE_ONLY is also used on constraint adding and dropping paths.
   WRITE_ONLY = 6;
   DELETE_ONLY = 7;
 
   // Intermediate states on the index dropping and adding paths.
+  // VALIDATED is also used on constraint adding and dropping paths.
   VALIDATED = 8;
   MERGED = 9;
   MERGE_ONLY = 10;
   BACKFILLED = 11;
   BACKFILL_ONLY = 12;
+
+  // Intermediate states on the transient index dropping path
+  TRANSIENT_DELETE_ONLY = 13;
+  TRANSIENT_WRITE_ONLY = 14;
+  TRANSIENT_BACKFILL_ONLY = 16;
+  TRANSIENT_BACKFILLED = 17;
+  TRANSIENT_MERGE_ONLY = 18;
+  TRANSIENT_MERGED = 19;
+  TRANSIENT_VALIDATED = 20;
+  TRANSIENT_PUBLIC = 21;
+  TRANSIENT_DROPPED = 22;
+
+  // When a basic descriptor (the object element) is first created before all
+  // the other dependent elements become public.
+  DESCRIPTOR_ADDED = 23;
 }
 
 // TargetMetadata refers to the metadata for individual elements, where
@@ -151,3 +173,21 @@ message DescriptorState {
   // Authorization is information about the creator of the schema change.
   Authorization authorization = 3 [(gogoproto.nullable) = false];
 }
+
+// CorpusState is used to serialize the current state object for the purpose,
+// of testing. See scpb.CurrentState for the object layout, this variant is
+// meant only for serialization in tests.
+message CorpusState {
+  string name = 1;
+  TargetState target_state = 2;
+  repeated Status status = 3;
+  bool revertible = 4;
+  bool in_rollback = 5;
+}
+
+// CorpusDisk is the disk format used for storing the declarative schema changer
+// corpuses.
+message CorpusDisk {
+  repeated CorpusState corpus_array = 1;
+}
+

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -6,6 +7,8 @@ go_library(
         "geo.go",
         "inverted_index_expr.go",
         "json_array.go",
+        "trigram.go",
+        "tsearch.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx",
     visibility = ["//visibility:public"],
@@ -46,7 +49,10 @@ go_test(
     srcs = [
         "geo_test.go",
         "json_array_test.go",
+        "trigram_test.go",
+        "tsearch_test.go",
     ],
+    args = ["-test.timeout=55s"],
     deps = [
         ":invertedidx",
         "//pkg/geo",
@@ -65,3 +71,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -5,6 +6,7 @@ go_library(
     srcs = [
         "datum_vec.go",
         "extended_column_factory.go",
+        "vec_handler.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/col/coldataext",
     visibility = ["//visibility:public"],
@@ -18,6 +20,12 @@ go_library(
         "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
+        "//pkg/util/buildutil",
+        "//pkg/util/duration",
+        "//pkg/util/encoding",
+        "//pkg/util/json",
+        "//pkg/util/timeutil/pgdate",
+        "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
@@ -26,6 +34,7 @@ go_test(
     name = "coldataext_test",
     size = "small",
     srcs = ["datum_vec_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":coldataext"],
     deps = [
         "//pkg/col/coldata",
@@ -37,3 +46,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

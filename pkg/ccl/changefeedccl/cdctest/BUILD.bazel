@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -5,6 +6,7 @@ go_library(
     srcs = [
         "mock_webhook_sink.go",
         "nemeses.go",
+        "row.go",
         "schema_registry.go",
         "testfeed.go",
         "tls_util.go",
@@ -16,8 +18,17 @@ go_library(
         "//pkg/ccl/changefeedccl/changefeedbase",
         "//pkg/jobs",
         "//pkg/jobs/jobspb",
+        "//pkg/keys",
+        "//pkg/kv/kvclient/rangefeed",
+        "//pkg/kv/kvpb",
         "//pkg/roachpb",
-        "//pkg/testutils/serverutils",
+        "//pkg/sql",
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/descs",
+        "//pkg/sql/isql",
+        "//pkg/sql/sem/tree",
+        "//pkg/testutils/sqlutils",
+        "//pkg/util",
         "//pkg/util/fsm",
         "//pkg/util/hlc",
         "//pkg/util/log",
@@ -26,6 +37,7 @@ go_library(
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_linkedin_goavro_v2//:goavro",
+        "@com_github_stretchr_testify//require",
     ],
 )
 
@@ -36,12 +48,14 @@ go_test(
         "main_test.go",
         "validator_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":cdctest"],
+    tags = ["ccl_test"],
     deps = [
         "//pkg/base",
+        "//pkg/ccl",
         "//pkg/ccl/storageccl",
-        "//pkg/ccl/utilccl",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/testutils",
@@ -54,3 +68,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

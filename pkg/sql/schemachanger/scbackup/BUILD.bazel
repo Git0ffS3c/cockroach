@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -10,12 +11,14 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/jobs",
-        "//pkg/kv",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/nstree",
+        "//pkg/sql/isql",
         "//pkg/sql/schemachanger/scexec",
         "//pkg/sql/schemachanger/scpb",
         "//pkg/sql/schemachanger/screl",
     ],
 )
+
+get_x_data(name = "get_x_data")

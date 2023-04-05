@@ -19,6 +19,33 @@ ALTER DATABASE db CONFIGURE ZONE USING num_replicas=7;
 ALTER TABLE db.t1 CONFIGURE ZONE USING num_voters=5;
 ----
 
+# Mark the database as offline.
+mark-database-offline database=db
+----
+
+# Write a protected timestamp on the offline db.
+protect record-id=9 ts=9
+descs 104
+----
+
+# We should still see the protectedts translate onto the tables in the offline db.
+translate database=db
+----
+/Table/10{6-7}                             num_replicas=7 num_voters=5 protection_policies=[{ts: 9}]
+/Table/10{7-8}                             num_replicas=7 protection_policies=[{ts: 9}]
+
+release record-id=9
+----
+
+mark-database-public database=db
+----
+
+translate database=db
+----
+/Table/10{6-7}                             num_replicas=7 num_voters=5
+/Table/10{7-8}                             num_replicas=7
+
+
 # Write a protected timestamp on t1.
 protect record-id=1 ts=1
 descs 106
@@ -106,6 +133,9 @@ release record-id=3
 release record-id=4
 ----
 
+block-gc-jobs
+----
+
 # Create an index on t1 to ensure that subzones also see protected timestamps.
 exec-sql
 CREATE INDEX idx ON db.t1(id);
@@ -128,3 +158,7 @@ translate database=db
 /Table/106/{3-4}                           ttl_seconds=1 num_replicas=7 num_voters=5 protection_policies=[{ts: 6}]
 /Table/10{6/4-7}                           num_replicas=7 num_voters=5 protection_policies=[{ts: 6}]
 /Table/10{7-8}                             num_replicas=7
+
+
+unblock-gc-jobs
+----

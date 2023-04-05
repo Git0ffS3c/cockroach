@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -63,7 +63,7 @@ type PrefixSorter struct {
 
 	// The set of ordinal numbers indexing into the Entry slice, representing
 	// which Prefixes (partitions) are 100% local to the gateway region
-	LocalPartitions util.FastIntSet
+	LocalPartitions intsets.Fast
 }
 
 // String returns a string representation of the PrefixSorter.
@@ -103,6 +103,11 @@ func (ps PrefixSorter) Less(i, j int) bool {
 // Swap is part of sort.Interface.
 func (ps PrefixSorter) Swap(i, j int) {
 	ps.Entry[i], ps.Entry[j] = ps.Entry[j], ps.Entry[i]
+}
+
+// Empty returns true if the PrefixSorter contains no prefixes.
+func (ps PrefixSorter) Empty() bool {
+	return len(ps.Entry) == 0
 }
 
 // Slice returns the ith slice of Prefix entries, all having the same
@@ -145,16 +150,15 @@ func PrefixesToString(prefixes []Prefix) string {
 // determined.
 func HasMixOfLocalAndRemotePartitions(
 	evalCtx *eval.Context, index cat.Index,
-) (localPartitions *util.FastIntSet, ok bool) {
+) (localPartitions intsets.Fast, ok bool) {
 	if index.PartitionCount() < 2 {
-		return nil, false
+		return intsets.Fast{}, false
 	}
 	var localRegion string
 	if localRegion, ok = evalCtx.GetLocalRegion(); !ok {
-		return nil, false
+		return intsets.Fast{}, false
 	}
 	var foundLocal, foundRemote bool
-	localPartitions = &util.FastIntSet{}
 	for i, n := 0, index.PartitionCount(); i < n; i++ {
 		part := index.Partition(i)
 		if IsZoneLocal(part.Zone(), localRegion) {
@@ -173,10 +177,10 @@ func HasMixOfLocalAndRemotePartitions(
 // group of equal-length prefixes they are ordered by value.
 // This is the main function for building a PrefixSorter.
 func GetSortedPrefixes(
-	index cat.Index, localPartitions util.FastIntSet, evalCtx *eval.Context,
-) *PrefixSorter {
+	index cat.Index, localPartitions intsets.Fast, evalCtx *eval.Context,
+) PrefixSorter {
 	if index == nil || index.PartitionCount() < 2 {
-		return nil
+		return PrefixSorter{}
 	}
 	allPrefixes := make([]Prefix, 0, index.PartitionCount())
 
@@ -215,7 +219,7 @@ func GetSortedPrefixes(
 
 	// The end of the last slice is always the last element.
 	ps.idx = append(ps.idx, len(allPrefixes)-1)
-	return &ps
+	return ps
 }
 
 // isConstraintLocal returns isLocal=true and ok=true if the given constraint is

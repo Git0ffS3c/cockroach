@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 // expressionCarrier handles visiting sub-expressions.
@@ -39,15 +40,16 @@ type expressionCarrier interface {
 // tableWriter handles writing kvs and forming table rows.
 //
 // Usage:
-//   err := tw.init(txn, evalCtx)
-//   // Handle err.
-//   for {
-//      values := ...
-//      row, err := tw.row(values)
-//      // Handle err.
-//   }
-//   err := tw.finalize()
-//   // Handle err.
+//
+//	err := tw.init(txn, evalCtx)
+//	// Handle err.
+//	for {
+//	   values := ...
+//	   row, err := tw.row(values)
+//	   // Handle err.
+//	}
+//	err := tw.finalize()
+//	// Handle err.
 type tableWriter interface {
 	expressionCarrier
 
@@ -144,6 +146,8 @@ type tableWriterBase struct {
 	forceProductionBatchSizes bool
 	// sv settings values for cluster settings
 	sv *settings.Values
+	// Adapter to make expose a kv.Batch as a Putter
+	putter row.KVBatchAdapter
 }
 
 var maxBatchBytes = settings.RegisterByteSizeSetting(
@@ -155,7 +159,10 @@ var maxBatchBytes = settings.RegisterByteSizeSetting(
 
 func (tb *tableWriterBase) init(
 	txn *kv.Txn, tableDesc catalog.TableDescriptor, evalCtx *eval.Context, settings *settings.Values,
-) {
+) error {
+	if txn.Type() != kv.RootTxn {
+		return errors.AssertionFailedf("unexpectedly non-root txn is used by the table writer")
+	}
 	tb.txn = txn
 	tb.desc = tableDesc
 	tb.lockTimeout = 0
@@ -171,6 +178,7 @@ func (tb *tableWriterBase) init(
 	tb.maxBatchByteSize = mutations.MaxBatchByteSize(batchMaxBytes, tb.forceProductionBatchSizes)
 	tb.sv = settings
 	tb.initNewBatch()
+	return nil
 }
 
 // setRowsWrittenLimit should be called before finalize whenever the
@@ -254,6 +262,7 @@ func (tb *tableWriterBase) enableAutoCommit() {
 
 func (tb *tableWriterBase) initNewBatch() {
 	tb.b = tb.txn.NewBatch()
+	tb.putter.Batch = tb.b
 	tb.b.Header.LockTimeout = tb.lockTimeout
 }
 

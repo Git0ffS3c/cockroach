@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -6,8 +7,10 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/faketreeeval",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/clusterversion",
+        "//pkg/roachpb",
         "//pkg/security/username",
-        "//pkg/sql/parser",
+        "//pkg/sql/catalog/descpb",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/pgwire/pgnotice",
@@ -18,8 +21,12 @@ go_library(
         "//pkg/sql/sessiondata",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",
+        "//pkg/util/duration",
         "//pkg/util/errorutil/unimplemented",
+        "//pkg/util/mon",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_lib_pq//oid",
     ],
 )
+
+get_x_data(name = "get_x_data")

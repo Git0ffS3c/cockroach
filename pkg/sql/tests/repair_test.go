@@ -19,7 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -56,16 +56,20 @@ func TestDescriptorRepairOrphanedDescriptors(t *testing.T) {
 	//  DROP DATABASE db CASCADE;
 	//
 	// This, due to #51782, leads to the table remaining public but with no
-	// parent database (52).
+	// parent database.
+	//
+	// NB: As of 07/15/22 the generated dscriptor was modified to have an ID 105,
+	// and a parentID 104. This was done to prevent it from colliding with system
+	// tables that can now occupy IDs below 100.
 	const (
-		orphanedTable = `0aeb010a03666f6f1835203428013a0042380a016910011a0c08011040180030005014600020002a1d6e65787476616c2827666f6f5f695f736571273a3a3a535452494e472930005036480252440a077072696d61727910011801220169300140004a10080010001a00200028003000380040005a007a020800800100880100900101980100a20106080012001800a8010060026a150a090a0561646d696e10020a080a04726f6f741002800101880103980100b201120a077072696d61727910001a016920012800b80101c20100e80100f2010408001200f801008002009202009a0200b20200b80200c0021d`
+		orphanedTable = `0a8f020a03666f6f1869206828013a0042470a016910011a0c08011040180030005014600020002a1d6e65787476616c2827666f6f5f695f736571273a3a3a535452494e4729300050366800700078008001008801009801004802524c0a077072696d61727910011801220169300140004a10080010001a00200028003000380040005a007a0408002000800100880100900101980100a20106080012001800a80100b20100ba010060026a190a090a0561646d696e10020a080a04726f6f74100212001800800101880103980100b201120a077072696d61727910001a016920012800b80101c20100e80100f2010408001200f801008002009202009a0200b20200b80200c0021dc80200e00200f00200`
 	)
 	// We want to inject a descriptor that has no parent. This will block
 	// backups among other things.
 	const (
-		parentID  = 52
+		parentID  = 104
 		schemaID  = 29
-		descID    = 53
+		descID    = 105
 		tableName = "foo"
 	)
 	// This test will inject the table and demonstrate
@@ -75,17 +79,6 @@ func TestDescriptorRepairOrphanedDescriptors(t *testing.T) {
 	t.Run("orphaned view - 51782", func(t *testing.T) {
 		_, db, cleanup := setup(t)
 		defer cleanup()
-
-		// Drop database postgres and its public schema to get rid of the
-		// namespace entries for 52 and 53.
-		if err := crdb.ExecuteTx(ctx, db, nil, func(tx *gosql.Tx) error {
-			if _, err := tx.Exec("DROP DATABASE postgres CASCADE"); err != nil {
-				return err
-			}
-			return nil
-		}); err != nil {
-			t.Fatal(err)
-		}
 
 		require.NoError(t, crdb.ExecuteTx(ctx, db, nil, func(tx *gosql.Tx) error {
 			if _, err := tx.Exec(
@@ -172,7 +165,7 @@ func TestDescriptorRepairOrphanedDescriptors(t *testing.T) {
 				"SELECT crdb_internal.unsafe_upsert_descriptor($1, crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', $2))",
 				parentID, `{
   "database": {
-    "id": 52,
+    "id": 104,
     "name": "to_drop",
     "privileges": {
       "owner_proto": "root",
@@ -266,7 +259,9 @@ func TestDescriptorRepair(t *testing.T) {
 
 	ctx := context.Background()
 	setup := func(t *testing.T) (serverutils.TestServerInterface, *gosql.DB, func()) {
-		s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		args := base.TestServerArgs{}
+		args.Knobs.EventLog = &sql.EventLogTestingKnobs{SyncWrites: true}
+		s, db, _ := serverutils.StartServer(t, args)
 		return s, db, func() {
 			s.Stopper().Stop(ctx)
 		}
@@ -388,7 +383,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				upsertInvalidDuplicateColumnDescriptorBefore,
 			},
 			op:       `SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID);`,
-			expErrRE: `relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 5
 			// Upsert a descriptor which is invalid, then try to upsert a namespace
@@ -400,7 +395,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_upsert_namespace_entry",
-					info: `"Force":true,"FailedValidation":true,"ValidationErrors":".*duplicate column name: \\"i\\""`,
+					info: `"Force":true,"FailedValidation":true,"ValidationErrors":".*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 		},
@@ -412,7 +407,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				`SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID, true);`,
 			},
 			op:       `SELECT crdb_internal.unsafe_delete_descriptor($invalidTableID);`,
-			expErrRE: `pq: crdb_internal.unsafe_delete_descriptor\(\): relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `pq: crdb_internal.unsafe_delete_descriptor\(\): relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 7
 			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
@@ -425,7 +420,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_delete_descriptor",
-					info: `"Force":true,.*duplicate column name: \\"i\\""`,
+					info: `"Force":true,.*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 		},
@@ -437,7 +432,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				`SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID, true);`,
 			},
 			op:       updateInvalidDuplicateColumnDescriptorNoForce,
-			expErrRE: `pq: crdb_internal.unsafe_upsert_descriptor\(\): relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `pq: crdb_internal.unsafe_upsert_descriptor\(\): relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 9
 			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
@@ -450,7 +445,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_upsert_descriptor",
-					info: `"Force":true,"ForceNotice":".*duplicate column name: \\"i\\""`,
+					info: `"Force":true,"ForceNotice":".*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 			after: []string{
@@ -466,7 +461,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				`SELECT crdb_internal.unsafe_upsert_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID, true);`,
 			},
 			op:       `SELECT crdb_internal.unsafe_delete_namespace_entry($defaultDBID, $defaultDBPublicSchemaID, 'foo', $invalidTableID);`,
-			expErrRE: `pq: crdb_internal.unsafe_delete_namespace_entry\(\): failed to retrieve descriptor $invalidTableID: relation "foo" \($invalidTableID\): duplicate column name: "i"`,
+			expErrRE: `pq: crdb_internal.unsafe_delete_namespace_entry\(\): failed to retrieve descriptor $invalidTableID: relation "foo" \($invalidTableID\): column "i" duplicate ID of column "i"`,
 		},
 		{ // 11
 			// Upsert a descriptor which is invalid, upsert a namespace entry for it,
@@ -479,7 +474,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			expEventLogEntries: []eventLogPattern{
 				{
 					typ:  "unsafe_delete_namespace_entry",
-					info: `"Force":true,"ForceNotice":".*duplicate column name: \\"i\\""`,
+					info: `"Force":true,"ForceNotice":".*duplicate ID of column \\"i\\".*"`,
 				},
 			},
 		},
@@ -494,7 +489,7 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 				`SELECT crdb_internal.unsafe_upsert_descriptor(id, descriptor, true) FROM system.descriptor WHERE id = 'test.foo'::REGCLASS::OID`,
 			},
 			op:       upsertInvalidNameInTestFooNoForce,
-			expErrRE: `pq: crdb_internal.unsafe_upsert_descriptor\(\): relation \"\" \($firstTableID\): empty table name`,
+			expErrRE: `pq: crdb_internal.unsafe_upsert_descriptor\(\): relation \"\" \($firstTableID\): empty relation name`,
 		},
 	} {
 		name := fmt.Sprintf("case #%d: %s", caseIdx+1, tc.op)
@@ -504,12 +499,13 @@ SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", 0, 'foo', id)
 			s, db, cleanup := setup(t)
 			now := s.Clock().Now().GoTime()
 			defer cleanup()
+
 			tdb := sqlutils.MakeSQLRunner(db)
-			descs.ValidateOnWriteEnabled.Override(ctx, &s.ClusterSettings().SV, false)
+			tdb.Exec(t, `SET descriptor_validation = read_only`)
 			for _, op := range tc.before {
 				tdb.Exec(t, op)
 			}
-			descs.ValidateOnWriteEnabled.Override(ctx, &s.ClusterSettings().SV, true)
+			tdb.Exec(t, `SET descriptor_validation = on`)
 			_, err := db.Exec(tc.op)
 			if tc.expErrRE == "" {
 				require.NoError(t, err)
@@ -872,8 +868,7 @@ func TestDescriptorRepairIdGeneration(t *testing.T) {
   }
 }`
 
-	// Required so test doesn't fail due to namespace validation failures.
-	descs.ValidateOnWriteEnabled.Override(ctx, &s.ClusterSettings().SV, false)
+	tdb.Exec(t, `SET descriptor_validation = read_only`)
 
 	// Inserting a descriptor with an ID too high should fail.
 	tdb.ExpectErr(t, "descriptor ID 1234 must be less than the descriptor ID sequence value", q, false /* force */, d)
@@ -905,9 +900,13 @@ func TestCorruptDescriptorRepair(t *testing.T) {
 	// back-reference.
 	tdb.Exec(t, `CREATE DATABASE testdb`)
 	tdb.Exec(t, `CREATE TABLE testdb.parent (k INT PRIMARY KEY, v STRING)`)
+	tdb.Exec(t, `INSERT INTO testdb.parent (k, v) VALUES (1, 'a')`)
 	tdb.Exec(t, `CREATE TABLE testdb.child (k INT NOT NULL, FOREIGN KEY (k) REFERENCES testdb.parent (k))`)
 	tdb.Exec(t, `SELECT crdb_internal.unsafe_delete_descriptor(id) FROM system.namespace WHERE name = 'child'`)
 	tdb.Exec(t, `SELECT crdb_internal.unsafe_delete_namespace_entry("parentID", "parentSchemaID", name, id) FROM system.namespace WHERE name = 'child'`)
+
+	// Querying the table should succeed in spite of the dangling back-reference.
+	tdb.CheckQueryResults(t, `SELECT * FROM testdb.parent`, [][]string{{"1", "a"}})
 
 	// Dropping the table should fail, because the table descriptor will fail
 	// the validation checks when being read from storage.

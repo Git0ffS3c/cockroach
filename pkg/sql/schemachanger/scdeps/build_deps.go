@@ -15,21 +15,22 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
-	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
@@ -41,8 +42,7 @@ import (
 func NewBuilderDependencies(
 	clusterID uuid.UUID,
 	codec keys.SQLCodec,
-	txn *kv.Txn,
-	descsCollection *descs.Collection,
+	txn descs.Txn,
 	schemaResolverFactory scbuild.SchemaResolverFactory,
 	authAccessor scbuild.AuthorizationAccessor,
 	astFormatter scbuild.AstFormatter,
@@ -50,39 +50,48 @@ func NewBuilderDependencies(
 	sessionData *sessiondata.SessionData,
 	settings *cluster.Settings,
 	statements []string,
-	internalExecutor sqlutil.InternalExecutor,
+	clientNoticeSender eval.ClientNoticeSender,
+	eventLogger scbuild.EventLogger,
+	referenceProviderFactory scbuild.ReferenceProviderFactory,
+	descIDGenerator eval.DescIDGenerator,
 ) scbuild.Dependencies {
 	return &buildDeps{
-		clusterID:        clusterID,
-		codec:            codec,
-		txn:              txn,
-		descsCollection:  descsCollection,
-		authAccessor:     authAccessor,
-		sessionData:      sessionData,
-		settings:         settings,
-		statements:       statements,
-		astFormatter:     astFormatter,
-		featureChecker:   featureChecker,
-		internalExecutor: internalExecutor,
+		clusterID:       clusterID,
+		codec:           codec,
+		txn:             txn.KV(),
+		descsCollection: txn.Descriptors(),
+		authAccessor:    authAccessor,
+		sessionData:     sessionData,
+		settings:        settings,
+		statements:      statements,
+		astFormatter:    astFormatter,
+		featureChecker:  featureChecker,
 		schemaResolver: schemaResolverFactory(
-			descsCollection, sessiondata.NewStack(sessionData), txn, authAccessor,
+			txn.Descriptors(), sessiondata.NewStack(sessionData), txn.KV(), authAccessor,
 		),
+		clientNoticeSender:       clientNoticeSender,
+		eventLogger:              eventLogger,
+		descIDGenerator:          descIDGenerator,
+		referenceProviderFactory: referenceProviderFactory,
 	}
 }
 
 type buildDeps struct {
-	clusterID        uuid.UUID
-	codec            keys.SQLCodec
-	txn              *kv.Txn
-	descsCollection  *descs.Collection
-	schemaResolver   resolver.SchemaResolver
-	authAccessor     scbuild.AuthorizationAccessor
-	sessionData      *sessiondata.SessionData
-	settings         *cluster.Settings
-	statements       []string
-	astFormatter     scbuild.AstFormatter
-	featureChecker   scbuild.FeatureChecker
-	internalExecutor sqlutil.InternalExecutor
+	clusterID                uuid.UUID
+	codec                    keys.SQLCodec
+	txn                      *kv.Txn
+	descsCollection          *descs.Collection
+	schemaResolver           resolver.SchemaResolver
+	authAccessor             scbuild.AuthorizationAccessor
+	sessionData              *sessiondata.SessionData
+	settings                 *cluster.Settings
+	statements               []string
+	astFormatter             scbuild.AstFormatter
+	featureChecker           scbuild.FeatureChecker
+	clientNoticeSender       eval.ClientNoticeSender
+	eventLogger              scbuild.EventLogger
+	referenceProviderFactory scbuild.ReferenceProviderFactory
+	descIDGenerator          eval.DescIDGenerator
 }
 
 var _ scbuild.CatalogReader = (*buildDeps)(nil)
@@ -91,9 +100,7 @@ var _ scbuild.CatalogReader = (*buildDeps)(nil)
 func (d *buildDeps) MayResolveDatabase(
 	ctx context.Context, name tree.Name,
 ) catalog.DatabaseDescriptor {
-	db, err := d.descsCollection.GetImmutableDatabaseByName(ctx, d.txn, string(name), tree.DatabaseLookupFlags{
-		AvoidLeased: true,
-	})
+	db, err := d.descsCollection.ByName(d.txn).MaybeGet().Database(ctx, string(name))
 	if err != nil {
 		panic(err)
 	}
@@ -108,13 +115,41 @@ func (d *buildDeps) MayResolveSchema(
 		name.CatalogName = tree.Name(d.schemaResolver.CurrentDatabase())
 	}
 	db := d.MayResolveDatabase(ctx, name.CatalogName)
-	schema, err := d.descsCollection.GetSchemaByName(ctx, d.txn, db, name.Schema(), tree.SchemaLookupFlags{
-		AvoidLeased: true,
-	})
+	schema, err := d.descsCollection.ByName(d.txn).MaybeGet().Schema(ctx, db, name.Schema())
 	if err != nil {
 		panic(err)
 	}
 	return db, schema
+}
+
+func (d *buildDeps) MustResolvePrefix(
+	ctx context.Context, name tree.ObjectNamePrefix,
+) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor) {
+	if !name.ExplicitCatalog {
+		name.CatalogName = tree.Name(d.schemaResolver.CurrentDatabase())
+		name.ExplicitCatalog = true
+	}
+
+	if name.ExplicitSchema {
+		db, sc := d.MayResolveSchema(ctx, name)
+		if sc == nil {
+			panic(errors.AssertionFailedf("prefix %s does not exist", name.String()))
+		}
+		return db, sc
+	}
+
+	path := d.sessionData.SearchPath
+	iter := path.IterWithoutImplicitPGSchemas()
+	for scName, ok := iter.Next(); ok; scName, ok = iter.Next() {
+		name.SchemaName = tree.Name(scName)
+		name.ExplicitSchema = true
+		db, sc := d.MayResolveSchema(ctx, name)
+		if sc != nil {
+			return db, sc
+		}
+	}
+
+	panic(errors.AssertionFailedf("prefix %s does not exist", name.String()))
 }
 
 // MayResolveTable implements the scbuild.CatalogReader interface.
@@ -122,9 +157,7 @@ func (d *buildDeps) MayResolveTable(
 	ctx context.Context, name tree.UnresolvedObjectName,
 ) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor) {
 	desc, prefix, err := resolver.ResolveExistingObject(ctx, d.schemaResolver, &name, tree.ObjectLookupFlags{
-		CommonLookupFlags: tree.CommonLookupFlags{
-			AvoidLeased: true,
-		},
+		AvoidLeased:       true,
 		DesiredObjectKind: tree.TableObject,
 	})
 	if err != nil {
@@ -141,9 +174,7 @@ func (d *buildDeps) MayResolveType(
 	ctx context.Context, name tree.UnresolvedObjectName,
 ) (catalog.ResolvedObjectPrefix, catalog.TypeDescriptor) {
 	desc, prefix, err := resolver.ResolveExistingObject(ctx, d.schemaResolver, &name, tree.ObjectLookupFlags{
-		CommonLookupFlags: tree.CommonLookupFlags{
-			AvoidLeased: true,
-		},
+		AvoidLeased:       true,
 		DesiredObjectKind: tree.TypeObject,
 	})
 	if err != nil {
@@ -165,32 +196,24 @@ func (d *buildDeps) MayResolveIndex(
 	idx catalog.Index,
 ) {
 	found, prefix, tbl, idx, err := resolver.ResolveIndex(
-		ctx, d.schemaResolver, &tableIndexName, d.txn, d.codec, false /* required */, false, /* requireActiveIndex */
+		ctx, d.schemaResolver, &tableIndexName, tree.IndexLookupFlags{IncludeNonActiveIndex: true},
 	)
+
 	if err != nil {
 		panic(err)
 	}
 	return found, prefix, tbl, idx
 }
 
-// ReadObjectNamesAndIDs implements the scbuild.CatalogReader interface.
-func (d *buildDeps) ReadObjectNamesAndIDs(
+// GetAllObjectsInSchema implements the scbuild.CatalogReader interface.
+func (d *buildDeps) GetAllObjectsInSchema(
 	ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor,
-) (tree.TableNames, descpb.IDs) {
-	names, ids, err := d.descsCollection.GetObjectNamesAndIDs(ctx, d.txn, db, schema.GetName(), tree.DatabaseListFlags{
-		CommonLookupFlags: tree.CommonLookupFlags{
-			Required:       true,
-			RequireMutable: false,
-			AvoidLeased:    true,
-			IncludeOffline: true,
-			IncludeDropped: true,
-		},
-		ExplicitPrefix: true,
-	})
+) nstree.Catalog {
+	c, err := d.descsCollection.GetAllObjectsInSchema(ctx, d.txn, db, schema)
 	if err != nil {
 		panic(err)
 	}
-	return names, ids
+	return c
 }
 
 // ResolveType implements the scbuild.CatalogReader interface.
@@ -205,11 +228,32 @@ func (d *buildDeps) ResolveTypeByOID(ctx context.Context, oid oid.Oid) (*types.T
 	return d.schemaResolver.ResolveTypeByOID(ctx, oid)
 }
 
+// ResolveFunction implements the scbuild.CatalogReader interface.
+func (d *buildDeps) ResolveFunction(
+	ctx context.Context, name *tree.UnresolvedName, path tree.SearchPath,
+) (*tree.ResolvedFunctionDefinition, error) {
+	return d.schemaResolver.ResolveFunction(ctx, name, path)
+}
+
+// ResolveFunctionByOID implements the scbuild.CatalogReader interface.
+func (d *buildDeps) ResolveFunctionByOID(
+	ctx context.Context, oid oid.Oid,
+) (*tree.FunctionName, *tree.Overload, error) {
+	return d.schemaResolver.ResolveFunctionByOID(ctx, oid)
+}
+
 // GetQualifiedTableNameByID implements the scbuild.CatalogReader interface.
 func (d *buildDeps) GetQualifiedTableNameByID(
 	ctx context.Context, id int64, requiredType tree.RequiredTableKind,
 ) (*tree.TableName, error) {
 	return d.schemaResolver.GetQualifiedTableNameByID(ctx, id, requiredType)
+}
+
+// GetQualifiedTableNameByID implements the scbuild.CatalogReader interface.
+func (d *buildDeps) GetQualifiedFunctionNameByID(
+	ctx context.Context, id int64,
+) (*tree.FunctionName, error) {
+	return d.schemaResolver.GetQualifiedFunctionNameByID(ctx, id)
 }
 
 // CurrentDatabase implements the scbuild.CatalogReader interface.
@@ -219,29 +263,35 @@ func (d *buildDeps) CurrentDatabase() string {
 
 // MustReadDescriptor implements the scbuild.CatalogReader interface.
 func (d *buildDeps) MustReadDescriptor(ctx context.Context, id descpb.ID) catalog.Descriptor {
-	flags := tree.CommonLookupFlags{
-		Required:       true,
-		RequireMutable: false,
-		AvoidLeased:    true,
-		IncludeOffline: true,
-		IncludeDropped: true,
-	}
-	desc, err := d.descsCollection.GetImmutableDescriptorByID(ctx, d.txn, id, flags)
+	desc, err := d.descsCollection.ByID(d.txn).Get().Desc(ctx, id)
 	if err != nil {
 		panic(err)
 	}
 	return desc
 }
 
-// MustGetSchemasForDatabase  implements the scbuild.CatalogReader interface.
-func (d *buildDeps) MustGetSchemasForDatabase(
+// GetAllSchemasInDatabase implements the scbuild.CatalogReader interface.
+func (d *buildDeps) GetAllSchemasInDatabase(
 	ctx context.Context, database catalog.DatabaseDescriptor,
-) map[descpb.ID]string {
-	schemas, err := d.descsCollection.GetSchemasForDatabase(ctx, d.txn, database)
+) nstree.Catalog {
+	schemas, err := d.descsCollection.GetAllSchemasInDatabase(ctx, d.txn, database)
 	if err != nil {
 		panic(err)
 	}
 	return schemas
+}
+
+// IsTableEmpty implements the scbuild.TableReader interface.
+func (d *buildDeps) IsTableEmpty(
+	ctx context.Context, id descpb.ID, primaryIndexID descpb.IndexID,
+) bool {
+	indexPrefix := rowenc.MakeIndexKeyPrefix(d.codec, id, primaryIndexID)
+	span := roachpb.Key(indexPrefix)
+	kvs, err := d.txn.Scan(ctx, span, span.PrefixEnd(), 1)
+	if err != nil {
+		panic(err)
+	}
+	return len(kvs) == 0
 }
 
 // CreatePartitioningCCL is the public hook point for the CCL-licensed
@@ -257,6 +307,11 @@ func (d *buildDeps) AuthorizationAccessor() scbuild.AuthorizationAccessor {
 
 // CatalogReader implements the scbuild.Dependencies interface.
 func (d *buildDeps) CatalogReader() scbuild.CatalogReader {
+	return d
+}
+
+// TableReader implements the scbuild.Dependencies interface.
+func (d *buildDeps) TableReader() scbuild.TableReader {
 	return d
 }
 
@@ -332,6 +387,16 @@ func (d *buildDeps) IncrementSchemaChangeDropCounter(counterType string) {
 	telemetry.Inc(sqltelemetry.SchemaChangeDropCounter(counterType))
 }
 
+// IncrementSchemaChangeAddColumnTypeCounter implements the scbuild.Dependencies
+func (d *buildDeps) IncrementSchemaChangeAddColumnTypeCounter(typeName string) {
+	telemetry.Inc(sqltelemetry.SchemaNewTypeCounter(typeName))
+}
+
+// IncrementSchemaChangeAddColumnQualificationCounter implements the scbuild.Dependencies
+func (d *buildDeps) IncrementSchemaChangeAddColumnQualificationCounter(qualification string) {
+	telemetry.Inc(sqltelemetry.SchemaNewColumnTypeQualificationCounter(qualification))
+}
+
 // IncrementUserDefinedSchemaCounter implements the scbuild.Dependencies
 // interface.
 func (d *buildDeps) IncrementUserDefinedSchemaCounter(
@@ -345,6 +410,52 @@ func (d *buildDeps) IncrementEnumCounter(counterType sqltelemetry.EnumTelemetryT
 	sqltelemetry.IncrementEnumCounter(counterType)
 }
 
-func (d *buildDeps) DescriptorCommentCache() scbuild.CommentCache {
-	return descmetadata.NewCommentCache(d.txn, d.internalExecutor)
+// IncrementDropOwnedByCounter implements the scbuild.Dependencies interface.
+func (d *buildDeps) IncrementDropOwnedByCounter() {
+	telemetry.Inc(sqltelemetry.CreateDropOwnedByCounter())
+}
+
+// IncrementSchemaChangeIndexCounter implements the scbuild.Dependencies interface.
+func (d *buildDeps) IncrementSchemaChangeIndexCounter(counterType string) {
+	telemetry.Inc(sqltelemetry.SchemaChangeIndexCounter(counterType))
+}
+
+func (d *buildDeps) DescriptorCommentGetter() scbuild.CommentGetter {
+	return d.descsCollection
+}
+
+func (d *buildDeps) ZoneConfigGetter() scbuild.ZoneConfigGetter {
+	return &zoneConfigGetter{
+		txn:         d.txn,
+		descriptors: d.descsCollection,
+	}
+}
+
+// ClientNoticeSender implements the scbuild.Dependencies interface.
+func (d *buildDeps) ClientNoticeSender() eval.ClientNoticeSender {
+	return d.clientNoticeSender
+}
+
+// EventLogger implements the scbuild.Dependencies interface.
+func (d *buildDeps) EventLogger() scbuild.EventLogger {
+	return d.eventLogger
+}
+
+type zoneConfigGetter struct {
+	txn         *kv.Txn
+	descriptors *descs.Collection
+}
+
+func (zc *zoneConfigGetter) GetZoneConfig(
+	ctx context.Context, id descpb.ID,
+) (catalog.ZoneConfig, error) {
+	return zc.descriptors.GetZoneConfig(ctx, zc.txn, id)
+}
+
+func (d *buildDeps) DescIDGenerator() eval.DescIDGenerator {
+	return d.descIDGenerator
+}
+
+func (d *buildDeps) ReferenceProviderFactory() scbuild.ReferenceProviderFactory {
+	return d.referenceProviderFactory
 }

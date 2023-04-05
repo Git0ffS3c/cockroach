@@ -13,15 +13,17 @@ package rpc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 func TestClientSSLSettings(t *testing.T) {
@@ -55,7 +57,7 @@ func TestClientSSLSettings(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			cfg := &base.Config{Insecure: tc.insecure, User: tc.user}
 			if tc.hasCerts {
-				testutils.FillCerts(cfg)
+				cfg.SSLCertsDir = certnames.EmbeddedCertsDir
 			} else {
 				// We can't leave this empty because otherwise it refers to the cwd which
 				// always exists.
@@ -65,11 +67,13 @@ func TestClientSSLSettings(t *testing.T) {
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
 			rpcContext := NewContext(ctx, ContextOptions{
-				TenantID: roachpb.SystemTenantID,
-				Clock:    hlc.NewClock(hlc.UnixNano, 1),
-				Stopper:  stopper,
-				Settings: cluster.MakeTestingClusterSettings(),
-				Config:   cfg,
+				TenantID:        roachpb.SystemTenantID,
+				ClientOnly:      true,
+				Clock:           &timeutil.DefaultTimeSource{},
+				ToleratedOffset: time.Nanosecond,
+				Stopper:         stopper,
+				Settings:        cluster.MakeTestingClusterSettings(),
+				Config:          cfg,
 			})
 
 			if cfg.HTTPRequestScheme() != tc.requestScheme {
@@ -117,17 +121,18 @@ func TestServerSSLSettings(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			cfg := &base.Config{Insecure: tc.insecure, User: username.NodeUserName()}
 			if tc.hasCerts {
-				testutils.FillCerts(cfg)
+				cfg.SSLCertsDir = certnames.EmbeddedCertsDir
 			}
 			ctx := context.Background()
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
 			rpcContext := NewContext(ctx, ContextOptions{
-				TenantID: roachpb.SystemTenantID,
-				Clock:    hlc.NewClock(hlc.UnixNano, 1),
-				Stopper:  stopper,
-				Settings: cluster.MakeTestingClusterSettings(),
-				Config:   cfg,
+				TenantID:        roachpb.SystemTenantID,
+				Clock:           &timeutil.DefaultTimeSource{},
+				ToleratedOffset: time.Nanosecond,
+				Stopper:         stopper,
+				Settings:        cluster.MakeTestingClusterSettings(),
+				Config:          cfg,
 			})
 			if cfg.HTTPRequestScheme() != tc.requestScheme {
 				t.Fatalf("#%d: expected HTTPRequestScheme=%s, got: %s", tcNum, tc.requestScheme, cfg.HTTPRequestScheme())

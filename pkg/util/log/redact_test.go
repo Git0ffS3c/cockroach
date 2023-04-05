@@ -18,10 +18,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const startRedactable = "‹"
@@ -39,7 +44,11 @@ func TestRedactedLogOutput(t *testing.T) {
 
 	defer TestingSetRedactable(false)()
 
-	Errorf(context.Background(), "test1 %v end", "hello")
+	ctx := context.Background()
+	sysIDPayload := testIDPayload{tenantID: "1"}
+	ctx = context.WithValue(ctx, serverident.ServerIdentificationContextKey{}, sysIDPayload)
+
+	Errorf(ctx, "test1 %v end", "hello")
 	if contains(redactableIndicator, t) {
 		t.Errorf("expected no marker indicator, got %q", contents())
 	}
@@ -50,15 +59,15 @@ func TestRedactedLogOutput(t *testing.T) {
 	// markers are disabled.
 	resetCaptured()
 
-	Errorf(context.Background(), "test2 %v end", startRedactable+"hello"+endRedactable)
+	Errorf(ctx, "test2 %v end", startRedactable+"hello"+endRedactable)
 	if !contains("test2 ?hello? end", t) {
 		t.Errorf("expected escaped markers, got %q", contents())
 	}
 
 	resetCaptured()
 	_ = TestingSetRedactable(true)
-	Errorf(context.Background(), "test3 %v end", "hello")
-	if !contains(redactableIndicator+" [-] 3  test3", t) {
+	Errorf(ctx, "test3 %v end", "hello")
+	if !contains(redactableIndicator+" [T1] 3  test3", t) {
 		t.Errorf("expected marker indicator, got %q", contents())
 	}
 	if !contains("test3 "+startRedactable+"hello"+endRedactable+" end", t) {
@@ -67,10 +76,10 @@ func TestRedactedLogOutput(t *testing.T) {
 
 	// Verify that safe parts of errors don't get enclosed in redaction markers
 	resetCaptured()
-	Errorf(context.Background(), "test3e %v end",
+	Errorf(ctx, "test3e %v end",
 		errors.AssertionFailedf("hello %v",
 			errors.Newf("error-in-error %s", "world"))) // nolint:errwrap
-	if !contains(redactableIndicator+" [-] 4  test3e", t) {
+	if !contains(redactableIndicator+" [T1] 4  test3e", t) {
 		t.Errorf("expected marker indicator, got %q", contents())
 	}
 	if !contains("test3e hello error-in-error "+startRedactable+"world"+endRedactable+" end", t) {
@@ -81,12 +90,60 @@ func TestRedactedLogOutput(t *testing.T) {
 	resetCaptured()
 
 	const specialString = "x" + startRedactable + "hello" + endRedactable + "y"
-	Errorf(context.Background(), "test4 %v end", specialString)
+	Errorf(ctx, "test4 %v end", specialString)
 	if contains(specialString, t) {
 		t.Errorf("expected markers to be removed, got %q", contents())
 	}
 	if !contains("test4 "+startRedactable+"x"+escapeMark+"hello"+escapeMark+"y"+endRedactable+" end", t) {
 		t.Errorf("expected escape mark, got %q", contents())
+	}
+}
+
+func TestSafeManaged(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := ScopeWithoutShowLogs(t)
+	defer s.Close(t)
+	tests := []struct {
+		name                          string
+		arg                           interface{}
+		expected                      redact.RedactableString
+		redactionPolicyManagedEnabled bool
+	}{
+		{
+			name:                          "redacts when not in redaction policy managed mode",
+			arg:                           "some value",
+			expected:                      redact.Sprint("some value"),
+			redactionPolicyManagedEnabled: false,
+		},
+		{
+			name:                          "marks safe when in redaction policy managed mode",
+			arg:                           "some value",
+			expected:                      redact.Sprint(redact.Safe("some value")),
+			redactionPolicyManagedEnabled: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				envutil.ClearEnvCache()
+			})
+
+			t.Setenv(redactionPolicyManagedEnvVar, fmt.Sprint(tc.redactionPolicyManagedEnabled))
+
+			TestingResetActive()
+			cfg := logconfig.DefaultConfig()
+			if err := cfg.Validate(&s.logDir); err != nil {
+				t.Fatal(err)
+			}
+			cleanupFn, err := ApplyConfig(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanupFn()
+
+			require.Equal(t, logging.hasManagedRedactionPolicy(), tc.redactionPolicyManagedEnabled)
+			require.Equal(t, tc.expected, redact.Sprint(SafeManaged(tc.arg)))
+		})
 	}
 }
 

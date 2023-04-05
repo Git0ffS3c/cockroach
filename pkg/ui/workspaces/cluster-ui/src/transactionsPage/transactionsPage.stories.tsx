@@ -20,6 +20,7 @@ import {
   timeScale,
   sortSetting,
   filters,
+  lastUpdated,
 } from "./transactions.fixture";
 
 import { TransactionsPage } from ".";
@@ -35,35 +36,45 @@ storiesOf("Transactions Page", module)
   ))
   .add("with data", () => (
     <TransactionsPage
+      isDataValid={true}
       {...routeProps}
       columns={columns}
       data={data}
       timeScale={timeScale}
       filters={filters}
       nodeRegions={nodeRegions}
+      hasAdminRole={true}
       onFilterChange={noop}
       onSortingChange={noop}
       refreshData={noop}
+      refreshNodes={noop}
+      refreshUserSQLRoles={noop}
       resetSQLStats={noop}
       search={""}
       sortSetting={sortSetting}
+      lastUpdated={lastUpdated}
     />
   ))
   .add("without data", () => {
     return (
       <TransactionsPage
         {...routeProps}
+        isDataValid={true}
         columns={columns}
         data={getEmptyData()}
         timeScale={timeScale}
         filters={filters}
         nodeRegions={nodeRegions}
+        hasAdminRole={true}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
+        refreshNodes={noop}
+        refreshUserSQLRoles={noop}
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
+        lastUpdated={lastUpdated}
       />
     );
   })
@@ -78,17 +89,22 @@ storiesOf("Transactions Page", module)
       <TransactionsPage
         {...routeProps}
         columns={columns}
+        isDataValid={true}
         data={getEmptyData()}
         timeScale={timeScale}
         filters={filters}
         history={history}
         nodeRegions={nodeRegions}
+        hasAdminRole={true}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
+        refreshNodes={noop}
+        refreshUserSQLRoles={noop}
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
+        lastUpdated={lastUpdated}
       />
     );
   })
@@ -97,16 +113,21 @@ storiesOf("Transactions Page", module)
       <TransactionsPage
         {...routeProps}
         columns={columns}
+        isDataValid={true}
         data={undefined}
         timeScale={timeScale}
         filters={filters}
         nodeRegions={nodeRegions}
+        hasAdminRole={true}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
+        refreshNodes={noop}
+        refreshUserSQLRoles={noop}
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
+        lastUpdated={lastUpdated}
       />
     );
   })
@@ -115,6 +136,7 @@ storiesOf("Transactions Page", module)
       <TransactionsPage
         {...routeProps}
         columns={columns}
+        isDataValid={true}
         data={undefined}
         timeScale={timeScale}
         error={
@@ -126,12 +148,16 @@ storiesOf("Transactions Page", module)
         }
         filters={filters}
         nodeRegions={nodeRegions}
+        hasAdminRole={true}
         onFilterChange={noop}
         onSortingChange={noop}
         refreshData={noop}
+        refreshNodes={noop}
+        refreshUserSQLRoles={noop}
         resetSQLStats={noop}
         search={""}
         sortSetting={sortSetting}
+        lastUpdated={lastUpdated}
       />
     );
   });

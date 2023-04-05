@@ -11,6 +11,7 @@
 package opgen
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 )
@@ -21,8 +22,7 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				minPhase(scop.PreCommitPhase),
-				emit(func(this *scpb.ColumnFamily) scop.Op {
+				emit(func(this *scpb.ColumnFamily) *scop.AddColumnFamily {
 					return &scop.AddColumnFamily{
 						TableID:  this.TableID,
 						FamilyID: this.FamilyID,
@@ -34,10 +34,23 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
 				revertible(false),
-				emit(func(this *scpb.ColumnFamily) scop.Op {
-					return notImplemented(this)
+				emit(func(this *scpb.ColumnFamily, md *opGenContext) *scop.AssertColumnFamilyIsRemoved {
+					// Use stricter criteria on 23.1, which will guarantee that the
+					// column family is cleaned up first using the column type element.
+					// The only purpose this operation serves is to make sure that this
+					// when the element reaches absent the column family has actually
+					// been removed. This would have been done via the last column
+					// type element referencing it.
+					if md.ActiveVersion.IsActive(clusterversion.V23_1) {
+						return &scop.AssertColumnFamilyIsRemoved{
+							TableID:  this.TableID,
+							FamilyID: this.FamilyID,
+						}
+					}
+					// We would have used NotImplemented before, but that will be an
+					// assertion now, so just return no-ops.
+					return nil
 				}),
 			),
 		),

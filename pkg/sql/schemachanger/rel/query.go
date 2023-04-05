@@ -14,6 +14,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
@@ -36,6 +37,9 @@ type Query struct {
 	facts []fact
 	// filters are the set of predicate filters to evaluate.
 	filters []filter
+	// notJoins are sub-queries which, if successfully unified, imply a
+	// contradiction in the outer query.
+	notJoins []subQuery
 
 	// cache one evalContext for reuse to accelerate benchmarks and deal with
 	// the common case.
@@ -43,6 +47,15 @@ type Query struct {
 		syncutil.Mutex
 		cached *evalContext
 	}
+}
+
+// queryDepth is a depth in the join order of a query.
+type queryDepth uint16
+
+type subQuery struct {
+	query             *Query
+	depth             queryDepth
+	inputSlotMappings util.FastIntMap
 }
 
 // Result represents A setting of entities which fulfills the
@@ -114,7 +127,7 @@ func (q *Query) putEvalContext(ec *evalContext) {
 // Entities returns the entities in the query in their join order.
 // This method exists primarily for introspection.
 func (q *Query) Entities() []Var {
-	var entitySlots util.FastIntSet
+	var entitySlots intsets.Fast
 	for _, slotIdx := range q.entities {
 		entitySlots.Add(int(slotIdx))
 	}

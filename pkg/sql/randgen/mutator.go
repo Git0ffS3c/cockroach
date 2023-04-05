@@ -218,6 +218,12 @@ func statisticsMutator(
 				return
 			}
 			colType := tree.MustBeStaticallyKnownType(col.Type)
+			if colType.Family() == types.CollatedStringFamily {
+				// Collated strings are not roundtrippable during
+				// encoding/decoding, so we cannot always make a valid
+				// histogram.
+				return
+			}
 			h := randHistogram(rng, colType)
 			stat := colStats[col.Name]
 			if err := stat.SetHistogram(&h); err != nil {
@@ -227,12 +233,13 @@ func statisticsMutator(
 		for _, def := range create.Defs {
 			switch def := def.(type) {
 			case *tree.ColumnTableDef:
-				var nullCount, distinctCount uint64
+				var nullCount, distinctCount, avgSize uint64
 				if rowCount > 0 {
 					if def.Nullable.Nullability != tree.NotNull {
 						nullCount = uint64(rng.Int63n(rowCount))
 					}
 					distinctCount = uint64(rng.Int63n(rowCount))
+					avgSize = uint64(rng.Int63n(32))
 				}
 				cols[def.Name] = def
 				colStats[def.Name] = &stats.JSONStatistic{
@@ -242,6 +249,7 @@ func statisticsMutator(
 					Columns:       []string{def.Name.String()},
 					DistinctCount: distinctCount,
 					NullCount:     nullCount,
+					AvgSize:       avgSize,
 				}
 				if (def.Unique.IsUnique && !def.Unique.WithoutIndex) || def.PrimaryKey.IsPrimaryKey {
 					makeHistogram(def)
@@ -287,7 +295,7 @@ func statisticsMutator(
 // bounds are byte-encoded inverted index keys.
 func randHistogram(rng *rand.Rand, colType *types.T) stats.HistogramData {
 	histogramColType := colType
-	if colinfo.ColumnTypeIsInvertedIndexable(colType) {
+	if colinfo.ColumnTypeIsOnlyInvertedIndexable(colType) {
 		histogramColType = types.Bytes
 	}
 	h := stats.HistogramData{
@@ -298,7 +306,7 @@ func randHistogram(rng *rand.Rand, colType *types.T) stats.HistogramData {
 	var encodedUpperBounds [][]byte
 	for i, numDatums := 0, rng.Intn(10); i < numDatums; i++ {
 		upper := RandDatum(rng, colType, false /* nullOk */)
-		if colinfo.ColumnTypeIsInvertedIndexable(colType) {
+		if colinfo.ColumnTypeIsOnlyInvertedIndexable(colType) {
 			encs := encodeInvertedIndexHistogramUpperBounds(colType, upper)
 			encodedUpperBounds = append(encodedUpperBounds, encs...)
 		} else {
@@ -663,6 +671,7 @@ var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts
 	for _, stmt := range stmts {
 		switch stmt := stmt.(type) {
 		case *tree.SetClusterSetting, *tree.SetVar, *tree.AlterTenantSetClusterSetting:
+			changed = true
 			continue
 		case *tree.CreateTable:
 			if stmt.PartitionByTable != nil {
@@ -775,6 +784,7 @@ func postgresCreateTableMutator(
 							Inverted: def.Inverted,
 							Columns:  newCols,
 							Storing:  def.Storing,
+							// Postgres doesn't support NotVisible Index, so NotVisible is not populated here.
 						})
 						changed = true
 					}
@@ -825,6 +835,7 @@ func postgresCreateTableMutator(
 						Inverted: def.Inverted,
 						Columns:  newCols,
 						Storing:  def.Storing,
+						// Postgres doesn't support NotVisible Index, so NotVisible is not populated here.
 					})
 					changed = true
 				default:
@@ -970,8 +981,11 @@ func indexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 				// Skip PK columns and columns already in the index.
 				continue
 			}
-			if tableInfo.columnsTableDefs[colOrdinal].Computed.Virtual {
-				// Virtual columns can't be stored.
+			// Virtual columns can't be stored.
+			if tableInfo.columnsTableDefs[colOrdinal].Computed.Virtual ||
+				// Neither can TableOID. Neither can MVCCTimestamp, but the logic to
+				// read the columns filters that one out.
+				tableInfo.columnsTableDefs[colOrdinal].Name == colinfo.TableOIDColumnName {
 				continue
 			}
 			if rng.Intn(2) == 0 {

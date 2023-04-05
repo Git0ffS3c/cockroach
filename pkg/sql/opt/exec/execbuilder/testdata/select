@@ -33,18 +33,22 @@ WHERE message LIKE '%SPAN START%' OR message LIKE '%pos%executing%';
 3   === SPAN START: sql txn ===                          sql txn
 3   [Open pos:?] executing ExecStmt: SELECT 1            sql txn
 4   === SPAN START: sql query ===                        sql query
-5   === SPAN START: consuming rows ===                   consuming rows
-6   === SPAN START: flow ===                             flow
+5   === SPAN START: optimizer ===                        optimizer
+6   === SPAN START: consuming rows ===                   consuming rows
+7   === SPAN START: flow ===                             flow
+8   === SPAN START: values ===                           values
 3   [Open pos:?] executing ExecStmt: COMMIT TRANSACTION  sql txn
-7   === SPAN START: sql query ===                        sql query
-8   === SPAN START: commit sql txn ===                   commit sql txn
+9   === SPAN START: sql query ===                        sql query
+10  === SPAN START: commit sql txn ===                   commit sql txn
 0   [NoTxn pos:?] executing ExecStmt: SELECT 2           session recording
-9   === SPAN START: sql txn ===                          sql txn
-9   [Open pos:?] executing ExecStmt: SELECT 2            sql txn
-10  === SPAN START: sql query ===                        sql query
-11  === SPAN START: consuming rows ===                   consuming rows
-12  === SPAN START: flow ===                             flow
-13  === SPAN START: commit sql txn ===                   commit sql txn
+11  === SPAN START: sql txn ===                          sql txn
+11  [Open pos:?] executing ExecStmt: SELECT 2            sql txn
+12  === SPAN START: sql query ===                        sql query
+13  === SPAN START: optimizer ===                        optimizer
+14  === SPAN START: consuming rows ===                   consuming rows
+15  === SPAN START: flow ===                             flow
+16  === SPAN START: values ===                           values
+17  === SPAN START: commit sql txn ===                   commit sql txn
 0   [NoTxn pos:?] executing Sync                         session recording
 0   [NoTxn pos:?] executing ExecStmt: SET TRACING = off  session recording
 
@@ -189,8 +193,18 @@ vectorized: true
   table: num_ref@bc
   spans: FULL SCAN
 
+let $num_ref_bc
+SELECT index_id
+  FROM crdb_internal.table_indexes
+ WHERE descriptor_id = $t_id AND index_name = 'bc';
+
+let $num_ref_pkey
+SELECT index_id
+  FROM crdb_internal.table_indexes
+ WHERE descriptor_id = $t_id AND index_name = 'num_ref_pkey';
+
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[$num_ref_pkey]
 ----
 distribution: local
 vectorized: true
@@ -202,7 +216,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[$num_ref_bc]
 ----
 distribution: local
 vectorized: true
@@ -214,7 +228,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[$num_ref_pkey]
 ----
 distribution: local
 vectorized: true
@@ -226,7 +240,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[$num_ref_bc]
 ----
 distribution: local
 vectorized: true
@@ -238,7 +252,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[$num_ref_pkey]
 ----
 distribution: local
 vectorized: true
@@ -250,7 +264,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[$num_ref_bc]
 ----
 distribution: local
 vectorized: true
@@ -390,7 +404,6 @@ vectorized: true
 ·
 • render
 │ columns: (r)
-│ estimated row count: 1,000 (missing stats)
 │ render r: x + 1
 │
 └── • scan
@@ -407,7 +420,6 @@ vectorized: true
 ·
 • render
 │ columns: (a, b, y, c, d)
-│ estimated row count: 1,000 (missing stats)
 │ render b: x + 1
 │ render c: y + 1
 │ render d: x + y
@@ -428,12 +440,10 @@ vectorized: true
 ·
 • render
 │ columns: (r)
-│ estimated row count: 1,000 (missing stats)
 │ render r: "?column?" + ("?column?" * "?column?")
 │
 └── • render
     │ columns: ("?column?", "?column?")
-    │ estimated row count: 1,000 (missing stats)
     │ render ?column?: x + 3
     │ render ?column?: y + 10
     │
@@ -466,7 +476,6 @@ vectorized: true
 ·
 • render
 │ columns: (a, b)
-│ estimated row count: 333 (missing stats)
 │ render a: x + 1
 │ render b: x + y
 │
@@ -531,22 +540,22 @@ CREATE TABLE t (
   FAMILY (a, b, c, d)
 )
 
-query TTBITTBB colnames
+query TTBITTTBBB colnames
 SHOW INDEXES FROM t
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
-t           b_idx       true        1             b            ASC        false    false
-t           b_idx       true        2             c            N/A        true     false
-t           b_idx       true        3             d            N/A        true     false
-t           b_idx       true        4             a            ASC        false    true
-t           c_idx       false       1             c            ASC        false    false
-t           c_idx       false       2             b            N/A        true     false
-t           c_idx       false       3             d            N/A        true     false
-t           c_idx       false       4             a            ASC        true     true
-t           t_pkey      false       1             a            ASC        false    false
-t           t_pkey      false       2             b            N/A        true     false
-t           t_pkey      false       3             c            N/A        true     false
-t           t_pkey      false       4             d            N/A        true     false
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible
+t           b_idx       true        1             b            b           ASC        false    false     true
+t           b_idx       true        2             c            c           N/A        true     false     true
+t           b_idx       true        3             d            d           N/A        true     false     true
+t           b_idx       true        4             a            a           ASC        false    true      true
+t           c_idx       false       1             c            c           ASC        false    false     true
+t           c_idx       false       2             b            b           N/A        true     false     true
+t           c_idx       false       3             d            d           N/A        true     false     true
+t           c_idx       false       4             a            a           ASC        true     true      true
+t           t_pkey      false       1             a            a           ASC        false    false     true
+t           t_pkey      false       2             b            b           N/A        true     false     true
+t           t_pkey      false       3             c            c           N/A        true     false     true
+t           t_pkey      false       4             d            d           N/A        true     false     true
 
 statement ok
 INSERT INTO t VALUES (1, 2, 3, 4)
@@ -725,7 +734,6 @@ vectorized: true
 ·
 • render
 │ columns: (a)
-│ estimated row count: 1,000 (missing stats)
 │ render a: 1
 │
 └── • scan
@@ -1342,7 +1350,6 @@ vectorized: true
 └── • render
     │ columns: ("?column?", a)
     │ ordering: +a
-    │ estimated row count: 1,000 (missing stats)
     │ render ?column?: a + (b + c)
     │ render a: a
     │
@@ -1370,7 +1377,6 @@ vectorized: true
     │
     └── • render
         │ columns: ("?column?", b)
-        │ estimated row count: 1,000 (missing stats)
         │ render ?column?: a + (c + (a + b))
         │ render b: b
         │
@@ -1393,7 +1399,6 @@ vectorized: true
 └── • render
     │ columns: ("?column?", a, b)
     │ ordering: -a,-b
-    │ estimated row count: 1,000 (missing stats)
     │ render ?column?: a + (c + (a + b))
     │ render a: a
     │ render b: b
@@ -1431,22 +1436,18 @@ EXPLAIN (VERBOSE) SELECT * FROM abcd WHERE a > b ORDER BY a DESC, b DESC
 distribution: local
 vectorized: true
 ·
-• sort
+• filter
 │ columns: (a, b, c, d)
 │ ordering: -a,-b
 │ estimated row count: 333 (missing stats)
-│ order: -a,-b
+│ filter: a > b
 │
-└── • filter
-    │ columns: (a, b, c, d)
-    │ estimated row count: 333 (missing stats)
-    │ filter: a > b
-    │
-    └── • scan
-          columns: (a, b, c, d)
-          estimated row count: 1,000 (missing stats)
-          table: abcd@abcd_pkey
-          spans: FULL SCAN
+└── • revscan
+      columns: (a, b, c, d)
+      ordering: -a,-b
+      estimated row count: 1,000 (missing stats)
+      table: abcd@abcd_pkey
+      spans: FULL SCAN
 
 query T
 EXPLAIN (VERBOSE) SELECT * FROM (SELECT a, b FROM abcd LIMIT 10) WHERE a > b ORDER BY a
@@ -1477,7 +1478,6 @@ vectorized: true
 • render
 │ columns: (a, x)
 │ ordering: +a
-│ estimated row count: 3 (missing stats)
 │ render x: c + (a + b)
 │ render a: a
 │

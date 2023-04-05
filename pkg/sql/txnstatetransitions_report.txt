@@ -1,6 +1,6 @@
 // Code generated; DO NOT EDIT.
 
-Aborted{}
+Aborted{WasUpgraded:false}
 	handled events:
 		NonRetriableErr{IsCommit:false}
 		NonRetriableErr{IsCommit:true}
@@ -12,6 +12,25 @@ Aborted{}
 		TxnFinishAborted{}
 		TxnRestart{}
 	missing events:
+		TxnCommittedWithShowCommitTimestamp{}
+		TxnFinishCommitted{}
+		TxnReleased{}
+		TxnStart{ImplicitTxn:false}
+		TxnStart{ImplicitTxn:true}
+		TxnUpgradeToExplicit{}
+Aborted{WasUpgraded:true}
+	handled events:
+		NonRetriableErr{IsCommit:false}
+		NonRetriableErr{IsCommit:true}
+		RetriableErr{CanAutoRetry:false, IsCommit:false}
+		RetriableErr{CanAutoRetry:false, IsCommit:true}
+		RetriableErr{CanAutoRetry:true, IsCommit:false}
+		RetriableErr{CanAutoRetry:true, IsCommit:true}
+		SavepointRollback{}
+		TxnFinishAborted{}
+		TxnRestart{}
+	missing events:
+		TxnCommittedWithShowCommitTimestamp{}
 		TxnFinishCommitted{}
 		TxnReleased{}
 		TxnStart{ImplicitTxn:false}
@@ -28,6 +47,7 @@ CommitWait{}
 		RetriableErr{CanAutoRetry:true, IsCommit:false}
 		RetriableErr{CanAutoRetry:true, IsCommit:true}
 		SavepointRollback{}
+		TxnCommittedWithShowCommitTimestamp{}
 		TxnFinishAborted{}
 		TxnReleased{}
 		TxnRestart{}
@@ -46,12 +66,13 @@ NoTxn{}
 		RetriableErr{CanAutoRetry:true, IsCommit:false}
 		RetriableErr{CanAutoRetry:true, IsCommit:true}
 		SavepointRollback{}
+		TxnCommittedWithShowCommitTimestamp{}
 		TxnFinishAborted{}
 		TxnFinishCommitted{}
 		TxnReleased{}
 		TxnRestart{}
 		TxnUpgradeToExplicit{}
-Open{ImplicitTxn:false}
+Open{ImplicitTxn:false, WasUpgraded:false}
 	handled events:
 		NonRetriableErr{IsCommit:false}
 		NonRetriableErr{IsCommit:true}
@@ -59,6 +80,7 @@ Open{ImplicitTxn:false}
 		RetriableErr{CanAutoRetry:false, IsCommit:true}
 		RetriableErr{CanAutoRetry:true, IsCommit:false}
 		RetriableErr{CanAutoRetry:true, IsCommit:true}
+		TxnCommittedWithShowCommitTimestamp{}
 		TxnFinishAborted{}
 		TxnFinishCommitted{}
 		TxnReleased{}
@@ -68,7 +90,25 @@ Open{ImplicitTxn:false}
 		TxnStart{ImplicitTxn:false}
 		TxnStart{ImplicitTxn:true}
 		TxnUpgradeToExplicit{}
-Open{ImplicitTxn:true}
+Open{ImplicitTxn:false, WasUpgraded:true}
+	handled events:
+		NonRetriableErr{IsCommit:false}
+		NonRetriableErr{IsCommit:true}
+		RetriableErr{CanAutoRetry:false, IsCommit:false}
+		RetriableErr{CanAutoRetry:false, IsCommit:true}
+		RetriableErr{CanAutoRetry:true, IsCommit:false}
+		RetriableErr{CanAutoRetry:true, IsCommit:true}
+		TxnCommittedWithShowCommitTimestamp{}
+		TxnFinishAborted{}
+		TxnFinishCommitted{}
+		TxnReleased{}
+		TxnRestart{}
+	missing events:
+		SavepointRollback{}
+		TxnStart{ImplicitTxn:false}
+		TxnStart{ImplicitTxn:true}
+		TxnUpgradeToExplicit{}
+Open{ImplicitTxn:true, WasUpgraded:false}
 	handled events:
 		NonRetriableErr{IsCommit:false}
 		NonRetriableErr{IsCommit:true}
@@ -81,7 +121,27 @@ Open{ImplicitTxn:true}
 		TxnUpgradeToExplicit{}
 	missing events:
 		SavepointRollback{}
+		TxnCommittedWithShowCommitTimestamp{}
 		TxnReleased{}
 		TxnRestart{}
 		TxnStart{ImplicitTxn:false}
 		TxnStart{ImplicitTxn:true}
+Open{ImplicitTxn:true, WasUpgraded:true}
+	unreachable!
+	handled events:
+		NonRetriableErr{IsCommit:true}
+		RetriableErr{CanAutoRetry:false, IsCommit:true}
+		TxnFinishAborted{}
+		TxnFinishCommitted{}
+	missing events:
+		NonRetriableErr{IsCommit:false}
+		RetriableErr{CanAutoRetry:false, IsCommit:false}
+		RetriableErr{CanAutoRetry:true, IsCommit:false}
+		RetriableErr{CanAutoRetry:true, IsCommit:true}
+		SavepointRollback{}
+		TxnCommittedWithShowCommitTimestamp{}
+		TxnReleased{}
+		TxnRestart{}
+		TxnStart{ImplicitTxn:false}
+		TxnStart{ImplicitTxn:true}
+		TxnUpgradeToExplicit{}

@@ -13,7 +13,7 @@ package optbuilder
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -26,11 +26,11 @@ type arbiterSet struct {
 
 	// indexes contains the index arbiters in the set, as ordinals into the
 	// table's indexes.
-	indexes util.FastIntSet
+	indexes intsets.Fast
 
 	// uniqueConstraints contains the unique constraint arbiters in the set, as
 	// ordinals into the table's unique constraints.
-	uniqueConstraints util.FastIntSet
+	uniqueConstraints intsets.Fast
 }
 
 // makeArbiterSet returns an initialized arbiterSet.
@@ -105,9 +105,8 @@ func (a *arbiterSet) ContainsUniqueConstraint(uniq cat.UniqueOrdinal) bool {
 //     pred is nil.
 //   - canaryOrd is the table column ordinal of a not-null column in the
 //     constraint's table.
-//
 func (a *arbiterSet) ForEach(
-	f func(name string, conflictOrds util.FastIntSet, pred tree.Expr, canaryOrd int),
+	f func(name string, conflictOrds intsets.Fast, pred tree.Expr, canaryOrd int),
 ) {
 	// Call the callback for each index arbiter.
 	a.indexes.ForEach(func(i int) {
@@ -150,14 +149,14 @@ func (a *arbiterSet) removeIndex(idx cat.IndexOrdinal) {
 // unique constraints. It is only useful when an ON CONFLICT statement specifies
 // no columns or constraints. For example, consider the table and statement:
 //
-//   CREATE TABLE t (
-//     a INT,
-//     b INT,
-//     UNIQUE INDEX a_b_key (a, b),
-//     UNIQUE WITHOUT INDEX b_key (b)
-//   )
+//	CREATE TABLE t (
+//	  a INT,
+//	  b INT,
+//	  UNIQUE INDEX a_b_key (a, b),
+//	  UNIQUE WITHOUT INDEX b_key (b)
+//	)
 //
-//   INSERT INTO t VALUES (1, 2) ON CONFLICT DO NOTHING
+//	INSERT INTO t VALUES (1, 2) ON CONFLICT DO NOTHING
 //
 // There is no need to use both a_b_key and b_key as arbiters for the INSERT
 // statement because any conflict in a_b_key will also be a conflict in b_key.
@@ -188,7 +187,7 @@ type minArbiterSet struct {
 
 	// indexConflictOrdsCache caches the conflict column sets of arbiter indexes
 	// in the set.
-	indexConflictOrdsCache map[cat.IndexOrdinal]util.FastIntSet
+	indexConflictOrdsCache map[cat.IndexOrdinal]intsets.Fast
 }
 
 // makeMinArbiterSet returns an initialized arbiterSet.
@@ -230,10 +229,9 @@ func (m *minArbiterSet) ArbiterSet() arbiterSet {
 // the unique constraint. An arbiter index is redundant if both of the following
 // hold:
 //
-//   1. Its conflict columns are a super set of the given conflict columns.
-//   2. The index and unique constraint are both non-partial, or have the same
-//      partial predicate.
-//
+//  1. Its conflict columns are a super set of the given conflict columns.
+//  2. The index and unique constraint are both non-partial, or have the same
+//     partial predicate.
 func (m *minArbiterSet) findRedundantIndex(
 	uniq cat.UniqueConstraint,
 ) (_ cat.IndexOrdinal, ok bool) {
@@ -260,7 +258,7 @@ func (m *minArbiterSet) initCache() {
 		return
 	}
 	// Cache each index's conflict columns.
-	m.indexConflictOrdsCache = make(map[cat.IndexOrdinal]util.FastIntSet, m.as.indexes.Len())
+	m.indexConflictOrdsCache = make(map[cat.IndexOrdinal]intsets.Fast, m.as.indexes.Len())
 	m.as.indexes.ForEach(func(i int) {
 		index := m.as.mb.tab.Index(i)
 		m.indexConflictOrdsCache[i] = getIndexLaxKeyOrdinals(index)

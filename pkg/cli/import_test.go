@@ -12,13 +12,14 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
@@ -55,7 +56,7 @@ func runImportCLICommand(
 	case err := <-errCh:
 		t.Fatalf("import command returned before expected: output: %v, error: %v", out, err)
 	}
-	data, err := ioutil.ReadFile(dumpFilePath)
+	data, err := os.ReadFile(dumpFilePath)
 	require.NoError(t, err)
 	userfileURI := constructUserfileDestinationURI(dumpFilePath, "", username.RootUserName())
 	checkUserFileContent(ctx, t, c.ExecutorConfig(), username.RootUserName(), userfileURI, data)
@@ -106,7 +107,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"pgdump",
 			"PGDUMP",
-			testutils.TestDataPath(t, "import", "db.sql"),
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"",
 			"IMPORT PGDUMP 'userfile://defaultdb.public.userfiles_root/db." +
 				"sql' WITH max_row_size='524288'",
@@ -117,7 +118,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"pgdump-with-options",
 			"PGDUMP",
-			testutils.TestDataPath(t, "import", "db.sql"),
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"--max-row-size=1000 --skip-foreign-keys=true --row-limit=10 " +
 				"--ignore-unsupported-statements=true --log-ignored-statements='foo://bar'",
 			"IMPORT PGDUMP 'userfile://defaultdb.public.userfiles_root/db." +
@@ -131,7 +132,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"pgdump-to-target-database",
 			"PGDUMP",
-			testutils.TestDataPath(t, "import", "db.sql"),
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"--ignore-unsupported-statements=true --url=postgresql:///baz",
 			"IMPORT PGDUMP 'userfile://defaultdb.public.userfiles_root/db." +
 				"sql' WITH max_row_size='524288', ignore_unsupported_statements",
@@ -142,7 +143,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"mysql",
 			"MYSQLDUMP",
-			testutils.TestDataPath(t, "import", "db.sql"),
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"",
 			"IMPORT MYSQLDUMP 'userfile://defaultdb.public.userfiles_root/db.sql'",
 			"IMPORT TABLE foo FROM MYSQLDUMP 'userfile://defaultdb.public.userfiles_root/db.sql'",
@@ -151,7 +152,7 @@ func TestImportCLI(t *testing.T) {
 		{
 			"mysql-with-options",
 			"MYSQLDUMP",
-			testutils.TestDataPath(t, "import", "db.sql"),
+			datapathutils.TestDataPath(t, "import", "db.sql"),
 			"--skip-foreign-keys=true --row-limit=10",
 			"IMPORT MYSQLDUMP 'userfile://defaultdb.public.userfiles_root/db." +
 				"sql' WITH skip_foreign_keys, row_limit='10'",

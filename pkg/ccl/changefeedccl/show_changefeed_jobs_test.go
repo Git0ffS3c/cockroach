@@ -10,10 +10,10 @@ package changefeedccl
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -45,7 +45,7 @@ func (d *fakeResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	}
 }
 
-func (d *fakeResumer) OnFailOrCancel(ctx context.Context, _ interface{}) error {
+func (d *fakeResumer) OnFailOrCancel(context.Context, interface{}, error) error {
 	return nil
 }
 
@@ -53,11 +53,11 @@ func TestShowChangefeedJobsBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 
-		foo := feed(t, f, `CREATE CHANGEFEED FOR foo`)
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo WITH format='json'`)
 		defer closeFeed(t, foo)
 
 		type row struct {
@@ -105,10 +105,9 @@ func TestShowChangefeedJobsBasic(t *testing.T) {
 		require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
 	}
 
-	t.Run(`enterprise`, enterpriseTest(testFn))
-	t.Run(`kafka`, kafkaTest(testFn))
-	t.Run(`cloudstorage`, cloudStorageTest(testFn))
-	t.Run(`pubsub`, pubsubTest(testFn))
+	// TODO: Webhook disabled since the query parameters on the sinkURI are
+	// correct but out of order
+	cdcTest(t, testFn, feedTestOmitSinks("webhook", "sinkless"), feedTestNoExternalConnection)
 }
 
 func TestShowChangefeedJobs(t *testing.T) {
@@ -338,8 +337,8 @@ func TestShowChangefeedJobsAlterChangefeed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 		sqlDB.Exec(t, `CREATE TABLE bar (a INT PRIMARY KEY)`)
 
@@ -427,5 +426,59 @@ func TestShowChangefeedJobsAlterChangefeed(t *testing.T) {
 		require.Equal(t, "json", out.format, "Expected format:%s but found format:%s", "json", out.format)
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	// Force kafka to validate topics
+	cdcTest(t, testFn, feedTestForceSink("kafka"), feedTestNoExternalConnection)
+}
+
+func TestShowChangefeedJobsAuthorization(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		ChangefeedJobPermissionsTestSetup(t, s)
+
+		var jobID jobspb.JobID
+		createFeed := func(stmt string) {
+			successfulFeed := feed(t, f, stmt)
+			defer closeFeed(t, successfulFeed)
+			_, err := successfulFeed.Next()
+			require.NoError(t, err)
+			jobID = successfulFeed.(cdctest.EnterpriseTestFeed).JobID()
+		}
+		rootDB := sqlutils.MakeSQLRunner(s.DB)
+
+		// Create a changefeed and assert who can see it.
+		asUser(t, f, `feedCreator`, func(userDB *sqlutils.SQLRunner) {
+			createFeed(`CREATE CHANGEFEED FOR table_a, table_b`)
+		})
+		expectedJobIDStr := strconv.Itoa(int(jobID))
+		asUser(t, f, `adminUser`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `userWithAllGrants`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `userWithSomeGrants`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{})
+		})
+		asUser(t, f, `jobController`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `regularUser`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{})
+		})
+
+		// Assert behavior when one of the tables is dropped.
+		rootDB.Exec(t, "DROP TABLE table_b")
+		// Having CHANGEFEED on only table_a is now sufficient.
+		asUser(t, f, `userWithSomeGrants`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{{expectedJobIDStr}})
+		})
+		asUser(t, f, `regularUser`, func(userDB *sqlutils.SQLRunner) {
+			userDB.CheckQueryResults(t, `SELECT job_id FROM [SHOW CHANGEFEED JOBS]`, [][]string{})
+		})
+	}
+
+	// Only enterprise sinks create jobs.
+	cdcTest(t, testFn, feedTestEnterpriseSinks)
 }

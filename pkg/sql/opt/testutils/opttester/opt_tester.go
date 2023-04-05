@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"net/url"
 	"os"
@@ -39,8 +38,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
@@ -60,9 +61,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/floatcmp"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -88,25 +91,26 @@ var (
 	)
 
 	formatFlags = map[string]memo.ExprFmtFlags{
-		"miscprops":   memo.ExprFmtHideMiscProps,
-		"constraints": memo.ExprFmtHideConstraints,
-		"funcdeps":    memo.ExprFmtHideFuncDeps,
-		"ruleprops":   memo.ExprFmtHideRuleProps,
-		"stats":       memo.ExprFmtHideStats,
-		"hist":        memo.ExprFmtHideHistograms,
-		"cost":        memo.ExprFmtHideCost,
-		"qual":        memo.ExprFmtHideQualifications,
-		"scalars":     memo.ExprFmtHideScalars,
-		"physprops":   memo.ExprFmtHidePhysProps,
-		"types":       memo.ExprFmtHideTypes,
-		"notnull":     memo.ExprFmtHideNotNull,
-		"columns":     memo.ExprFmtHideColumns,
-		"all":         memo.ExprFmtHideAll,
+		"miscprops":       memo.ExprFmtHideMiscProps,
+		"constraints":     memo.ExprFmtHideConstraints,
+		"funcdeps":        memo.ExprFmtHideFuncDeps,
+		"ruleprops":       memo.ExprFmtHideRuleProps,
+		"stats":           memo.ExprFmtHideStats,
+		"hist":            memo.ExprFmtHideHistograms,
+		"cost":            memo.ExprFmtHideCost,
+		"qual":            memo.ExprFmtHideQualifications,
+		"scalars":         memo.ExprFmtHideScalars,
+		"physprops":       memo.ExprFmtHidePhysProps,
+		"types":           memo.ExprFmtHideTypes,
+		"notnull":         memo.ExprFmtHideNotNull,
+		"columns":         memo.ExprFmtHideColumns,
+		"all":             memo.ExprFmtHideAll,
+		"notvisibleindex": memo.ExprFmtHideNotVisibleIndexInfo,
 	}
 )
 
 // RuleSet efficiently stores an unordered set of RuleNames.
-type RuleSet = util.FastIntSet
+type RuleSet = intsets.Fast
 
 // OptTester is a helper for testing the various optimizer components. It
 // contains the boiler-plate code for the following useful tasks:
@@ -134,6 +138,10 @@ type OptTester struct {
 // Flags are control knobs for tests. Note that specific testcases can
 // override these defaults.
 type Flags struct {
+	ctx context.Context
+
+	evalCtx eval.Context
+
 	// ExprFormat controls the output detail of build / opt/ optsteps command
 	// directives.
 	ExprFormat memo.ExprFmtFlags
@@ -179,20 +187,9 @@ type Flags struct {
 	// the coster will be in the range [c - 0.5 * c, c + 0.5 * c).
 	PerturbCost float64
 
-	// JoinLimit is the default value for SessionData.ReorderJoinsLimit.
-	JoinLimit int
-
 	// PreferLookupJoinsForFK is the default value for
 	// SessionData.PreferLookupJoinsForFKs.
 	PreferLookupJoinsForFKs bool
-
-	// PropagateInputOrdering is the default value for
-	// SessionData.PropagateInputOrdering.
-	PropagateInputOrdering bool
-
-	// NullOrderedLast is the default value for
-	// SessionData.NullOrderedLast.
-	NullOrderedLast bool
 
 	// Locality specifies the location of the planning node as a set of user-
 	// defined key/value pairs, ordered from most inclusive to least inclusive.
@@ -211,13 +208,9 @@ type Flags struct {
 	// only used by the inject-stats commands.
 	Table string
 
-	// SaveTablesPrefix specifies the prefix of the table to create or print
-	// for each subexpression in the query.
-	SaveTablesPrefix string
-
 	// IgnoreTables specifies the subset of stats tables which should not be
 	// outputted by the stats-quality command.
-	IgnoreTables util.FastIntSet
+	IgnoreTables intsets.Fast
 
 	// File specifies the name of the file to import. This field is only used by
 	// the import command.
@@ -257,9 +250,13 @@ type Flags struct {
 	// QueryArgs are values for placeholders, used for assign-placeholders-*.
 	QueryArgs []string
 
-	// UseMultiColStats is the value for SessionData.OptimizerUseMultiColStats.
-	// It defaults to true in New.
-	UseMultiColStats bool
+	// SkipRace indicates that a test should be skipped if the race detector is
+	// enabled.
+	SkipRace bool
+
+	// RoundFloatsInStringsSigFigs specifies the number of significant figures
+	// to round floats embedded in strings to where zero means do not round.
+	RoundFloatsInStringsSigFigs int
 }
 
 // New constructs a new instance of the OptTester for the given SQL statement.
@@ -267,13 +264,18 @@ type Flags struct {
 func New(catalog cat.Catalog, sql string) *OptTester {
 	ctx := context.Background()
 	ot := &OptTester{
-		Flags:   Flags{JoinLimit: opt.DefaultJoinOrderLimit, UseMultiColStats: true},
 		catalog: catalog,
 		sql:     sql,
 		ctx:     ctx,
 		semaCtx: tree.MakeSemaContext(),
 		evalCtx: eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings()),
 	}
+	ot.evalCtx.SessionData().ReorderJoinsLimit = opt.DefaultJoinOrderLimit
+	ot.evalCtx.SessionData().OptimizerUseMultiColStats = true
+	ot.Flags.ctx = ot.ctx
+	ot.Flags.evalCtx = ot.evalCtx
+	ot.semaCtx.SearchPath = tree.EmptySearchPath
+	ot.semaCtx.FunctionResolver = ot.catalog
 	// To allow opttester tests to use now(), we hardcode a preset transaction
 	// time. May 10, 2017 is a historic day: the release date of CockroachDB 1.0.
 	ot.evalCtx.TxnTimestamp = time.Date(2017, 05, 10, 13, 0, 0, 0, time.UTC)
@@ -283,256 +285,271 @@ func New(catalog cat.Catalog, sql string) *OptTester {
 	ot.evalCtx.SessionData().UserProto = username.MakeSQLUsernameFromPreNormalizedString("opttester").EncodeProto()
 	ot.evalCtx.SessionData().Database = "defaultdb"
 	ot.evalCtx.SessionData().ZigzagJoinEnabled = true
+	ot.evalCtx.SessionData().OptimizerUseForecasts = true
 	ot.evalCtx.SessionData().OptimizerUseHistograms = true
 	ot.evalCtx.SessionData().LocalityOptimizedSearch = true
 	ot.evalCtx.SessionData().ReorderJoinsLimit = opt.DefaultJoinOrderLimit
 	ot.evalCtx.SessionData().InsertFastPath = true
+	ot.evalCtx.SessionData().OptSplitScanLimit = tabledesc.MaxBucketAllowed
+	ot.evalCtx.SessionData().VariableInequalityLookupJoinEnabled = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedDisjunctionStats = true
+	ot.evalCtx.SessionData().OptimizerUseLimitOrderingForStreamingGroupBy = true
+	ot.evalCtx.SessionData().OptimizerUseImprovedSplitDisjunctionForJoins = true
+	ot.evalCtx.SessionData().OptimizerAlwaysUseHistograms = true
 
 	return ot
 }
 
 // RunCommand implements commands that are used by most tests:
 //
-//  - exec-ddl
+//   - exec-ddl
 //
-//    Runs a SQL DDL statement to build the test catalog. Only a small number
-//    of DDL statements are supported, and those not fully. This is only
-//    available when using a TestCatalog.
+//     Runs a SQL DDL statement to build the test catalog. Only a small number
+//     of DDL statements are supported, and those not fully. This is only
+//     available when using a TestCatalog.
 //
-//  - build [flags]
+//   - build [flags]
 //
-//    Builds an expression tree from a SQL query and outputs it without any
-//    optimizations applied to it.
+//     Builds an expression tree from a SQL query and outputs it without any
+//     optimizations applied to it.
 //
-//  - norm [flags]
+//   - norm [flags]
 //
-//    Builds an expression tree from a SQL query, applies normalization
-//    optimizations, and outputs it without any exploration optimizations
-//    applied to it.
+//     Builds an expression tree from a SQL query, applies normalization
+//     optimizations, and outputs it without any exploration optimizations
+//     applied to it.
 //
-//  - opt [flags]
+//   - opt [flags]
 //
-//    Builds an expression tree from a SQL query, fully optimizes it using the
-//    memo, and then outputs the lowest cost tree.
+//     Builds an expression tree from a SQL query, fully optimizes it using the
+//     memo, and then outputs the lowest cost tree.
 //
-//  - assign-placeholders-build query-args=(...)
+//   - assign-placeholders-build query-args=(...)
 //
-//    Builds a query that has placeholders (with normalization disabled), then
-//    assigns placeholders to the given query arguments. Normalization rules are
-//    disabled when assigning placeholders.
+//     Builds a query that has placeholders (with normalization disabled), then
+//     assigns placeholders to the given query arguments. Normalization rules are
+//     disabled when assigning placeholders.
 //
-//  - assign-placeholders-norm query-args=(...)
+//   - assign-placeholders-norm query-args=(...)
 //
-//    Builds a query that has placeholders (with normalization enabled), then
-//    assigns placeholders to the given query arguments. Normalization rules are
-//    enabled when assigning placeholders.
+//     Builds a query that has placeholders (with normalization enabled), then
+//     assigns placeholders to the given query arguments. Normalization rules are
+//     enabled when assigning placeholders.
 //
-//  - assign-placeholders-opt query-args=(...)
+//   - assign-placeholders-opt query-args=(...)
 //
-//    Builds a query that has placeholders (with normalization enabled), then
-//    assigns placeholders to the given query arguments and fully optimizes it.
+//     Builds a query that has placeholders (with normalization enabled), then
+//     assigns placeholders to the given query arguments and fully optimizes it.
 //
-//  - placeholder-fast-path [flags]
+//   - placeholder-fast-path [flags]
 //
-//    Builds an expression tree from a SQL query which contains placeholders and
-//    attempts to use the placeholder fast path to obtain a fully optimized
-//    expression with placeholders.
+//     Builds an expression tree from a SQL query which contains placeholders and
+//     attempts to use the placeholder fast path to obtain a fully optimized
+//     expression with placeholders.
 //
-//  - build-cascades [flags]
+//   - build-cascades [flags]
 //
-//    Builds a query and then recursively builds cascading queries. Outputs all
-//    unoptimized plans.
+//     Builds a query and then recursively builds cascading queries. Outputs all
+//     unoptimized plans.
 //
-//  - optsteps [flags]
+//   - optsteps [flags]
 //
-//    Outputs the lowest cost tree for each step in optimization using the
-//    standard unified diff format. Used for debugging the optimizer.
+//     Outputs the lowest cost tree for each step in optimization using the
+//     standard unified diff format. Used for debugging the optimizer.
 //
-//  - optstepsweb [flags]
+//   - optstepsweb [flags]
 //
-//    Similar to optsteps, but outputs a URL which displays the results.
+//     Similar to optsteps, but outputs a URL which displays the results.
 //
-//  - exploretrace [flags]
+//   - exploretrace [flags]
 //
-//    Outputs information about exploration rule application. Used for debugging
-//    the optimizer.
+//     Outputs information about exploration rule application. Used for debugging
+//     the optimizer.
 //
-//  - memo [flags]
+//   - memo [flags]
 //
-//    Builds an expression tree from a SQL query, fully optimizes it using the
-//    memo, and then outputs the memo containing the forest of trees.
+//     Builds an expression tree from a SQL query, fully optimizes it using the
+//     memo, and then outputs the memo containing the forest of trees.
 //
-//  - rulestats [flags]
+//   - rulestats [flags]
 //
-//    Performs the optimization and outputs statistics about applied rules.
+//     Performs the optimization and outputs statistics about applied rules.
 //
-//  - expr
+//   - expr
 //
-//    Builds an expression directly from an opt-gen-like string; see
-//    exprgen.Build.
+//     Builds an expression directly from an opt-gen-like string; see
+//     exprgen.Build.
 //
-//  - exprnorm
+//   - exprnorm
 //
-//    Builds an expression directly from an opt-gen-like string (see
-//    exprgen.Build), applies normalization optimizations, and outputs the tree
-//    without any exploration optimizations applied to it.
+//     Builds an expression directly from an opt-gen-like string (see
+//     exprgen.Build), applies normalization optimizations, and outputs the tree
+//     without any exploration optimizations applied to it.
 //
-//  - expropt
+//   - expropt
 //
-//    Builds an expression directly from an opt-gen-like string (see
-//    exprgen.Optimize), applies normalization and exploration optimizations,
-//    and outputs the tree.
+//     Builds an expression directly from an opt-gen-like string (see
+//     exprgen.Optimize), applies normalization and exploration optimizations,
+//     and outputs the tree.
 //
-//  - stats-quality [flags]
+//   - stats-quality [flags]
 //
-//    Fully optimizes the given query and saves the subexpressions as tables
-//    in the test catalog with their estimated statistics injected.
-//    If rewriteActualFlag=true, also executes the given query against a
-//    running database and saves the intermediate results as tables.
-//    Compares estimated statistics for a relational expression with the actual
-//    statistics calculated by calling CREATE STATISTICS on the output of the
-//    expression. If rewriteActualFlag=false, stats-quality must have been run
-//    previously with rewriteActualFlag=true to save the statistics as tables.
+//     Fully optimizes the given query and saves the subexpressions as tables
+//     in the test catalog with their estimated statistics injected.
+//     If rewriteActualFlag=true, also executes the given query against a
+//     running database and saves the intermediate results as tables.
+//     Compares estimated statistics for a relational expression with the actual
+//     statistics calculated by calling CREATE STATISTICS on the output of the
+//     expression. If rewriteActualFlag=false, stats-quality must have been run
+//     previously with rewriteActualFlag=true to save the statistics as tables.
 //
-//  - reorderjoins [flags]
+//   - reorderjoins [flags]
 //
-//    Fully optimizes the given query and outputs information from
-//    joinOrderBuilder during join reordering. See the ReorderJoins comment in
-//    reorder_joins.go for information on the output format.
+//     Fully optimizes the given query and outputs information from
+//     joinOrderBuilder during join reordering. See the ReorderJoins comment in
+//     reorder_joins.go for information on the output format.
 //
-//  - import file=...
+//   - import file=...
 //
-//    Imports a file containing exec-ddl commands in order to add tables and/or
-//    stats to the catalog. This allows commonly-used schemas such as TPC-C or
-//    TPC-H to be used by multiple test files without copying the schemas and
-//    stats multiple times. The file name must be provided with the file flag.
-//    The path of the file should be relative to
-//    testutils/opttester/testfixtures.
+//     Imports a file containing exec-ddl commands in order to add tables and/or
+//     stats to the catalog. This allows commonly-used schemas such as TPC-C or
+//     TPC-H to be used by multiple test files without copying the schemas and
+//     stats multiple times. The file name must be provided with the file flag.
+//     The path of the file should be relative to
+//     testutils/opttester/testfixtures.
 //
-//  - inject-stats file=... table=...
+//   - inject-stats file=... table=...
 //
-//    Injects table statistics from a json file.
+//     Injects table statistics from a json file.
 //
-//  - check-size [rule-limit=...] [group-limit=...] [suppress-report]
+//   - check-size [rule-limit=...] [group-limit=...] [suppress-report]
 //
-//    Fully optimizes the given query and outputs the number of rules applied
-//    and memo groups created. If the rule-limit or group-limit flags are set,
-//    check-size will result in a test error if the rule application or memo
-//    group count exceeds the corresponding limit. If either the rule-limit or
-//    group-limit options are used the suppress-report option suppresses
-//    printing of the number of rules and groups explored.
+//     Fully optimizes the given query and outputs the number of rules applied
+//     and memo groups created. If the rule-limit or group-limit flags are set,
+//     check-size will result in a test error if the rule application or memo
+//     group count exceeds the corresponding limit. If either the rule-limit or
+//     group-limit options are used the suppress-report option suppresses
+//     printing of the number of rules and groups explored.
 //
-//  - index-candidates
+//   - index-candidates
 //
-//    Walks through the SQL statement to determine candidates for index
-//    recommendation. See the indexrec package.
+//     Walks through the SQL statement to determine candidates for index
+//     recommendation. See the indexrec package.
 //
-//  - index-recommendations
+//   - index-recommendations
 //
-//    Walks through the SQL statement and recommends indexes to add in order to
-//    speed up its execution, if these indexes exist. See the indexrec package.
+//     Walks through the SQL statement and recommends indexes to add in order to
+//     speed up its execution, if these indexes exist. See the indexrec package.
 //
 // Supported flags:
 //
-//  - format: controls the formatting of expressions for build, opt, and
-//    optsteps commands. Format flags are of the form
-//      (show|hide)-(all|miscprops|constraints|scalars|types|...)
-//    See formatFlags for all flags. Multiple flags can be specified; each flag
-//    modifies the existing set of the flags.
+//   - format: controls the formatting of expressions for build, opt, and
+//     optsteps commands. Format flags are of the form
+//     (show|hide)-(all|miscprops|constraints|scalars|types|...)
+//     See formatFlags for all flags. Multiple flags can be specified; each flag
+//     modifies the existing set of the flags.
 //
-//  - no-stable-folds: disallows constant folding for stable operators; only
-//                     used with "norm".
+//   - no-stable-folds: disallows constant folding for stable operators; only
+//     used with "norm".
 //
-//  - fully-qualify-names: fully qualify all column names in the test output.
+//   - fully-qualify-names: fully qualify all column names in the test output.
 //
-//  - expect: fail the test if the rules specified by name are not "applied".
-//    For normalization rules, "applied" means that the rule's pattern matched
-//    an expression. For exploration rules, "applied" means that the rule's
-//    pattern matched an expression and the rule generated one or more new
-//    expressions in the memo.
+//   - expect: fail the test if the rules specified by name are not "applied".
+//     For normalization rules, "applied" means that the rule's pattern matched
+//     an expression. For exploration rules, "applied" means that the rule's
+//     pattern matched an expression and the rule generated one or more new
+//     expressions in the memo.
 //
-//  - expect-not: fail the test if the rules specified by name are "applied".
+//   - expect-not: fail the test if the rules specified by name are "applied".
 //
-//  - disable: disables optimizer rules by name. Examples:
-//      opt disable=ConstrainScan
-//      norm disable=(NegateOr,NegateAnd)
+//   - disable: disables optimizer rules by name. Examples:
+//     opt disable=ConstrainScan
+//     norm disable=(NegateOr,NegateAnd)
 //
-//  - rule: used with exploretrace; the value is the name of a rule. When
-//    specified, the exploretrace output is filtered to only show expression
-//    changes due to that specific rule.
+//   - rule: used with exploretrace; the value is the name of a rule. When
+//     specified, the exploretrace output is filtered to only show expression
+//     changes due to that specific rule.
 //
-//  - skip-no-op: used with exploretrace; hide instances of rules that don't
-//    generate any new expressions.
+//   - skip-no-op: used with exploretrace; hide instances of rules that don't
+//     generate any new expressions.
 //
-//  - colstat: requests the calculation of a column statistic on the top-level
-//    expression. The value is a column or a list of columns. The flag can
-//    be used multiple times to request different statistics.
+//   - colstat: requests the calculation of a column statistic on the top-level
+//     expression. The value is a column or a list of columns. The flag can
+//     be used multiple times to request different statistics.
 //
-//  - perturb-cost: used to randomly perturb the estimated cost of each
-//    expression in the query tree for the purpose of creating alternate query
-//    plans in the optimizer.
+//   - perturb-cost: used to randomly perturb the estimated cost of each
+//     expression in the query tree for the purpose of creating alternate query
+//     plans in the optimizer.
 //
-//  - locality: used to set the locality of the node that plans the query. This
-//    can affect costing when there are multiple possible indexes to choose
-//    from, each in different localities.
+//   - locality: used to set the locality of the node that plans the query. This
+//     can affect costing when there are multiple possible indexes to choose
+//     from, each in different localities.
 //
-//  - database: used to set the current database used by the query. This is
-//    used by the stats-quality command when rewriteActualFlag=true.
+//   - database: used to set the current database used by the query. This is
+//     used by the stats-quality command when rewriteActualFlag=true.
 //
-//  - table: used to set the current table used by the command. This is used by
-//    the inject-stats command.
+//   - table: used to set the current table used by the command. This is used by
+//     the inject-stats command.
 //
-//  - stats-quality-prefix: must be used with the stats-quality command. If
-//    rewriteActualFlag=true, indicates that a table should be created with the
-//    given prefix for the output of each subexpression in the query. Otherwise,
-//    outputs the name of the table that would be created for each
-//    subexpression.
+//   - stats-quality-prefix: must be used with the stats-quality command. If
+//     rewriteActualFlag=true, indicates that a table should be created with the
+//     given prefix for the output of each subexpression in the query. Otherwise,
+//     outputs the name of the table that would be created for each
+//     subexpression.
 //
-//  - ignore-tables: specifies the set of stats tables for which stats quality
-//    comparisons should not be outputted. Only used with the stats-quality
-//    command. Note that tables can always be added to the `ignore-tables` set
-//    without necessitating a run with `rewrite-actual-stats=true`, because the
-//    now-ignored stats outputs will simply be removed. However, the reverse is
-//    not possible. So, the best way to rewrite a stats quality test for which
-//    the plan has changed is to first remove the `ignore-tables` flag, then add
-//    it back and do a normal rewrite to remove the superfluous tables.
+//   - ignore-tables: specifies the set of stats tables for which stats quality
+//     comparisons should not be outputted. Only used with the stats-quality
+//     command. Note that tables can always be added to the `ignore-tables` set
+//     without necessitating a run with `rewrite-actual-stats=true`, because the
+//     now-ignored stats outputs will simply be removed. However, the reverse is
+//     not possible. So, the best way to rewrite a stats quality test for which
+//     the plan has changed is to first remove the `ignore-tables` flag, then add
+//     it back and do a normal rewrite to remove the superfluous tables.
 //
-//  - file: specifies a file, used for the following commands:
-//     - import: the file path is relative to opttester/testfixtures;
-//     - inject-stats: the file path is relative to the test file.
+//   - file: specifies a file, used for the following commands:
 //
-//  - join-limit: sets the value for SessionData.ReorderJoinsLimit, which
-//  indicates the number of joins at which the optimizer should stop attempting
-//  to reorder.
+//   - import: the file path is relative to opttester/testfixtures;
 //
-//  - prefer-lookup-joins-for-fks sets SessionData.PreferLookupJoinsForFKs to
-//  true, causing foreign key operations to prefer lookup joins.
+//   - inject-stats: the file path is relative to the test file.
 //
-//  - null-ordered-last sets SessionData.NullOrderedLast to true, which orders
-//  NULL values last in ascending order.
+//   - join-limit: sets the value for SessionData.ReorderJoinsLimit, which
+//     indicates the number of joins at which the optimizer should stop
+//     attempting to reorder.
 //
-//  - cascade-levels: used to limit the depth of recursive cascades for
-//    build-cascades.
+//   - prefer-lookup-joins-for-fks: sets SessionData.PreferLookupJoinsForFKs to
+//     true, causing foreign key operations to prefer lookup joins.
 //
-//  - index-version: controls the version of the index descriptor created in
-//    the test catalog. This is used by the exec-ddl command for CREATE INDEX
-//    statements.
+//   - null-ordered-last: sets SessionData.NullOrderedLast to true, which orders
+//     NULL values last in ascending order.
 //
-//  - split-diff: replaces the unified diff output of the optsteps command with
-//    a split diff where the before and after expressions are printed in their
-//    entirety. This is only used by the optsteps command.
+//   - cascade-levels: used to limit the depth of recursive cascades for
+//     build-cascades.
 //
-//  - rule-limit: used with check-size to set a max limit on the number of rules
-//    that can be applied before a testing error is returned.
+//   - index-version: controls the version of the index descriptor created in
+//     the test catalog. This is used by the exec-ddl command for CREATE INDEX
+//     statements.
 //
-//  - group-limit: used with check-size to set a max limit on the number of
-//    groups that can be added to the memo before a testing error is returned.
+//   - split-diff: replaces the unified diff output of the optsteps command with
+//     a split diff where the before and after expressions are printed in their
+//     entirety. This is only used by the optsteps command.
 //
-//  - use-multi-col-stats sets the value for
-//  SessionData.OptimizerUseMultiColStats which indicates whether or not
-//  multi-column statistics are used for cardinality estimation in the
-//  optimizer. This option requires a single boolean argument.
+//   - rule-limit: used with check-size to set a max limit on the number of rules
+//     that can be applied before a testing error is returned.
 //
+//   - skip-race: skips the test if the race detector is enabled.
+//
+//   - group-limit: used with check-size to set a max limit on the number of
+//     groups that can be added to the memo before a testing error is returned.
+//
+//   - memo-cycles: used with memo to search the memo for cycles and output a
+//     path with a cycle if one is found.
+//
+//   - skip-race: skips the test if the race detector is enabled.
+//
+//   - set: sets the session setting for the given SQL statement, for example:
+//     build set=prefer_lookup_joins_for_fks=true
+//     DELETE FROM parent WHERE p = 3
+//     ----
 func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	// Allow testcases to override the flags.
 	for _, a := range d.CmdArgs {
@@ -542,17 +559,17 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	}
 	ot.Flags.Verbose = datadriven.Verbose()
 
-	ot.semaCtx.Placeholders = tree.PlaceholderInfo{}
+	// Skip the test if the skip-race flag was provided and the race detector is
+	// enabled.
+	if ot.Flags.SkipRace && util.RaceEnabled {
+		return d.Expected
+	}
 
-	ot.evalCtx.SessionData().ReorderJoinsLimit = int64(ot.Flags.JoinLimit)
-	ot.evalCtx.SessionData().PreferLookupJoinsForFKs = ot.Flags.PreferLookupJoinsForFKs
-	ot.evalCtx.SessionData().PropagateInputOrdering = ot.Flags.PropagateInputOrdering
-	ot.evalCtx.SessionData().NullOrderedLast = ot.Flags.NullOrderedLast
-	ot.evalCtx.SessionData().OptimizerUseMultiColStats = ot.Flags.UseMultiColStats
+	ot.semaCtx.Placeholders = tree.PlaceholderInfo{}
 
 	ot.evalCtx.TestingKnobs.OptimizerCostPerturbation = ot.Flags.PerturbCost
 	ot.evalCtx.Locality = ot.Flags.Locality
-	ot.evalCtx.SessionData().SaveTablesPrefix = ot.Flags.SaveTablesPrefix
+	ot.evalCtx.OriginalLocality = ot.Flags.Locality
 	ot.evalCtx.Placeholders = nil
 
 	switch d.Cmd {
@@ -613,6 +630,9 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 			d.Fatalf(tb, "%+v", err)
 		}
 		ot.postProcess(tb, d, e)
+		if ot.Flags.RoundFloatsInStringsSigFigs > 0 {
+			return floatcmp.RoundFloatsInString(ot.FormatExpr(e), ot.Flags.RoundFloatsInStringsSigFigs)
+		}
 		return ot.FormatExpr(e)
 
 	case "assign-placeholders-build", "assign-placeholders-norm", "assign-placeholders-opt":
@@ -739,6 +759,9 @@ func (ot *OptTester) RunCommand(tb testing.TB, d *datadriven.TestData) string {
 	case "expropt":
 		e, err := ot.ExprOpt()
 		if err != nil {
+			if len(errors.GetAllDetails(err)) > 0 {
+				return fmt.Sprintf("error: %s\ndetails:\n%s", err, errors.FlattenDetails(err))
+			}
 			return fmt.Sprintf("error: %s\n", err)
 		}
 		ot.postProcess(tb, d, e)
@@ -799,7 +822,9 @@ func (ot *OptTester) FormatExpr(e opt.Expr) string {
 	if rel, ok := e.(memo.RelExpr); ok {
 		mem = rel.Memo()
 	}
-	return memo.FormatExpr(e, ot.Flags.ExprFormat, mem, ot.catalog)
+	return memo.FormatExpr(
+		ot.ctx, e, ot.Flags.ExprFormat, false /* redactableValues */, mem, ot.catalog,
+	)
 }
 
 func formatRuleSet(r RuleSet) string {
@@ -833,7 +858,7 @@ func (ot *OptTester) postProcess(tb testing.TB, d *datadriven.TestData, e opt.Ex
 
 	if rel, ok := e.(memo.RelExpr); ok {
 		for _, cols := range ot.Flags.ColStats {
-			memo.RequestColStat(&ot.evalCtx, rel, cols)
+			memo.RequestColStat(ot.ctx, &ot.evalCtx, rel, cols)
 		}
 	}
 	ot.checkExpectedRules(tb, d)
@@ -846,10 +871,10 @@ func fillInLazyProps(e opt.Expr) {
 		rel = rel.FirstExpr()
 
 		// Derive columns that are candidates for pruning.
-		norm.DerivePruneCols(rel)
+		norm.DerivePruneCols(rel, intsets.Fast{} /* disabledRules */)
 
 		// Derive columns that are candidates for null rejection.
-		norm.DeriveRejectNullCols(rel)
+		norm.DeriveRejectNullCols(rel, intsets.Fast{} /* disabledRules */)
 
 		// Make sure the interesting orderings are calculated.
 		ordering.DeriveInterestingOrderings(rel)
@@ -876,6 +901,27 @@ func ruleNamesToRuleSet(args []string) (RuleSet, error) {
 // See OptTester.RunCommand for supported flags.
 func (f *Flags) Set(arg datadriven.CmdArg) error {
 	switch arg.Key {
+	case "round-in-strings":
+		if len(arg.Vals) != 1 {
+			return fmt.Errorf("round-in-strings requires a single argument")
+		}
+		sigFigs, err := strconv.Atoi(arg.Vals[0])
+		if err != nil {
+			return err
+		}
+		f.RoundFloatsInStringsSigFigs = sigFigs
+	case "set":
+		for _, val := range arg.Vals {
+			s := strings.Split(val, "=")
+			if len(s) != 2 {
+				return errors.Errorf("Expected both session variable name and value for set flag")
+			}
+			err := sql.SetSessionVariable(f.ctx, f.evalCtx, s[0], s[1])
+			if err != nil {
+				return err
+			}
+		}
+
 	case "format":
 		if len(arg.Vals) == 0 {
 			return fmt.Errorf("format flag requires value(s)")
@@ -915,28 +961,6 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 			}
 			f.DisableRules.Add(int(r))
 		}
-
-	case "join-limit":
-		if len(arg.Vals) != 1 {
-			return fmt.Errorf("join-limit requires a single argument")
-		}
-		limit, err := strconv.ParseInt(arg.Vals[0], 10, 64)
-		if err != nil {
-			return errors.Wrap(err, "join-limit")
-		}
-		f.JoinLimit = int(limit)
-
-	case "prefer-lookup-joins-for-fks":
-		if len(arg.Vals) > 0 {
-			return fmt.Errorf("unknown vals for prefer-lookup-joins-for-fks")
-		}
-		f.PreferLookupJoinsForFKs = true
-
-	case "null-ordered-last":
-		if len(arg.Vals) > 0 {
-			return fmt.Errorf("unknown vals for null-ordered-last")
-		}
-		f.NullOrderedLast = true
 
 	case "rule":
 		if len(arg.Vals) != 1 {
@@ -1009,14 +1033,8 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 		}
 		f.Table = arg.Vals[0]
 
-	case "stats-quality-prefix":
-		if len(arg.Vals) != 1 {
-			return fmt.Errorf("stats-quality-prefix requires one argument")
-		}
-		f.SaveTablesPrefix = arg.Vals[0]
-
 	case "ignore-tables":
-		var tables util.FastIntSet
+		var tables intsets.Fast
 		addTables := func(val string) error {
 			table, err := strconv.Atoi(val)
 			if err != nil {
@@ -1099,18 +1117,11 @@ func (f *Flags) Set(arg datadriven.CmdArg) error {
 	case "query-args":
 		f.QueryArgs = arg.Vals
 
-	case "propagate-input-ordering":
-		f.PropagateInputOrdering = true
+	case "memo-cycles":
+		f.MemoFormat = xform.FmtCycle
 
-	case "use-multi-col-stats":
-		if len(arg.Vals) != 1 {
-			return fmt.Errorf("use-multi-col-stats requires a single argument")
-		}
-		b, err := strconv.ParseBool(arg.Vals[0])
-		if err != nil {
-			return errors.Wrap(err, "use-multi-col-stats")
-		}
-		f.UseMultiColStats = b
+	case "skip-race":
+		f.SkipRace = true
 
 	default:
 		return fmt.Errorf("unknown argument: %s", arg.Key)
@@ -1193,7 +1204,7 @@ func (ot *OptTester) AssignPlaceholders(
 	if err != nil {
 		return nil, err
 	}
-	prepMemo := o.DetachMemo()
+	prepMemo := o.DetachMemo(ot.ctx)
 
 	// Construct placeholder values.
 	if exp := len(ot.semaCtx.Placeholders.Types); len(queryArgs) != exp {
@@ -1216,6 +1227,7 @@ func (ot *OptTester) AssignPlaceholders(
 			"", /* context */
 			&ot.semaCtx,
 			volatility.Volatile,
+			false, /*allowAssignmentCast*/
 		)
 		if err != nil {
 			return nil, err
@@ -1264,23 +1276,24 @@ func (ot *OptTester) Memo() (string, error) {
 	if _, err := ot.optimizeExpr(o, nil); err != nil {
 		return "", err
 	}
-	return o.FormatMemo(ot.Flags.MemoFormat), nil
+	return o.FormatMemo(ot.Flags.MemoFormat, false /* redactableValues */), nil
 }
 
 // Expr parses the input directly into an expression; see exprgen.Build.
 func (ot *OptTester) Expr() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx, ot.catalog)
+	f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
 	f.DisableOptimizations()
 
-	return exprgen.Build(ot.catalog, &f, ot.sql)
+	return exprgen.Build(ot.ctx, ot.catalog, &f, ot.sql)
 }
 
 // ExprNorm parses the input directly into an expression and runs
 // normalization; see exprgen.Build.
 func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 	var f norm.Factory
-	f.Init(&ot.evalCtx, ot.catalog)
+	f.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	f.SetDisabledRules(ot.Flags.DisableRules)
 
 	if !ot.Flags.NoStableFolds {
 		f.FoldingControl().AllowStableFolds()
@@ -1296,7 +1309,7 @@ func (ot *OptTester) ExprNorm() (opt.Expr, error) {
 		ot.appliedRules.Add(int(ruleName))
 	})
 
-	return exprgen.Build(ot.catalog, &f, ot.sql)
+	return exprgen.Build(ot.ctx, ot.catalog, &f, ot.sql)
 }
 
 // ExprOpt parses the input directly into an expression and runs normalization
@@ -1317,7 +1330,7 @@ func (ot *OptTester) ExprOpt() (opt.Expr, error) {
 		ot.appliedRules.Add(int(ruleName))
 	})
 
-	return exprgen.Optimize(ot.catalog, o, ot.sql)
+	return exprgen.Optimize(ot.ctx, ot.catalog, o, ot.sql)
 }
 
 // RuleStats performs the optimization and returns statistics about how many
@@ -1423,17 +1436,18 @@ func (ot *OptTester) RuleStats() (string, error) {
 // transformation. The output of each step is diff'd against the output of a
 // previous step, using the standard unified diff format.
 //
-//   CREATE TABLE a (x INT PRIMARY KEY, y INT, UNIQUE INDEX (y))
+//	CREATE TABLE a (x INT PRIMARY KEY, y INT, UNIQUE INDEX (y))
 //
-//   SELECT x FROM a WHERE x=1
+//	SELECT x FROM a WHERE x=1
 //
 // At the time of this writing, this query triggers 6 rule applications:
-//   EnsureSelectFilters     Wrap Select predicate with Filters operator
-//   FilterUnusedSelectCols  Do not return unused "y" column from Scan
-//   EliminateProject        Remove unneeded Project operator
-//   GenerateIndexScans      Explore scanning "y" index to get "x" values
-//   ConstrainScan           Explore pushing "x=1" into "x" index Scan
-//   ConstrainScan           Explore pushing "x=1" into "y" index Scan
+//
+//	EnsureSelectFilters     Wrap Select predicate with Filters operator
+//	FilterUnusedSelectCols  Do not return unused "y" column from Scan
+//	EliminateProject        Remove unneeded Project operator
+//	GenerateIndexScans      Explore scanning "y" index to get "x" values
+//	ConstrainScan           Explore pushing "x=1" into "x" index Scan
+//	ConstrainScan           Explore pushing "x=1" into "y" index Scan
 //
 // Some steps produce better plans that have a lower execution cost. Other steps
 // don't. However, it's useful to see both kinds of steps. The optsteps output
@@ -1441,7 +1455,6 @@ func (ot *OptTester) RuleStats() (string, error) {
 // a better plan has been found, and weaker "----" header delimiters when not.
 // In both cases, the output shows the expressions that were changed or added by
 // the rule, even if the total expression tree cost worsened.
-//
 func (ot *OptTester) OptSteps() (string, error) {
 	var prevBest, prev, next string
 	ot.builder.Reset()
@@ -1453,7 +1466,7 @@ func (ot *OptTester) OptSteps() (string, error) {
 			return "", err
 		}
 
-		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
+		next = os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat, false /* redactableValues */)
 
 		// This call comes after setting "next", because we want to output the
 		// final expression, even though there were no diffs from the previous
@@ -1524,7 +1537,7 @@ func (ot *OptTester) optStepsNormDiff() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		expr := os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat)
+		expr := os.fo.o.FormatExpr(os.Root(), ot.Flags.ExprFormat, false /* redactableValues */)
 		name := "Initial"
 		if len(normSteps) > 0 {
 			rule := os.LastRuleName()
@@ -1589,11 +1602,14 @@ func (ot *OptTester) optStepsExploreDiff() (string, error) {
 			continue
 		}
 		newNodes := et.NewExprs()
-		before := et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat)
+		before := et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, false /* redactableValues */)
 
 		for i := range newNodes {
 			name := et.LastRuleName().String()
-			after := memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog)
+			after := memo.FormatExpr(
+				ot.ctx, newNodes[i], ot.Flags.ExprFormat, false /* redactableValues */, et.fo.o.Memo(),
+				ot.catalog,
+			)
 
 			diff := difflib.UnifiedDiff{
 				A:        difflib.SplitLines(before),
@@ -1700,7 +1716,11 @@ func (ot *OptTester) optStepsDisplay(before string, after string, os *optSteps) 
 	}
 
 	if before == after {
-		altHeader("%s (no changes)\n", os.LastRuleName())
+		msg := "no changes"
+		if os.LastRuleName().IsNormalize() {
+			msg = "normalization of expression outside of memo"
+		}
+		altHeader("%s (%s)\n", os.LastRuleName(), msg)
 		return
 	}
 
@@ -1779,13 +1799,16 @@ func (ot *OptTester) ExploreTrace() (string, error) {
 		ot.output("%s\n", et.LastRuleName())
 		ot.separator("=")
 		ot.output("Source expression:\n")
-		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat))
+		ot.indent(et.fo.o.FormatExpr(et.SrcExpr(), ot.Flags.ExprFormat, false /* redactableValues */))
 		if len(newNodes) == 0 {
 			ot.output("\nNo new expressions.\n")
 		}
 		for i := range newNodes {
 			ot.output("\nNew expression %d of %d:\n", i+1, len(newNodes))
-			ot.indent(memo.FormatExpr(newNodes[i], ot.Flags.ExprFormat, et.fo.o.Memo(), ot.catalog))
+			ot.indent(memo.FormatExpr(
+				ot.ctx, newNodes[i], ot.Flags.ExprFormat, false /* redactableValues */, et.fo.o.Memo(),
+				ot.catalog,
+			))
 		}
 	}
 	return ot.builder.String(), nil
@@ -1809,7 +1832,7 @@ func (ot *OptTester) Import(tb testing.TB) {
 // testFixturePath returns the path of a fixture inside opttester/testfixtures.
 func (ot *OptTester) testFixturePath(tb testing.TB, file string) string {
 	if bazel.BuiltWithBazel() {
-		runfile := testutils.RewritableDataPath(tb, "pkg", "sql", "opt", "testutils", "opttester", "testfixtures", file)
+		runfile := datapathutils.RewritableDataPath(tb, "pkg", "sql", "opt", "testutils", "opttester", "testfixtures", file)
 		if _, err := os.Stat(runfile); oserror.IsNotExist(err) {
 			tb.Fatalf("%s; is your package missing a dependency on \"//pkg/sql/opt/testutils/opttester:testfixtures\"?", err)
 		}
@@ -1836,7 +1859,7 @@ func (ot *OptTester) InjectStats(tb testing.TB, d *datadriven.TestData) {
 	// "file:linenum".
 	testfilePath := strings.SplitN(d.Pos, ":", 1)[0]
 	path := filepath.Join(filepath.Dir(testfilePath), ot.Flags.File)
-	stats, err := ioutil.ReadFile(path)
+	stats, err := os.ReadFile(path)
 	if err != nil {
 		tb.Fatalf("error reading %s: %v", path, err)
 	}
@@ -1875,7 +1898,7 @@ func (ot *OptTester) StatsQuality(tb testing.TB, d *datadriven.TestData) (string
 	// tree. Keep track of the name of each table so that stats can be outputted
 	// later.
 	var names []string
-	nameGen := memo.NewExprNameGenerator(ot.Flags.SaveTablesPrefix)
+	nameGen := memo.NewExprNameGenerator(ot.evalCtx.SessionData().SaveTablesPrefix)
 	var traverse func(e opt.Expr) error
 	traverse = func(e opt.Expr) error {
 		if r, ok := e.(memo.RelExpr); ok {
@@ -1971,7 +1994,7 @@ func (ot *OptTester) saveActualTables() error {
 	}
 
 	if _, err := c.ExecContext(ctx,
-		fmt.Sprintf("SET save_tables_prefix = '%s'", ot.Flags.SaveTablesPrefix),
+		fmt.Sprintf("SET save_tables_prefix = '%s'", ot.evalCtx.SessionData().SaveTablesPrefix),
 	); err != nil {
 		return err
 	}
@@ -2023,14 +2046,14 @@ func (ot *OptTester) createTableAs(name tree.TableName, rel memo.RelExpr) (*test
 
 		// Make sure we have estimated stats for this column.
 		colSet := opt.MakeColSet(col)
-		memo.RequestColStat(&ot.evalCtx, rel, colSet)
-		stat, ok := relProps.Stats.ColStats.Lookup(colSet)
+		memo.RequestColStat(ot.ctx, &ot.evalCtx, rel, colSet)
+		stat, ok := relProps.Statistics().ColStats.Lookup(colSet)
 		if !ok {
 			return nil, fmt.Errorf("could not find statistic for column %s", colName)
 		}
 		jsonStats[i] = ot.makeStat(
 			[]string{colName},
-			uint64(int64(math.Round(relProps.Stats.RowCount))),
+			uint64(int64(math.Round(relProps.Statistics().RowCount))),
 			uint64(int64(math.Round(stat.DistinctCount))),
 			uint64(int64(math.Round(stat.NullCount))),
 		)
@@ -2166,20 +2189,41 @@ func (ot *OptTester) IndexRecommendations() (string, error) {
 	}
 	md := normExpr.(memo.RelExpr).Memo().Metadata()
 	indexCandidates := indexrec.FindIndexCandidateSet(normExpr, md)
-	_, hypTables := indexrec.BuildOptAndHypTableMaps(indexCandidates)
+	_, hypTables := indexrec.BuildOptAndHypTableMaps(ot.catalog, indexCandidates)
 
 	optExpr, err := ot.OptimizeWithTables(hypTables)
 	if err != nil {
 		return "", err
 	}
 	md = optExpr.(memo.RelExpr).Memo().Metadata()
-	indexRecommendations := indexrec.FindIndexRecommendationSet(optExpr, md)
-	result := indexRecommendations.Output()
-
-	if result == nil {
-		return fmt.Sprintf("No index recommendations.\n--\nOptimal Plan.\n%s", ot.FormatExpr(optExpr)), nil
+	recs, err := indexrec.FindRecs(ot.ctx, optExpr, md)
+	if err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("%s\n--\nOptimal Plan.\n%s", strings.Join(result, "\n"), ot.FormatExpr(optExpr)), nil
+	if len(recs) == 0 {
+		return fmt.Sprintf("no index recommendations\n--\noptimal plan:\n%s", ot.FormatExpr(optExpr)), nil
+	}
+
+	var sb strings.Builder
+	for i := range recs {
+		t := ""
+		switch recs[i].RecType {
+		case indexrec.TypeCreateIndex:
+			t = "creation"
+		case indexrec.TypeReplaceIndex:
+			t = "replacement"
+		case indexrec.TypeAlterIndex:
+			t = "alteration"
+		default:
+			return sb.String(), errors.New("unexpected index recommendation type")
+		}
+		sb.WriteString(t)
+		sb.WriteString(": ")
+		sb.WriteString(recs[i].SQL)
+		sb.WriteByte('\n')
+	}
+	sb.WriteString(fmt.Sprintf("--\noptimal plan:\n%s", ot.FormatExpr(optExpr)))
+	return sb.String(), nil
 }
 
 func (ot *OptTester) buildExpr(factory *norm.Factory) error {
@@ -2200,7 +2244,8 @@ func (ot *OptTester) buildExpr(factory *norm.Factory) error {
 // notifier that updates ot.appliedRules.
 func (ot *OptTester) makeOptimizer() *xform.Optimizer {
 	var o xform.Optimizer
-	o.Init(&ot.evalCtx, ot.catalog)
+	o.Init(ot.ctx, &ot.evalCtx, ot.catalog)
+	o.Factory().SetDisabledRules(ot.Flags.DisableRules)
 	o.NotifyOnAppliedRule(func(ruleName opt.RuleName, source, target opt.Expr) {
 		// Exploration rules are marked as "applied" if they generate one or
 		// more new expressions.
@@ -2221,14 +2266,14 @@ func (ot *OptTester) optimizeExpr(
 		return nil, err
 	}
 	if tables != nil {
-		o.Memo().Metadata().UpdateTableMeta(tables)
+		o.Memo().Metadata().UpdateTableMeta(&ot.evalCtx, tables)
 	}
 	root, err := o.Optimize()
 	if err != nil {
 		return nil, err
 	}
 	if ot.Flags.PerturbCost != 0 {
-		o.Memo().ResetLogProps(&ot.evalCtx)
+		o.Memo().ResetLogProps(ot.ctx, &ot.evalCtx)
 		o.RecomputeCost()
 	}
 	return root, nil
@@ -2269,13 +2314,15 @@ func ruleFromString(str string) (opt.RuleName, error) {
 func (ot *OptTester) ExecBuild(f exec.Factory, mem *memo.Memo, expr opt.Expr) (exec.Plan, error) {
 	// For DDL we need a fresh root transaction that isn't system tenant.
 	if opt.IsDDLOp(expr) {
-		ot.evalCtx.Codec = keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+		ot.evalCtx.Codec = keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 		factory := kv.MockTxnSenderFactory{}
-		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		clock := hlc.NewClockForTesting(nil)
 		stopper := stop.NewStopper()
 		db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 		ot.evalCtx.Txn = kv.NewTxn(context.Background(), db, 1)
 	}
-	bld := execbuilder.New(f, ot.makeOptimizer(), mem, ot.catalog, expr, &ot.evalCtx, true)
+	bld := execbuilder.New(context.Background(), f, ot.makeOptimizer(), mem, ot.catalog, expr, &ot.evalCtx, true,
+		false, /* isANSIDML */
+	)
 	return bld.Build()
 }

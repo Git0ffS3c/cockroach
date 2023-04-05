@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
@@ -44,11 +45,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1067,7 +1069,7 @@ func TestJoinReader(t *testing.T) {
 		math.MaxInt64,
 		st,
 	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 	for i, td := range []catalog.TableDescriptor{tdSecondary, tdFamily} {
 		for _, c := range testCases {
@@ -1095,6 +1097,7 @@ func TestJoinReader(t *testing.T) {
 							defer evalCtx.Stop(ctx)
 							flowCtx := execinfra.FlowCtx{
 								EvalCtx: &evalCtx,
+								Mon:     evalCtx.TestingMon,
 								Cfg: &execinfra.ServerConfig{
 									Settings:    st,
 									TempStorage: tempEngine,
@@ -1120,12 +1123,12 @@ func TestJoinReader(t *testing.T) {
 
 							index := td.ActiveIndexes()[c.indexIdx]
 							var fetchColIDs []descpb.ColumnID
-							var neededOrds util.FastIntSet
+							var neededOrds intsets.Fast
 							for _, ord := range c.fetchCols {
 								neededOrds.Add(int(ord))
 								fetchColIDs = append(fetchColIDs, td.PublicColumns()[ord].GetID())
 							}
-							var fetchSpec descpb.IndexFetchSpec
+							var fetchSpec fetchpb.IndexFetchSpec
 							if err := rowenc.InitIndexFetchSpec(
 								&fetchSpec,
 								keys.SystemSQLCodec,
@@ -1136,6 +1139,7 @@ func TestJoinReader(t *testing.T) {
 							splitter := span.MakeSplitter(td, index, neededOrds)
 
 							jr, err := newJoinReader(
+								ctx,
 								&flowCtx,
 								0, /* processorID */
 								&execinfrapb.JoinReaderSpec{
@@ -1152,7 +1156,6 @@ func TestJoinReader(t *testing.T) {
 								},
 								in,
 								&post,
-								out,
 								lookupJoinReaderType,
 							)
 							if err != nil {
@@ -1165,7 +1168,7 @@ func TestJoinReader(t *testing.T) {
 							}
 							// Else, use the default.
 
-							jr.Run(ctx)
+							jr.Run(ctx, out)
 
 							if !in.Done {
 								t.Fatal("joinReader didn't consume all the rows")
@@ -1270,10 +1273,11 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 		math.MaxInt64,
 		st,
 	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -1287,11 +1291,13 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 	// DiskBackedIndexedRowContainer.
 	flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = mon.DefaultPoolAllocationSize
 
-	// Input row is just a single 0.
+	// The two input rows are just a single 0 each. We use two input rows because
+	// matches to the first input row are never buffered.
 	inputRows := rowenc.EncDatumRows{
 		rowenc.EncDatumRow{rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(key))}},
+		rowenc.EncDatumRow{rowenc.EncDatum{Datum: tree.NewDInt(tree.DInt(key))}},
 	}
-	var fetchSpec descpb.IndexFetchSpec
+	var fetchSpec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
 		&fetchSpec,
 		keys.SystemSQLCodec,
@@ -1304,6 +1310,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 
 	out := &distsqlutils.RowBuffer{}
 	jr, err := newJoinReader(
+		ctx,
 		&flowCtx,
 		0, /* processorID */
 		&execinfrapb.JoinReaderSpec{
@@ -1318,13 +1325,12 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 			Projection:    true,
 			OutputColumns: []uint32{2},
 		},
-		out,
 		lookupJoinReaderType,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	jr.Run(ctx)
+	jr.Run(ctx, out)
 
 	count := 0
 	for {
@@ -1340,7 +1346,7 @@ CREATE TABLE test.t (a INT, s STRING, INDEX (a, s))`); err != nil {
 		require.Equal(t, expected, actual)
 		count++
 	}
-	require.Equal(t, numRows, count)
+	require.Equal(t, numRows*len(inputRows), count)
 	require.True(t, jr.(*joinReader).Spilled())
 }
 
@@ -1372,7 +1378,7 @@ func TestJoinReaderDrain(t *testing.T) {
 
 	// Run the flow in a verbose trace so that we can test for tracing info.
 	tracer := s.TracerI().(*tracing.Tracer)
-	ctx, sp := tracer.StartSpanCtx(context.Background(), "test flow ctx", tracing.WithRecording(tracing.RecordingVerbose))
+	ctx, sp := tracer.StartSpanCtx(context.Background(), "test flow ctx", tracing.WithRecording(tracingpb.RecordingVerbose))
 	defer sp.Finish()
 
 	evalCtx := eval.MakeTestingEvalContext(st)
@@ -1381,23 +1387,26 @@ func TestJoinReaderDrain(t *testing.T) {
 	defer diskMonitor.Stop(ctx)
 
 	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx)
+	require.NoError(t, err)
 	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), leafInputState)
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
 		},
 		Txn:         leafTxn,
+		Gateway:     false,
 		DiskMonitor: diskMonitor,
 	}
 
 	encRow := make(rowenc.EncDatumRow, 1)
 	encRow[0] = rowenc.DatumToEncDatum(types.Int, tree.NewDInt(1))
 
-	var fetchSpec descpb.IndexFetchSpec
+	var fetchSpec fetchpb.IndexFetchSpec
 	if err := rowenc.InitIndexFetchSpec(
 		&fetchSpec,
 		keys.SystemSQLCodec,
@@ -1406,14 +1415,14 @@ func TestJoinReaderDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
+	testReaderProcessorDrain(ctx, t, func() (execinfra.Processor, error) {
 		return newJoinReader(
+			ctx,
 			&flowCtx,
 			0, /* processorID */
 			&execinfrapb.JoinReaderSpec{FetchSpec: fetchSpec},
 			distsqlutils.NewRowBuffer(types.OneIntCol, nil /* rows */, distsqlutils.RowBufferArgs{}),
 			&execinfrapb.PostProcessSpec{},
-			out,
 			lookupJoinReaderType,
 		)
 	})
@@ -1432,14 +1441,14 @@ func TestJoinReaderDrain(t *testing.T) {
 		out.ConsumerDone()
 
 		jr, err := newJoinReader(
-			&flowCtx, 0 /* processorID */, &execinfrapb.JoinReaderSpec{
+			ctx, &flowCtx, 0 /* processorID */, &execinfrapb.JoinReaderSpec{
 				FetchSpec: fetchSpec,
-			}, in, &execinfrapb.PostProcessSpec{},
-			out, lookupJoinReaderType)
+			}, in, &execinfrapb.PostProcessSpec{}, lookupJoinReaderType,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		jr.Run(ctx)
+		jr.Run(ctx, out)
 		row, meta := out.Next()
 		if row != nil {
 			t.Fatalf("row was pushed unexpectedly: %s", row.String(types.OneIntCol))
@@ -1570,7 +1579,7 @@ func TestIndexJoiner(t *testing.T) {
 
 	for _, c := range testCases {
 		t.Run(c.description, func(t *testing.T) {
-			var fetchSpec descpb.IndexFetchSpec
+			var fetchSpec fetchpb.IndexFetchSpec
 			if err := rowenc.InitIndexFetchSpec(
 				&fetchSpec,
 				keys.SystemSQLCodec,
@@ -1579,7 +1588,7 @@ func TestIndexJoiner(t *testing.T) {
 			); err != nil {
 				t.Fatal(err)
 			}
-			splitter := span.MakeSplitter(c.desc, c.desc.GetPrimaryIndex(), util.MakeFastIntSet(0, 1, 2, 3))
+			splitter := span.MakeSplitter(c.desc, c.desc.GetPrimaryIndex(), intsets.MakeFast(0, 1, 2, 3))
 
 			spec := execinfrapb.JoinReaderSpec{
 				FetchSpec:      fetchSpec,
@@ -1638,17 +1647,22 @@ func BenchmarkJoinReader(b *testing.B) {
 //
 // input: 0,1,2,3,4 (size of input is 'numLookupRows')
 // table: one | four | sixteen |
-//          0 |    0 |       0
-//          1 |    0 |       0
-//          2 |    0 |       0
-//          3 |    0 |       0
-//          4 |    1 |       0
-//          5 |    1 |       0
-//  ...
+//
+//	        0 |    0 |       0
+//	        1 |    0 |       0
+//	        2 |    0 |       0
+//	        3 |    0 |       0
+//	        4 |    1 |       0
+//	        5 |    1 |       0
+//	...
+//
 // SELECT one FROM input INNER LOOKUP JOIN t64 ON i = one;
-//    -> 0,1,2,3,4
+//
+//	-> 0,1,2,3,4
+//
 // SELECT four FROM input INNER LOOKUP JOIN t64 ON i = four;
-//    -> 0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3
+//
+//	-> 0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3
 func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 
 	// Create an *on-disk* store spec for the primary store and temp engine to
@@ -1669,6 +1683,7 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 		diskMonitor = execinfra.NewTestDiskMonitor(ctx, st)
 		flowCtx     = execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
@@ -1686,7 +1701,11 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 	defer cleanupTempDir()
 	tempStoreSpec, err := base.NewStoreSpec(fmt.Sprintf("path=%s", tempStoragePath))
 	require.NoError(b, err)
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{Path: tempStoragePath, Mon: diskMonitor}, tempStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{
+		Path:     tempStoragePath,
+		Mon:      diskMonitor,
+		Settings: st,
+	}, tempStoreSpec)
 	require.NoError(b, err)
 	defer tempEngine.Close()
 	flowCtx.Cfg.TempStorage = tempEngine
@@ -1806,7 +1825,7 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 								}), numLookupRows)
 								output := rowDisposer{}
 
-								var fetchSpec descpb.IndexFetchSpec
+								var fetchSpec fetchpb.IndexFetchSpec
 								if err := rowenc.InitIndexFetchSpec(
 									&fetchSpec,
 									keys.SystemSQLCodec,
@@ -1841,12 +1860,12 @@ func benchmarkJoinReader(b *testing.B, bc JRBenchConfig) {
 								for i := 0; i < b.N; i++ {
 									flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
 									jr, err := newJoinReader(
-										&flowCtx, 0 /* processorID */, &spec, input, &execinfrapb.PostProcessSpec{}, &output, lookupJoinReaderType,
+										ctx, &flowCtx, 0 /* processorID */, &spec, input, &execinfrapb.PostProcessSpec{}, lookupJoinReaderType,
 									)
 									if err != nil {
 										b.Fatal(err)
 									}
-									jr.Run(ctx)
+									jr.Run(ctx, &output)
 									if !spilled && jr.(*joinReader).Spilled() {
 										spilled = true
 									}
@@ -1933,6 +1952,7 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 		diskMonitor = execinfra.NewTestDiskMonitor(ctx, st)
 		flowCtx     = execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
@@ -1950,7 +1970,11 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 	defer cleanupTempDir()
 	tempStoreSpec, err := base.NewStoreSpec(fmt.Sprintf("path=%s", tempStoragePath))
 	require.NoError(b, err)
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{Path: tempStoragePath, Mon: diskMonitor}, tempStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{
+		Path:     tempStoragePath,
+		Mon:      diskMonitor,
+		Settings: st,
+	}, tempStoreSpec)
 	require.NoError(b, err)
 	defer tempEngine.Close()
 	flowCtx.Cfg.TempStorage = tempEngine
@@ -2015,7 +2039,7 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 				fetchColumnIDs = append(fetchColumnIDs, descpb.ColumnID(i))
 			}
 
-			var fetchSpec descpb.IndexFetchSpec
+			var fetchSpec fetchpb.IndexFetchSpec
 			if err := rowenc.InitIndexFetchSpec(
 				&fetchSpec,
 				keys.SystemSQLCodec,
@@ -2045,11 +2069,11 @@ func BenchmarkJoinReaderLookupStress(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				jr, err := newJoinReader(&flowCtx, 0 /* processorID */, &spec, input, &post, &output, lookupJoinReaderType)
+				jr, err := newJoinReader(ctx, &flowCtx, 0 /* processorID */, &spec, input, &post, lookupJoinReaderType)
 				if err != nil {
 					b.Fatal(err)
 				}
-				jr.Run(ctx)
+				jr.Run(ctx, &output)
 
 				if output.NumRowsDisposed() != numLookupRows {
 					b.Fatalf("got %d output rows, expected %d", output.NumRowsDisposed(), numLookupRows)

@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -29,7 +30,8 @@ import (
 )
 
 // TestInOrderResultsBuffer verifies that the inOrderResultsBuffer returns the
-// results in the correct order (with increasing 'Position' values).
+// results in the correct order (with increasing 'Position' values, or with
+// increasing 'subRequestIdx' values when 'Position' values are equal).
 // Additionally, it randomly asks the buffer to spill to disk.
 func TestInOrderResultsBuffer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -54,7 +56,7 @@ func TestInOrderResultsBuffer(t *testing.T) {
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 
 	budget := newBudget(nil /* acc */, math.MaxInt /* limitBytes */)
@@ -68,33 +70,42 @@ func TestInOrderResultsBuffer(t *testing.T) {
 
 		// Generate a set of results.
 		var results []Result
-		var addOrder []int
 		for i := 0; i < numExpectedResponses; i++ {
 			// Randomly choose between Get and Scan responses.
 			if rng.Float64() < 0.5 {
 				get := makeResultWithGetResp(rng, rng.Float64() < 0.1 /* empty */)
+				get.memoryTok.toRelease = rng.Int63n(100)
 				get.Position = i
 				results = append(results, get)
 			} else {
-				scan := makeResultWithScanResp(rng)
-				// TODO(yuzefovich): once lookup joins are supported, make Scan
-				// responses spanning multiple ranges for a single original Scan
-				// request.
-				scan.ScanResp.Complete = true
-				scan.Position = i
-				results = append(results, scan)
+				// Randomize the number of ranges the original Scan request
+				// touches.
+				numRanges := 1
+				if rng.Float64() < 0.5 {
+					numRanges = rng.Intn(10) + 1
+				}
+				for j := 0; j < numRanges; j++ {
+					scan := makeResultWithScanResp(rng)
+					scan.scanComplete = j+1 == numRanges
+					scan.memoryTok.toRelease = rng.Int63n(100)
+					scan.Position = i
+					scan.subRequestIdx = int32(j)
+					scan.subRequestDone = true
+					results = append(results, scan)
+				}
 			}
-			results[len(results)-1].memoryTok.toRelease = rng.Int63n(100)
-			addOrder = append(addOrder, i)
 		}
 
 		// Randomize the order in which the results are added into the buffer.
+		addOrder := make([]int, len(results))
+		for i := range addOrder {
+			addOrder[i] = i
+		}
 		rng.Shuffle(len(addOrder), func(i, j int) {
 			addOrder[i], addOrder[j] = addOrder[j], addOrder[i]
 		})
 
 		var received []Result
-		var addOrderIdx int
 		for {
 			r, allComplete, err := b.get(ctx)
 			require.NoError(t, err)
@@ -103,13 +114,16 @@ func TestInOrderResultsBuffer(t *testing.T) {
 				break
 			}
 
-			numToAdd := rng.Intn(len(results)-addOrderIdx) + 1
-			toAdd := make([]Result, numToAdd)
-			for i := range toAdd {
-				toAdd[i] = results[addOrder[addOrderIdx]]
-				addOrderIdx++
+			budget.mu.Lock()
+			b.Lock()
+			numToAdd := rng.Intn(len(addOrder)) + 1
+			for i := 0; i < numToAdd; i++ {
+				b.addLocked(results[addOrder[0]])
+				addOrder = addOrder[1:]
 			}
-			b.add(toAdd)
+			b.doneAddingLocked(ctx)
+			b.Unlock()
+			budget.mu.Unlock()
 
 			// With 50% probability, try spilling some of the buffered results
 			// to disk.
@@ -150,16 +164,9 @@ func TestInOrderResultsBuffer(t *testing.T) {
 	}
 }
 
-func fillEnqueueKeys(r *Result, rng *rand.Rand) {
-	r.EnqueueKeysSatisfied = make([]int, rng.Intn(20)+1)
-	for i := range r.EnqueueKeysSatisfied {
-		r.EnqueueKeysSatisfied[i] = rng.Int()
-	}
-}
-
 func makeResultWithGetResp(rng *rand.Rand, empty bool) Result {
 	var r Result
-	r.GetResp = &roachpb.GetResponse{}
+	r.GetResp = &kvpb.GetResponse{}
 	if !empty {
 		rawBytes := make([]byte, rng.Intn(20)+1)
 		rng.Read(rawBytes)
@@ -172,7 +179,6 @@ func makeResultWithGetResp(rng *rand.Rand, empty bool) Result {
 			},
 		}
 	}
-	fillEnqueueKeys(&r, rng)
 	return r
 }
 
@@ -185,9 +191,8 @@ func makeResultWithScanResp(rng *rand.Rand) Result {
 		rng.Read(batchResponse)
 		batchResponses[i] = batchResponse
 	}
-	r.ScanResp.ScanResponse = &roachpb.ScanResponse{
+	r.ScanResp = &kvpb.ScanResponse{
 		BatchResponses: batchResponses,
 	}
-	fillEnqueueKeys(&r, rng)
 	return r
 }

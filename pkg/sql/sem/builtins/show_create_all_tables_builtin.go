@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -70,7 +71,7 @@ func getTopologicallySortedTableIDs(
 		SELECT dependson_id
 		FROM %s.crdb_internal.backward_dependencies
 		WHERE descriptor_id = $1
-		`, dbName)
+		`, lexbase.EscapeSQLIdent(dbName))
 		it, err := evalPlanner.QueryIteratorEx(
 			ctx,
 			"crdb_internal.show_create_all_tables",
@@ -100,6 +101,9 @@ func getTopologicallySortedTableIDs(
 		}
 
 		dependsOnIDs[tid] = refs
+		if err := it.Close(); err != nil {
+			return nil, err
+		}
 	}
 
 	// First sort by ids to guarantee stable output.
@@ -149,14 +153,14 @@ func getTopologicallySortedTableIDs(
 // crdb_internal.show_create_all_tables for a specified database.
 func getTableIDs(
 	ctx context.Context, evalPlanner eval.Planner, txn *kv.Txn, dbName string, acc *mon.BoundAccount,
-) ([]int64, error) {
+) (tableIDs []int64, retErr error) {
 	query := fmt.Sprintf(`
 		SELECT descriptor_id
 		FROM %s.crdb_internal.create_statements
 		WHERE database_name = $1 
 		AND is_virtual = FALSE
 		AND is_temporary = FALSE
-		`, dbName)
+		`, lexbase.EscapeSQLIdent(dbName))
 	it, err := evalPlanner.QueryIteratorEx(
 		ctx,
 		"crdb_internal.show_create_all_tables",
@@ -167,8 +171,9 @@ func getTableIDs(
 	if err != nil {
 		return nil, err
 	}
-
-	var tableIDs []int64
+	defer func() {
+		retErr = errors.CombineErrors(retErr, it.Close())
+	}()
 
 	var ok bool
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
@@ -244,7 +249,7 @@ func getCreateStatement(
 			create_nofks
 		FROM %s.crdb_internal.create_statements
 		WHERE descriptor_id = $1
-	`, dbName)
+	`, lexbase.EscapeSQLIdent(dbName))
 	row, err := evalPlanner.QueryRowEx(
 		ctx,
 		"crdb_internal.show_create_all_tables",
@@ -274,7 +279,7 @@ func getAlterStatements(
 			%s
 		FROM %s.crdb_internal.create_statements
 		WHERE descriptor_id = $1
-	`, statementType, dbName)
+	`, statementType, lexbase.EscapeSQLIdent(dbName))
 	row, err := evalPlanner.QueryRowEx(
 		ctx,
 		"crdb_internal.show_create_all_tables",

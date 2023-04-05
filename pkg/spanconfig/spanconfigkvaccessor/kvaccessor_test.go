@@ -22,8 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvaccessor"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -37,28 +38,28 @@ import (
 // TestDataDriven runs datadriven tests against the kvaccessor interface.
 // The syntax is as follows:
 //
-// 		kvaccessor-get
-// 		span [a,e)
-// 		span [a,b)
-// 		span [b,c)
-//		system-target {cluster}
-//		system-target {source=1,target=20}
-//		system-target {source=1,target=1}
-//		system-target {source=20,target=20}
-// 		system-target {source=1, all-tenant-keyspace-targets-set}
-//      ----
+//			kvaccessor-get
+//			span [a,e)
+//			span [a,b)
+//			span [b,c)
+//			system-target {cluster}
+//			system-target {source=1,target=20}
+//			system-target {source=1,target=1}
+//			system-target {source=20,target=20}
+//			system-target {source=1, all-tenant-keyspace-targets-set}
+//	     ----
 //
-// 		kvaccessor-update
-// 		delete [c,e)
-// 		upsert [c,d):C
-// 		upsert [d,e):D
-// 		delete {source=1,target=1}
-// 		upsert {source=1,target=1}:A
-// 		upsert {cluster}:F
-//      ----
+//			kvaccessor-update
+//			delete [c,e)
+//			upsert [c,d):C
+//			upsert [d,e):D
+//			delete {source=1,target=1}
+//			upsert {source=1,target=1}:A
+//			upsert {cluster}:F
+//	     ----
 //
-// 		kvaccessor-get-all-system-span-configs-that-apply tenant-id=<tenantID>
-//      ----
+//			kvaccessor-get-all-system-span-configs-that-apply tenant-id=<tenantID>
+//	     ----
 //
 // They tie into GetSpanConfigRecords and UpdateSpanConfigRecords
 // respectively. For kvaccessor-get, each listed target is added to the set of
@@ -69,7 +70,7 @@ import (
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		ctx := context.Background()
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
 		defer tc.Stopper().Stop(ctx)
@@ -79,7 +80,7 @@ func TestDataDriven(t *testing.T) {
 		tdb.Exec(t, fmt.Sprintf("CREATE TABLE %s (LIKE system.span_configurations INCLUDING ALL)", dummySpanConfigurationsFQN))
 		accessor := spanconfigkvaccessor.New(
 			tc.Server(0).DB(),
-			tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
+			tc.Server(0).InternalExecutor().(isql.Executor),
 			tc.Server(0).ClusterSettings(),
 			tc.Server(0).Clock(),
 			dummySpanConfigurationsFQN,
@@ -113,7 +114,7 @@ func TestDataDriven(t *testing.T) {
 			case "kvaccessor-get-all-system-span-configs-that-apply":
 				var tenID uint64
 				d.ScanArgs(t, "tenant-id", &tenID)
-				spanConfigs, err := accessor.GetAllSystemSpanConfigsThatApply(ctx, roachpb.MakeTenantID(tenID))
+				spanConfigs, err := accessor.GetAllSystemSpanConfigsThatApply(ctx, roachpb.MustMakeTenantID(tenID))
 				if err != nil {
 					return fmt.Sprintf("err: %s", err.Error())
 				}
@@ -146,7 +147,13 @@ func BenchmarkKVAccessorUpdate(b *testing.B) {
 		}
 
 		b.Run(fmt.Sprintf("batch-size=%d", batchSize), func(b *testing.B) {
-			tc := testcluster.StartTestCluster(b, 1, base.TestClusterArgs{})
+			tc := testcluster.StartTestCluster(b, 1, base.TestClusterArgs{
+				ServerArgs: base.TestServerArgs{
+					// Requires span_configuration table which is not visible
+					// from secondary tenants.
+					DefaultTestTenant: base.TestTenantDisabled,
+				},
+			})
 			defer tc.Stopper().Stop(ctx)
 
 			const dummySpanConfigurationsFQN = "defaultdb.public.dummy_span_configurations"
@@ -155,7 +162,7 @@ func BenchmarkKVAccessorUpdate(b *testing.B) {
 
 			accessor := spanconfigkvaccessor.New(
 				tc.Server(0).DB(),
-				tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
+				tc.Server(0).InternalExecutor().(isql.Executor),
 				tc.Server(0).ClusterSettings(),
 				tc.Server(0).Clock(),
 				dummySpanConfigurationsFQN,
@@ -182,7 +189,13 @@ func TestKVAccessorPagination(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			// Requires span_configuration table which is not visible
+			// from secondary tenants.
+			DefaultTestTenant: base.TestTenantDisabled,
+		},
+	})
 	defer tc.Stopper().Stop(ctx)
 
 	const dummySpanConfigurationsFQN = "defaultdb.public.dummy_span_configurations"
@@ -192,7 +205,7 @@ func TestKVAccessorPagination(t *testing.T) {
 	var batches, batchSize int
 	accessor := spanconfigkvaccessor.New(
 		tc.Server(0).DB(),
-		tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
+		tc.Server(0).InternalExecutor().(isql.Executor),
 		tc.Server(0).ClusterSettings(),
 		tc.Server(0).Clock(),
 		dummySpanConfigurationsFQN,
@@ -311,7 +324,7 @@ func TestKVAccessorCommitMinTSWaitRespondsToCtxCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	accessor := spanconfigkvaccessor.New(
 		tc.Server(0).DB(),
-		tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
+		tc.Server(0).InternalExecutor().(isql.Executor),
 		tc.Server(0).ClusterSettings(),
 		tc.Server(0).Clock(),
 		dummySpanConfigurationsFQN,

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -47,7 +46,7 @@ func TestCleanupSchemaObjects(t *testing.T) {
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
-	s, db, kvDB := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
 
 	conn, err := db.Conn(ctx)
@@ -94,31 +93,30 @@ INSERT INTO perm_table VALUES (DEFAULT, 1);
 		require.NoError(t, err)
 		require.NoError(t, rows.Close())
 	}
-
-	require.NoError(
-		t,
-		s.ExecutorConfig().(ExecutorConfig).CollectionFactory.Txn(
+	execCfg := s.ExecutorConfig().(ExecutorConfig)
+	ief := execCfg.InternalDB
+	require.NoError(t, ief.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
+	) error {
+		// Add a hack to not wait for one version on the descriptors.
+		defer txn.Descriptors().ReleaseAll(ctx)
+		defaultDB, err := txn.Descriptors().ByID(txn.KV()).WithoutNonPublic().Get().Database(ctx, namesToID["defaultdb"])
+		if err != nil {
+			return err
+		}
+		tempSchema, err := txn.Descriptors().ByName(txn.KV()).Get().Schema(ctx, defaultDB, tempSchemaName)
+		if err != nil {
+			return err
+		}
+		return cleanupTempSchemaObjects(
 			ctx,
-			s.InternalExecutor().(*InternalExecutor),
-			kvDB,
-			func(ctx context.Context, txn *kv.Txn, descsCol *descs.Collection) error {
-				execCfg := s.ExecutorConfig().(ExecutorConfig)
-				defaultDB, err := descsCol.Direct().MustGetDatabaseDescByID(ctx, txn, namesToID["defaultdb"])
-				require.NoError(t, err)
-				err = cleanupSchemaObjects(
-					ctx,
-					execCfg.Settings,
-					txn,
-					descsCol,
-					execCfg.Codec,
-					s.InternalExecutor().(*InternalExecutor),
-					defaultDB,
-					tempSchemaName,
-				)
-				require.NoError(t, err)
-				return nil
-			}),
-	)
+			txn,
+			txn.Descriptors(),
+			execCfg.Codec,
+			defaultDB,
+			tempSchema,
+		)
+	}))
 
 	ensureTemporaryObjectsAreDeleted(ctx, t, conn, tempSchemaName, tempNames)
 

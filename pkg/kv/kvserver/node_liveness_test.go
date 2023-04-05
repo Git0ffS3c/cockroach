@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
@@ -90,7 +91,7 @@ func TestNodeLiveness(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -295,7 +296,7 @@ func TestNodeIsLiveCallback(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -355,7 +356,7 @@ func TestNodeHeartbeatCallback(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -422,7 +423,7 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -655,7 +656,7 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -669,7 +670,7 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 	l1, _ := nl.GetLiveness(1)
 	l2, _ := nl.GetLiveness(2)
 	l3, _ := nl.GetLiveness(3)
-	expectedLMap := liveness.IsLiveMap{
+	expectedLMap := livenesspb.IsLiveMap{
 		1: {Liveness: l1.Liveness, IsLive: true},
 		2: {Liveness: l2.Liveness, IsLive: true},
 		3: {Liveness: l3.Liveness, IsLive: true},
@@ -705,7 +706,7 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 	l1, _ = nl.GetLiveness(1)
 	l2, _ = nl.GetLiveness(2)
 	l3, _ = nl.GetLiveness(3)
-	expectedLMap = liveness.IsLiveMap{
+	expectedLMap = livenesspb.IsLiveMap{
 		1: {Liveness: l1.Liveness, IsLive: true},
 		2: {Liveness: l2.Liveness, IsLive: false},
 		3: {Liveness: l3.Liveness, IsLive: false},
@@ -727,7 +728,7 @@ func TestNodeLivenessGetLivenesses(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -800,7 +801,7 @@ func TestNodeLivenessConcurrentHeartbeats(t *testing.T) {
 	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
-				ClockSource: manualClock.UnixNano,
+				WallClock: manualClock,
 			},
 		},
 	})
@@ -846,7 +847,7 @@ func TestNodeLivenessConcurrentIncrementEpochs(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -1014,14 +1015,14 @@ func TestNodeLivenessRetryAmbiguousResultError(t *testing.T) {
 	var injectedErrorCount int32
 
 	injectError.Store(true)
-	testingEvalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
-		if _, ok := args.Req.(*roachpb.ConditionalPutRequest); !ok {
+	testingEvalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
+		if _, ok := args.Req.(*kvpb.ConditionalPutRequest); !ok {
 			return nil
 		}
 		if val := injectError.Load(); val != nil && val.(bool) {
 			atomic.AddInt32(&injectedErrorCount, 1)
 			injectError.Store(false)
-			return roachpb.NewError(roachpb.NewAmbiguousResultErrorf("test"))
+			return kvpb.NewError(kvpb.NewAmbiguousResultErrorf("test"))
 		}
 		return nil
 	}
@@ -1064,8 +1065,8 @@ func TestNodeLivenessRetryAmbiguousResultOnCreateError(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	errorsToTest := []error{
-		roachpb.NewAmbiguousResultErrorf("test"),
-		roachpb.NewTransactionStatusError(roachpb.TransactionStatusError_REASON_UNKNOWN, "foo"),
+		kvpb.NewAmbiguousResultErrorf("test"),
+		kvpb.NewTransactionStatusError(kvpb.TransactionStatusError_REASON_UNKNOWN, "foo"),
 		kv.OnePCNotAllowedError{},
 	}
 
@@ -1081,8 +1082,8 @@ func TestNodeLivenessRetryAmbiguousResultOnCreateError(t *testing.T) {
 			roachpb.NodeID(2): {true, 0},
 			roachpb.NodeID(3): {true, 0},
 		})
-		testingEvalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
-			if req, ok := args.Req.(*roachpb.ConditionalPutRequest); ok {
+		testingEvalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
+			if req, ok := args.Req.(*kvpb.ConditionalPutRequest); ok {
 				if val := injectError.Load(); val != nil {
 					var liveness livenesspb.Liveness
 					if err := req.Value.GetProto(&liveness); err != nil {
@@ -1097,7 +1098,7 @@ func TestNodeLivenessRetryAmbiguousResultOnCreateError(t *testing.T) {
 						}
 						injectErrorMap[liveness.NodeID] = injectErrorData{false, injectErrorMap[liveness.NodeID].count + 1}
 						injectError.Store(injectErrorMap)
-						return roachpb.NewError(errorToTest)
+						return kvpb.NewError(errorToTest)
 					}
 				}
 			}
@@ -1144,9 +1145,9 @@ func TestNodeLivenessNoRetryOnAmbiguousResultCausedByCancellation(t *testing.T) 
 
 	ctx := context.Background()
 	var sem chan struct{}
-	testingEvalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
+	testingEvalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
 		// Maybe trap a liveness heartbeat.
-		_, ok := args.Req.(*roachpb.ConditionalPutRequest)
+		_, ok := args.Req.(*kvpb.ConditionalPutRequest)
 		if !ok {
 			return nil
 		}
@@ -1208,7 +1209,7 @@ func TestNodeLivenessNoRetryOnAmbiguousResultCausedByCancellation(t *testing.T) 
 
 	// Check that Heartbeat() returned an ambiguous error, and take that as proof
 	// that the heartbeat wasn't retried.
-	require.True(t, errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)), "%+v", err)
+	require.True(t, errors.HasType(err, (*kvpb.AmbiguousResultError)(nil)), "%+v", err)
 }
 
 func verifyNodeIsDecommissioning(t *testing.T, tc *testcluster.TestCluster, nodeID roachpb.NodeID) {

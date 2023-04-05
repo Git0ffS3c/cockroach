@@ -131,21 +131,20 @@ func newCSVExporter(sp execinfrapb.ExportSpec) *csvExporter {
 }
 
 func newCSVWriterProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec execinfrapb.ExportSpec,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	c := &csvWriter{
 		flowCtx:     flowCtx,
 		processorID: processorID,
 		spec:        spec,
 		input:       input,
-		output:      output,
 	}
 	semaCtx := tree.MakeSemaContext()
-	if err := c.out.Init(&execinfrapb.PostProcessSpec{}, c.OutputTypes(), &semaCtx, flowCtx.NewEvalCtx()); err != nil {
+	if err := c.out.Init(ctx, &execinfrapb.PostProcessSpec{}, c.OutputTypes(), &semaCtx, flowCtx.NewEvalCtx()); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -157,7 +156,6 @@ type csvWriter struct {
 	spec        execinfrapb.ExportSpec
 	input       execinfra.RowSource
 	out         execinfra.ProcOutputHelper
-	output      execinfra.RowReceiver
 }
 
 var _ execinfra.Processor = &csvWriter{}
@@ -174,17 +172,17 @@ func (sp *csvWriter) MustBeStreaming() bool {
 	return false
 }
 
-func (sp *csvWriter) Run(ctx context.Context) {
+func (sp *csvWriter) Run(ctx context.Context, output execinfra.RowReceiver) {
 	ctx, span := tracing.ChildSpan(ctx, "csvWriter")
 	defer span.Finish()
 
 	instanceID := sp.flowCtx.EvalCtx.NodeID.SQLInstanceID()
-	uniqueID := builtins.GenerateUniqueInt(instanceID)
+	uniqueID := builtins.GenerateUniqueInt(builtins.ProcessUniqueID(instanceID))
 
 	err := func() error {
 		typs := sp.input.OutputTypes()
 		sp.input.Start(ctx)
-		input := execinfra.MakeNoMetadataRowSource(sp.input, sp.output)
+		input := execinfra.MakeNoMetadataRowSource(sp.input, output)
 
 		alloc := &tree.DatumAlloc{}
 
@@ -290,14 +288,14 @@ func (sp *csvWriter) Run(ctx context.Context) {
 				),
 			}
 
-			cs, err := sp.out.EmitRow(ctx, res, sp.output)
+			cs, err := sp.out.EmitRow(ctx, res, output)
 			if err != nil {
 				return err
 			}
 			if cs != execinfra.NeedMoreRows {
-				// TODO(dt): presumably this is because our recv already closed due to
-				// another error... so do we really need another one?
-				return errors.New("unexpected closure of consumer")
+				// We don't return an error here because we want the error (if any) that
+				// actually caused the consumer to enter a closed/draining state to take precendence.
+				return nil
 			}
 			if done {
 				break
@@ -309,7 +307,12 @@ func (sp *csvWriter) Run(ctx context.Context) {
 
 	// TODO(dt): pick up tracing info in trailing meta
 	execinfra.DrainAndClose(
-		ctx, sp.output, err, func(context.Context) {} /* pushTrailingMeta */, sp.input)
+		ctx, output, err, func(context.Context, execinfra.RowReceiver) {} /* pushTrailingMeta */, sp.input)
+}
+
+// Resume is part of the execinfra.Processor interface.
+func (sp *csvWriter) Resume(output execinfra.RowReceiver) {
+	panic("not implemented")
 }
 
 func init() {

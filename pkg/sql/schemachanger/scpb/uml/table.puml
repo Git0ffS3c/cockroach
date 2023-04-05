@@ -15,6 +15,7 @@ object View
 View :  ViewID
 View : []UsesTypeIDs
 View : []UsesRelationIDs
+View : []ForwardReferences
 View :  IsTemporary
 View :  IsMaterialized
 
@@ -39,6 +40,18 @@ object AliasType
 AliasType :  TypeID
 AliasType :  TypeT
 
+object CompositeType
+
+CompositeType :  TypeID
+CompositeType :  ArrayTypeID
+
+object Function
+
+Function :  FunctionID
+Function : []Params
+Function :  ReturnSet
+Function :  ReturnType
+
 object ColumnFamily
 
 ColumnFamily :  TableID
@@ -54,6 +67,7 @@ Column :  IsInaccessible
 Column :  GeneratedAsIdentityType
 Column :  GeneratedAsIdentitySequenceOption
 Column :  PgAttributeNum
+Column :  IsSystemColumn
 
 object PrimaryIndex
 
@@ -62,6 +76,7 @@ PrimaryIndex :  Index
 object SecondaryIndex
 
 SecondaryIndex :  Index
+SecondaryIndex :  EmbeddedExpr
 
 object TemporaryIndex
 
@@ -73,6 +88,15 @@ object UniqueWithoutIndexConstraint
 UniqueWithoutIndexConstraint :  TableID
 UniqueWithoutIndexConstraint :  ConstraintID
 UniqueWithoutIndexConstraint : []ColumnIDs
+UniqueWithoutIndexConstraint :  Predicate
+UniqueWithoutIndexConstraint :  IndexIDForValidation
+
+object UniqueWithoutIndexConstraintUnvalidated
+
+UniqueWithoutIndexConstraintUnvalidated :  TableID
+UniqueWithoutIndexConstraintUnvalidated :  ConstraintID
+UniqueWithoutIndexConstraintUnvalidated : []ColumnIDs
+UniqueWithoutIndexConstraintUnvalidated :  Predicate
 
 object CheckConstraint
 
@@ -80,6 +104,15 @@ CheckConstraint :  TableID
 CheckConstraint :  ConstraintID
 CheckConstraint : []ColumnIDs
 CheckConstraint :  Expression
+CheckConstraint :  FromHashShardedColumn
+CheckConstraint :  IndexIDForValidation
+
+object CheckConstraintUnvalidated
+
+CheckConstraintUnvalidated :  TableID
+CheckConstraintUnvalidated :  ConstraintID
+CheckConstraintUnvalidated : []ColumnIDs
+CheckConstraintUnvalidated :  Expression
 
 object ForeignKeyConstraint
 
@@ -88,6 +121,21 @@ ForeignKeyConstraint :  ConstraintID
 ForeignKeyConstraint : []ColumnIDs
 ForeignKeyConstraint :  ReferencedTableID
 ForeignKeyConstraint : []ReferencedColumnIDs
+ForeignKeyConstraint :  OnUpdateAction
+ForeignKeyConstraint :  OnDeleteAction
+ForeignKeyConstraint :  CompositeKeyMatchMethod
+ForeignKeyConstraint :  IndexIDForValidation
+
+object ForeignKeyConstraintUnvalidated
+
+ForeignKeyConstraintUnvalidated :  TableID
+ForeignKeyConstraintUnvalidated :  ConstraintID
+ForeignKeyConstraintUnvalidated : []ColumnIDs
+ForeignKeyConstraintUnvalidated :  ReferencedTableID
+ForeignKeyConstraintUnvalidated : []ReferencedColumnIDs
+ForeignKeyConstraintUnvalidated :  OnUpdateAction
+ForeignKeyConstraintUnvalidated :  OnDeleteAction
+ForeignKeyConstraintUnvalidated :  CompositeKeyMatchMethod
 
 object TableComment
 
@@ -98,6 +146,25 @@ object RowLevelTTL
 
 RowLevelTTL :  TableID
 RowLevelTTL :  RowLevelTTL
+
+object TableZoneConfig
+
+TableZoneConfig :  TableID
+
+object IndexZoneConfig
+
+IndexZoneConfig :  TableID
+IndexZoneConfig :  IndexID
+IndexZoneConfig :  PartitionName
+
+object TableData
+
+TableData :  TableID
+TableData :  DatabaseID
+
+object TablePartitioning
+
+TablePartitioning :  TableID
 
 object TableLocalityGlobal
 
@@ -133,7 +200,7 @@ ColumnType :  TypeT
 ColumnType :  IsNullable
 ColumnType :  ComputeExpr
 ColumnType :  IsVirtual
-ColumnType :  IsRelationBeingDropped
+ColumnType :  ElementCreationMetadata
 
 object ColumnDefaultExpression
 
@@ -160,6 +227,12 @@ ColumnComment :  ColumnID
 ColumnComment :  Comment
 ColumnComment :  PgAttributeNum
 
+object ColumnNotNull
+
+ColumnNotNull :  TableID
+ColumnNotNull :  ColumnID
+ColumnNotNull :  IndexIDForValidation
+
 object IndexName
 
 IndexName :  TableID
@@ -177,7 +250,6 @@ object SecondaryIndexPartial
 SecondaryIndexPartial :  TableID
 SecondaryIndexPartial :  IndexID
 SecondaryIndexPartial :  Expression
-SecondaryIndexPartial :  IsRelationBeingDropped
 
 object IndexComment
 
@@ -185,11 +257,27 @@ IndexComment :  TableID
 IndexComment :  IndexID
 IndexComment :  Comment
 
-object ConstraintName
+object IndexColumn
 
-ConstraintName :  TableID
-ConstraintName :  ConstraintID
-ConstraintName :  Name
+IndexColumn :  TableID
+IndexColumn :  IndexID
+IndexColumn :  ColumnID
+IndexColumn :  OrdinalInKind
+IndexColumn :  Kind
+IndexColumn :  Direction
+IndexColumn :  Implicit
+IndexColumn :  InvertedKind
+
+object IndexData
+
+IndexData :  TableID
+IndexData :  IndexID
+
+object ConstraintWithoutIndexName
+
+ConstraintWithoutIndexName :  TableID
+ConstraintWithoutIndexName :  ConstraintID
+ConstraintWithoutIndexName :  Name
 
 object ConstraintComment
 
@@ -214,6 +302,7 @@ object UserPrivileges
 UserPrivileges :  DescriptorID
 UserPrivileges :  UserName
 UserPrivileges :  Privileges
+UserPrivileges :  WithGrantOption
 
 object DatabaseRegionConfig
 
@@ -230,6 +319,10 @@ object DatabaseComment
 DatabaseComment :  DatabaseID
 DatabaseComment :  Comment
 
+object DatabaseData
+
+DatabaseData :  DatabaseID
+
 object SchemaParent
 
 SchemaParent :  SchemaID
@@ -240,10 +333,62 @@ object SchemaComment
 SchemaComment :  SchemaID
 SchemaComment :  Comment
 
-object ObjectParent
+object SchemaChild
 
-ObjectParent :  ObjectID
-ObjectParent :  ParentSchemaID
+SchemaChild :  ChildObjectID
+SchemaChild :  SchemaID
+
+object EnumTypeValue
+
+EnumTypeValue :  TypeID
+EnumTypeValue : []PhysicalRepresentation
+EnumTypeValue :  LogicalRepresentation
+
+object CompositeTypeAttrType
+
+CompositeTypeAttrType :  CompositeTypeID
+CompositeTypeAttrType :  TypeT
+
+object CompositeTypeAttrName
+
+CompositeTypeAttrName :  CompositeTypeID
+CompositeTypeAttrName :  Name
+
+object FunctionName
+
+FunctionName :  FunctionID
+FunctionName :  Name
+
+object FunctionVolatility
+
+FunctionVolatility :  FunctionID
+FunctionVolatility :  Volatility
+
+object FunctionLeakProof
+
+FunctionLeakProof :  FunctionID
+FunctionLeakProof :  LeakProof
+
+object FunctionNullInputBehavior
+
+FunctionNullInputBehavior :  FunctionID
+FunctionNullInputBehavior :  NullInputBehavior
+
+object FunctionBody
+
+FunctionBody :  FunctionID
+FunctionBody :  Body
+FunctionBody :  Lang
+FunctionBody : []UsesTables
+FunctionBody : []UsesViews
+FunctionBody : []UsesSequenceIDs
+FunctionBody : []UsesTypeIDs
+
+object FunctionParamDefaultExpression
+
+FunctionParamDefaultExpression :  FunctionID
+FunctionParamDefaultExpression :  Ordinal
+FunctionParamDefaultExpression :  Expression
 
 Table <|-- ColumnFamily
 Table <|-- Column
@@ -255,12 +400,22 @@ View <|-- SecondaryIndex
 Table <|-- TemporaryIndex
 View <|-- TemporaryIndex
 Table <|-- UniqueWithoutIndexConstraint
+Table <|-- UniqueWithoutIndexConstraintUnvalidated
 Table <|-- CheckConstraint
+Table <|-- CheckConstraintUnvalidated
 Table <|-- ForeignKeyConstraint
+Table <|-- ForeignKeyConstraintUnvalidated
 Table <|-- TableComment
 View <|-- TableComment
 Sequence <|-- TableComment
 Table <|-- RowLevelTTL
+Table <|-- TableZoneConfig
+View <|-- TableZoneConfig
+Index <|-- IndexZoneConfig
+Table <|-- TableData
+View <|-- TableData
+Sequence <|-- TableData
+Table <|-- TablePartitioning
 Table <|-- TableLocalityGlobal
 Table <|-- TableLocalityPrimaryRegion
 Table <|-- TableLocalitySecondaryRegion
@@ -271,6 +426,7 @@ Column <|-- ColumnDefaultExpression
 Column <|-- ColumnOnUpdateExpression
 Column <|-- SequenceOwner
 Column <|-- ColumnComment
+Column <|-- ColumnNotNull
 PrimaryIndex <|-- IndexName
 SecondaryIndex <|-- IndexName
 PrimaryIndex <|-- IndexPartitioning
@@ -278,9 +434,16 @@ SecondaryIndex <|-- IndexPartitioning
 SecondaryIndex <|-- SecondaryIndexPartial
 PrimaryIndex <|-- IndexComment
 SecondaryIndex <|-- IndexComment
-UniqueWithoutIndexConstraint <|-- ConstraintName
-CheckConstraint <|-- ConstraintName
-ForeignKeyConstraint <|-- ConstraintName
+PrimaryIndex <|-- IndexColumn
+SecondaryIndex <|-- IndexColumn
+TemporaryIndex <|-- IndexColumn
+Column <|-- IndexColumn
+PrimaryIndex <|-- IndexData
+SecondaryIndex <|-- IndexData
+TemporaryIndex <|-- IndexData
+UniqueWithoutIndexConstraint <|-- ConstraintWithoutIndexName
+CheckConstraint <|-- ConstraintWithoutIndexName
+ForeignKeyConstraint <|-- ConstraintWithoutIndexName
 PrimaryIndex <|-- ConstraintComment
 SecondaryIndex <|-- ConstraintComment
 UniqueWithoutIndexConstraint <|-- ConstraintComment
@@ -310,11 +473,21 @@ EnumType <|-- UserPrivileges
 Database <|-- DatabaseRegionConfig
 Database <|-- DatabaseRoleSetting
 Database <|-- DatabaseComment
+Database <|-- DatabaseData
 Schema <|-- SchemaParent
 Schema <|-- SchemaComment
-AliasType <|-- ObjectParent
-EnumType <|-- ObjectParent
-Table <|-- ObjectParent
-View <|-- ObjectParent
-Sequence <|-- ObjectParent
+AliasType <|-- SchemaChild
+EnumType <|-- SchemaChild
+Table <|-- SchemaChild
+View <|-- SchemaChild
+Sequence <|-- SchemaChild
+EnumType <|-- EnumTypeValue
+CompositeType <|-- CompositeTypeAttrType
+CompositeType <|-- CompositeTypeAttrName
+Function <|-- FunctionName
+Function <|-- FunctionVolatility
+Function <|-- FunctionLeakProof
+Function <|-- FunctionNullInputBehavior
+Function <|-- FunctionBody
+Function <|-- FunctionParamDefaultExpression
 @enduml

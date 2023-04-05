@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -11,6 +12,7 @@ go_library(
 go_test(
     name = "contentionutils_test",
     srcs = ["concurrent_buffer_guard_test.go"],
+    args = ["-test.timeout=295s"],
     embed = [":contentionutils"],
     deps = [
         "//pkg/util/syncutil",
@@ -19,3 +21,5 @@ go_test(
         "@org_golang_x_exp//rand",
     ],
 )
+
+get_x_data(name = "get_x_data")

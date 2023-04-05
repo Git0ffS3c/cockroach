@@ -13,6 +13,7 @@ package scgraph
 import (
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/rel"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
@@ -22,7 +23,7 @@ import (
 	"github.com/cockroachdb/redact"
 )
 
-// Graph is a graph whose nodes are *scpb.Nodes. Graphs are constructed during
+// Graph is a graph whose nodes are *screl.Nodes. Graphs are constructed during
 // schema change planning. Edges in the graph represent dependencies between
 // nodes, either due to the sequencing of statuses for a single target or due to
 // inter-target dependencies between statuses.
@@ -35,16 +36,18 @@ type Graph struct {
 	targetNodes []map[scpb.Status]*screl.Node
 
 	// Maps a target to its index in targetNodes.
-	targetIdxMap map[*scpb.Target]int
+	targetIdxMap map[*scpb.Target]targetIdx
+
+	// depEdges stores the DepEdges to facilitate efficient lookups.
+	depEdges depEdges
+
+	// opEdges stores all OpEdges in the order they were added.
+	opEdges []*OpEdge
 
 	// opEdgesFrom maps a Node to an opEdge that proceeds
 	// from it. A Node may have at most one opEdge from it.
-	opEdgesFrom map[*screl.Node]*OpEdge
-
-	// depEdgesFrom and depEdgesTo map a Node from and to its dependencies.
-	// A Node dependency is another target node which cannot be reached before
-	// reaching this node.
-	depEdgesFrom, depEdgesTo *depEdgeTree
+	// opEdgesTo is the same but s/from/to/.
+	opEdgesFrom, opEdgesTo map[*screl.Node]*OpEdge
 
 	// opToOpEdge maps from an operation back to the
 	// opEdge that generated it as an index.
@@ -54,10 +57,11 @@ type Graph struct {
 	// any operations.
 	noOpOpEdges map[*OpEdge]map[RuleName]struct{}
 
-	edges []Edge
-
 	entities *rel.Database
 }
+
+// targetIdx is the index in the targets slice where a given target resides.
+type targetIdx uint32
 
 // RuleName is the name of a rule. It exists as a type to avoid redaction and
 // clarify the meaning of the string.
@@ -97,26 +101,40 @@ func New(cs scpb.CurrentState) (*Graph, error) {
 				{Attr: rel.Type, Eq: reflect.TypeOf((*screl.Node)(nil))},
 			},
 		},
+		{
+			Attrs:    []rel.Attr{screl.ReferencedTypeIDs},
+			Inverted: true,
+		},
+		{
+			Attrs:    []rel.Attr{screl.ReferencedSequenceIDs},
+			Inverted: true,
+		},
+		{
+			Attrs:    []rel.Attr{screl.ReferencedFunctionIDs},
+			Inverted: true,
+		},
 	}...)
 	if err != nil {
 		return nil, err
 	}
 	g := Graph{
-		targetIdxMap: map[*scpb.Target]int{},
+		targetIdxMap: map[*scpb.Target]targetIdx{},
 		opEdgesFrom:  map[*screl.Node]*OpEdge{},
+		opEdgesTo:    map[*screl.Node]*OpEdge{},
 		noOpOpEdges:  map[*OpEdge]map[RuleName]struct{}{},
 		opToOpEdge:   map[scop.Op]*OpEdge{},
 		entities:     db,
 	}
-	g.depEdgesFrom = newDepEdgeTree(fromTo, g.compareNodes)
-	g.depEdgesTo = newDepEdgeTree(toFrom, g.compareNodes)
-	for i, status := range cs.Current {
+	g.depEdges = makeDepEdges(func(n *screl.Node) targetIdx {
+		return g.targetIdxMap[n.Target]
+	})
+	for i, status := range cs.Initial {
 		t := &cs.Targets[i]
 		if existing, ok := g.targetIdxMap[t]; ok {
 			return nil, errors.Errorf("invalid initial state contains duplicate target: %v and %v", *t, cs.Targets[existing])
 		}
 		idx := len(g.targets)
-		g.targetIdxMap[t] = idx
+		g.targetIdxMap[t] = targetIdx(idx)
 		g.targets = append(g.targets, t)
 		n := &screl.Node{Target: t, CurrentStatus: status}
 		g.targetNodes = append(g.targetNodes, map[scpb.Status]*screl.Node{status: n})
@@ -136,10 +154,10 @@ func (g *Graph) ShallowClone() *Graph {
 		targetNodes:  g.targetNodes,
 		targetIdxMap: g.targetIdxMap,
 		opEdgesFrom:  g.opEdgesFrom,
-		depEdgesFrom: g.depEdgesFrom,
-		depEdgesTo:   g.depEdgesTo,
+		opEdgesTo:    g.opEdgesTo,
+		depEdges:     g.depEdges,
+		opEdges:      g.opEdges,
 		opToOpEdge:   g.opToOpEdge,
-		edges:        g.edges,
 		entities:     g.entities,
 		noOpOpEdges:  make(map[*OpEdge]map[RuleName]struct{}),
 	}
@@ -199,15 +217,21 @@ func (g *Graph) GetOpEdgeFrom(n *screl.Node) (*OpEdge, bool) {
 	return oe, ok
 }
 
+// GetOpEdgeTo returns the unique incoming op edge to the specified node,
+// if one exists.
+func (g *Graph) GetOpEdgeTo(n *screl.Node) (*OpEdge, bool) {
+	oe, ok := g.opEdgesTo[n]
+	return oe, ok
+}
+
 // AddOpEdges adds an op edges connecting the nodes for two statuses of a target.
 func (g *Graph) AddOpEdges(
-	t *scpb.Target, from, to scpb.Status, revertible bool, minPhase scop.Phase, ops ...scop.Op,
+	t *scpb.Target, from, to scpb.Status, revertible, canFail bool, ops ...scop.Op,
 ) (err error) {
-
 	oe := &OpEdge{
 		op:         ops,
 		revertible: revertible,
-		minPhase:   minPhase,
+		canFail:    canFail,
 	}
 	if oe.from, err = g.getOrCreateNode(t, from); err != nil {
 		return err
@@ -219,7 +243,11 @@ func (g *Graph) AddOpEdges(
 		return errors.Errorf("duplicate outbound op edge %v and %v",
 			oe, existing)
 	}
-	g.edges = append(g.edges, oe)
+	if existing, exists := g.opEdgesTo[oe.to]; exists {
+		return errors.Errorf("duplicate outbound op edge %v and %v",
+			oe, existing)
+	}
+	g.opEdges = append(g.opEdges, oe)
 	typ := scop.MutationType
 	for i, op := range ops {
 		if i == 0 {
@@ -231,6 +259,7 @@ func (g *Graph) AddOpEdges(
 	}
 	oe.typ = typ
 	g.opEdgesFrom[oe.from] = oe
+	g.opEdgesTo[oe.to] = oe
 	// Store mapping from op to Edge
 	for _, op := range ops {
 		g.opToOpEdge[op] = oe
@@ -246,24 +275,24 @@ func (g *Graph) GetOpEdgeFromOp(op scop.Op) *OpEdge {
 // AddDepEdge adds a dep edge connecting two nodes (specified by their targets
 // and statuses).
 func (g *Graph) AddDepEdge(
-	rule RuleName,
+	ruleName RuleName,
 	kind DepEdgeKind,
 	fromTarget *scpb.Target,
 	fromStatus scpb.Status,
 	toTarget *scpb.Target,
 	toStatus scpb.Status,
 ) (err error) {
-	de := &DepEdge{rule: rule, kind: kind}
-	if de.from, err = g.getOrCreateNode(fromTarget, fromStatus); err != nil {
+	rule := Rule{Name: ruleName, Kind: kind}
+	from, err := g.getOrCreateNode(fromTarget, fromStatus)
+	if err != nil {
 		return err
 	}
-	if de.to, err = g.getOrCreateNode(toTarget, toStatus); err != nil {
+	to, err := g.getOrCreateNode(toTarget, toStatus)
+	if err != nil {
 		return err
 	}
-	g.edges = append(g.edges, de)
-	g.depEdgesFrom.insert(de)
-	g.depEdgesTo.insert(de)
-	return nil
+	return g.depEdges.insertOrUpdate(rule, kind, from, to)
+
 }
 
 // MarkAsNoOp marks an edge as no-op, so that no operations are emitted from
@@ -310,48 +339,65 @@ func (g *Graph) Order() int {
 }
 
 // Validate returns an error if there's a cycle in the graph.
-func (g *Graph) Validate() (err error) {
-	marks := make(map[*screl.Node]bool, g.Order())
-	var visit func(n *screl.Node)
-	visit = func(n *screl.Node) {
-		if err != nil {
-			return
-		}
-		permanent, marked := marks[n]
-		if marked && !permanent {
-			err = errors.AssertionFailedf("graph is not acyclical")
-			return
-		}
-		if marked && permanent {
-			return
-		}
-		marks[n] = false
-		_ = g.ForEachDepEdgeTo(n, func(de *DepEdge) error {
-			visit(de.From())
+func (g *Graph) Validate() error {
+	order := g.Order()
+	done := make(map[*screl.Node]bool, order)
+	pred := make(map[*screl.Node]Edge, order)
+	var visit func(n *screl.Node, in Edge) error
+	visit = func(n *screl.Node, in Edge) error {
+		if done[n] {
 			return nil
-		})
-		marks[n] = true
-	}
-	_ = g.ForEachNode(func(n *screl.Node) error {
-		visit(n)
+		}
+		if _, found := pred[n]; found {
+			return errors.WithDetail(
+				errors.AssertionFailedf("graph is not acyclical"),
+				cycleErrorDetail(n, in, pred),
+			)
+		}
+		pred[n] = in
+		if out, ok := g.GetOpEdgeFrom(n); ok {
+			if err := visit(out.To(), out); err != nil {
+				return err
+			}
+		}
+		if err := g.ForEachDepEdgeFrom(n, func(out *DepEdge) error {
+			return visit(out.To(), out)
+		}); err != nil {
+			return err
+		}
+		done[n] = true
 		return nil
+	}
+	return g.ForEachNode(func(n *screl.Node) error {
+		return visit(n, nil /* in */)
 	})
-	return err
 }
 
-// compareNodes compares two nodes in a graph. A nil nodes is the minimum value.
-func (g *Graph) compareNodes(a, b *screl.Node) (less, eq bool) {
-	switch {
-	case a == b:
-		return false, true
-	case a == nil:
-		return true, false
-	case b == nil:
-		return false, false
-	case a.Target == b.Target:
-		return a.CurrentStatus < b.CurrentStatus, a.CurrentStatus == b.CurrentStatus
-	default:
-		aIdx, bIdx := g.targetIdxMap[a.Target], g.targetIdxMap[b.Target]
-		return aIdx < bIdx, aIdx == bIdx
+func cycleErrorDetail(target *screl.Node, edge Edge, pred map[*screl.Node]Edge) string {
+	var collectCycle func(e Edge) []Edge
+	collectCycle = func(e Edge) (c []Edge) {
+		if e == nil {
+			return nil
+		}
+		current := e.From()
+		if current != target {
+			c = collectCycle(pred[current])
+		}
+		return append(c, e)
 	}
+	var sb strings.Builder
+	sb.WriteString("cycle:\n")
+	for _, e := range collectCycle(edge) {
+		sb.WriteString(screl.NodeString(e.From()))
+		sb.WriteString(" --> ")
+		if de, ok := e.(*DepEdge); ok {
+			sb.WriteString(de.RuleNames().String())
+		} else {
+			sb.WriteString("op edge")
+		}
+		sb.WriteRune('\n')
+	}
+	sb.WriteString(screl.NodeString(target))
+	sb.WriteRune('\n')
+	return sb.String()
 }

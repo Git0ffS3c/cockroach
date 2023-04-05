@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
@@ -61,7 +61,7 @@ type SampleReservoir struct {
 	// sampleCols contains the ordinals of columns that should be sampled from
 	// each row. Note that the sampled rows still contain all columns, but
 	// any columns not part of this set are given a null value.
-	sampleCols util.FastIntSet
+	sampleCols intsets.Fast
 }
 
 var _ heap.Interface = &SampleReservoir{}
@@ -71,7 +71,7 @@ func (sr *SampleReservoir) Init(
 	numSamples, minNumSamples int,
 	colTypes []*types.T,
 	memAcc *mon.BoundAccount,
-	sampleCols util.FastIntSet,
+	sampleCols intsets.Fast,
 ) {
 	if minNumSamples < 1 || minNumSamples > numSamples {
 		minNumSamples = numSamples
@@ -265,7 +265,7 @@ func (sr *SampleReservoir) copyRow(
 			dst[i].Datum = truncateDatum(evalCtx, dst[i].Datum, maxBytesPerSample)
 			afterSize = dst[i].Size()
 		} else {
-			dst[i].Datum = deepCopyDatum(evalCtx, dst[i].Datum)
+			dst[i].Datum = deepCopyDatum(dst[i].Datum)
 		}
 
 		// Perform memory accounting.
@@ -351,7 +351,7 @@ func truncateString(s string, maxBytes int) string {
 // Note: this function is currently only called for key-encoded datums. Update
 // the calling function if there is a need to call this for value-encoded
 // datums as well.
-func deepCopyDatum(evalCtx *eval.Context, d tree.Datum) tree.Datum {
+func deepCopyDatum(d tree.Datum) tree.Datum {
 	switch t := d.(type) {
 	case *tree.DString:
 		return tree.NewDString(deepCopyString(string(*t)))
@@ -365,7 +365,7 @@ func deepCopyDatum(evalCtx *eval.Context, d tree.Datum) tree.Datum {
 
 	case *tree.DOidWrapper:
 		return &tree.DOidWrapper{
-			Wrapped: deepCopyDatum(evalCtx, t.Wrapped),
+			Wrapped: deepCopyDatum(t.Wrapped),
 			Oid:     t.Oid,
 		}
 

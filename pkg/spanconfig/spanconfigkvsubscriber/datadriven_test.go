@@ -25,9 +25,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvaccessor"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -41,69 +43,68 @@ import (
 // TestDataDriven runs datadriven tests against the KVSubscriber interface.
 // The syntax is as follows:
 //
-//      update
-//      delete [c,e)
-//      upsert [c,d):C
-//      upsert [d,e):D
-//      upsert {entire-keyspace}:X
-//      delete {source=1,target=20}
-//      ----
+//		update
+//		delete [c,e)
+//		upsert [c,d):C
+//		upsert [d,e):D
+//		upsert {entire-keyspace}:X
+//		delete {source=1,target=20}
+//		----
 //
-//      get
-//      span [a,b)
-//      span [b,c)
-//      ----
-//      [a,b):A
-//      [b,d):B
+//		get
+//		span [a,b)
+//		span [b,c)
+//		----
+//		[a,b):A
+//		[b,d):B
 //
-//      start
-//      ----
+//		start
+//		----
 //
-//      updates
-//      ----
-//      [a,b)
-//      [b,d)
-//      [e,f)
+//		updates
+//		----
+//		[a,b)
+//		[b,d)
+//		[e,f)
 //
-//      store-reader key=b
-//      ----
-//      [b,d):B
+//		store-reader key=b
+//		----
+//		[b,d):B
 //
-//      store-reader compute-split=[a,c)
-//      ----
-//      b
+//		store-reader compute-split=[a,c)
+//		----
+//		b
 //
-//      store-reader needs-split=[b,h)
-//      ----
-//      true
+//		store-reader needs-split=[b,h)
+//		----
+//		true
 //
-//      inject-buffer-overflow
-//      ----
-//      ok
+//		inject-buffer-overflow
+//		----
+//		ok
 //
-// - update and get tie into GetSpanConfigRecords and UpdateSpanConfigRecords
-//   respectively on the KVAccessor interface, and are a convenient shorthand to
-//   populate the system table that the KVSubscriber subscribes to. The input is
-//   processed in a single batch.
-// - start starts the subscription process. It can also be used to verify
-//   behavior when re-establishing subscriptions after hard errors.
-// - updates lists the span updates the KVSubscriber receives, in the listed
-//   order. Updates in a batch are de-duped.
-// - store-reader {key,compute-split,needs-split} relate to GetSpanConfigForKey,
-//   ComputeSplitKey and NeedsSplit respectively on the StoreReader subset of the
-//   KVSubscriber interface.
-// - inject-buffer-overflow can be used to inject rangefeed buffer overflow
-//   errors within the kvsubscriber. It pokes into the internals of the
-//   kvsubscriber and is useful to test teardown and recovery behavior.
+//	  - update and get tie into GetSpanConfigRecords and UpdateSpanConfigRecords
+//	    respectively on the KVAccessor interface, and are a convenient shorthand to
+//	    populate the system table that the KVSubscriber subscribes to. The input is
+//	    processed in a single batch.
+//	  - start starts the subscription process. It can also be used to verify
+//	    behavior when re-establishing subscriptions after hard errors.
+//	  - updates lists the span updates the KVSubscriber receives, in the listed
+//	    order. Updates in a batch are de-duped.
+//	  - store-reader {key,compute-split,needs-split} relate to GetSpanConfigForKey,
+//	    ComputeSplitKey and NeedsSplit respectively on the StoreReader subset of the
+//	    KVSubscriber interface.
+//	  - inject-buffer-overflow can be used to inject rangefeed buffer overflow
+//	    errors within the kvsubscriber. It pokes into the internals of the
+//	    kvsubscriber and is useful to test teardown and recovery behavior.
 //
 // Text of the form [a,b) and [a,b):C correspond to spans and span config
 // records; see spanconfigtestutils.Parse{Span,Config,SpanConfigRecord} for more
 // details.
-// TODO(arul): Add ability to express tenant spans to this datadriven test.
 func TestDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
 		ctx := context.Background()
 		ctx, cancel := context.WithCancel(ctx)
 		tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{})
@@ -125,7 +126,7 @@ func TestDataDriven(t *testing.T) {
 
 		kvAccessor := spanconfigkvaccessor.New(
 			tc.Server(0).DB(),
-			tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
+			tc.Server(0).InternalExecutor().(isql.Executor),
 			tc.Server(0).ClusterSettings(),
 			tc.Server(0).Clock(),
 			fmt.Sprintf("defaultdb.public.%s", dummyTableName),
@@ -147,6 +148,7 @@ func TestDataDriven(t *testing.T) {
 			10<<20, /* 10 MB */
 			spanconfigtestutils.ParseConfig(t, "FALLBACK"),
 			tc.Server(0).ClusterSettings(),
+			spanconfigstore.NewEmptyBoundsReader(),
 			&spanconfig.TestingKnobs{
 				KVSubscriberRangeFeedKnobs: &rangefeedcache.TestingKnobs{
 					OnTimestampAdvance: func(ts hlc.Timestamp) {
@@ -167,6 +169,7 @@ func TestDataDriven(t *testing.T) {
 					ErrorInjectionCh: injectedErrCh,
 				},
 			},
+			nil, /* registry */
 		)
 
 		kvSubscriber.Subscribe(func(ctx context.Context, span roachpb.Span) {
@@ -282,7 +285,8 @@ func TestDataDriven(t *testing.T) {
 					d.ScanArgs(t, cmdArg.Key, &spanStr)
 					span := spanconfigtestutils.ParseSpan(t, spanStr)
 					start, end := roachpb.RKey(span.Key), roachpb.RKey(span.EndKey)
-					splitKey := kvSubscriber.ComputeSplitKey(ctx, start, end)
+					splitKey, err := kvSubscriber.ComputeSplitKey(ctx, start, end)
+					require.NoError(t, err)
 					return string(splitKey)
 
 				case "needs-split":
@@ -290,7 +294,8 @@ func TestDataDriven(t *testing.T) {
 					d.ScanArgs(t, cmdArg.Key, &spanStr)
 					span := spanconfigtestutils.ParseSpan(t, spanStr)
 					start, end := roachpb.RKey(span.Key), roachpb.RKey(span.EndKey)
-					result := kvSubscriber.NeedsSplit(ctx, start, end)
+					result, err := kvSubscriber.NeedsSplit(ctx, start, end)
+					require.NoError(t, err)
 					return fmt.Sprintf("%t", result)
 
 				default:

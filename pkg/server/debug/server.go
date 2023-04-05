@@ -11,29 +11,32 @@
 package debug
 
 import (
-	"bytes"
 	"context"
 	"expvar"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/pprof"
-	"path"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/goroutineui"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
+	"github.com/cockroachdb/cockroach/pkg/server/debug/replay"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	pebbletool "github.com/cockroachdb/pebble/tool"
+	"github.com/cockroachdb/pebble/vfs"
 	metrics "github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
 	"github.com/spf13/cobra"
@@ -67,12 +70,15 @@ type Server struct {
 	spy        logSpy
 }
 
+type serverTickleFn = func(ctx context.Context, name roachpb.TenantName) error
+
 // NewServer sets up a debug server.
 func NewServer(
 	ambientContext log.AmbientContext,
 	st *cluster.Settings,
 	hbaConfDebugFn http.HandlerFunc,
 	profiler pprofui.Profiler,
+	serverTickleFn serverTickleFn,
 ) *Server {
 	mux := http.NewServeMux()
 
@@ -111,16 +117,36 @@ func NewServer(
 	// Register the stopper endpoint, which lists all active tasks.
 	mux.HandleFunc("/debug/stopper", stop.HandleDebug)
 
+	if serverTickleFn != nil {
+		// Register the server tickling function.
+		//
+		// TODO(knz): This can be removed once
+		// https://github.com/cockroachdb/cockroach/issues/84585 is
+		// implemented.
+		mux.Handle("/debug/tickle", handleTickle(serverTickleFn))
+	}
+
 	// Set up the vmodule endpoint.
 	vsrv := &vmoduleServer{}
 	mux.HandleFunc("/debug/vmodule", vsrv.vmoduleHandleDebug)
 
 	// Set up the log spy, a tool that allows inspecting filtered logs at high
-	// verbosity.
+	// verbosity. We require the tenant ID from the ambientCtx to set the logSpy
+	// tenant filter.
 	spy := logSpy{
 		vsrv:         vsrv,
 		setIntercept: log.InterceptWith,
 	}
+	serverTenantID := ambientContext.ServerIDs.ServerIdentityString(serverident.IdentifyTenantID)
+	if serverTenantID == "" {
+		panic("programmer error: cannot instantiate a debug.Server with no tenantID in the ambientCtx")
+	}
+	parsed, err := strconv.ParseUint(serverTenantID, 10, 64)
+	if err != nil {
+		panic("programmer error: failed parsing ambientCtx tenantID during debug.Server initialization")
+	}
+	spy.tenantID = roachpb.MustMakeTenantID(parsed)
+
 	mux.HandleFunc("/debug/logspy", spy.handleDebugLogSpy)
 
 	ps := pprofui.NewServer(pprofui.NewMemStorage(pprofui.ProfileConcurrency, pprofui.ProfileExpiry), profiler)
@@ -149,12 +175,10 @@ func NewServer(
 }
 
 func analyzeLSM(dir string, writer io.Writer) error {
-	manifestName, err := ioutil.ReadFile(path.Join(dir, "CURRENT"))
+	db, err := pebble.Peek(dir, vfs.Default)
 	if err != nil {
 		return err
 	}
-
-	manifestPath := path.Join(dir, string(bytes.TrimSpace(manifestName)))
 
 	t := pebbletool.New(pebbletool.Comparers(storage.EngineComparer))
 
@@ -170,7 +194,12 @@ func analyzeLSM(dir string, writer io.Writer) error {
 	}
 
 	lsm.SetOutput(writer)
-	lsm.Run(lsm, []string{manifestPath})
+	return lsm.RunE(lsm, []string{db.ManifestFilename})
+}
+
+func (ds *Server) RegisterWorkloadCollector(stores *kvserver.Stores) error {
+	h := replay.HTTPHandler{Stores: stores}
+	ds.mux.HandleFunc("/debug/workload_capture", h.HandleRequest)
 	return nil
 }
 
@@ -183,7 +212,7 @@ func (ds *Server) RegisterEngines(specs []base.StoreSpec, engines []storage.Engi
 
 	storeIDs := make([]roachpb.StoreIdent, len(engines))
 	for i := range engines {
-		id, err := kvserver.ReadStoreIdent(context.Background(), engines[i])
+		id, err := kvstorage.ReadStoreIdent(context.Background(), engines[i])
 		if err != nil {
 			return err
 		}
@@ -269,4 +298,26 @@ If you are not redirected automatically, follow this <a href='/#/debug'>link</a>
 </body>
 </html>
 `)
+}
+
+type handleTickle serverTickleFn
+
+func (h handleTickle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	opts := r.URL.Query()
+	var name string
+	if n := opts["name"]; len(n) > 0 {
+		name = n[0]
+	}
+	w.Header().Add("Content-type", "text/plain")
+	if name == "" {
+		fmt.Fprint(w, "no name specified")
+		return
+	}
+	ctx := r.Context()
+	err := serverTickleFn(h)(ctx, roachpb.TenantName(name))
+	if err != nil {
+		fmt.Fprint(w, err)
+		return
+	}
+	fmt.Fprintf(w, "server for tenant %q was tickled", name)
 }

@@ -20,16 +20,15 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/migration"
-	"github.com/cockroachdb/cockroach/pkg/migration/migrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -115,7 +114,7 @@ func setupMixedCluster(
 	})
 
 	// We simulate crashes using this cluster, and having this enabled (which is
-	// a default migration) causes leaktest to complain.
+	// a default upgrade) causes leaktest to complain.
 	if _, err := tc.ServerConn(0).Exec("SET CLUSTER SETTING diagnostics.reporting.enabled = 'false'"); err != nil {
 		t.Fatal(err)
 	}
@@ -193,11 +192,8 @@ func TestClusterVersionPersistedOnJoin(t *testing.T) {
 
 	for i := 0; i < len(tc.TestCluster.Servers); i++ {
 		for _, engine := range tc.TestCluster.Servers[i].Engines() {
-			cv, err := kvserver.ReadClusterVersion(ctx, engine)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cv.Version != newVersion {
+			cv := engine.MinVersion()
+			if cv != newVersion {
 				t.Fatalf("n%d: expected version %v, got %v", i+1, newVersion, cv)
 			}
 		}
@@ -251,7 +247,7 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	// Check the cluster version is still oldVersion.
 	curVersion := tc.getVersionFromSelect(0)
 	if curVersion != oldVersion.String() {
-		t.Fatalf("cluster version should still be %s, but get %s", oldVersion, curVersion)
+		t.Fatalf("cluster version should still be %s, but got %s", oldVersion, curVersion)
 	}
 
 	// Reset cluster.preserve_downgrade_option to enable auto upgrade.
@@ -262,7 +258,7 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	// Check the cluster version is bumped to newVersion.
 	testutils.SucceedsSoon(t, func() error {
 		if version := tc.getVersionFromSelect(0); version != newVersion.String() {
-			return errors.Errorf("cluster version is still %s, should be %s", oldVersion, newVersion)
+			return errors.Errorf("cluster version is still %s, should be %s", version, newVersion)
 		}
 		return nil
 	})
@@ -324,11 +320,8 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	// Since the wrapped version setting exposes the new versions, it must
 	// definitely be present on all stores on the first try.
 	if err := tc.Servers[1].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
-		cv, err := kvserver.ReadClusterVersion(ctx, s.Engine())
-		if err != nil {
-			return err
-		}
-		if act := cv.Version.String(); act != exp {
+		cv := s.TODOEngine().MinVersion()
+		if act := cv.String(); act != exp {
 			t.Fatalf("%s: %s persisted, but should be %s", s, act, exp)
 		}
 		return nil
@@ -417,22 +410,21 @@ func TestClusterVersionMixedVersionTooOld(t *testing.T) {
 			DisableAutomaticVersionUpgrade: make(chan struct{}),
 			BinaryVersionOverride:          v0,
 		},
-		// Inject a migration which would run to upgrade the cluster.
-		// We'll validate that we never create a job for this migration.
-		MigrationManager: &migration.TestingKnobs{
-			ListBetweenOverride: func(from, to clusterversion.ClusterVersion) []clusterversion.ClusterVersion {
-				return []clusterversion.ClusterVersion{to}
+		// Inject an upgrade which would run to upgrade the cluster.
+		// We'll validate that we never create a job for this upgrade.
+		UpgradeManager: &upgradebase.TestingKnobs{
+			ListBetweenOverride: func(from, to roachpb.Version) []roachpb.Version {
+				return []roachpb.Version{to}
 			},
-			RegistryOverride: func(cv clusterversion.ClusterVersion) (migration.Migration, bool) {
-				if !cv.Version.Equal(v1) {
+			RegistryOverride: func(cv roachpb.Version) (upgradebase.Upgrade, bool) {
+				if !cv.Equal(v1) {
 					return nil, false
 				}
-				return migration.NewTenantMigration("testing", clusterversion.ClusterVersion{
-					Version: v1,
-				},
-					migrations.NoPrecondition,
+				return upgrade.NewTenantUpgrade("testing",
+					v1,
+					upgrade.NoPrecondition,
 					func(
-						ctx context.Context, version clusterversion.ClusterVersion, deps migration.TenantDeps, _ *jobs.Job,
+						ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps,
 					) error {
 						return nil
 					}), true
@@ -470,10 +462,10 @@ func TestClusterVersionMixedVersionTooOld(t *testing.T) {
 		})
 	}
 
-	// Ensure that no migration jobs got created.
+	// Ensure that no upgrade jobs got created.
 	{
 		sqlutils.MakeSQLRunner(tc.ServerConn(0)).CheckQueryResults(
-			t, "SELECT * FROM crdb_internal.jobs WHERE job_type = 'MIGRATION'", [][]string{})
+			t, "SELECT * FROM crdb_internal.jobs WHERE job_type = 'upgrade'", [][]string{})
 	}
 
 	// Check that we can still talk to the first three nodes.

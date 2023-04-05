@@ -596,6 +596,16 @@ sort
 build
 SELECT b, c FROM t ORDER BY @2
 ----
+error (01P01): invalid syntax @2
+
+build
+SELECT b, c FROM t ORDER BY @4
+----
+error (01P01): invalid syntax @4
+
+build set=allow_ordinal_column_references=true
+SELECT b, c FROM t ORDER BY @2
+----
 sort
  ├── columns: b:2 c:3  [hidden: column6:6]
  ├── ordering: +6
@@ -606,7 +616,7 @@ sort
       └── projections
            └── b:2 [as=column6:6]
 
-build
+build set=allow_ordinal_column_references=true
 SELECT b, c FROM t ORDER BY @4
 ----
 sort
@@ -1091,7 +1101,7 @@ sort
 
 # Try NULLS ordered last.
 # Next two plans should be the same.
-build null-ordered-last
+build set=null_ordered_last=true
 SELECT a, b FROM abcd ORDER BY b, c
 ----
 sort
@@ -1105,7 +1115,7 @@ sort
            ├── b:2 IS NULL [as=nulls_ordering_b:7]
            └── c:3 IS NULL [as=nulls_ordering_c:8]
 
-build null-ordered-last
+build set=null_ordered_last=true
 SELECT a, b FROM abcd ORDER BY b, c NULLS LAST
 ----
 sort
@@ -1120,7 +1130,7 @@ sort
            └── c:3 IS NULL [as=nulls_ordering_c:8]
 
 # Should be different from the plan above (1 null re-ordering).
-build null-ordered-last
+build set=null_ordered_last=true
 SELECT a, b FROM abcd ORDER BY b NULLS FIRST, c
 ----
 sort
@@ -1134,7 +1144,7 @@ sort
            └── c:3 IS NULL [as=nulls_ordering_c:7]
 
 # Should be different from the two plans above (2 null re-orderings).
-build null-ordered-last
+build set=null_ordered_last=true
 SELECT a, b FROM abcd ORDER BY b NULLS FIRST, c DESC NULLS LAST
 ----
 sort
@@ -1218,7 +1228,7 @@ sort
 
 # Try with NULL ordered last.
 # Next two plans should be the same.
-build null-ordered-last
+build set=null_ordered_last=true
 SELECT * FROM abcd ORDER BY b DESC
 ----
 sort
@@ -1231,7 +1241,7 @@ sort
       └── projections
            └── b:2 IS NULL [as=nulls_ordering_b:7]
 
-build null-ordered-last
+build set=null_ordered_last=true
 SELECT * FROM abcd ORDER BY b DESC NULLS FIRST
 ----
 sort
@@ -1245,7 +1255,7 @@ sort
            └── b:2 IS NULL [as=nulls_ordering_b:7]
 
 # Should be different from the plan above (1 null re-ordering).
-build null-ordered-last
+build set=null_ordered_last=true
 SELECT * FROM abcd ORDER BY b DESC NULLS LAST
 ----
 sort

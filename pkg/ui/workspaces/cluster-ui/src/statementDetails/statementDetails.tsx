@@ -8,118 +8,114 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
+import React, { ReactNode, useContext } from "react";
 import { Col, Row, Tabs } from "antd";
-import { Text, Heading, InlineAlert } from "@cockroachlabs/ui-components";
-import { PageConfig, PageConfigItem } from "src/pageConfig";
-import _ from "lodash";
-import React, { ReactNode } from "react";
+import "antd/lib/col/style";
+import "antd/lib/row/style";
+import "antd/lib/tabs/style";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import { InlineAlert, Text } from "@cockroachlabs/ui-components";
+import { ArrowLeft } from "@cockroachlabs/icons";
+import { isNil } from "lodash";
+import Long from "long";
 import { Helmet } from "react-helmet";
 import { Link, RouteComponentProps } from "react-router-dom";
 import classNames from "classnames/bind";
-import { format as d3Format } from "d3-format";
-import { ArrowLeft } from "@cockroachlabs/icons";
-import { cockroach, google } from "@cockroachlabs/crdb-protobuf-client";
-import Long from "long";
-import { Location } from "history";
+import { PageConfig, PageConfigItem } from "src/pageConfig";
+import { BarGraphTimeSeries } from "../graphs/bargraph";
+import { AxisUnits } from "../graphs";
+import { AlignedData, Options } from "uplot";
 
 import {
-  NumericStat,
-  intersperse,
-  Bytes,
-  Duration,
-  FixLong,
-  longToInt,
-  stdDev,
-  formatNumberForDisplay,
-  unique,
-  queryByName,
   appAttr,
   appNamesAttr,
+  FixFingerprintHexValue,
+  DATE_FORMAT_24_UTC,
+  intersperse,
+  queryByName,
   RenderCount,
+  TimestampToMoment,
+  unique,
 } from "src/util";
-import { Loading } from "src/loading";
+import { getValidErrorsList, Loading } from "src/loading";
 import { Button } from "src/button";
 import { SqlBox, SqlBoxSize } from "src/sql";
-import { SortSetting } from "src/sortedtable";
-import { Tooltip } from "@cockroachlabs/ui-components";
 import { PlanDetails } from "./planDetails";
-import { SummaryCard } from "src/summaryCard";
-import {
-  latencyBreakdown,
-  genericBarChart,
-  formatTwoPlaces,
-} from "src/barCharts";
+import { SummaryCard, SummaryCardItem } from "src/summaryCard";
 import { DiagnosticsView } from "./diagnostics/diagnosticsView";
-import sortedTableStyles from "src/sortedtable/sortedtable.module.scss";
+import insightTableStyles from "../insightsTable/insightsTable.module.scss";
 import summaryCardStyles from "src/summaryCard/summaryCard.module.scss";
+import timeScaleStyles from "src/timeScaleDropdown/timeScale.module.scss";
 import styles from "./statementDetails.module.scss";
 import { commonStyles } from "src/common";
-import { NodeSummaryStats } from "../nodes";
 import { UIConfigState } from "../store";
-import moment from "moment";
 import { StatementDetailsRequest } from "src/api/statementsApi";
 import {
+  getValidOption,
   TimeScale,
+  timeScale1hMinOptions,
   TimeScaleDropdown,
+  timeScaleToString,
   toRoundedDateRange,
 } from "../timeScaleDropdown";
-import SQLActivityError from "../sqlActivity/errorComponent";
+import LoadingError from "../sqlActivity/errorComponent";
 import {
   ActivateDiagnosticsModalRef,
   ActivateStatementDiagnosticsModal,
 } from "../statementsDiagnostics";
-type IDuration = google.protobuf.IDuration;
-type StatementDetailsResponse = cockroach.server.serverpb.StatementDetailsResponse;
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
+import {
+  generateContentionTimeseries,
+  generateExecCountTimeseries,
+  generateExecRetriesTimeseries,
+  generateExecuteAndPlanningTimeseries,
+  generateRowsProcessedTimeseries,
+  generateCPUTimeseries,
+} from "./timeseriesUtils";
+import { Delayed } from "../delayed";
+import moment from "moment";
+import {
+  InsertStmtDiagnosticRequest,
+  InsightRecommendation,
+  StatementDiagnosticsReport,
+  StmtInsightsReq,
+} from "../api";
+import {
+  getStmtInsightRecommendations,
+  InsightType,
+  StmtInsightEvent,
+} from "../insights";
+import {
+  InsightsSortedTable,
+  makeInsightsColumns,
+} from "../insightsTable/insightsTable";
+import { CockroachCloudContext } from "../contexts";
+
+type StatementDetailsResponse =
+  cockroach.server.serverpb.StatementDetailsResponse;
 
 const { TabPane } = Tabs;
-
-export interface Fraction {
-  numerator: number;
-  denominator: number;
-}
 
 export type StatementDetailsProps = StatementDetailsOwnProps &
   RouteComponentProps<{ implicitTxn: string; statement: string }>;
 
 export interface StatementDetailsState {
-  sortSetting: SortSetting;
   currentTab?: string;
-}
+  cardWidth: number;
 
-interface NumericStatRow {
-  name: string;
-  value: NumericStat;
-  bar?: () => ReactNode;
-  summary?: boolean;
-  // You can override the table's formatter on a per-row basis with this format
-  // method.
-  format?: (v: number) => string;
-}
+  /**
+   * The latest non-null query text associated with the statement fingerprint in the URL.
+   * We save this to preserve this data when the time frame changes such that there is no
+   * longer data for this statement fingerprint in the selected time frame.
+   */
+  query: string;
 
-interface NumericStatTableProps {
-  title?: string;
-  description?: string;
-  measure: string;
-  rows: NumericStatRow[];
-  count: number;
-  format?: (v: number) => string;
+  /**
+   * The latest non-null formatted query associated with the statement fingerprint in the URL.
+   * We save this to preserve data when the time frame changes such that there is no longer
+   * data for this statement fingerprint in the selected time frame.
+   */
+  formattedQuery: string;
 }
-
-export type NodesSummary = {
-  nodeStatuses: cockroach.server.status.statuspb.INodeStatus[];
-  nodeIDs: string[];
-  nodeStatusByID: Dictionary<cockroach.server.status.statuspb.INodeStatus>;
-  nodeSums: NodeSummaryStats;
-  nodeDisplayNameByID: Dictionary<string>;
-  livenessStatusByNodeID: Dictionary<
-    cockroach.kv.kvserver.liveness.livenesspb.NodeLivenessStatus
-  >;
-  livenessByNodeID: Dictionary<
-    cockroach.kv.kvserver.liveness.livenesspb.ILiveness
-  >;
-  storeIDsByNodeID: Dictionary<string[]>;
-};
 
 export interface StatementDetailsDispatchProps {
   refreshStatementDetails: (req: StatementDetailsRequest) => void;
@@ -127,59 +123,55 @@ export interface StatementDetailsDispatchProps {
   refreshUserSQLRoles: () => void;
   refreshNodes: () => void;
   refreshNodesLiveness: () => void;
+  refreshStatementFingerprintInsights: (req: StmtInsightsReq) => void;
   createStatementDiagnosticsReport: (
-    statementFingerprint: string,
-    minExecLatency: IDuration,
-    expiresAfter: IDuration,
+    insertStmtDiagnosticsRequest: InsertStmtDiagnosticRequest,
   ) => void;
   dismissStatementDiagnosticsAlertMessage?: () => void;
   onTabChanged?: (tabName: string) => void;
   onTimeScaleChange: (ts: TimeScale) => void;
   onDiagnosticsModalOpen?: (statementFingerprint: string) => void;
   onDiagnosticBundleDownload?: (statementFingerprint?: string) => void;
-  onDiagnosticCancelRequest?: (report: IStatementDiagnosticsReport) => void;
+  onDiagnosticCancelRequest?: (report: StatementDiagnosticsReport) => void;
   onSortingChange?: (
     name: string,
     columnTitle: string,
     ascending: boolean,
   ) => void;
   onBackToStatementsClick?: () => void;
-  onStatementDetailsQueryChange: (query: string) => void;
-  onStatementDetailsFormattedQueryChange: (formattedQuery: string) => void;
 }
 
 export interface StatementDetailsStateProps {
   statementFingerprintID: string;
   statementDetails: StatementDetailsResponse;
   isLoading: boolean;
-  latestQuery: string;
-  latestFormattedQuery: string;
   statementsError: Error | null;
+  lastUpdated: moment.Moment | null;
   timeScale: TimeScale;
-  nodeNames: { [nodeId: string]: string };
   nodeRegions: { [nodeId: string]: string };
-  diagnosticsReports: cockroach.server.serverpb.IStatementDiagnosticsReport[];
+  diagnosticsReports: StatementDiagnosticsReport[];
   uiConfig?: UIConfigState["pages"]["statementDetails"];
   isTenant?: UIConfigState["isTenant"];
   hasViewActivityRedactedRole?: UIConfigState["hasViewActivityRedactedRole"];
+  hasAdminRole?: UIConfigState["hasAdminRole"];
+  statementFingerprintInsights?: StmtInsightEvent[];
 }
 
 export type StatementDetailsOwnProps = StatementDetailsDispatchProps &
   StatementDetailsStateProps;
 
 const cx = classNames.bind(styles);
-const sortableTableCx = classNames.bind(sortedTableStyles);
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);
+const timeScaleStylesCx = classNames.bind(timeScaleStyles);
+const insightsTableCx = classNames.bind(insightTableStyles);
 
-function getStatementDetailsRequest(
-  timeScale: TimeScale,
-  statementFingerprintID: string,
-  location: Location,
+function getStatementDetailsRequestFromProps(
+  props: StatementDetailsProps,
 ): cockroach.server.serverpb.StatementDetailsRequest {
-  const [start, end] = toRoundedDateRange(timeScale);
+  const [start, end] = toRoundedDateRange(props.timeScale);
   return new cockroach.server.serverpb.StatementDetailsRequest({
-    fingerprint_id: statementFingerprintID,
-    app_names: queryByName(location, appNamesAttr)?.split(","),
+    fingerprint_id: props.statementFingerprintID,
+    app_names: queryByName(props.location, appNamesAttr)?.split(","),
     start: Long.fromNumber(start.unix()),
     end: Long.fromNumber(end.unix()),
   });
@@ -189,7 +181,6 @@ function AppLink(props: { app: string }) {
   if (!props.app) {
     return <Text className={cx("app-name", "app-name__unset")}>(unset)</Text>;
   }
-
   const searchParams = new URLSearchParams({ [appAttr]: props.app });
 
   return (
@@ -220,146 +211,91 @@ function renderTransactionType(implicitTxn: boolean) {
   return "Explicit";
 }
 
-class NumericStatTable extends React.Component<NumericStatTableProps> {
-  static defaultProps = {
-    format: (v: number) => `${v}`,
-  };
-
-  render() {
-    const { rows } = this.props;
-    return (
-      <table
-        className={classNames(
-          sortableTableCx("sort-table"),
-          cx("statements-table"),
-        )}
-      >
-        <thead>
-          <tr
-            className={sortableTableCx(
-              "sort-table__row",
-              "sort-table__row--header",
-            )}
-          >
-            <th
-              className={sortableTableCx(
-                "sort-table__cell",
-                "sort-table__cell--header",
-              )}
-            >
-              {this.props.title}
-            </th>
-            <th className={sortableTableCx("sort-table__cell")}>
-              Mean {this.props.measure}
-            </th>
-            <th className={sortableTableCx("sort-table__cell")}>
-              Standard Deviation
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row: NumericStatRow, idx) => {
-            let { format } = this.props;
-            if (row.format) {
-              format = row.format;
-            }
-            const className = sortableTableCx(
-              "sort-table__row",
-              "sort-table__row--body",
-              {
-                "sort-table__row--summary": row.summary,
-              },
-            );
-            return (
-              <tr className={className} key={idx}>
-                <th
-                  className={sortableTableCx(
-                    "sort-table__cell",
-                    "sort-table__cell--header",
-                  )}
-                  style={{ textAlign: "left" }}
-                >
-                  {row.name}
-                </th>
-                <td className={sortableTableCx("sort-table__cell")}>
-                  {row.bar ? row.bar() : null}
-                </td>
-                <td
-                  className={sortableTableCx(
-                    "sort-table__cell",
-                    "sort-table__cell--active",
-                  )}
-                >
-                  {format(stdDev(row.value, this.props.count))}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    );
-  }
-}
-
 export class StatementDetails extends React.Component<
   StatementDetailsProps,
   StatementDetailsState
 > {
   activateDiagnosticsRef: React.RefObject<ActivateDiagnosticsModalRef>;
+
   constructor(props: StatementDetailsProps) {
     super(props);
     const searchParams = new URLSearchParams(props.history.location.search);
     this.state = {
-      sortSetting: {
-        // Latency
-        ascending: false,
-        columnTitle: "statementTime",
-      },
       currentTab: searchParams.get("tab") || "overview",
+      cardWidth: 700,
+      query: this.props.statementDetails?.statement?.metadata?.query,
+      formattedQuery:
+        this.props.statementDetails?.statement?.metadata?.formatted_query,
     };
     this.activateDiagnosticsRef = React.createRef();
-  }
 
-  static defaultProps: Partial<StatementDetailsProps> = {
-    onDiagnosticBundleDownload: _.noop,
-    uiConfig: {
-      showStatementDiagnosticsLink: true,
-    },
-    isTenant: false,
-    hasViewActivityRedactedRole: false,
-  };
+    // In case the user selected a option not available on this page,
+    // force a selection of a valid option. This is necessary for the case
+    // where the value 10/30 min is selected on the Metrics page.
+    const ts = getValidOption(this.props.timeScale, timeScale1hMinOptions);
+    if (ts !== this.props.timeScale) {
+      this.changeTimeScale(ts);
+    }
+  }
 
   hasDiagnosticReports = (): boolean =>
     this.props.diagnosticsReports.length > 0;
 
-  changeSortSetting = (ss: SortSetting): void => {
-    this.setState({
-      sortSetting: ss,
-    });
-    if (this.props.onSortingChange) {
-      this.props.onSortingChange("Stats By Node", ss.columnTitle, ss.ascending);
+  changeTimeScale = (ts: TimeScale): void => {
+    if (this.props.onTimeScaleChange) {
+      this.props.onTimeScaleChange(ts);
     }
   };
 
-  refreshStatementDetails = (
-    timeScale: TimeScale,
-    statementFingerprintID: string,
-    location: Location,
-  ): void => {
-    const req = getStatementDetailsRequest(
-      timeScale,
-      statementFingerprintID,
-      location,
-    );
+  refreshStatementDetails = (): void => {
+    const req = getStatementDetailsRequestFromProps(this.props);
     this.props.refreshStatementDetails(req);
+    this.refreshStatementInsights();
+  };
+
+  refreshStatementInsights = (): void => {
+    const [startTime, endTime] = toRoundedDateRange(this.props.timeScale);
+    const id = BigInt(this.props.statementFingerprintID).toString(16);
+    const req: StmtInsightsReq = {
+      start: startTime,
+      end: endTime,
+      stmtFingerprintId: id,
+    };
+    this.props.refreshStatementFingerprintInsights(req);
+  };
+
+  handleResize = (): void => {
+    // Use the same size as the summary card and remove a space for margin (22).
+    const cardWidth = document.getElementById("first-card")
+      ? document.getElementById("first-card")?.offsetWidth - 22
+      : 700;
+    if (cardWidth !== this.state.cardWidth) {
+      this.setState({
+        cardWidth: cardWidth,
+      });
+    }
   };
 
   componentDidMount(): void {
-    this.refreshStatementDetails(
-      this.props.timeScale,
-      this.props.statementFingerprintID,
-      this.props.location,
-    );
+    this.refreshStatementDetails();
+
+    window.addEventListener("resize", this.handleResize);
+    this.handleResize();
+    // For the first data fetch for this page, we refresh if there are:
+    // - Last updated is null (no statement details fetched previously)
+    // - The time interval is not custom, i.e. we have a moving window
+    // in which case we poll every 5 minutes. For the first fetch we will
+    // calculate the next time to refresh based on when the data was last
+    // updated.
+    if (this.props.timeScale.key !== "Custom" || !this.props.lastUpdated) {
+      const now = moment();
+      const nextRefresh =
+        this.props.lastUpdated?.clone().add(5, "minutes") || now;
+      setTimeout(
+        this.refreshStatementDetails,
+        Math.max(0, nextRefresh.diff(now, "milliseconds")),
+      );
+    }
     this.props.refreshUserSQLRoles();
     if (!this.props.isTenant) {
       this.props.refreshNodes();
@@ -371,16 +307,13 @@ export class StatementDetails extends React.Component<
   }
 
   componentDidUpdate(prevProps: StatementDetailsProps): void {
+    this.handleResize();
     if (
-      prevProps.timeScale != this.props.timeScale ||
-      prevProps.statementFingerprintID != this.props.statementFingerprintID ||
-      prevProps.location != this.props.location
+      prevProps.timeScale !== this.props.timeScale ||
+      prevProps.statementFingerprintID !== this.props.statementFingerprintID ||
+      prevProps.location !== this.props.location
     ) {
-      this.refreshStatementDetails(
-        this.props.timeScale,
-        this.props.statementFingerprintID,
-        this.props.location,
-      );
+      this.refreshStatementDetails();
     }
 
     if (!this.props.isTenant) {
@@ -391,30 +324,22 @@ export class StatementDetails extends React.Component<
       }
     }
 
-    // If new, non-empty-string query text is available (derived from the statement details response),
-    // cache the query text.
+    // If a new, non-empty-string query text is available
+    // (derived from the statement details response), save the query text.
+    const newQuery =
+      this.props.statementDetails?.statement?.metadata?.query ||
+      this.state.query;
+    const newFormattedQuery =
+      this.props.statementDetails?.statement?.metadata?.formatted_query ||
+      this.state.formattedQuery;
     if (
-      this.props.statementDetails &&
-      this.props.statementDetails.statement.metadata.query != "" &&
-      this.props.latestQuery !=
-        this.props.statementDetails.statement.metadata.query
+      newQuery !== this.state.query ||
+      newFormattedQuery !== this.state.formattedQuery
     ) {
-      this.props.onStatementDetailsQueryChange(
-        this.props.statementDetails.statement.metadata.query,
-      );
-    }
-
-    // If a new, non-empty-string formatted query text is available (derived from the statement details response),
-    // cache the query text.
-    if (
-      this.props.statementDetails &&
-      this.props.statementDetails.statement.metadata.formatted_query != "" &&
-      this.props.latestFormattedQuery !=
-        this.props.statementDetails.statement.metadata.formatted_query
-    ) {
-      this.props.onStatementDetailsFormattedQueryChange(
-        this.props.statementDetails.statement.metadata.formatted_query,
-      );
+      this.setState({
+        query: newQuery,
+        formattedQuery: newFormattedQuery,
+      });
     }
 
     // If the statementFingerprintID (derived from the URL) changes, invalidate the cached query texts.
@@ -422,8 +347,7 @@ export class StatementDetails extends React.Component<
     // The new query text and the formatted query text would be an empty string, and we need to invalidate the old
     // query text and formatted query text.
     if (this.props.statementFingerprintID != prevProps.statementFingerprintID) {
-      this.props.onStatementDetailsQueryChange("");
-      this.props.onStatementDetailsFormattedQueryChange("");
+      this.setState({ query: null, formattedQuery: null });
     }
   }
 
@@ -455,6 +379,22 @@ export class StatementDetails extends React.Component<
       onDiagnosticsModalOpen,
     } = this.props;
     const app = queryByName(this.props.location, appAttr);
+    const longLoadingMessage = this.props.isLoading &&
+      isNil(this.props.statementDetails) &&
+      isNil(getValidErrorsList(this.props.statementsError)) && (
+        <Delayed delay={moment.duration(2, "s")}>
+          <InlineAlert
+            intent="info"
+            title="If the selected time interval contains a large amount of data, this page might take a few minutes to load."
+          />
+        </Delayed>
+      );
+
+    const hasTimeout = this.props.statementsError?.name
+      ?.toLowerCase()
+      .includes("timeout");
+    const error = hasTimeout ? null : this.props.statementsError;
+
     return (
       <div className={cx("root")}>
         <Helmet title={`Details | ${app ? `${app} App |` : ""} Statements`} />
@@ -470,21 +410,22 @@ export class StatementDetails extends React.Component<
             Statements
           </Button>
           <h3 className={commonStyles("base-heading", "no-margin-bottom")}>
-            Statement Details
+            Statement Fingerprint
           </h3>
         </div>
         <section className={cx("section", "section--container")}>
           <Loading
             loading={this.props.isLoading}
-            page={"statement details"}
-            error={this.props.statementsError}
+            page={"statement fingerprint"}
+            error={error}
             render={this.renderTabs}
             renderError={() =>
-              SQLActivityError({
+              LoadingError({
                 statsType: "statements",
               })
             }
           />
+          {longLoadingMessage}
           <ActivateStatementDiagnosticsModal
             ref={this.activateDiagnosticsRef}
             activate={createStatementDiagnosticsReport}
@@ -498,9 +439,12 @@ export class StatementDetails extends React.Component<
 
   renderTabs = (): React.ReactElement => {
     const { currentTab } = this.state;
-    const { stats } = this.props.statementDetails.statement;
-
-    const hasData = Number(stats.count) > 0;
+    const hasTimeout = this.props.statementsError?.name
+      ?.toLowerCase()
+      .includes("timeout");
+    const hasData =
+      Number(this.props.statementDetails?.statement?.stats?.count) > 0;
+    const period = timeScaleToString(this.props.timeScale);
 
     return (
       <Tabs
@@ -510,10 +454,10 @@ export class StatementDetails extends React.Component<
         activeKey={currentTab}
       >
         <TabPane tab="Overview" key="overview">
-          {this.renderOverviewTabContent(hasData)}
+          {this.renderOverviewTabContent(hasTimeout, hasData, period)}
         </TabPane>
         <TabPane tab="Explain Plans" key="explain-plan">
-          {this.renderExplainPlanTabContent(hasData)}
+          {this.renderExplainPlanTabContent(hasTimeout, hasData, period)}
         </TabPane>
         {!this.props.isTenant && !this.props.hasViewActivityRedactedRole && (
           <TabPane
@@ -527,13 +471,6 @@ export class StatementDetails extends React.Component<
             {this.renderDiagnosticsTabContent(hasData)}
           </TabPane>
         )}
-        <TabPane
-          tab="Execution Stats"
-          key="execution-stats"
-          className={cx("fit-content-width")}
-        >
-          {this.renderExecutionStatsTabContent(hasData)}
-        </TabPane>
       </Tabs>
     );
   };
@@ -544,323 +481,337 @@ export class StatementDetails extends React.Component<
     </section>
   );
 
-  renderNoDataWithTimeScaleAndSqlBoxTabContent = (): React.ReactElement => (
+  renderNoDataWithTimeScaleAndSqlBoxTabContent = (
+    hasTimeout: boolean,
+  ): React.ReactElement => (
     <>
       <PageConfig>
         <PageConfigItem>
           <TimeScaleDropdown
+            options={timeScale1hMinOptions}
             currentScale={this.props.timeScale}
             setTimeScale={this.props.onTimeScaleChange}
           />
         </PageConfigItem>
       </PageConfig>
       <section className={cx("section")}>
-        {this.props.latestFormattedQuery && (
+        {this.state.formattedQuery && (
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
               <SqlBox
-                value={this.props.latestFormattedQuery}
-                size={SqlBoxSize.small}
+                value={this.state.formattedQuery}
+                size={SqlBoxSize.custom}
+                format={true}
               />
             </Col>
           </Row>
         )}
-        <InlineAlert
-          intent="info"
-          title="Data not available for this time frame. Select a different time frame."
-        />
+        {hasTimeout && (
+          <InlineAlert
+            intent="danger"
+            title={LoadingError({
+              statsType: "statements",
+              timeout: true,
+            })}
+          />
+        )}
+        {!hasTimeout && (
+          <InlineAlert
+            intent="info"
+            title="Data not available for this time frame. Select a different time frame."
+          />
+        )}
       </section>
     </>
   );
 
-  renderOverviewTabContent = (hasData: boolean): React.ReactElement => {
+  renderOverviewTabContent = (
+    hasTimeout: boolean,
+    hasData: boolean,
+    period: string,
+  ): React.ReactElement => {
     if (!hasData) {
-      return this.renderNoDataWithTimeScaleAndSqlBoxTabContent();
+      return this.renderNoDataWithTimeScaleAndSqlBoxTabContent(hasTimeout);
     }
-    const { nodeRegions, isTenant } = this.props;
+    const { cardWidth } = this.state;
+    const { nodeRegions, isTenant, statementFingerprintInsights } = this.props;
     const { stats } = this.props.statementDetails.statement;
     const {
       app_names,
       databases,
-      dist_sql_count,
+      fingerprint_id,
       failed_count,
       full_scan_count,
       vec_count,
       total_count,
       implicit_txn,
     } = this.props.statementDetails.statement.metadata;
-
-    const { statement } = this.props.statementDetails;
-
-    const totalCountBarChart = longToInt(statement.stats.count);
-    const firstAttemptsBarChart = longToInt(
-      statement.stats.first_attempt_count,
-    );
-    const retriesBarChart = totalCountBarChart - firstAttemptsBarChart;
-    const maxRetriesBarChart = longToInt(statement.stats.max_retries);
+    const { statement_statistics_per_aggregated_ts } =
+      this.props.statementDetails;
 
     const nodes: string[] = unique(
       (stats.nodes || []).map(node => node.toString()),
     ).sort();
     const regions = unique(
-      (stats.nodes || []).map(node => nodeRegions[node.toString()]),
+      isTenant
+        ? stats.regions || []
+        : nodes.map(node => nodeRegions[node]).filter(r => r), // Remove undefined / unknown regions.
     ).sort();
 
-    const duration = (v: number) => Duration(v * 1e9);
     const lastExec =
       stats.last_exec_timestamp &&
-      moment(stats.last_exec_timestamp.seconds.low * 1e3).format(
-        "MMM DD, YYYY HH:MM",
-      );
+      TimestampToMoment(stats.last_exec_timestamp).format(DATE_FORMAT_24_UTC);
+
     const statementSampled = stats.exec_stats.count > Long.fromNumber(0);
     const unavailableTooltip = !statementSampled && (
-      <Tooltip
-        placement="bottom"
-        style="default"
-        content={
-          <p>
-            This metric is part of the statement execution and therefore will
-            not be available until the statement is sampled via tracing.
-          </p>
-        }
-      >
-        <span className={cx("tooltip-info")}>unavailable</span>
-      </Tooltip>
+      <div>
+        This metric is part of the statement execution and therefore will not be
+        available until the statement is sampled.
+      </div>
     );
+    const noSamples = statementSampled ? "" : " (no samples)";
 
     const db = databases ? (
       <Text>{databases}</Text>
     ) : (
       <Text className={cx("app-name", "app-name__unset")}>(unset)</Text>
     );
+
+    const statsPerAggregatedTs = statement_statistics_per_aggregated_ts.sort(
+      (a, b) =>
+        a.aggregated_ts.seconds < b.aggregated_ts.seconds
+          ? -1
+          : a.aggregated_ts.seconds > b.aggregated_ts.seconds
+          ? 1
+          : 0,
+    );
+
+    const executionAndPlanningTimeseries: AlignedData =
+      generateExecuteAndPlanningTimeseries(statsPerAggregatedTs);
+    const executionAndPlanningOps: Partial<Options> = {
+      axes: [{}, { label: "Time Spent" }],
+      series: [
+        {},
+        { label: "Execution" },
+        { label: "Planning" },
+        { label: "Idle" },
+      ],
+      width: cardWidth,
+    };
+
+    const rowsProcessedTimeseries: AlignedData =
+      generateRowsProcessedTimeseries(statsPerAggregatedTs);
+    const rowsProcessedOps: Partial<Options> = {
+      axes: [{}, { label: "Rows" }],
+      series: [{}, { label: "Rows Read" }, { label: "Rows Written" }],
+      width: cardWidth,
+    };
+
+    const execRetriesTimeseries: AlignedData =
+      generateExecRetriesTimeseries(statsPerAggregatedTs);
+    const execRetriesOps: Partial<Options> = {
+      axes: [{}, { label: "Retries" }],
+      series: [{}, { label: "Retries" }],
+      legend: { show: false },
+      width: cardWidth,
+    };
+
+    const execCountTimeseries: AlignedData =
+      generateExecCountTimeseries(statsPerAggregatedTs);
+    const execCountOps: Partial<Options> = {
+      axes: [{}, { label: "Execution Counts" }],
+      series: [{}, { label: "Execution Counts" }],
+      legend: { show: false },
+      width: cardWidth,
+    };
+
+    const contentionTimeseries: AlignedData =
+      generateContentionTimeseries(statsPerAggregatedTs);
+    const contentionOps: Partial<Options> = {
+      axes: [{}, { label: "Contention" }],
+      series: [{}, { label: "Contention" }],
+      legend: { show: false },
+      width: cardWidth,
+    };
+
+    const cpuTimeseries: AlignedData =
+      generateCPUTimeseries(statsPerAggregatedTs);
+    const cpuOps: Partial<Options> = {
+      axes: [{}, { label: "CPU Time" }],
+      series: [{}, { label: "CPU Time" }],
+      legend: { show: false },
+      width: cardWidth,
+    };
+
+    const isCockroachCloud = useContext(CockroachCloudContext);
+    const insightsColumns = makeInsightsColumns(
+      isCockroachCloud,
+      this.props.hasAdminRole,
+      true,
+      true,
+    );
+    const tableData: InsightRecommendation[] = [];
+    if (statementFingerprintInsights) {
+      const tableDataTypes = new Set<InsightType>();
+      statementFingerprintInsights.forEach(insight => {
+        const rec = getStmtInsightRecommendations(insight);
+        rec.forEach(entry => {
+          if (!tableDataTypes.has(entry.type)) {
+            tableData.push(entry);
+            tableDataTypes.add(entry.type);
+          }
+        });
+      });
+    }
+
     return (
       <>
         <PageConfig>
           <PageConfigItem>
             <TimeScaleDropdown
+              options={timeScale1hMinOptions}
               currentScale={this.props.timeScale}
               setTimeScale={this.props.onTimeScaleChange}
             />
           </PageConfigItem>
         </PageConfig>
+        <p className={timeScaleStylesCx("time-label", "label-margin")}>
+          Showing aggregated stats from{" "}
+          <span className={timeScaleStylesCx("bold")}>{period}</span>
+        </p>
         <section className={cx("section")}>
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
               <SqlBox
-                value={this.props.latestFormattedQuery}
-                size={SqlBoxSize.small}
+                value={this.state.formattedQuery}
+                size={SqlBoxSize.custom}
+                format={true}
+              />
+            </Col>
+          </Row>
+          <Row gutter={24} className={cx("margin-left-neg")}>
+            <Col className="gutter-row" span={12}>
+              <SummaryCard id="first-card" className={cx("summary-card")}>
+                {!isTenant && (
+                  <SummaryCardItem
+                    label="Nodes"
+                    value={intersperse<ReactNode>(
+                      nodes.map(n => <NodeLink node={n} key={n} />),
+                      ", ",
+                    )}
+                  />
+                )}
+                <SummaryCardItem
+                  label="Regions"
+                  value={intersperse<ReactNode>(regions, ", ")}
+                />
+                <SummaryCardItem label="Database" value={db} />
+                <SummaryCardItem
+                  label="Application Name"
+                  value={intersperse<ReactNode>(
+                    app_names.map(a => <AppLink app={a} key={a} />),
+                    ", ",
+                  )}
+                />
+                <SummaryCardItem
+                  label="Fingerprint ID"
+                  value={FixFingerprintHexValue(fingerprint_id)}
+                />
+              </SummaryCard>
+            </Col>
+            <Col className="gutter-row" span={12}>
+              <SummaryCard className={cx("summary-card")}>
+                <SummaryCardItem
+                  label="Failed?"
+                  value={RenderCount(failed_count, total_count)}
+                />
+                <SummaryCardItem
+                  label="Full scan?"
+                  value={RenderCount(full_scan_count, total_count)}
+                />
+                <SummaryCardItem
+                  label="Vectorized execution?"
+                  value={RenderCount(vec_count, total_count)}
+                />
+                <SummaryCardItem
+                  label="Transaction type"
+                  value={renderTransactionType(implicit_txn)}
+                />
+                <SummaryCardItem label="Last execution time" value={lastExec} />
+              </SummaryCard>
+            </Col>
+          </Row>
+          {tableData?.length > 0 && (
+            <>
+              <p
+                className={summaryCardStylesCx("summary--card__divider--large")}
+              />
+              <Row gutter={24}>
+                <Col className="gutter-row" span={24}>
+                  <InsightsSortedTable
+                    columns={insightsColumns}
+                    data={tableData}
+                    tableWrapperClassName={insightsTableCx("sorted-table")}
+                  />
+                </Col>
+              </Row>
+            </>
+          )}
+          <p className={summaryCardStylesCx("summary--card__divider--large")} />
+          <Row gutter={24}>
+            <Col className="gutter-row" span={12}>
+              <BarGraphTimeSeries
+                title="Statement Times"
+                alignedData={executionAndPlanningTimeseries}
+                uPlotOptions={executionAndPlanningOps}
+                yAxisUnits={AxisUnits.Duration}
+              />
+            </Col>
+            <Col className="gutter-row" span={12}>
+              <BarGraphTimeSeries
+                title="Rows Processed"
+                alignedData={rowsProcessedTimeseries}
+                uPlotOptions={rowsProcessedOps}
+                yAxisUnits={AxisUnits.Count}
               />
             </Col>
           </Row>
           <Row gutter={24}>
             <Col className="gutter-row" span={12}>
-              <SummaryCard className={cx("summary-card")}>
-                <Row>
-                  <Col>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Heading type="h5">Mean statement time</Heading>
-                      <Text type="body-strong">
-                        {formatNumberForDisplay(
-                          stats.service_lat.mean,
-                          duration,
-                        )}
-                      </Text>
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Planning time</Text>
-                      <Text>
-                        {formatNumberForDisplay(stats.plan_lat.mean, duration)}
-                      </Text>
-                    </div>
-                    <p
-                      className={summaryCardStylesCx("summary--card__divider")}
-                    />
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Execution time</Text>
-                      <Text>
-                        {formatNumberForDisplay(stats.run_lat.mean, duration)}
-                      </Text>
-                    </div>
-                    <p
-                      className={summaryCardStylesCx("summary--card__divider")}
-                    />
-                  </Col>
-                </Row>
-              </SummaryCard>
-              <SummaryCard className={cx("summary-card")}>
-                <Row>
-                  <Col>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Heading type="h5">Resource usage</Heading>
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Mean rows/bytes read</Text>
-                      {statementSampled && (
-                        <Text>
-                          {formatNumberForDisplay(
-                            stats.rows_read.mean,
-                            formatTwoPlaces,
-                          )}
-                          {" / "}
-                          {formatNumberForDisplay(stats.bytes_read.mean, Bytes)}
-                        </Text>
-                      )}
-                      {unavailableTooltip}
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Mean rows written</Text>
-                      <Text>
-                        {formatNumberForDisplay(
-                          stats.rows_written?.mean,
-                          formatTwoPlaces,
-                        )}
-                      </Text>
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Max memory usage</Text>
-                      {statementSampled && (
-                        <Text>
-                          {formatNumberForDisplay(
-                            stats.exec_stats.max_mem_usage.mean,
-                            Bytes,
-                          )}
-                        </Text>
-                      )}
-                      {unavailableTooltip}
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Network usage</Text>
-                      {statementSampled && (
-                        <Text>
-                          {formatNumberForDisplay(
-                            stats.exec_stats.network_bytes.mean,
-                            Bytes,
-                          )}
-                        </Text>
-                      )}
-                      {unavailableTooltip}
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Max scratch disk usage</Text>
-                      {statementSampled && (
-                        <Text>
-                          {formatNumberForDisplay(
-                            stats.exec_stats.max_disk_usage.mean,
-                            Bytes,
-                          )}
-                        </Text>
-                      )}
-                      {unavailableTooltip}
-                    </div>
-                  </Col>
-                </Row>
-              </SummaryCard>
+              <BarGraphTimeSeries
+                title="Execution Retries"
+                alignedData={execRetriesTimeseries}
+                uPlotOptions={execRetriesOps}
+                yAxisUnits={AxisUnits.Count}
+              />
             </Col>
             <Col className="gutter-row" span={12}>
-              <SummaryCard className={cx("summary-card")}>
-                <Heading type="h5">Statement details</Heading>
-                {!isTenant && (
-                  <div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Nodes</Text>
-                      <Text>
-                        {intersperse<ReactNode>(
-                          nodes.map(n => <NodeLink node={n} key={n} />),
-                          ", ",
-                        )}
-                      </Text>
-                    </div>
-                    <div className={summaryCardStylesCx("summary--card__item")}>
-                      <Text>Regions</Text>
-                      <Text>{intersperse<ReactNode>(regions, ", ")}</Text>
-                    </div>
-                  </div>
-                )}
-
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Database</Text>
-                  {db}
-                </div>
-                <p
-                  className={summaryCardStylesCx(
-                    "summary--card__divider--large",
-                  )}
-                />
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>App</Text>
-                  <Text>
-                    {intersperse<ReactNode>(
-                      app_names.map(a => <AppLink app={a} key={a} />),
-                      ", ",
-                    )}
-                  </Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Failed?</Text>
-                  <Text>{RenderCount(failed_count, total_count)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Distributed execution?</Text>
-                  <Text>{RenderCount(dist_sql_count, total_count)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Full Scan?</Text>
-                  <Text>{RenderCount(full_scan_count, total_count)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Vectorized execution?</Text>
-                  <Text>{RenderCount(vec_count, total_count)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Transaction type</Text>
-                  <Text>{renderTransactionType(implicit_txn)}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Last execution time</Text>
-                  <Text>{lastExec}</Text>
-                </div>
-                <p
-                  className={summaryCardStylesCx(
-                    "summary--card__divider--large",
-                  )}
-                />
-                <Heading type="h5">Execution counts</Heading>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>First attempts</Text>
-                  <Text>{firstAttemptsBarChart}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Total executions</Text>
-                  <Text>{totalCountBarChart}</Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Retries</Text>
-                  <Text
-                    className={summaryCardStylesCx(
-                      "summary--card__item--value",
-                      {
-                        "summary--card__item--value-red": retriesBarChart > 0,
-                      },
-                    )}
-                  >
-                    {retriesBarChart}
-                  </Text>
-                </div>
-                <div className={summaryCardStylesCx("summary--card__item")}>
-                  <Text>Max retries</Text>
-                  <Text
-                    className={summaryCardStylesCx(
-                      "summary--card__item--value",
-                      {
-                        "summary--card__item--value-red":
-                          maxRetriesBarChart > 0,
-                      },
-                    )}
-                  >
-                    {maxRetriesBarChart}
-                  </Text>
-                </div>
-              </SummaryCard>
+              <BarGraphTimeSeries
+                title="Execution Count"
+                alignedData={execCountTimeseries}
+                uPlotOptions={execCountOps}
+                yAxisUnits={AxisUnits.Count}
+              />
+            </Col>
+          </Row>
+          <Row gutter={24}>
+            <Col className="gutter-row" span={12}>
+              <BarGraphTimeSeries
+                title={`Contention Time${noSamples}`}
+                alignedData={contentionTimeseries}
+                uPlotOptions={contentionOps}
+                tooltip={unavailableTooltip}
+                yAxisUnits={AxisUnits.Duration}
+              />
+            </Col>
+            <Col className="gutter-row" span={12}>
+              <BarGraphTimeSeries
+                title={`CPU Time${noSamples}`}
+                alignedData={cpuTimeseries}
+                uPlotOptions={cpuOps}
+                tooltip={unavailableTooltip}
+                yAxisUnits={AxisUnits.Duration}
+              />
             </Col>
           </Row>
         </section>
@@ -868,9 +819,13 @@ export class StatementDetails extends React.Component<
     );
   };
 
-  renderExplainPlanTabContent = (hasData: boolean): React.ReactElement => {
+  renderExplainPlanTabContent = (
+    hasTimeout: boolean,
+    hasData: boolean,
+    period: string,
+  ): React.ReactElement => {
     if (!hasData) {
-      return this.renderNoDataWithTimeScaleAndSqlBoxTabContent();
+      return this.renderNoDataWithTimeScaleAndSqlBoxTabContent(hasTimeout);
     }
     const { statement_statistics_per_plan_hash } = this.props.statementDetails;
     const { formatted_query } = this.props.statementDetails.statement.metadata;
@@ -879,26 +834,39 @@ export class StatementDetails extends React.Component<
         <PageConfig>
           <PageConfigItem>
             <TimeScaleDropdown
+              options={timeScale1hMinOptions}
               currentScale={this.props.timeScale}
-              setTimeScale={this.props.onTimeScaleChange}
+              setTimeScale={this.changeTimeScale}
             />
           </PageConfigItem>
         </PageConfig>
+        <p className={timeScaleStylesCx("time-label", "label-margin")}>
+          Showing explain plans from{" "}
+          <span className={timeScaleStylesCx("bold")}>{period}</span>
+        </p>
         <section className={cx("section")}>
           <Row gutter={24}>
             <Col className="gutter-row" span={24}>
-              <SqlBox value={formatted_query} size={SqlBoxSize.small} />
+              <SqlBox
+                value={formatted_query}
+                size={SqlBoxSize.custom}
+                format={true}
+              />
             </Col>
           </Row>
           <p className={summaryCardStylesCx("summary--card__divider")} />
-          <PlanDetails plans={statement_statistics_per_plan_hash} />
+          <PlanDetails
+            statementFingerprintID={this.props.statementFingerprintID}
+            plans={statement_statistics_per_plan_hash}
+            hasAdminRole={this.props.hasAdminRole}
+          />
         </section>
       </>
     );
   };
 
   renderDiagnosticsTabContent = (hasData: boolean): React.ReactElement => {
-    if (!hasData && !this.props.latestQuery) {
+    if (!hasData && !this.state.query) {
       return this.renderNoDataTabContent();
     }
 
@@ -908,128 +876,18 @@ export class StatementDetails extends React.Component<
         diagnosticsReports={this.props.diagnosticsReports}
         dismissAlertMessage={this.props.dismissStatementDiagnosticsAlertMessage}
         hasData={this.hasDiagnosticReports()}
-        statementFingerprint={this.props.latestQuery}
+        statementFingerprint={
+          this.props.statementDetails?.statement?.metadata?.query
+        }
         onDownloadDiagnosticBundleClick={this.props.onDiagnosticBundleDownload}
-        onDiagnosticCancelRequestClick={this.props.onDiagnosticCancelRequest}
+        onDiagnosticCancelRequestClick={report =>
+          this.props.onDiagnosticCancelRequest(report)
+        }
         showDiagnosticsViewLink={
-          this.props.uiConfig.showStatementDiagnosticsLink
+          this.props.uiConfig?.showStatementDiagnosticsLink
         }
         onSortingChange={this.props.onSortingChange}
       />
-    );
-  };
-
-  renderExecutionStatsTabContent = (hasData: boolean): React.ReactElement => {
-    if (!hasData) {
-      return this.renderNoDataTabContent();
-    }
-    const { stats } = this.props.statementDetails.statement;
-
-    const count = FixLong(stats.count).toInt();
-    const { statement } = this.props.statementDetails;
-    const {
-      parseBarChart,
-      planBarChart,
-      runBarChart,
-      overheadBarChart,
-      overallBarChart,
-    } = latencyBreakdown(statement);
-    return (
-      <>
-        <SummaryCard>
-          <h3
-            className={classNames(
-              commonStyles("base-heading"),
-              summaryCardStylesCx("summary--card__title"),
-            )}
-          >
-            Execution Latency By Phase
-            <div className={cx("numeric-stats-table__tooltip")}>
-              <Tooltip content="The execution latency of this statement, broken down by phase.">
-                <div className={cx("numeric-stats-table__tooltip-hover-area")}>
-                  <div className={cx("numeric-stats-table__info-icon")}>i</div>
-                </div>
-              </Tooltip>
-            </div>
-          </h3>
-          <NumericStatTable
-            title="Phase"
-            measure="Latency"
-            count={count}
-            format={(v: number) => Duration(v * 1e9)}
-            rows={[
-              { name: "Parse", value: stats.parse_lat, bar: parseBarChart },
-              { name: "Plan", value: stats.plan_lat, bar: planBarChart },
-              { name: "Run", value: stats.run_lat, bar: runBarChart },
-              {
-                name: "Overhead",
-                value: stats.overhead_lat,
-                bar: overheadBarChart,
-              },
-              {
-                name: "Overall",
-                summary: true,
-                value: stats.service_lat,
-                bar: overallBarChart,
-              },
-            ]}
-          />
-        </SummaryCard>
-        <SummaryCard>
-          <h3
-            className={classNames(
-              commonStyles("base-heading"),
-              summaryCardStylesCx("summary--card__title"),
-            )}
-          >
-            Other Execution Statistics
-          </h3>
-          <NumericStatTable
-            title="Stat"
-            measure="Quantity"
-            count={count}
-            format={d3Format(".2f")}
-            rows={[
-              {
-                name: "Rows Read",
-                value: stats.rows_read,
-                bar: genericBarChart(stats.rows_read, stats.count),
-              },
-              {
-                name: "Disk Bytes Read",
-                value: stats.bytes_read,
-                bar: genericBarChart(stats.bytes_read, stats.count, Bytes),
-                format: Bytes,
-              },
-              {
-                name: "Rows Written",
-                value: stats.rows_written,
-                bar: genericBarChart(stats.rows_written, stats.count),
-              },
-              {
-                name: "Network Bytes Sent",
-                value: stats.exec_stats.network_bytes,
-                bar: genericBarChart(
-                  stats.exec_stats.network_bytes,
-                  stats.exec_stats.count,
-                  Bytes,
-                ),
-                format: Bytes,
-              },
-            ].filter(function(r) {
-              if (
-                r.name === "Network Bytes Sent" &&
-                r.value &&
-                r.value.mean === 0
-              ) {
-                // Omit if empty.
-                return false;
-              }
-              return r.value;
-            })}
-          />
-        </SummaryCard>
-      </>
     );
   };
 }

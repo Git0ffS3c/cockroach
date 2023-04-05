@@ -30,40 +30,40 @@ import (
 )
 
 // DecorateErrorWithPlanDetails adds plan graphviz URLs as error details.
-func (p Plan) DecorateErrorWithPlanDetails(err error) error {
+func (p Plan) DecorateErrorWithPlanDetails(err error) (retErr error) {
 	if err == nil {
 		return nil
 	}
-
 	if len(p.Stages) > 0 {
-		explain, explainErr := p.ExplainVerbose()
-		if explainErr != nil {
-			explainErr = errors.Wrapf(explainErr, "error when generating EXPLAIN plan")
-			err = errors.CombineErrors(err, explainErr)
-		} else {
-			err = errors.WithDetailf(err, "%s", explain)
-		}
-
-		stagesURL, stagesErr := p.StagesURL()
-		if stagesErr != nil {
-			stagesErr = errors.Wrapf(stagesErr, "error when generating EXPLAIN graphviz URL")
-			err = errors.CombineErrors(err, stagesErr)
-		} else {
-			err = errors.WithDetailf(err, "stages graphviz: %s", stagesURL)
-		}
+		err = addDetail(err, "EXPLAIN plan", "", p.ExplainVerbose)
+		err = addDetail(err, "EXPLAIN graphviz URL", "stages graphviz: ", p.StagesURL)
 	}
-
 	if p.Graph != nil {
-		dependenciesURL, dependenciesErr := p.DependenciesURL()
-		if dependenciesErr != nil {
-			dependenciesErr = errors.Wrapf(dependenciesErr, "error when generating dependencies graphviz URL")
-			err = errors.CombineErrors(err, dependenciesErr)
-		} else {
-			err = errors.WithDetailf(err, "dependencies graphviz: %s", dependenciesURL)
-		}
+		err = addDetail(err, "dependencies graphviz URL", "dependencies graphviz: ", p.DependenciesURL)
 	}
+	return err
+}
 
-	return errors.WithAssertionFailure(err)
+func addDetail(
+	undecoratedError error, errWrapStr, detailFmtStr string, genDetail func() (string, error),
+) (err error) {
+	err = undecoratedError
+	defer func() {
+		if r := recover(); r != nil {
+			rAsErr, ok := r.(error)
+			if !ok {
+				rAsErr = errors.Errorf("%v", r)
+			}
+			rAsErr = errors.Wrapf(rAsErr, "panic when generating plan error detail %s", errWrapStr)
+			err = errors.CombineErrors(err, rAsErr)
+		}
+	}()
+	detail, detailErr := genDetail()
+	if detailErr == nil {
+		return errors.WithDetailf(err, detailFmtStr+"%s", detail)
+	}
+	detailErr = errors.Wrapf(detailErr, "error when generating plan error detail %s", errWrapStr)
+	return errors.CombineErrors(err, detailErr)
 }
 
 // DependenciesURL returns a URL to render the dependency graph in the Plan.
@@ -110,11 +110,20 @@ func (p Plan) explain(style treeprinter.Style) (string, error) {
 		if p.InRollback {
 			sb.WriteString("rolling back ")
 		}
-		for _, stmt := range p.Statements {
-			sb.WriteString(strings.TrimSuffix(stmt.RedactedStatement, ";"))
-			sb.WriteString("; ")
+		lastStmt := p.Statements[len(p.Statements)-1].RedactedStatement
+		sb.WriteString(strings.TrimSuffix(lastStmt, ";"))
+		if len(p.Statements) > 1 {
+			sb.WriteString("; following ")
+			for i, stmt := range p.Statements[:len(p.Statements)-1] {
+				if i > 0 {
+					sb.WriteString("; ")
+				}
+				sb.WriteString(strings.TrimSuffix(stmt.RedactedStatement, ";"))
+			}
 		}
+		sb.WriteString(";")
 	}
+
 	root := tp.Child(sb.String())
 	var pn treeprinter.Node
 	for i, s := range p.Stages {
@@ -163,7 +172,7 @@ func (p Plan) explainTargets(s scstage.Stage, sn treeprinter.Node, style treepri
 			targetTypeMap.Set(k, numTransitions+1)
 		}
 		// Collect rules affecting this element's status transitions.
-		if style == treeprinter.BulletStyle {
+		if style == treeprinter.BulletStyle && !s.IsResetPreCommitStage() {
 			n, nodeFound := p.Graph.GetNode(t, before)
 			if !nodeFound {
 				return errors.Errorf("could not find node [[%s, %s], %s] in graph",
@@ -190,8 +199,11 @@ func (p Plan) explainTargets(s scstage.Stage, sn treeprinter.Node, style treepri
 	// Generate format string for printing element status transition.
 	fmtCompactTransition := fmt.Sprintf("%%-%ds → %%-%ds %%s", beforeMaxLen, afterMaxLen)
 	// Go over each target grouping.
-	targetTypeMap.ForEach(func(key, numTransitions int) {
-		ts := scpb.TargetStatus(key)
+	for _, ts := range []scpb.TargetStatus{scpb.ToPublic, scpb.Transient, scpb.ToAbsent} {
+		numTransitions := targetTypeMap.GetDefault(int(ts))
+		if numTransitions == 0 {
+			continue
+		}
 		plural := "s"
 		if numTransitions == 1 {
 			plural = ""
@@ -216,7 +228,9 @@ func (p Plan) explainTargets(s scstage.Stage, sn treeprinter.Node, style treepri
 			for _, de := range depEdges {
 				rn := en.Childf("%s dependency from %s %s",
 					de.Kind(), de.From().CurrentStatus, screl.ElementString(de.From().Element()))
-				rn.AddLine(fmt.Sprintf("rule: %q", de.Name()))
+				for _, r := range de.Rules() {
+					rn.AddLine(fmt.Sprintf("rule: %q", r.Name))
+				}
 			}
 			noOpEdges := noOpByElement[t.Element()]
 			for _, oe := range noOpEdges {
@@ -231,7 +245,7 @@ func (p Plan) explainTargets(s scstage.Stage, sn treeprinter.Node, style treepri
 				}
 			}
 		}
-	})
+	}
 	return nil
 }
 

@@ -13,8 +13,11 @@ package scbuildstmt
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
@@ -41,6 +44,10 @@ type BuildCtx interface {
 
 	// Add adds an absent element to the BuilderState, targeting PUBLIC.
 	Add(element scpb.Element)
+
+	// AddTransient adds an absent element to the BuilderState, targeting
+	// TRANSIENT_ABSENT.
+	AddTransient(element scpb.Element)
 
 	// Drop sets the ABSENT target on an existing element in the BuilderState.
 	Drop(element scpb.Element)
@@ -69,13 +76,31 @@ type BuilderState interface {
 	NameResolver
 	PrivilegeChecker
 	TableHelpers
+	FunctionHelpers
 
 	// QueryByID returns all elements sharing the given descriptor ID.
 	QueryByID(descID catid.DescID) ElementResultSet
 
 	// Ensure ensures the presence of the given element in the BuilderState with
-	// the given statuses and metadata.
-	Ensure(current scpb.Status, target scpb.TargetStatus, elem scpb.Element, meta scpb.TargetMetadata)
+	// the given target status and metadata.
+	Ensure(elem scpb.Element, target scpb.TargetStatus, meta scpb.TargetMetadata)
+
+	// LogEventForExistingTarget tells the builder to write an entry in the event
+	// log for the existing target corresponding to the provided element.
+	// An error is thrown if no such target exists.
+	LogEventForExistingTarget(element scpb.Element)
+
+	// GenerateUniqueDescID returns the next available descriptor id for a new
+	// descriptor and mark the new id as being used for new descriptor, so that
+	// the builder knows to avoid loading existing descriptor for decomposition.
+	GenerateUniqueDescID() catid.DescID
+
+	// BuildUserPrivilegesFromDefaultPrivileges generates owner and user
+	// privileges elements from default privileges of the given database
+	// and schemas for the given descriptor and object type.
+	BuildUserPrivilegesFromDefaultPrivileges(
+		db *scpb.Database, sc *scpb.Schema, descID descpb.ID, objType privilege.TargetObjectType,
+	) (*scpb.Owner, []*scpb.UserPrivileges)
 }
 
 // EventLogState encapsulates the state of the metadata to decorate the eventlog
@@ -129,12 +154,28 @@ type Telemetry interface {
 	// counter.
 	IncrementSchemaChangeDropCounter(counterType string)
 
+	// IncrementSchemaChangeAddColumnTypeCounter increments telemetry counters for
+	// different types added as columns.
+	IncrementSchemaChangeAddColumnTypeCounter(typeName string)
+
+	// IncrementSchemaChangeAddColumnQualificationCounter increments telemetry
+	// counters for different qualifications (default expressions) on a newly
+	// added column.
+	IncrementSchemaChangeAddColumnQualificationCounter(qualification string)
+
 	// IncrementUserDefinedSchemaCounter increments the selected user-defined
 	// schema telemetry counter.
 	IncrementUserDefinedSchemaCounter(counterType sqltelemetry.UserDefinedSchemaTelemetryType)
 
 	// IncrementEnumCounter increments the selected enum telemetry counter.
 	IncrementEnumCounter(counterType sqltelemetry.EnumTelemetryType)
+
+	// IncrementDropOwnedByCounter increments the DROP OWNED BY telemetry counter.
+	IncrementDropOwnedByCounter()
+
+	// IncrementSchemaChangeIndexCounter schema change counters related to index
+	// features during creation.
+	IncrementSchemaChangeIndexCounter(counterType string)
 }
 
 // SchemaFeatureChecker checks if a schema change feature is allowed by the
@@ -143,6 +184,12 @@ type SchemaFeatureChecker interface {
 	// CheckFeature returns if the feature name specified is allowed or disallowed,
 	// by the database administrator.
 	CheckFeature(ctx context.Context, featureName tree.SchemaFeatureName) error
+
+	// CanPerformDropOwnedBy returns if we can do DROP OWNED BY for the
+	// given role.
+	CanPerformDropOwnedBy(
+		ctx context.Context, role username.SQLUsername,
+	) (bool, error)
 }
 
 // PrivilegeChecker checks an element's privileges.
@@ -154,6 +201,13 @@ type PrivilegeChecker interface {
 	// CheckPrivilege panics if the current user does not have the specified
 	// privilege for the element.
 	CheckPrivilege(e scpb.Element, privilege privilege.Kind)
+
+	// CurrentUserHasAdminOrIsMemberOf returns true iff the current user is (1)
+	// an admin or (2) has membership in the specified role.
+	CurrentUserHasAdminOrIsMemberOf(member username.SQLUsername) bool
+
+	// CurrentUser returns the user of current session.
+	CurrentUser() username.SQLUsername
 }
 
 // TableHelpers has methods useful for creating new table elements.
@@ -175,23 +229,40 @@ type TableHelpers interface {
 	// to this materialized view.
 	NextViewIndexID(view *scpb.View) catid.IndexID
 
-	// SecondaryIndexPartitioningDescriptor creates a new partitioning descriptor
+	// NextTableConstraintID returns the ID that should be used for any new constraint
+	// added to this table.
+	NextTableConstraintID(id catid.DescID) catid.ConstraintID
+
+	// IndexPartitioningDescriptor creates a new partitioning descriptor
 	// for the secondary index element, or panics.
-	SecondaryIndexPartitioningDescriptor(
-		index *scpb.SecondaryIndex,
-		partBy *tree.PartitionBy,
-	) catpb.PartitioningDescriptor
+	IndexPartitioningDescriptor(indexName string,
+		index *scpb.Index, keyColumns []*scpb.IndexColumn,
+		partBy *tree.PartitionBy) catpb.PartitioningDescriptor
 
 	// ResolveTypeRef resolves a type reference.
 	ResolveTypeRef(typeref tree.ResolvableTypeReference) scpb.TypeT
 
 	// WrapExpression constructs an expression wrapper given an AST.
-	WrapExpression(expr tree.Expr) *scpb.Expression
+	WrapExpression(parentID catid.DescID, expr tree.Expr) *scpb.Expression
 
 	// ComputedColumnExpression returns a validated computed column expression
 	// and its type.
 	// TODO(postamar): make this more low-level instead of consuming an AST
-	ComputedColumnExpression(tbl *scpb.Table, d *tree.ColumnTableDef) (tree.Expr, scpb.TypeT)
+	ComputedColumnExpression(tbl *scpb.Table, d *tree.ColumnTableDef) tree.Expr
+
+	// PartialIndexPredicateExpression returns a validated partial predicate
+	// wrapped expression
+	PartialIndexPredicateExpression(
+		tableID catid.DescID, expr tree.Expr,
+	) tree.Expr
+
+	// IsTableEmpty returns if the table is empty or not.
+	IsTableEmpty(tbl *scpb.Table) bool
+}
+
+type FunctionHelpers interface {
+	BuildReferenceProvider(stmt tree.Statement) ReferenceProvider
+	WrapFunctionBody(fnID descpb.ID, bodyStr string, lang catpb.Function_Language, provider ReferenceProvider) *scpb.FunctionBody
 }
 
 // ElementResultSet wraps the results of an element query.
@@ -229,6 +300,10 @@ type ResolveParams struct {
 	// RequiredPrivilege defines the privilege required for the resolved
 	// descriptor.
 	RequiredPrivilege privilege.Kind
+
+	// RequireOwnership if set to true, requires current user be the owner of the
+	// resolved descriptor. It preempts RequiredPrivilege.
+	RequireOwnership bool
 }
 
 // NameResolver looks up elements in the catalog by name, and vice-versa.
@@ -244,8 +319,15 @@ type NameResolver interface {
 	// ResolveSchema retrieves a schema by name and returns its elements.
 	ResolveSchema(name tree.ObjectNamePrefix, p ResolveParams) ElementResultSet
 
-	// ResolveEnumType retrieves a type by name and returns its elements.
-	ResolveEnumType(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
+	// ResolvePrefix retrieves database and schema given the name prefix. The
+	// requested schema must exist and current user must have the required
+	// privilege.
+	ResolvePrefix(
+		prefix tree.ObjectNamePrefix, requiredSchemaPriv privilege.Kind,
+	) (dbElts ElementResultSet, scElts ElementResultSet)
+
+	// ResolveUserDefinedTypeType retrieves a type by name and returns its elements.
+	ResolveUserDefinedTypeType(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
 
 	// ResolveRelation retrieves a relation by name and returns its elements.
 	ResolveRelation(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
@@ -262,14 +344,37 @@ type NameResolver interface {
 	// ResolveIndex retrieves an index by name and returns its elements.
 	ResolveIndex(relationID catid.DescID, indexName tree.Name, p ResolveParams) ElementResultSet
 
-	// ResolveTableIndexBestEffort retrieves a table which contains the target
+	// ResolveUDF retrieves a user defined function and returns its elements.
+	ResolveUDF(fnObj *tree.FuncObj, p ResolveParams) ElementResultSet
+
+	// ResolveIndexByName retrieves a table which contains the target
 	// index and returns its elements. Name of database, schema or table may be
-	// missing. It panics if require=true but index is not found.
-	ResolveTableIndexBestEffort(tableIndexName *tree.TableIndexName, p ResolveParams, required bool) ElementResultSet
+	// missing.
+	// If index is not found, it returns nil if p.IsExistenceOptional or panic if !p.IsExistenceOptional.
+	ResolveIndexByName(tableIndexName *tree.TableIndexName, p ResolveParams) ElementResultSet
 
 	// ResolveColumn retrieves a column by name and returns its elements.
 	ResolveColumn(relationID catid.DescID, columnName tree.Name, p ResolveParams) ElementResultSet
 
 	// ResolveConstraint retrieves a constraint by name and returns its elements.
 	ResolveConstraint(relationID catid.DescID, constraintName tree.Name, p ResolveParams) ElementResultSet
+}
+
+// ReferenceProvider provides all referenced objects with in current DDL
+// statement. For example, CREATE VIEW and CREATE FUNCTION both could reference
+// other objects, and cross-references need to probably tracked.
+type ReferenceProvider interface {
+	// ForEachTableReference iterate through all referenced tables and the
+	// reference details with the given function.
+	ForEachTableReference(f func(tblID descpb.ID, idxID descpb.IndexID, colIDs descpb.ColumnIDs) error) error
+	// ForEachViewReference iterate through all referenced views and the reference
+	// details with the given function.
+	ForEachViewReference(f func(viewID descpb.ID, colIDs descpb.ColumnIDs) error) error
+	// ReferencedSequences returns all referenced sequence IDs
+	ReferencedSequences() catalog.DescriptorIDSet
+	// ReferencedTypes returns all referenced type IDs (not including implicit
+	// table types)
+	ReferencedTypes() catalog.DescriptorIDSet
+	// ReferencedRelationIDs Returns all referenced relation IDs.
+	ReferencedRelationIDs() catalog.DescriptorIDSet
 }

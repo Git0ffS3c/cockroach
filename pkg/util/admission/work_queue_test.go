@@ -21,14 +21,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/pebble"
 	"github.com/stretchr/testify/require"
 )
 
@@ -55,29 +57,39 @@ func (b *builderWithMu) stringAndReset() string {
 }
 
 type testGranter struct {
-	buf                   *builderWithMu
-	r                     requester
+	gk   grantKind
+	name string
+	buf  *builderWithMu
+	r    requester
+
+	// Configurable knobs for tests.
 	returnValueFromTryGet bool
+	additionalTokens      int64
 }
 
-var _ granter = &testGranter{}
+var _ granterWithStoreWriteDone = &testGranter{}
 
 func (tg *testGranter) grantKind() grantKind {
-	return slot
+	return tg.gk
 }
+
 func (tg *testGranter) tryGet(count int64) bool {
-	tg.buf.printf("tryGet: returning %t", tg.returnValueFromTryGet)
+	tg.buf.printf("tryGet%s: returning %t", tg.name, tg.returnValueFromTryGet)
 	return tg.returnValueFromTryGet
 }
+
 func (tg *testGranter) returnGrant(count int64) {
-	tg.buf.printf("returnGrant %d", count)
+	tg.buf.printf("returnGrant%s %d", tg.name, count)
 }
+
 func (tg *testGranter) tookWithoutPermission(count int64) {
-	tg.buf.printf("tookWithoutPermission %d", count)
+	tg.buf.printf("tookWithoutPermission%s %d", tg.name, count)
 }
+
 func (tg *testGranter) continueGrantChain(grantChainID grantChainID) {
-	tg.buf.printf("continueGrantChain %d", grantChainID)
+	tg.buf.printf("continueGrantChain%s %d", tg.name, grantChainID)
 }
+
 func (tg *testGranter) grant(grantChainID grantChainID) {
 	rv := tg.r.granted(grantChainID)
 	if rv > 0 {
@@ -87,7 +99,15 @@ func (tg *testGranter) grant(grantChainID grantChainID) {
 		// concurrency_manager_test.go.
 		time.Sleep(50 * time.Millisecond)
 	}
-	tg.buf.printf("granted: returned %d", rv)
+	tg.buf.printf("granted%s: returned %d", tg.name, rv)
+}
+
+func (tg *testGranter) storeWriteDone(
+	originalTokens int64, doneInfo StoreWorkDoneInfo,
+) (additionalTokens int64) {
+	tg.buf.printf("storeWriteDone%s: originalTokens %d, doneBytes(write %d,ingested %d) returning %d",
+		tg.name, originalTokens, doneInfo.WriteBytes, doneInfo.IngestedBytes, tg.additionalTokens)
+	return tg.additionalTokens
 }
 
 type testWork struct {
@@ -168,19 +188,21 @@ func TestWorkQueueBasic(t *testing.T) {
 	initialTime := timeutil.FromUnixMicros(int64(100) * int64(time.Millisecond/time.Microsecond))
 	var timeSource *timeutil.ManualTime
 	var st *cluster.Settings
-	datadriven.RunTest(t, testutils.TestDataPath(t, "work_queue"),
+	registry := metric.NewRegistry()
+	metrics := makeWorkQueueMetrics("", registry)
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "work_queue"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "init":
 				closeFn()
-				tg = &testGranter{buf: &buf}
+				tg = &testGranter{gk: slot, buf: &buf}
 				opts := makeWorkQueueOptions(KVWork)
 				timeSource = timeutil.NewManualTime(initialTime)
 				opts.timeSource = timeSource
 				opts.disableEpochClosingGoroutine = true
 				st = cluster.MakeTestingClusterSettings()
 				q = makeWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()),
-					KVWork, tg, st, opts).(*WorkQueue)
+					KVWork, tg, st, metrics, opts).(*WorkQueue)
 				tg.r = q
 				wrkMap.resetMap()
 				return ""
@@ -303,7 +325,7 @@ func TestWorkQueueBasic(t *testing.T) {
 func scanTenantID(t *testing.T, d *datadriven.TestData) roachpb.TenantID {
 	var id int
 	d.ScanArgs(t, "tenant", &id)
-	return roachpb.MakeTenantID(uint64(id))
+	return roachpb.MustMakeTenantID(uint64(id))
 }
 
 // TestWorkQueueTokenResetRace induces racing between tenantInfo.used
@@ -316,10 +338,12 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var buf builderWithMu
-	tg := &testGranter{buf: &buf}
+	tg := &testGranter{gk: slot, buf: &buf}
 	st := cluster.MakeTestingClusterSettings()
+	registry := metric.NewRegistry()
+	metrics := makeWorkQueueMetrics("", registry)
 	q := makeWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()), SQLKVResponseWork, tg,
-		st, makeWorkQueueOptions(SQLKVResponseWork)).(*WorkQueue)
+		st, metrics, makeWorkQueueOptions(SQLKVResponseWork)).(*WorkQueue)
 	tg.r = q
 	createTime := int64(0)
 	stopCh := make(chan struct{})
@@ -334,7 +358,7 @@ func TestWorkQueueTokenResetRace(t *testing.T) {
 			select {
 			case <-ticker.C:
 				ctx, cancel := context.WithCancel(context.Background())
-				work2 := &testWork{tenantID: roachpb.MakeTenantID(tenantID), cancel: cancel}
+				work2 := &testWork{tenantID: roachpb.MustMakeTenantID(tenantID), cancel: cancel}
 				tenantID++
 				go func(ctx context.Context, w *testWork, createTime int64) {
 					enabled, err := q.Admit(ctx, WorkInfo{
@@ -439,15 +463,26 @@ func TestPriorityStates(t *testing.T) {
 		})
 }
 
+func tryScanWorkClass(t *testing.T, d *datadriven.TestData) admissionpb.WorkClass {
+	wc := admissionpb.RegularWorkClass
+	if d.HasArg("elastic") {
+		var b bool
+		d.ScanArgs(t, "elastic", &b)
+		if b {
+			wc = admissionpb.ElasticWorkClass
+		}
+	}
+	return wc
+}
+
 /*
 TestStoreWorkQueueBasic is a datadriven test with the following commands:
 init
 admit id=<int> tenant=<int> priority=<int> create-time-millis=<int> bypass=<bool>
-  [write-bytes=<int>] [ingest-request=<bool>]
-set-try-get-return-value v=<bool>
-granted
+set-try-get-return-value v=<bool> [elastic=<bool>]
+granted [elastic=<bool>]
 cancel-work id=<int>
-work-done id=<int> [ingested-into-l0=<int>]
+work-done id=<int> [write-bytes=<int>] [ingested-bytes=<int>] [additional-tokens=<int>]
 print
 */
 func TestStoreWorkQueueBasic(t *testing.T) {
@@ -461,31 +496,37 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 		}
 	}
 	defer closeFn()
-	var tg *testGranter
+	var tg [admissionpb.NumWorkClasses]*testGranter
 	var wrkMap workMap
 	var buf builderWithMu
 	var st *cluster.Settings
 	printQueue := func() string {
 		q.mu.Lock()
 		defer q.mu.Unlock()
-		return fmt.Sprintf("%s\nstats:%+v\nestimates:%+v", q.q.String(), q.mu.stats,
+		return fmt.Sprintf("regular workqueue: %s\nelastic workqueue: %s\nstats:%+v\nestimates:%+v",
+			q.q[admissionpb.RegularWorkClass].String(), q.q[admissionpb.ElasticWorkClass].String(), q.mu.stats,
 			q.mu.estimates)
 	}
 
-	datadriven.RunTest(t, testutils.TestDataPath(t, "store_work_queue"),
+	registry := metric.NewRegistry()
+	metrics := makeWorkQueueMetrics("", registry)
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "store_work_queue"),
 		func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "init":
 				closeFn()
-				tg = &testGranter{buf: &buf}
+				tg[admissionpb.RegularWorkClass] = &testGranter{gk: token, name: " regular", buf: &buf}
+				tg[admissionpb.ElasticWorkClass] = &testGranter{gk: token, name: " elastic", buf: &buf}
 				opts := makeWorkQueueOptions(KVWork)
 				opts.usesTokens = true
 				opts.timeSource = timeutil.NewManualTime(timeutil.FromUnixMicros(0))
 				opts.disableEpochClosingGoroutine = true
 				st = cluster.MakeTestingClusterSettings()
-				q = makeStoreWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()),
-					tg, st, opts).(*StoreWorkQueue)
-				tg.r = q
+				q = makeStoreWorkQueue(log.MakeTestingAmbientContext(tracing.NewTracer()), roachpb.StoreID(1),
+					[admissionpb.NumWorkClasses]granterWithStoreWriteDone{tg[admissionpb.RegularWorkClass], tg[admissionpb.ElasticWorkClass]},
+					st, metrics, opts, nil /* testing knobs */).(*StoreWorkQueue)
+				tg[admissionpb.RegularWorkClass].r = q.getRequesters()[admissionpb.RegularWorkClass]
+				tg[admissionpb.ElasticWorkClass].r = q.getRequesters()[admissionpb.ElasticWorkClass]
 				wrkMap.resetMap()
 				return ""
 
@@ -501,14 +542,6 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 				d.ScanArgs(t, "create-time-millis", &createTime)
 				var bypass bool
 				d.ScanArgs(t, "bypass", &bypass)
-				var writeBytes int
-				if d.HasArg("write-bytes") {
-					d.ScanArgs(t, "write-bytes", &writeBytes)
-				}
-				var ingestRequest bool
-				if d.HasArg("ingest-request") {
-					d.ScanArgs(t, "ingest-request", &ingestRequest)
-				}
 				ctx, cancel := context.WithCancel(context.Background())
 				wrkMap.set(id, &testWork{tenantID: tenant, cancel: cancel})
 				workInfo := StoreWriteWorkInfo{
@@ -518,8 +551,6 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 						CreateTime:      int64(createTime) * int64(time.Millisecond),
 						BypassAdmission: bypass,
 					},
-					WriteBytes:    int64(writeBytes),
-					IngestRequest: ingestRequest,
 				}
 				go func(ctx context.Context, info StoreWriteWorkInfo, id int) {
 					handle, err := q.Admit(ctx, workInfo)
@@ -539,22 +570,21 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 			case "set-try-get-return-value":
 				var v bool
 				d.ScanArgs(t, "v", &v)
-				tg.returnValueFromTryGet = v
+				wc := tryScanWorkClass(t, d)
+				tg[wc].returnValueFromTryGet = v
 				return ""
 
 			case "set-store-request-estimates":
 				var estimates storeRequestEstimates
-				var percentIngestedIntoL0 int
-				d.ScanArgs(t, "percent-ingested-into-l0", &percentIngestedIntoL0)
-				estimates.fractionOfIngestIntoL0 = float64(percentIngestedIntoL0) / 100
-				var workBytesAddition int
-				d.ScanArgs(t, "work-bytes-addition", &workBytesAddition)
-				estimates.workByteAddition = int64(workBytesAddition)
+				var writeTokens int
+				d.ScanArgs(t, "write-tokens", &writeTokens)
+				estimates.writeTokens = int64(writeTokens)
 				q.setStoreRequestEstimates(estimates)
 				return printQueue()
 
 			case "granted":
-				tg.grant(0)
+				wc := tryScanWorkClass(t, d)
+				tg[wc].grant(0)
 				return buf.stringAndReset()
 
 			case "cancel-work":
@@ -576,9 +606,16 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 			case "work-done":
 				var id int
 				d.ScanArgs(t, "id", &id)
-				var ingestedIntoL0Bytes int
-				if d.HasArg("ingested-into-l0") {
-					d.ScanArgs(t, "ingested-into-l0", &ingestedIntoL0Bytes)
+				var writeBytes, ingestedBytes int
+				if d.HasArg("write-bytes") {
+					d.ScanArgs(t, "write-bytes", &writeBytes)
+				}
+				if d.HasArg("ingested-bytes") {
+					d.ScanArgs(t, "ingested-bytes", &ingestedBytes)
+				}
+				var additionalTokens int
+				if d.HasArg("additional-tokens") {
+					d.ScanArgs(t, "additional-tokens", &additionalTokens)
 				}
 				work, ok := wrkMap.get(id)
 				if !ok {
@@ -587,9 +624,35 @@ func TestStoreWorkQueueBasic(t *testing.T) {
 				if !work.admitted {
 					return fmt.Sprintf("id not admitted: %d\n", id)
 				}
-				require.NoError(t, q.AdmittedWorkDone(work.handle, int64(ingestedIntoL0Bytes)))
+				tg[work.handle.workClass].additionalTokens = int64(additionalTokens)
+				require.NoError(t, q.AdmittedWorkDone(work.handle,
+					StoreWorkDoneInfo{
+						WriteBytes:    int64(writeBytes),
+						IngestedBytes: int64(ingestedBytes),
+					}))
 				wrkMap.delete(id)
 				return buf.stringAndReset()
+
+			case "bypassed-work-done":
+				var workCount, writeBytes, ingestedBytes int
+				d.ScanArgs(t, "work-count", &workCount)
+				d.ScanArgs(t, "write-bytes", &writeBytes)
+				d.ScanArgs(t, "ingested-bytes", &ingestedBytes)
+				q.BypassedWorkDone(int64(workCount), StoreWorkDoneInfo{
+					WriteBytes:    int64(writeBytes),
+					IngestedBytes: int64(ingestedBytes),
+				})
+				return buf.stringAndReset()
+
+			case "stats-to-ignore":
+				var ingestedBytes, ingestedIntoL0Bytes int
+				d.ScanArgs(t, "ingested-bytes", &ingestedBytes)
+				d.ScanArgs(t, "ingested-into-L0-bytes", &ingestedIntoL0Bytes)
+				q.StatsToIgnore(pebble.IngestOperationStats{
+					Bytes:                     uint64(ingestedBytes),
+					ApproxIngestedIntoL0Bytes: uint64(ingestedIntoL0Bytes),
+				})
+				return printQueue()
 
 			case "print":
 				return printQueue()

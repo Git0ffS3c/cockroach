@@ -24,15 +24,16 @@ import (
 // ReorderJoins optimizes the given query and outputs intermediate steps taken
 // during join enumeration. For each call to joinOrderBuilder.Reorder, the
 // output is as follows:
-//   1. The original join tree that is used to form the join graph.
-//   2. The vertexes of the join graph (as well as compact aliases that will be
-//      used to output joins added to the memo).
-//   3. The edges of the join graph.
-//   4. The joins which joinOrderBuilder attempts to add to the memo. An output
-//      like 'AB CD' means a join tree containing relations A and B is being
-//      joined to a join tree containing relations C and D. There is also a
-//      'refs' field containing all relations that are referenced by the join's
-//      ON condition.
+//  1. The original join tree that is used to form the join graph.
+//  2. The vertexes of the join graph (as well as compact aliases that will be
+//     used to output joins added to the memo).
+//  3. The edges of the join graph.
+//  4. The joins which joinOrderBuilder attempts to add to the memo. An output
+//     like 'AB CD' means a join tree containing relations A and B is being
+//     joined to a join tree containing relations C and D. There is also a
+//     'refs' field containing all relations that are referenced by the join's
+//     ON condition.
+//
 // The final optimized plan is then output.
 func (ot *OptTester) ReorderJoins() (string, error) {
 	ot.builder.Reset()
@@ -60,7 +61,7 @@ func (ot *OptTester) ReorderJoins() (string, error) {
 			ot.separator("-")
 			ot.output(fmt.Sprintf("Join Tree #%d\n", treeNum))
 			ot.separator("-")
-			ot.indent(o.FormatExpr(join, memo.ExprFmtHideAll))
+			ot.indent(o.FormatExpr(join, memo.ExprFmtHideAll, false /* redactableValues */))
 			ot.output("Vertexes\n")
 			for i := range vertexes {
 				ot.indent(jof.formatVertex(vertexes[i]))
@@ -73,23 +74,29 @@ func (ot *OptTester) ReorderJoins() (string, error) {
 			relsJoinedLast = ""
 		})
 
-	o.JoinOrderBuilder().NotifyOnAddJoin(func(left, right, all, refs []memo.RelExpr, op opt.Operator) {
-		relsToJoin := jof.formatVertexSet(all)
-		if relsToJoin != relsJoinedLast {
-			ot.output(fmt.Sprintf("Joining %s\n", relsToJoin))
-			relsJoinedLast = relsToJoin
-		}
-		ot.indent(
-			fmt.Sprintf(
-				"%s %s [%s, refs=%s]",
-				jof.formatVertexSet(left),
-				jof.formatVertexSet(right),
-				joinOpLabel(op),
-				jof.formatVertexSet(refs),
-			),
-		)
-		joinsConsidered++
-	})
+	o.JoinOrderBuilder().NotifyOnAddJoin(
+		func(left, right, all, joinRefs, selRefs []memo.RelExpr, op opt.Operator) {
+			relsToJoin := jof.formatVertexSet(all)
+			if relsToJoin != relsJoinedLast {
+				ot.output(fmt.Sprintf("Joining %s\n", relsToJoin))
+				relsJoinedLast = relsToJoin
+			}
+			var selString string
+			if len(selRefs) > 0 {
+				selString = fmt.Sprintf(" [select, refs=%s]", jof.formatVertexSet(selRefs))
+			}
+			ot.indent(
+				fmt.Sprintf(
+					"%s %s [%s, refs=%s]%s",
+					jof.formatVertexSet(left),
+					jof.formatVertexSet(right),
+					joinOpLabel(op),
+					jof.formatVertexSet(joinRefs),
+					selString,
+				),
+			)
+			joinsConsidered++
+		})
 
 	expr, err := ot.optimizeExpr(o, nil)
 	if err != nil {
@@ -106,16 +113,15 @@ func (ot *OptTester) ReorderJoins() (string, error) {
 type joinOrderFormatter struct {
 	o *xform.Optimizer
 
-	// relLabels is a map from the first ColumnID of each base relation to its
-	// assigned label.
-	relLabels map[opt.ColumnID]string
+	// relLabels is a map from each base relation to its assigned label.
+	relLabels map[memo.RelExpr]string
 }
 
 // newJoinOrderFormatter returns an initialized joinOrderFormatter.
 func newJoinOrderFormatter(o *xform.Optimizer) *joinOrderFormatter {
 	return &joinOrderFormatter{
 		o:         o,
-		relLabels: make(map[opt.ColumnID]string),
+		relLabels: make(map[memo.RelExpr]string),
 	}
 }
 
@@ -125,7 +131,7 @@ func (jof *joinOrderFormatter) formatVertex(vertex memo.RelExpr) string {
 	var b strings.Builder
 	b.WriteString(jof.relLabel(vertex))
 	b.WriteString(":\n")
-	expr := jof.o.FormatExpr(vertex, memo.ExprFmtHideAll)
+	expr := jof.o.FormatExpr(vertex, memo.ExprFmtHideAll, false /* redactableValues */)
 	expr = strings.TrimRight(expr, " \n\t\r")
 	lines := strings.Split(expr, "\n")
 	for _, line := range lines {
@@ -155,7 +161,9 @@ func (jof *joinOrderFormatter) formatEdge(edge xform.OnReorderEdgeParam) string 
 			if i != 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString(strings.TrimSuffix(jof.o.FormatExpr(&edge.Filters[i], memo.ExprFmtHideAll), "\n"))
+			b.WriteString(strings.TrimSuffix(
+				jof.o.FormatExpr(&edge.Filters[i], memo.ExprFmtHideAll, false /* redactableValues*/), "\n",
+			))
 		}
 	}
 	b.WriteString(fmt.Sprintf(
@@ -188,11 +196,7 @@ func (jof *joinOrderFormatter) formatRules(rules []xform.OnReorderRuleParam) str
 // relLabel returns the label for the given relation. Labels will follow the
 // pattern A, B, ..., Z, A1, B1, etc.
 func (jof *joinOrderFormatter) relLabel(e memo.RelExpr) string {
-	firstCol, ok := e.Relational().OutputCols.Next(0)
-	if !ok {
-		panic(errors.AssertionFailedf("failed to retrieve column from %v", e.Op()))
-	}
-	if label, ok := jof.relLabels[firstCol]; ok {
+	if label, ok := jof.relLabels[e]; ok {
 		return label
 	}
 	const lenAlphabet = 26
@@ -203,7 +207,7 @@ func (jof *joinOrderFormatter) relLabel(e memo.RelExpr) string {
 		// Names will follow the pattern: A, B, ..., Z, A1, B1, etc.
 		label += strconv.Itoa(number)
 	}
-	jof.relLabels[firstCol] = label
+	jof.relLabels[e] = label
 	return label
 }
 

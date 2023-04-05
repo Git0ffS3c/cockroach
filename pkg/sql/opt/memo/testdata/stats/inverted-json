@@ -100,13 +100,13 @@ index-join t
       ├── stats: [rows=1110]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7\x00\x019", "7\x00\x019"]
            │         └── ["7\x00\xff", "8")
            ├── flags: force-index=j_idx
-           ├── stats: [rows=1110, distinct(1)=1000, null(1)=0, avgsize(1)=4, distinct(5)=4, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=1110, distinct(1)=1000, null(1)=0, distinct(5)=4, null(5)=0]
            │   histogram(5)=  0       10       0          990           0          100           0           10
            │                <--- '\x37000139' --- '\x3761000112620001' --- '\x3763000112640001' --- '\x3765000112660001'
            ├── key: (1)
@@ -126,7 +126,7 @@ index-join t
       ├── columns: k:1(int!null)
       ├── inverted constraint: /5/1
       │    └── spans: ["7c\x00\x01\x12d\x00\x01", "7c\x00\x01\x12d\x00\x01"]
-      ├── stats: [rows=100, distinct(5)=1, null(5)=0, avgsize(5)=4]
+      ├── stats: [rows=100, distinct(5)=1, null(5)=0]
       │   histogram(5)=  0          100           0           0
       │                <--- '\x3763000112640001' --- '\x3763000112640002'
       └── key: (1)
@@ -146,7 +146,7 @@ index-join t
       ├── columns: k:1(int!null)
       ├── inverted constraint: /5/1
       │    └── spans: ["7c\x00\x01\x12d\x00\x01", "7c\x00\x01\x12d\x00\x01"]
-      ├── stats: [rows=100, distinct(5)=1, null(5)=0, avgsize(5)=4]
+      ├── stats: [rows=100, distinct(5)=1, null(5)=0]
       │   histogram(5)=  0          100           0           0
       │                <--- '\x3763000112640001' --- '\x3763000112640002'
       └── key: (1)
@@ -159,7 +159,7 @@ SELECT * FROM t WHERE j @> '{"c": "d"}' OR j @> '{"e": "f"}'
 index-join t
  ├── columns: k:1(int!null) j:2(jsonb!null)
  ├── immutable
- ├── stats: [rows=666.6667, distinct(2)=10, null(2)=0, avgsize(2)=4]
+ ├── stats: [rows=666.6667, distinct(2)=10, null(2)=0]
  ├── key: (1)
  ├── fd: (1)-->(2)
  └── inverted-filter
@@ -172,12 +172,12 @@ index-join t
       ├── stats: [rows=110]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7c\x00\x01\x12d\x00\x01", "7c\x00\x01\x12d\x00\x01"]
            │         └── ["7e\x00\x01\x12f\x00\x01", "7e\x00\x01\x12f\x00\x01"]
-           ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, avgsize(1)=4, distinct(5)=2, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, distinct(5)=2, null(5)=0]
            │   histogram(5)=  0          100           0           10
            │                <--- '\x3763000112640001' --- '\x3765000112660001'
            ├── key: (1)
@@ -203,13 +203,13 @@ index-join t
       ├── stats: [rows=1110]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7\x00\x018", "7\x00\x018"]
            │         └── ["7\x00\x03", "7\x00\x03"]
            ├── flags: force-index=j_idx
-           ├── stats: [rows=1110, distinct(1)=1000, null(1)=0, avgsize(1)=4, distinct(5)=4, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=1110, distinct(1)=1000, null(1)=0, distinct(5)=4, null(5)=0]
            │   histogram(5)=  0       10       0          990           0          100           0           10           0      0
            │                <--- '\x37000138' --- '\x37000300012a0200' --- '\x37000300012a0400' --- '\x37000300012a0600' --- '\x370004'
            ├── key: (1)
@@ -229,7 +229,7 @@ index-join t
       ├── columns: k:1(int!null)
       ├── inverted constraint: /5/1
       │    └── spans: ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
-      ├── stats: [rows=100, distinct(5)=1, null(5)=0, avgsize(5)=4]
+      ├── stats: [rows=100, distinct(5)=1, null(5)=0]
       │   histogram(5)=  0          100           0           0
       │                <--- '\x37000300012a0400' --- '\x37000300012a0401'
       └── key: (1)
@@ -242,7 +242,7 @@ SELECT * FROM t WHERE j @> '[2]' OR j @> '[3]'
 index-join t
  ├── columns: k:1(int!null) j:2(jsonb!null)
  ├── immutable
- ├── stats: [rows=666.6667, distinct(2)=10, null(2)=0, avgsize(2)=4]
+ ├── stats: [rows=666.6667, distinct(2)=10, null(2)=0]
  ├── key: (1)
  ├── fd: (1)-->(2)
  └── inverted-filter
@@ -255,12 +255,12 @@ index-join t
       ├── stats: [rows=110]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
            │         └── ["7\x00\x03\x00\x01*\x06\x00", "7\x00\x03\x00\x01*\x06\x00"]
-           ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, avgsize(1)=4, distinct(5)=2, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, distinct(5)=2, null(5)=0]
            │   histogram(5)=  0          100           0           10           0           0
            │                <--- '\x37000300012a0400' --- '\x37000300012a0600' --- '\x37000300012a0601'
            ├── key: (1)
@@ -286,7 +286,7 @@ select
  │         ├── columns: k:1(int!null)
  │         ├── inverted constraint: /5/1
  │         │    └── spans: ["7\x00\x018", "7\x00\x018"]
- │         ├── stats: [rows=10, distinct(5)=1, null(5)=0, avgsize(5)=4]
+ │         ├── stats: [rows=10, distinct(5)=1, null(5)=0]
  │         │   histogram(5)=  0       10       0       0
  │         │                <--- '\x37000138' --- '\x37000139'
  │         └── key: (1)
@@ -313,7 +313,7 @@ select
  │         ├── columns: k:1(int!null)
  │         ├── inverted constraint: /5/1
  │         │    └── spans: ["7\x00\x019", "7\x00\x019"]
- │         ├── stats: [rows=10, distinct(5)=1, null(5)=0, avgsize(5)=4]
+ │         ├── stats: [rows=10, distinct(5)=1, null(5)=0]
  │         │   histogram(5)=  0       10       0       0
  │         │                <--- '\x37000139' --- '\x3700013a'
  │         └── key: (1)
@@ -346,12 +346,12 @@ select
  │         ├── stats: [rows=110]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
  │              │         └── ["7c\x00\x01\x12d\x00\x01", "7c\x00\x01\x12d\x00\x01"]
- │              ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, avgsize(1)=4, distinct(5)=2, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, distinct(5)=2, null(5)=0]
  │              │   histogram(5)=  0       10       0          100           0           0
  │              │                <--- '\x37000139' --- '\x3763000112640001' --- '\x3763000112640002'
  │              ├── key: (1)
@@ -386,13 +386,13 @@ select
  │         ├── stats: [rows=120]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
  │              │         ├── ["7c\x00\x01\x12d\x00\x01", "7c\x00\x01\x12d\x00\x01"]
  │              │         └── ["7e\x00\x01\x12f\x00\x01", "7e\x00\x01\x12f\x00\x01"]
- │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, avgsize(1)=4, distinct(5)=3, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, distinct(5)=3, null(5)=0]
  │              │   histogram(5)=  0       10       0          100           0           10
  │              │                <--- '\x37000139' --- '\x3763000112640001' --- '\x3765000112660001'
  │              ├── key: (1)
@@ -431,13 +431,13 @@ select
  │         ├── stats: [rows=120]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
  │              │         ├── ["7c\x00\x01\x12d\x00\x01", "7c\x00\x01\x12d\x00\x01"]
  │              │         └── ["7e\x00\x01\x12f\x00\x01", "7e\x00\x01\x12f\x00\x01"]
- │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, avgsize(1)=4, distinct(5)=3, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, distinct(5)=3, null(5)=0]
  │              │   histogram(5)=  0       10       0          100           0           10
  │              │                <--- '\x37000139' --- '\x3763000112640001' --- '\x3765000112660001'
  │              ├── key: (1)
@@ -473,13 +473,13 @@ select
  │         ├── stats: [rows=110]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x01*\x04\x00", "7\x00\x01*\x04\x00"]
  │              │         ├── ["7\x00\x018", "7\x00\x018"]
  │              │         └── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
- │              ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, avgsize(1)=4, distinct(5)=2, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=110, distinct(1)=99.0991, null(1)=0, distinct(5)=2, null(5)=0]
  │              │   histogram(5)=  0       10       0          100           0           0
  │              │                <--- '\x37000138' --- '\x37000300012a0400' --- '\x37000300012a0401'
  │              ├── key: (1)
@@ -516,7 +516,7 @@ select
  │         ├── stats: [rows=120]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x01*\x04\x00", "7\x00\x01*\x04\x00"]
@@ -524,7 +524,7 @@ select
  │              │         ├── ["7\x00\x018", "7\x00\x018"]
  │              │         ├── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
  │              │         └── ["7\x00\x03\x00\x01*\x06\x00", "7\x00\x03\x00\x01*\x06\x00"]
- │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, avgsize(1)=4, distinct(5)=3, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, distinct(5)=3, null(5)=0]
  │              │   histogram(5)=  0       10       0          100           0           10           0           0
  │              │                <--- '\x37000138' --- '\x37000300012a0400' --- '\x37000300012a0600' --- '\x37000300012a0601'
  │              ├── key: (1)
@@ -567,7 +567,7 @@ select
  │         ├── stats: [rows=120]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x01*\x04\x00", "7\x00\x01*\x04\x00"]
@@ -575,7 +575,7 @@ select
  │              │         ├── ["7\x00\x018", "7\x00\x018"]
  │              │         ├── ["7\x00\x03\x00\x01*\x04\x00", "7\x00\x03\x00\x01*\x04\x00"]
  │              │         └── ["7\x00\x03\x00\x01*\x06\x00", "7\x00\x03\x00\x01*\x06\x00"]
- │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, avgsize(1)=4, distinct(5)=3, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=120, distinct(1)=108.108, null(1)=0, distinct(5)=3, null(5)=0]
  │              │   histogram(5)=  0       10       0          100           0           10           0           0
  │              │                <--- '\x37000138' --- '\x37000300012a0400' --- '\x37000300012a0600' --- '\x37000300012a0601'
  │              ├── key: (1)
@@ -659,12 +659,12 @@ index-join t
       ├── stats: [rows=100]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7\x00\x019", "7\x00\x019"]
            │         └── ["7\x00\xff", "8")
-           ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=4, distinct(5)=1, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(5)=1, null(5)=0]
            │   histogram(5)=  0      100
            │                <--- '\x37000139'
            ├── key: (1)
@@ -691,12 +691,12 @@ index-join t
       ├── stats: [rows=100]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7\x00\x018", "7\x00\x018"]
            │         └── ["7\x00\x03", "7\x00\x03"]
-           ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=4, distinct(5)=1, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(5)=1, null(5)=0]
            │   histogram(5)=  0      100       0       0
            │                <--- '\x37000138' --- '\x37000139'
            ├── key: (1)
@@ -722,7 +722,7 @@ select
  │         ├── columns: k:1(int!null)
  │         ├── inverted constraint: /5/1
  │         │    └── spans: ["7a\x00\x02b\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x01\x12c\x00\x01"]
- │         ├── stats: [rows=4e-07, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │         ├── stats: [rows=4e-07, distinct(5)=4e-07, null(5)=0]
  │         │   histogram(5)=
  │         └── key: (1)
  └── filters
@@ -748,7 +748,7 @@ select
  │         ├── columns: k:1(int!null)
  │         ├── inverted constraint: /5/1
  │         │    └── spans: ["7a\x00\x02b\x00\x02c\x00\x01\x12d\x00\x01", "7a\x00\x02b\x00\x02c\x00\x01\x12d\x00\x01"]
- │         ├── stats: [rows=4e-07, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │         ├── stats: [rows=4e-07, distinct(5)=4e-07, null(5)=0]
  │         │   histogram(5)=
  │         └── key: (1)
  └── filters
@@ -786,12 +786,12 @@ select
  │         ├── stats: [rows=4e-07]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7a\x00\x02b\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x01\x12c\x00\x01"]
  │              │         └── ["7a\x00\x02d\x00\x01\x12e\x00\x01", "7a\x00\x02d\x00\x01\x12e\x00\x01"]
- │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
  │              │   histogram(5)=
  │              ├── key: (1)
  │              └── fd: (1)-->(5)
@@ -843,14 +843,14 @@ select
  │         ├── stats: [rows=4e-07]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7a\x00\x02\x00\x03\x00\x01\x12b\x00\x01", "7a\x00\x02\x00\x03\x00\x01\x12b\x00\x01"]
  │              │         ├── ["7a\x00\x02\x00\x03\x00\x01\x12c\x00\x01", "7a\x00\x02\x00\x03\x00\x01\x12c\x00\x01"]
  │              │         ├── ["7a\x00\x02\x00\x03\x00\x01\x12d\x00\x01", "7a\x00\x02\x00\x03\x00\x01\x12d\x00\x01"]
  │              │         └── ["7a\x00\x02\x00\x03\x00\x01\x12e\x00\x01", "7a\x00\x02\x00\x03\x00\x01\x12e\x00\x01"]
- │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
  │              │   histogram(5)=
  │              ├── key: (1)
  │              └── fd: (1)-->(5)
@@ -896,13 +896,13 @@ select
  │         ├── stats: [rows=4e-07]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12c\x00\x01"]
  │              │         ├── ["7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12d\x00\x01", "7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12d\x00\x01"]
  │              │         └── ["7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12e\x00\x01", "7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12e\x00\x01"]
- │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
  │              │   histogram(5)=
  │              ├── key: (1)
  │              └── fd: (1)-->(5)
@@ -935,12 +935,12 @@ select
  │         ├── stats: [rows=4e-07]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7a\x00\x018", "7a\x00\x018"]
  │              │         └── ["7a\x00\x02\x00\x03", "7a\x00\x02\x00\x03"]
- │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
  │              │   histogram(5)=
  │              ├── key: (1)
  │              └── fd: (1)-->(5)
@@ -973,12 +973,12 @@ select
  │         ├── stats: [rows=4e-07]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7a\x00\x019", "7a\x00\x019"]
  │              │         └── ["7a\x00\x02\x00\xff", "7a\x00\x03")
- │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
  │              │   histogram(5)=
  │              ├── key: (1)
  │              └── fd: (1)-->(5)
@@ -1005,12 +1005,12 @@ index-join t
       ├── stats: [rows=4e-07]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7a\x00\x01*\x02\x00", "7a\x00\x01*\x02\x00"]
            │         └── ["7a\x00\x02\x00\x03\x00\x01*\x02\x00", "7a\x00\x02\x00\x03\x00\x01*\x02\x00"]
-           ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
            │   histogram(5)=
            ├── key: (1)
            └── fd: (1)-->(5)
@@ -1041,12 +1041,12 @@ select
  │         ├── stats: [rows=100]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
  │              │         └── ["7a\x00\x01*\x02\x00", "7a\x00\x01*\x02\x00"]
- │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=4, distinct(5)=1, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(5)=1, null(5)=0]
  │              │   histogram(5)=  0      100
  │              │                <--- '\x37000139'
  │              ├── key: (1)
@@ -1074,12 +1074,12 @@ index-join t
       ├── stats: [rows=4e-07]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7a\x00\x02b\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x01\x12c\x00\x01"]
            │         └── ["7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12c\x00\x01"]
-           ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
            │   histogram(5)=
            ├── key: (1)
            └── fd: (1)-->(5)
@@ -1111,13 +1111,13 @@ select
  │         ├── stats: [rows=100]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
  │              │         ├── ["7a\x00\x019", "7a\x00\x019"]
  │              │         └── ["7a\x00\x02b\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x01\x12c\x00\x01"]
- │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=4, distinct(5)=1, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(5)=1, null(5)=0]
  │              │   histogram(5)=  0      100
  │              │                <--- '\x37000139'
  │              ├── key: (1)
@@ -1140,7 +1140,7 @@ index-join t
       ├── columns: k:1(int!null)
       ├── inverted constraint: /5/1
       │    └── spans: ["7a\x00\x02b\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x01\x12c\x00\x01"]
-      ├── stats: [rows=4e-07, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+      ├── stats: [rows=4e-07, distinct(5)=4e-07, null(5)=0]
       │   histogram(5)=
       └── key: (1)
 
@@ -1171,13 +1171,13 @@ select
  │         ├── stats: [rows=100]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
  │              │         ├── ["7a\x00\x019", "7a\x00\x019"]
  │              │         └── ["7a\x00\x02b\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x01\x12c\x00\x01"]
- │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=4, distinct(5)=1, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(5)=1, null(5)=0]
  │              │   histogram(5)=  0      100
  │              │                <--- '\x37000139'
  │              ├── key: (1)
@@ -1216,12 +1216,12 @@ select
  │         ├── stats: [rows=4e-07]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7a\x00\x02\x00\x03\x00\x01*\x02\x00", "7a\x00\x02\x00\x03\x00\x01*\x02\x00"]
  │              │         └── ["7a\x00\x02\x00\x03\x00\x01*\x04\x00", "7a\x00\x02\x00\x03\x00\x01*\x04\x00"]
- │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
  │              │   histogram(5)=
  │              ├── key: (1)
  │              └── fd: (1)-->(5)
@@ -1258,7 +1258,7 @@ select
  │         ├── stats: [rows=100]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
@@ -1267,7 +1267,7 @@ select
  │              │         ├── ["7a\x00\x018", "7a\x00\x018"]
  │              │         ├── ["7a\x00\x02\x00\x03\x00\x01*\x02\x00", "7a\x00\x02\x00\x03\x00\x01*\x02\x00"]
  │              │         └── ["7a\x00\x02\x00\x03\x00\x01*\x04\x00", "7a\x00\x02\x00\x03\x00\x01*\x04\x00"]
- │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=4, distinct(5)=1, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(5)=1, null(5)=0]
  │              │   histogram(5)=  0      100
  │              │                <--- '\x37000139'
  │              ├── key: (1)
@@ -1296,12 +1296,12 @@ index-join t
       ├── stats: [rows=4e-07]
       ├── key: (1)
       └── scan t@j_idx
-           ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+           ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
            ├── inverted constraint: /5/1
            │    └── spans
            │         ├── ["7a\x00\x02b\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x01\x12c\x00\x01"]
            │         └── ["7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12c\x00\x01", "7a\x00\x02b\x00\x02\x00\x03\x00\x01\x12c\x00\x01"]
-           ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, avgsize(1)=4, distinct(5)=4e-07, null(5)=0, avgsize(5)=4]
+           ├── stats: [rows=4e-07, distinct(1)=4e-07, null(1)=0, distinct(5)=4e-07, null(5)=0]
            │   histogram(5)=
            ├── key: (1)
            └── fd: (1)-->(5)
@@ -1337,7 +1337,7 @@ select
  │         ├── stats: [rows=100]
  │         ├── key: (1)
  │         └── scan t@j_idx
- │              ├── columns: k:1(int!null) j_inverted_key:5(jsonb!null)
+ │              ├── columns: k:1(int!null) j_inverted_key:5(encodedkey!null)
  │              ├── inverted constraint: /5/1
  │              │    └── spans
  │              │         ├── ["7\x00\x019", "7\x00\x019"]
@@ -1347,7 +1347,7 @@ select
  │              │         ├── ["7a\x00\x02b\x00\x018", "7a\x00\x02b\x00\x018"]
  │              │         ├── ["7a\x00\x02b\x00\x02\x00\x03\x00\x01*\x02\x00", "7a\x00\x02b\x00\x02\x00\x03\x00\x01*\x02\x00"]
  │              │         └── ["7a\x00\x02b\x00\x02\x00\x03\x00\x01*\x04\x00", "7a\x00\x02b\x00\x02\x00\x03\x00\x01*\x04\x00"]
- │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, avgsize(1)=4, distinct(5)=1, null(5)=0, avgsize(5)=4]
+ │              ├── stats: [rows=100, distinct(1)=100, null(1)=0, distinct(5)=1, null(5)=0]
  │              │   histogram(5)=  0      100
  │              │                <--- '\x37000139'
  │              ├── key: (1)

@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -51,7 +52,7 @@ type TestingKnobs struct {
 
 	// OverrideAsOfClause is a function which has a chance of modifying
 	// tree.AsOfClause.
-	OverrideAsOfClause func(clause *tree.AsOfClause)
+	OverrideAsOfClause func(clause *tree.AsOfClause, stmtTimestamp time.Time)
 
 	// BeforeUpdate is called in the update transaction after the update function
 	// has run. If an error is returned, it will be propagated and the update will
@@ -70,7 +71,18 @@ type TestingKnobs struct {
 	TimeSource *hlc.Clock
 
 	// DisableAdoptions disables job adoptions.
+	//
+	// When setting this, you probably want to set UpgradeManager.DontUseJobs too,
+	// otherwise a test server will fail to bootstrap. The TestServer code
+	// validates that these knobs are used in tandem.
 	DisableAdoptions bool
+
+	// DisableRegistryLifecycleManagement
+	DisableRegistryLifecycleManagent bool
+
+	// BeforeWaitForJobsQuery is called once per invocation of the
+	// poll-show-jobs query in WaitForJobs.
+	BeforeWaitForJobsQuery func(jobs []jobspb.JobID)
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -88,7 +100,7 @@ type TestingIntervalOverrides struct {
 	// Gc overrides the gcIntervalSetting cluster setting.
 	Gc *time.Duration
 
-	// RetentionTime overrides the retentionTimeSetting cluster setting.
+	// RetentionTime overrides the RetentionTimeSetting cluster setting.
 	RetentionTime *time.Duration
 
 	// RetryInitialDelay overrides retryInitialDelaySetting cluster setting.
@@ -96,17 +108,26 @@ type TestingIntervalOverrides struct {
 
 	// RetryMaxDelay overrides retryMaxDelaySetting cluster setting.
 	RetryMaxDelay *time.Duration
+
+	// WaitForJobsInitialDelay is the initial delay used in
+	// WaitForJobs calls.
+	WaitForJobsInitialDelay *time.Duration
+
+	// WaitForJobsMaxDelay
+	WaitForJobsMaxDelay *time.Duration
 }
 
+const defaultShortInterval = 10 * time.Millisecond
+
 // NewTestingKnobsWithShortIntervals return a TestingKnobs structure with
-// overrides for short adopt and cancel intervals.
+// overrides for short adopt, cancel, and retry intervals.
 func NewTestingKnobsWithShortIntervals() *TestingKnobs {
-	defaultShortInterval := 10 * time.Millisecond
+	interval := defaultShortInterval
 	if util.RaceEnabled {
-		defaultShortInterval *= 5
+		interval *= 5
 	}
 	return NewTestingKnobsWithIntervals(
-		defaultShortInterval, defaultShortInterval, defaultShortInterval, defaultShortInterval,
+		interval, interval, interval, interval,
 	)
 }
 

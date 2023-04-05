@@ -27,10 +27,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
-	"golang.org/x/tools/container/intsets"
 )
 
 func TestInterner(t *testing.T) {
@@ -154,12 +153,12 @@ func TestInterner(t *testing.T) {
 		WindowsItemPrivate: WindowsItemPrivate{Col: 0, Frame: frame2},
 	}}
 
-	viewDep1 := opt.ViewDep{}
-	viewDep2 := opt.ViewDep{}
-	viewDeps1 := opt.ViewDeps{viewDep1}
-	viewDeps2 := opt.ViewDeps{viewDep1}
-	viewDeps3 := opt.ViewDeps{viewDep2}
-	viewDeps4 := opt.ViewDeps{viewDep1, viewDep2}
+	viewDep1 := opt.SchemaDep{}
+	viewDep2 := opt.SchemaDep{}
+	viewDeps1 := opt.SchemaDeps{viewDep1}
+	viewDeps2 := opt.SchemaDeps{viewDep1}
+	viewDeps3 := opt.SchemaDeps{viewDep2}
+	viewDeps4 := opt.SchemaDeps{viewDep1, viewDep2}
 
 	invSpan1 := inverted.MakeSingleValSpan([]byte("abc"))
 	invSpan2 := inverted.MakeSingleValSpan([]byte("abc"))
@@ -379,7 +378,7 @@ func TestInterner(t *testing.T) {
 		{hashFn: in.hasher.HashScanFlags, eqFn: in.hasher.IsScanFlagsEqual, variations: []testVariation{
 			// Use unnamed fields so that compilation fails if a new field is
 			// added to ScanFlags.
-			{val1: ScanFlags{false, false, false, false, false, 0, 0, util.FastIntSet{}}, val2: ScanFlags{}, equal: true},
+			{val1: ScanFlags{false, false, false, false, false, 0, 0, false, intsets.Fast{}}, val2: ScanFlags{}, equal: true},
 			{val1: ScanFlags{}, val2: ScanFlags{}, equal: true},
 			{val1: ScanFlags{NoIndexJoin: false}, val2: ScanFlags{NoIndexJoin: true}, equal: false},
 			{val1: ScanFlags{NoIndexJoin: true}, val2: ScanFlags{NoIndexJoin: true}, equal: true},
@@ -455,17 +454,17 @@ func TestInterner(t *testing.T) {
 			{val1: cat.UniqueOrdinals{1, 2}, val2: cat.UniqueOrdinals{1, 2, 3}, equal: false},
 		}},
 
-		{hashFn: in.hasher.HashViewDeps, eqFn: in.hasher.IsViewDepsEqual, variations: []testVariation{
+		{hashFn: in.hasher.HashSchemaDeps, eqFn: in.hasher.IsSchemaDepsEqual, variations: []testVariation{
 			{val1: viewDeps1, val2: viewDeps1, equal: true},
 			{val1: viewDeps1, val2: viewDeps2, equal: false},
 			{val1: viewDeps1, val2: viewDeps3, equal: false},
 			{val1: viewDeps1, val2: viewDeps4, equal: false},
 		}},
 
-		{hashFn: in.hasher.HashViewTypeDeps, eqFn: in.hasher.IsViewTypeDepsEqual, variations: []testVariation{
-			{val1: util.MakeFastIntSet(), val2: util.MakeFastIntSet(), equal: true},
-			{val1: util.MakeFastIntSet(1, 2, 3), val2: util.MakeFastIntSet(3, 2, 1), equal: true},
-			{val1: util.MakeFastIntSet(1, 2, 3), val2: util.MakeFastIntSet(1, 2), equal: false},
+		{hashFn: in.hasher.HashSchemaTypeDeps, eqFn: in.hasher.IsSchemaTypeDepsEqual, variations: []testVariation{
+			{val1: intsets.MakeFast(), val2: intsets.MakeFast(), equal: true},
+			{val1: intsets.MakeFast(1, 2, 3), val2: intsets.MakeFast(3, 2, 1), equal: true},
+			{val1: intsets.MakeFast(1, 2, 3), val2: intsets.MakeFast(1, 2), equal: false},
 		}},
 
 		{hashFn: in.hasher.HashWindowFrame, eqFn: in.hasher.IsWindowFrameEqual, variations: []testVariation{
@@ -511,7 +510,7 @@ func TestInterner(t *testing.T) {
 				equal: false,
 			},
 			{
-				val1:  opt.Locking{WaitPolicy: tree.LockWaitSkip},
+				val1:  opt.Locking{WaitPolicy: tree.LockWaitSkipLocked},
 				val2:  opt.Locking{WaitPolicy: tree.LockWaitError},
 				equal: false,
 			},
@@ -601,20 +600,20 @@ func TestInterner(t *testing.T) {
 			},
 		}},
 
-		{hashFn: in.hasher.HashMaterializeClause, eqFn: in.hasher.IsMaterializeClauseEqual, variations: []testVariation{
+		{hashFn: in.hasher.HashCTEMaterializeClause, eqFn: in.hasher.IsCTEMaterializeClauseEqual, variations: []testVariation{
 			{
-				val1:  tree.MaterializeClause{Set: true, Materialize: true},
-				val2:  tree.MaterializeClause{Set: true, Materialize: true},
+				val1:  tree.CTEMaterializeAlways,
+				val2:  tree.CTEMaterializeAlways,
 				equal: true,
 			},
 			{
-				val1:  tree.MaterializeClause{Set: true, Materialize: false},
-				val2:  tree.MaterializeClause{Set: true, Materialize: false},
+				val1:  tree.CTEMaterializeNever,
+				val2:  tree.CTEMaterializeNever,
 				equal: true,
 			},
 			{
-				val1:  tree.MaterializeClause{Set: true, Materialize: false},
-				val2:  tree.MaterializeClause{Set: false, Materialize: true},
+				val1:  tree.CTEMaterializeNever,
+				val2:  tree.CTEMaterializeDefault,
 				equal: false,
 			},
 		}},
@@ -792,7 +791,8 @@ func BenchmarkEncodeDatum(b *testing.B) {
 	r := rand.New(rand.NewSource(0))
 	datums := make([]tree.Datum, 10000)
 	for i := range datums {
-		datums[i] = randgen.RandDatumWithNullChance(r, randgen.RandEncodableType(r), 0)
+		datums[i] = randgen.RandDatumWithNullChance(r, randgen.RandEncodableType(r), 0, /* nullChance */
+			false /* favorCommonData */, false /* targetColumnIsUnique */)
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -806,7 +806,8 @@ func BenchmarkIsDatumEqual(b *testing.B) {
 	r := rand.New(rand.NewSource(0))
 	datums := make([]tree.Datum, 1000)
 	for i := range datums {
-		datums[i] = randgen.RandDatumWithNullChance(r, randgen.RandEncodableType(r), 0)
+		datums[i] = randgen.RandDatumWithNullChance(r, randgen.RandEncodableType(r), 0, /* nullChance */
+			false /* favorCommonData */, false /* targetColumnIsUnique */)
 	}
 	b.ResetTimer()
 	var h hasher

@@ -27,11 +27,13 @@ import {
 
 import * as H from "history";
 import moment from "moment";
+import { defaultFilters } from "src/queryFilter";
 const history = H.createHashHistory();
 
 const withLoadingIndicator: DatabaseDetailsPageProps = {
   loading: true,
   loaded: false,
+  lastError: undefined,
   name: randomName(),
   tables: [],
   viewMode: ViewMode.Tables,
@@ -48,6 +50,9 @@ const withLoadingIndicator: DatabaseDetailsPageProps = {
   refreshDatabaseDetails: () => {},
   refreshTableDetails: () => {},
   refreshTableStats: () => {},
+  search: null,
+  filters: defaultFilters,
+  nodeRegions: {},
   location: history.location,
   history,
   match: {
@@ -61,6 +66,7 @@ const withLoadingIndicator: DatabaseDetailsPageProps = {
 const withoutData: DatabaseDetailsPageProps = {
   loading: false,
   loaded: true,
+  lastError: null,
   name: randomName(),
   tables: [],
   viewMode: ViewMode.Tables,
@@ -77,6 +83,9 @@ const withoutData: DatabaseDetailsPageProps = {
   refreshDatabaseDetails: () => {},
   refreshTableDetails: () => {},
   refreshTableStats: () => {},
+  search: null,
+  filters: defaultFilters,
+  nodeRegions: {},
   location: history.location,
   history,
   match: {
@@ -98,6 +107,7 @@ function createTable(): DatabaseDetailsPageDataTable {
     details: {
       loading: false,
       loaded: true,
+      lastError: null,
       columnCount: _.random(5, 42),
       indexCount: _.random(1, 6),
       userCount: roles.length,
@@ -105,10 +115,14 @@ function createTable(): DatabaseDetailsPageDataTable {
       grants: grants,
       statsLastUpdated: moment("0001-01-01T00:00:00Z"),
       hasIndexRecommendations: false,
+      livePercentage: _.random(0, 100),
+      liveBytes: _.random(0, 10000),
+      totalBytes: _.random(0, 10000),
     },
     stats: {
       loading: false,
       loaded: true,
+      lastError: null,
       replicationSizeInBytes: _.random(1000.0) * 1024 ** _.random(1, 2),
       rangeCount: _.random(50, 500),
       nodesByRegionString:
@@ -120,6 +134,7 @@ function createTable(): DatabaseDetailsPageDataTable {
 const withData: DatabaseDetailsPageProps = {
   loading: false,
   loaded: true,
+  lastError: null,
   name: randomName(),
   tables: [createTable()],
   viewMode: ViewMode.Tables,
@@ -136,6 +151,9 @@ const withData: DatabaseDetailsPageProps = {
   refreshDatabaseDetails: () => {},
   refreshTableDetails: () => {},
   refreshTableStats: () => {},
+  search: null,
+  filters: defaultFilters,
+  nodeRegions: {},
   location: history.location,
   history,
   match: {

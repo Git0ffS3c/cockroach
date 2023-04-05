@@ -12,33 +12,46 @@ package kvserver
 
 import (
 	"context"
+	"math"
 	"time"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/raftpb"
+)
+
+var (
+	logRaftRecvQueueFullEvery = log.Every(1 * time.Second)
+	logRaftSendQueueFullEvery = log.Every(1 * time.Second)
 )
 
 type raftRequestInfo struct {
 	req        *kvserverpb.RaftMessageRequest
+	size       int64 // size of req in bytes
 	respStream RaftMessageResponseStream
 }
 
 type raftReceiveQueue struct {
 	mu struct { // not to be locked directly
+		destroyed bool
 		syncutil.Mutex
 		infos []raftRequestInfo
 	}
+	maxLen int
+	acc    mon.BoundAccount
 }
 
 // Len returns the number of requests in the queue.
@@ -62,7 +75,18 @@ func (q *raftReceiveQueue) drainLocked() ([]raftRequestInfo, bool) {
 	}
 	infos := q.mu.infos
 	q.mu.infos = nil
+	q.acc.Clear(context.Background())
 	return infos, true
+}
+
+func (q *raftReceiveQueue) Delete() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.drainLocked()
+	if err := q.acc.ResizeTo(context.Background(), 0); err != nil {
+		panic(err) // ResizeTo(., 0) always returns nil
+	}
+	q.mu.destroyed = true
 }
 
 // Recycle makes a slice that the caller knows will no longer be accessed
@@ -83,28 +107,29 @@ func (q *raftReceiveQueue) Recycle(processed []raftRequestInfo) {
 
 func (q *raftReceiveQueue) Append(
 	req *kvserverpb.RaftMessageRequest, s RaftMessageResponseStream,
-) (shouldQueue, appended bool) {
+) (shouldQueue bool, size int64, appended bool) {
+	size = int64(req.Size())
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if len(q.mu.infos) >= replicaRequestQueueSize {
-		return false, false
+	if q.mu.destroyed || len(q.mu.infos) >= q.maxLen {
+		return false, size, false
+	}
+	if q.acc.Grow(context.Background(), size) != nil {
+		return false, size, false
 	}
 	q.mu.infos = append(q.mu.infos, raftRequestInfo{
 		req:        req,
 		respStream: s,
+		size:       size,
 	})
 	// The operation that enqueues the first message will
 	// be put in charge of triggering a drain of the queue.
-	return len(q.mu.infos) == 1, true
+	return len(q.mu.infos) == 1, size, true
 }
 
 type raftReceiveQueues struct {
-	m syncutil.IntMap // RangeID -> *raftReceiveQueue
-	// delMu is held while deleting an entry from `m`. This
-	// is necessary since `IntMap` does not return the element
-	// being removed (if any) and we want stronger synchronization
-	// to prevent memory accounting leaks.
-	delMu syncutil.Mutex
+	mon *mon.BytesMonitor
+	m   syncutil.IntMap // RangeID -> *raftReceiveQueue
 }
 
 func (qs *raftReceiveQueues) Load(rangeID roachpb.RangeID) (*raftReceiveQueue, bool) {
@@ -113,79 +138,64 @@ func (qs *raftReceiveQueues) Load(rangeID roachpb.RangeID) (*raftReceiveQueue, b
 }
 
 func (qs *raftReceiveQueues) LoadOrCreate(
-	rangeID roachpb.RangeID,
+	rangeID roachpb.RangeID, maxLen int,
 ) (_ *raftReceiveQueue, loaded bool) {
 	if q, ok := qs.Load(rangeID); ok {
 		return q, ok // fast path
 	}
-	q := &raftReceiveQueue{}
+	q := &raftReceiveQueue{maxLen: maxLen}
+	q.acc.Init(context.Background(), qs.mon)
 	value, loaded := qs.m.LoadOrStore(int64(rangeID), unsafe.Pointer(q))
 	return (*raftReceiveQueue)(value), loaded
 }
 
+// Delete drains the queue and marks it as deleted. Future Appends
+// will result in appended=false.
 func (qs *raftReceiveQueues) Delete(rangeID roachpb.RangeID) {
-	qs.delMu.Lock()
-	defer qs.delMu.Unlock()
 	if q, ok := qs.Load(rangeID); ok {
+		q.Delete()
 		qs.m.Delete(int64(rangeID))
-		// NB: this is inconsequential today but in the future will
-		// allow for sane memory accounting.
-		// Also, we want to make `q` refuse further additions, since
-		// `Delete` is called from the replica removal path which is
-		// not under the raft scheduler. So we may delete this queue
-		// but the scheduler may be adding a request to it after due
-		// to loose synchronization. This would similarly upset mem
-		// accounting (and also today it leaks memory when it happens).
-		q.Drain()
 	}
 }
 
 // HandleDelegatedSnapshot reads the incoming delegated snapshot message and
 // throttles sending snapshots before passing the request to the sender replica.
 func (s *Store) HandleDelegatedSnapshot(
-	ctx context.Context,
-	req *kvserverpb.DelegateSnapshotRequest,
-	stream DelegateSnapshotResponseStream,
-	span *tracing.Span,
-) error {
+	ctx context.Context, req *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
 	ctx = s.AnnotateCtx(ctx)
-	const name = "storage.Store: handle snapshot delegation"
-	return s.stopper.RunTaskWithErr(
-		ctx, name, func(ctx context.Context) error {
-			sender, err := s.GetReplica(req.RangeID)
-			if err != nil {
-				return err
-			}
-			// Pass the request to the sender replica.
-			err = sender.followerSendSnapshot(ctx, req.RecipientReplica, req, stream)
 
-			// Get the recording of the child RPC and serialize it in the response.
-			recording := span.FinishAndGetConfiguredRecording()
-			resp := &kvserverpb.DelegateSnapshotResponse{
-				SnapResponse: &kvserverpb.SnapshotResponse{
-					Status:  kvserverpb.SnapshotResponse_APPLIED,
-					Message: "Snapshot successfully applied by recipient",
-				},
-			}
-			if recording != nil {
-				resp.CollectedSpans = recording
-			}
-			// If an error occurred during snapshot sending, send an error response.
-			if err != nil {
-				return stream.Send(
-					&kvserverpb.DelegateSnapshotResponse{
-						SnapResponse: &kvserverpb.SnapshotResponse{
-							Status:  kvserverpb.SnapshotResponse_ERROR,
-							Message: err.Error(),
-						},
-						CollectedSpans: resp.CollectedSpans,
-					},
-				)
-			}
-			// Send a final response that snapshot sending is completed.
-			return stream.Send(resp)
-		},
-	)
+	if fn := s.cfg.TestingKnobs.SendSnapshot; fn != nil {
+		fn(req)
+	}
+
+	sp := tracing.SpanFromContext(ctx)
+
+	// This can happen if the delegate doesn't know about the range yet. Return an
+	// error immediately.
+	sender, err := s.GetReplica(req.RangeID)
+	if err != nil {
+		return &kvserverpb.DelegateSnapshotResponse{
+			Status:         kvserverpb.DelegateSnapshotResponse_ERROR,
+			EncodedError:   errors.EncodeError(context.Background(), err),
+			CollectedSpans: sp.GetConfiguredRecording(),
+		}
+	}
+
+	// Pass the request to the sender replica.
+	if err := sender.followerSendSnapshot(ctx, req.RecipientReplica, req); err != nil {
+		// If an error occurred during snapshot sending, send an error response.
+		return &kvserverpb.DelegateSnapshotResponse{
+			Status:         kvserverpb.DelegateSnapshotResponse_ERROR,
+			EncodedError:   errors.EncodeError(context.Background(), err),
+			CollectedSpans: sp.GetConfiguredRecording(),
+		}
+	}
+
+	return &kvserverpb.DelegateSnapshotResponse{
+		Status:         kvserverpb.DelegateSnapshotResponse_APPLIED,
+		CollectedSpans: sp.GetConfiguredRecording(),
+	}
 }
 
 // HandleSnapshot reads an incoming streaming snapshot and applies it if
@@ -216,7 +226,8 @@ func (s *Store) uncoalesceBeats(
 		log.Infof(ctx, "uncoalescing %d beats of type %v: %+v", len(beats), msgT, beats)
 	}
 	beatReqs := make([]kvserverpb.RaftMessageRequest, len(beats))
-	var toEnqueue []roachpb.RangeID
+	batch := s.scheduler.NewEnqueueBatch()
+	defer batch.Close()
 	for i, beat := range beats {
 		msg := raftpb.Message{
 			Type:   msgT,
@@ -247,17 +258,17 @@ func (s *Store) uncoalesceBeats(
 
 		enqueue := s.HandleRaftUncoalescedRequest(ctx, &beatReqs[i], respStream)
 		if enqueue {
-			toEnqueue = append(toEnqueue, beat.RangeID)
+			batch.Add(beat.RangeID)
 		}
 	}
-	s.scheduler.EnqueueRaftRequests(toEnqueue...)
+	s.scheduler.EnqueueRaftRequests(batch)
 }
 
 // HandleRaftRequest dispatches a raft message to the appropriate Replica. It
 // requires that s.mu is not held.
 func (s *Store) HandleRaftRequest(
 	ctx context.Context, req *kvserverpb.RaftMessageRequest, respStream RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	// NB: unlike the other two RaftMessageHandler methods implemented by Store,
 	// this one doesn't need to directly run through a Stopper task because it
 	// delegates all work through a raftScheduler, whose workers' lifetimes are
@@ -291,12 +302,19 @@ func (s *Store) HandleRaftUncoalescedRequest(
 	// count them.
 	s.metrics.RaftRcvdMessages[req.Message.Type].Inc(1)
 
-	q, _ := s.raftRecvQueues.LoadOrCreate(req.RangeID)
-	enqueue, appended := q.Append(req, respStream)
+	// NB: add a buffer for extra messages, to allow heartbeats getting through
+	// even if MsgApp quota is maxed out by the sender.
+	q, _ := s.raftRecvQueues.LoadOrCreate(req.RangeID,
+		s.cfg.RaftMaxInflightMsgs+replicaQueueExtraSize)
+	enqueue, size, appended := q.Append(req, respStream)
 	if !appended {
 		// TODO(peter): Return an error indicating the request was dropped. Note
 		// that dropping the request is safe. Raft will retry.
-		s.metrics.RaftRcvdMsgDropped.Inc(1)
+		s.metrics.RaftRcvdDropped.Inc(1)
+		s.metrics.RaftRcvdDroppedBytes.Inc(size)
+		if logRaftRecvQueueFullEvery.ShouldLog() {
+			log.Warningf(ctx, "raft receive queue for r%d is full", req.RangeID)
+		}
 		return false
 	}
 	return enqueue
@@ -308,8 +326,8 @@ func (s *Store) HandleRaftUncoalescedRequest(
 func (s *Store) withReplicaForRequest(
 	ctx context.Context,
 	req *kvserverpb.RaftMessageRequest,
-	f func(context.Context, *Replica) *roachpb.Error,
-) *roachpb.Error {
+	f func(context.Context, *Replica) *kvpb.Error,
+) *kvpb.Error {
 	// Lazily create the replica.
 	r, _, err := s.getOrCreateReplica(
 		ctx,
@@ -318,10 +336,10 @@ func (s *Store) withReplicaForRequest(
 		&req.FromReplica,
 	)
 	if err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 	defer r.raftMu.Unlock()
-	r.setLastReplicaDescriptorsRaftMuLocked(req)
+	r.setLastReplicaDescriptors(req)
 	return f(ctx, r)
 }
 
@@ -330,7 +348,11 @@ func (s *Store) withReplicaForRequest(
 // state; callers will probably want to handle this themselves at some point.
 func (s *Store) processRaftRequestWithReplica(
 	ctx context.Context, r *Replica, req *kvserverpb.RaftMessageRequest,
-) *roachpb.Error {
+) *kvpb.Error {
+	// Record the CPU time processing the request for this replica. This is
+	// recorded regardless of errors that are encountered.
+	defer r.MeasureRaftCPUNanos(grunning.Time())
+
 	if verboseRaftLoggingEnabled() {
 		log.Infof(ctx, "incoming raft message:\n%s", raftDescribeMessage(req.Message, raftEntryFormatter))
 	}
@@ -355,7 +377,7 @@ func (s *Store) processRaftRequestWithReplica(
 	if req.ToReplica.ReplicaID == 0 {
 		log.VEventf(ctx, 1, "refusing incoming Raft message %s from %+v to %+v",
 			req.Message.Type, req.FromReplica, req.ToReplica)
-		return roachpb.NewErrorf(
+		return kvpb.NewErrorf(
 			"cannot recreate replica that is not a member of its range (StoreID %s not found in r%d)",
 			r.store.StoreID(), req.RangeID,
 		)
@@ -364,7 +386,7 @@ func (s *Store) processRaftRequestWithReplica(
 	drop := maybeDropMsgApp(ctx, (*replicaMsgAppDropper)(r), &req.Message, req.RangeStartKey)
 	if !drop {
 		if err := r.stepRaftGroup(req); err != nil {
-			return roachpb.NewError(err)
+			return kvpb.NewError(err)
 		}
 	}
 	return nil
@@ -380,16 +402,15 @@ func (s *Store) processRaftRequestWithReplica(
 // will have been removed.
 func (s *Store) processRaftSnapshotRequest(
 	ctx context.Context, snapHeader *kvserverpb.SnapshotRequest_Header, inSnap IncomingSnapshot,
-) *roachpb.Error {
+) *kvpb.Error {
 	return s.withReplicaForRequest(ctx, &snapHeader.RaftMessageRequest, func(
 		ctx context.Context, r *Replica,
-	) (pErr *roachpb.Error) {
+	) (pErr *kvpb.Error) {
 		ctx = r.AnnotateCtx(ctx)
 		if snapHeader.RaftMessageRequest.Message.Type != raftpb.MsgSnap {
 			log.Fatalf(ctx, "expected snapshot: %+v", snapHeader.RaftMessageRequest)
 		}
 
-		var stats handleRaftReadyStats
 		typ := removePlaceholderFailed
 		defer func() {
 			// In the typical case, handleRaftReadyRaftMuLocked calls through to
@@ -431,7 +452,7 @@ func (s *Store) processRaftSnapshotRequest(
 		// withReplicaForRequest that this replica is not currently being removed
 		// and we've been holding the raftMu the entire time.
 		if err := r.stepRaftGroup(&snapHeader.RaftMessageRequest); err != nil {
-			return roachpb.NewError(err)
+			return kvpb.NewError(err)
 		}
 
 		// We've handed the snapshot to Raft, which will typically apply it (in
@@ -441,10 +462,8 @@ func (s *Store) processRaftSnapshotRequest(
 		// be there based on `stats.snap.applied`	but it is a questionable use of
 		// stats and more susceptible to bugs.
 		typ = removePlaceholderDropped
-		var expl string
-		var err error
-		stats, expl, err = r.handleRaftReadyRaftMuLocked(ctx, inSnap)
-		maybeFatalOnRaftReadyErr(ctx, expl, err)
+		stats, err := r.handleRaftReadyRaftMuLocked(ctx, inSnap)
+		maybeFatalOnRaftReadyErr(ctx, err)
 		if !stats.snap.applied {
 			// This line would be hit if a snapshot was sent when it isn't necessary
 			// (i.e. follower was able to catch up via the log in the interim) or when
@@ -472,12 +491,12 @@ func (s *Store) HandleRaftResponse(
 			ctx = repl.AnnotateCtx(ctx)
 		}
 		switch val := resp.Union.GetValue().(type) {
-		case *roachpb.Error:
+		case *kvpb.Error:
 			switch tErr := val.GetDetail().(type) {
-			case *roachpb.ReplicaTooOldError:
+			case *kvpb.ReplicaTooOldError:
 				if replErr != nil {
 					// RangeNotFoundErrors are expected here; nothing else is.
-					if !errors.HasType(replErr, (*roachpb.RangeNotFoundError)(nil)) {
+					if !errors.HasType(replErr, (*kvpb.RangeNotFoundError)(nil)) {
 						log.Errorf(ctx, "%v", replErr)
 					}
 					return nil
@@ -515,10 +534,10 @@ func (s *Store) HandleRaftResponse(
 				return s.removeReplicaRaftMuLocked(ctx, repl, nextReplicaID, RemoveOptions{
 					DestroyData: true,
 				})
-			case *roachpb.RaftGroupDeletedError:
+			case *kvpb.RaftGroupDeletedError:
 				if replErr != nil {
 					// RangeNotFoundErrors are expected here; nothing else is.
-					if !errors.HasType(replErr, (*roachpb.RangeNotFoundError)(nil)) {
+					if !errors.HasType(replErr, (*kvpb.RangeNotFoundError)(nil)) {
 						log.Errorf(ctx, "%v", replErr)
 					}
 					return nil
@@ -530,7 +549,7 @@ func (s *Store) HandleRaftResponse(
 				// other replicas are (#23994). Add it to the replica GC queue to do a
 				// proper check.
 				s.replicaGCQueue.AddAsync(ctx, repl, replicaGCPriorityDefault)
-			case *roachpb.StoreNotFoundError:
+			case *kvpb.StoreNotFoundError:
 				log.Warningf(ctx, "raft error: node %d claims to not contain store %d for replica %s: %s",
 					resp.FromReplica.NodeID, resp.FromReplica.StoreID, resp.FromReplica, val)
 				return val.GetDetail() // close Raft connection
@@ -551,6 +570,7 @@ func (s *Store) enqueueRaftUpdateCheck(rangeID roachpb.RangeID) {
 	s.scheduler.EnqueueRaftReady(rangeID)
 }
 
+// TODO(tbg): rename this to processRecvQueue.
 func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID) bool {
 	q, ok := s.raftRecvQueues.Load(rangeID)
 	if !ok {
@@ -566,7 +586,7 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 	for i := range infos {
 		info := &infos[i]
 		if pErr := s.withReplicaForRequest(
-			ctx, info.req, func(_ context.Context, r *Replica) *roachpb.Error {
+			ctx, info.req, func(_ context.Context, r *Replica) *kvpb.Error {
 				return s.processRaftRequestWithReplica(r.raftCtx, r, info.req)
 			},
 		); pErr != nil {
@@ -577,6 +597,8 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 				log.VEventf(ctx, 1, "error sending error: %s", err)
 			}
 		}
+		s.metrics.RaftRcvdSteppedBytes.Inc(info.size)
+		infos[i] = raftRequestInfo{}
 	}
 
 	if hadError {
@@ -590,6 +612,14 @@ func (s *Store) processRequestQueue(ctx context.Context, rangeID roachpb.RangeID
 		// forgiving.
 		//
 		// See https://github.com/cockroachdb/cockroach/issues/30951#issuecomment-428010411.
+		//
+		// TODO(tbg): for adding actual memory accounting, we need more clarity about
+		// the contract. For example, it would be a problem if the queue got deleted
+		// (as a result of the replica getting deleted) but then getting recreated errantly.
+		// In that case, we would "permanently" leak an allocation, which over time could
+		// eat up the budget. We must ensure, essentially, that we create a queue only
+		// when the replica is alive (according to its destroyStatus) and ensure it is
+		// destroyed once that changes.
 		if _, exists := s.mu.replicasByRangeID.Load(rangeID); !exists && q.Len() == 0 {
 			s.raftRecvQueues.Delete(rangeID)
 		}
@@ -607,9 +637,13 @@ func (s *Store) processReady(rangeID roachpb.RangeID) {
 		return
 	}
 
+	// Record the CPU time processing the request for this replica. This is
+	// recorded regardless of errors that are encountered.
+	defer r.MeasureRaftCPUNanos(grunning.Time())
+
 	ctx := r.raftCtx
-	stats, expl, err := r.handleRaftReady(ctx, noSnap)
-	maybeFatalOnRaftReadyErr(ctx, expl, err)
+	stats, err := r.handleRaftReady(ctx, noSnap)
+	maybeFatalOnRaftReadyErr(ctx, err)
 	elapsed := stats.tEnd.Sub(stats.tBegin)
 	s.metrics.RaftWorkingDurationNanos.Inc(elapsed.Nanoseconds())
 	s.metrics.RaftHandleReadyLatency.RecordValue(elapsed.Nanoseconds())
@@ -627,11 +661,17 @@ func (s *Store) processTick(_ context.Context, rangeID roachpb.RangeID) bool {
 	if !ok {
 		return false
 	}
-	livenessMap, _ := s.livenessMap.Load().(liveness.IsLiveMap)
 
+	livenessMap, _ := s.livenessMap.Load().(livenesspb.IsLiveMap)
+	ioThresholds := s.ioThresholds.Current()
+
+	// Record the CPU time processing the request for this replica. This is
+	// recorded regardless of errors that are encountered.
+	defer r.MeasureRaftCPUNanos(grunning.Time())
 	start := timeutil.Now()
 	ctx := r.raftCtx
-	exists, err := r.tick(ctx, livenessMap)
+
+	exists, err := r.tick(ctx, livenessMap, ioThresholds)
 	if err != nil {
 		log.Errorf(ctx, "%v", err)
 	}
@@ -647,9 +687,9 @@ func (s *Store) processTick(_ context.Context, rangeID roachpb.RangeID) bool {
 // See the comment in shouldFollowerQuiesceOnNotify for details on how these two
 // functions combine to provide the guarantee that:
 //
-//   If a quorum of replica in a Raft group is alive and at least
-//   one of these replicas is up-to-date, the Raft group will catch
-//   up any of the live, lagging replicas.
+//	If a quorum of replica in a Raft group is alive and at least
+//	one of these replicas is up-to-date, the Raft group will catch
+//	up any of the live, lagging replicas.
 //
 // Note that this mechanism can race with concurrent invocations of processTick,
 // which may have a copy of the previous livenessMap where the now-live node is
@@ -686,6 +726,8 @@ func (s *Store) processRaft(ctx context.Context) {
 		s.cfg.Transport.Stop(s.StoreID())
 	}))
 
+	s.syncWaiter.Start(ctx, s.stopper)
+
 	// We'll want to cancel all in-flight proposals. Proposals embed tracing
 	// spans in them, and we don't want to be leaking any.
 	s.stopper.AddCloser(stop.CloserFn(func() {
@@ -697,7 +739,7 @@ func (s *Store) processRaft(ctx context.Context) {
 				prop.finishApplication(
 					context.Background(),
 					proposalResult{
-						Err: roachpb.NewError(roachpb.NewAmbiguousResultErrorf("store is stopping")),
+						Err: kvpb.NewError(kvpb.NewAmbiguousResultErrorf("store is stopping")),
 					},
 				)
 			}
@@ -711,16 +753,17 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.RaftTickInterval)
 	defer ticker.Stop()
 
-	var rangeIDs []roachpb.RangeID
+	batch := s.scheduler.NewEnqueueBatch()
+	defer batch.Close() // reuse the same batch until done
 
 	for {
 		select {
 		case <-ticker.C:
-			rangeIDs = rangeIDs[:0]
 			// Update the liveness map.
 			if s.cfg.NodeLiveness != nil {
 				s.updateLivenessMap()
 			}
+			s.updateIOThresholdMap()
 
 			s.unquiescedReplicas.Lock()
 			// Why do we bother to ever queue a Replica on the Raft scheduler for
@@ -728,17 +771,37 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 			// then a single bad/slow Replica can disrupt tick processing for every
 			// Replica on the store which cascades into Raft elections and more
 			// disruption.
+			batch.Reset()
 			for rangeID := range s.unquiescedReplicas.m {
-				rangeIDs = append(rangeIDs, rangeID)
+				batch.Add(rangeID)
 			}
 			s.unquiescedReplicas.Unlock()
 
-			s.scheduler.EnqueueRaftTicks(rangeIDs...)
+			s.scheduler.EnqueueRaftTicks(batch)
 			s.metrics.RaftTicks.Inc(1)
 
 		case <-s.stopper.ShouldQuiesce():
 			return
 		}
+	}
+}
+
+func (s *Store) updateIOThresholdMap() {
+	ioThresholdMap := map[roachpb.StoreID]*admissionpb.IOThreshold{}
+	for _, sd := range s.cfg.StorePool.GetStores() {
+		ioThreshold := sd.Capacity.IOThreshold // need a copy
+		ioThresholdMap[sd.StoreID] = &ioThreshold
+	}
+	threshold := pauseReplicationIOThreshold.Get(&s.cfg.Settings.SV)
+	if threshold <= 0 {
+		threshold = math.MaxFloat64
+	}
+	old, cur := s.ioThresholds.Replace(ioThresholdMap, threshold)
+	// Log whenever the set of overloaded stores changes.
+	shouldLog := log.V(1) || old.seq != cur.seq
+	if shouldLog {
+		log.Infof(
+			s.AnnotateCtx(context.Background()), "pausable stores: %+v", cur)
 	}
 }
 

@@ -15,16 +15,19 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -32,9 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/catkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/enum"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	kvstorage "github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -88,9 +92,9 @@ func (m *Manager) WaitForNoVersion(
 		stmt := fmt.Sprintf(`SELECT count(1) FROM system.public.lease AS OF SYSTEM TIME '%s' WHERE ("descID" = %d AND expiration > $1)`,
 			now.AsOfSystemTime(),
 			id)
-		values, err := m.storage.internalExecutor.QueryRowEx(
+		values, err := m.storage.db.Executor().QueryRowEx(
 			ctx, "count-leases", nil, /* txn */
-			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			sessiondata.RootUserSessionDataOverride,
 			stmt, now.GoTime(),
 		)
 		if err != nil {
@@ -113,19 +117,38 @@ func (m *Manager) WaitForNoVersion(
 
 // WaitForOneVersion returns once there are no unexpired leases on the
 // previous version of the descriptor. It returns the descriptor with the
-// current version.
+// current version, though note that it will not be validated or hydrated.
+//
 // After returning there can only be versions of the descriptor >= to the
 // returned version. Lease acquisition (see acquire()) maintains the
 // invariant that no new leases for desc.Version-1 will be granted once
 // desc.Version exists.
+//
+// If the descriptor is not found, an error will be returned. The error
+// can be detected by using errors.Is(err, catalog.ErrDescriptorNotFound).
 func (m *Manager) WaitForOneVersion(
 	ctx context.Context, id descpb.ID, retryOpts retry.Options,
 ) (desc catalog.Descriptor, _ error) {
 	for lastCount, r := 0, retry.Start(retryOpts); r.Next(); {
-		if err := m.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
-			version := m.storage.settings.Version.ActiveVersion(ctx)
-			desc, err = catkv.MustGetDescriptorByID(ctx, version, m.Codec(), txn, nil /* vd */, id, catalog.Any)
-			return err
+		if err := m.storage.db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) (err error) {
+			// Use the lower-level MaybeGetDescriptorByIDUnvalidated to avoid
+			// performing validation while waiting for leases to drain.
+			// Validation is somewhat expensive but more importantly, is not
+			// particularly desirable in this context: there are valid cases where
+			// descriptors can be removed or made invalid. For instance, the
+			// descriptor could be a type or a schema which is dropped by a subsequent
+			// concurrent schema change.
+			const isDescriptorRequired = false
+			cr := m.storage.newCatalogReader(ctx)
+			c, err := cr.GetByIDs(ctx, txn, []descpb.ID{id}, isDescriptorRequired, catalog.Any)
+			if err != nil {
+				return err
+			}
+			desc = c.LookupDescriptor(id)
+			if desc == nil {
+				return errors.Wrapf(catalog.ErrDescriptorNotFound, "waiting for leases to drain on descriptor %d", id)
+			}
+			return nil
 		}); err != nil {
 			return nil, err
 		}
@@ -134,7 +157,7 @@ func (m *Manager) WaitForOneVersion(
 		// version of the descriptor.
 		now := m.storage.clock.Now()
 		descs := []IDVersion{NewIDVersionPrev(desc.GetName(), desc.GetID(), desc.GetVersion())}
-		count, err := CountLeases(ctx, m.storage.internalExecutor, descs, now)
+		count, err := CountLeases(ctx, m.storage.db.Executor(), descs, now)
 		if err != nil {
 			return nil, err
 		}
@@ -198,7 +221,9 @@ type historicalDescriptor struct {
 //
 // In the following scenario v4 is our oldest active lease
 // [v1@t1			][v2@t3			][v3@t5				][v4@t7
-// 		 [start												end]
+//
+//	[start												end]
+//
 // getDescriptorsFromStoreForInterval(..., start, end) will get back:
 // [v3, v2] (reverse order)
 //
@@ -227,82 +252,107 @@ func getDescriptorsFromStoreForInterval(
 
 	// Create an export request (1 kv call) for all descriptors for given
 	// descriptor ID written during the interval [timestamp, endTimestamp).
-	batchRequestHeader := roachpb.Header{
-		Timestamp: upperBound.Prev(),
+	batchRequestHeader := kvpb.Header{
+		Timestamp:                   upperBound.Prev(),
+		ReturnElasticCPUResumeSpans: true,
 	}
 	descriptorKey := catalogkeys.MakeDescMetadataKey(codec, id)
-	requestHeader := roachpb.RequestHeader{
-		Key:    descriptorKey,
-		EndKey: descriptorKey.PrefixEnd(),
-	}
-	req := &roachpb.ExportRequest{
-		RequestHeader: requestHeader,
-		StartTime:     lowerBound.Prev(),
-		MVCCFilter:    roachpb.MVCCFilter_All,
-		ReturnSST:     true,
-	}
-
-	// Export request returns descriptors in decreasing modification time.
-	res, pErr := kv.SendWrappedWith(ctx, db.NonTransactionalSender(), batchRequestHeader, req)
-	if pErr != nil {
-		return nil, errors.Wrapf(pErr.GoError(), "error in retrieving descs between %s, %s",
-			lowerBound, upperBound)
-	}
-
 	// Unmarshal key span retrieved from export request to construct historical descs.
 	var descriptorsRead []historicalDescriptor
-	// Keep track of the most recently processed descriptor's modification time to
-	// set as the expiration for the next descriptor to process. Recall we process
-	// descriptors in decreasing modification time.
-	subsequentModificationTime := upperBound
-	for _, file := range res.(*roachpb.ExportResponse).Files {
-		if err := func() error {
-			it, err := kvstorage.NewMemSSTIterator(file.SST, false /* verify */)
-			if err != nil {
-				return err
-			}
-			defer it.Close()
-
-			// Convert each MVCC key value pair corresponding to the specified
-			// descriptor ID.
-			for it.SeekGE(kvstorage.NilKey); ; it.Next() {
-				if ok, err := it.Valid(); err != nil {
-					return err
-				} else if !ok {
-					return nil
-				}
-
-				// Decode key and value of descriptor.
-				k := it.UnsafeKey()
-				descContent := it.UnsafeValue()
-				if descContent == nil {
-					return errors.Wrapf(errors.New("unsafe value error"), "error "+
-						"extracting raw bytes of descriptor with key %s modified between "+
-						"%s, %s", k.String(), k.Timestamp, subsequentModificationTime)
-				}
-
-				// Construct a plain descriptor.
-				value := roachpb.Value{RawBytes: descContent}
-				var desc descpb.Descriptor
-				if err := value.GetProto(&desc); err != nil {
-					return err
-				}
-				descBuilder := descbuilder.NewBuilderWithMVCCTimestamp(&desc, k.Timestamp)
-
-				// Construct a historical descriptor with expiration.
-				histDesc := historicalDescriptor{
-					desc:       descBuilder.BuildImmutable(),
-					expiration: subsequentModificationTime,
-				}
-				descriptorsRead = append(descriptorsRead, histDesc)
-
-				// Update the expiration time for next descriptor.
-				subsequentModificationTime = k.Timestamp
-			}
-		}(); err != nil {
-			return nil, err
+	for {
+		requestHeader := kvpb.RequestHeader{
+			Key:    descriptorKey,
+			EndKey: descriptorKey.PrefixEnd(),
 		}
+		req := &kvpb.ExportRequest{
+			RequestHeader: requestHeader,
+			StartTime:     lowerBound.Prev(),
+			MVCCFilter:    kvpb.MVCCFilter_All,
+		}
+
+		// Export request returns descriptors in decreasing modification time.
+		res, pErr := kv.SendWrappedWith(ctx, db.NonTransactionalSender(), batchRequestHeader, req)
+		if pErr != nil {
+			return nil, errors.Wrapf(pErr.GoError(), "error in retrieving descs between %s, %s",
+				lowerBound, upperBound)
+		}
+
+		// Keep track of the most recently processed descriptor's modification time to
+		// set as the expiration for the next descriptor to process. Recall we process
+		// descriptors in decreasing modification time.
+		subsequentModificationTime := upperBound
+		exportResp := res.(*kvpb.ExportResponse)
+		for _, file := range exportResp.Files {
+			if err := func() error {
+				it, err := kvstorage.NewMemSSTIterator(file.SST, false, /* verify */
+					kvstorage.IterOptions{
+						// NB: We assume there will be no MVCC range tombstones here.
+						KeyTypes:   kvstorage.IterKeyTypePointsOnly,
+						LowerBound: keys.MinKey,
+						UpperBound: keys.MaxKey,
+					})
+				if err != nil {
+					return err
+				}
+				defer func() {
+					if it != nil {
+						it.Close()
+					}
+				}()
+
+				// Convert each MVCC key value pair corresponding to the specified
+				// descriptor ID.
+				for it.SeekGE(kvstorage.NilKey); ; it.Next() {
+					if ok, err := it.Valid(); err != nil {
+						return err
+					} else if !ok {
+						// Close and nil out the iter to release the underlying resources.
+						it.Close()
+						it = nil
+						return nil
+					}
+
+					// Decode key and value of descriptor.
+					k := it.UnsafeKey()
+					descContent, err := it.UnsafeValue()
+					if err != nil {
+						return err
+					}
+					if descContent == nil {
+						return errors.Wrapf(errors.New("unsafe value error"), "error "+
+							"extracting raw bytes of descriptor with key %s modified between "+
+							"%s, %s", k.String(), k.Timestamp, subsequentModificationTime)
+					}
+
+					// Construct a plain descriptor.
+					value := roachpb.Value{RawBytes: descContent, Timestamp: k.Timestamp}
+					descBuilder, err := descbuilder.FromSerializedValue(&value)
+					if err != nil {
+						return err
+					}
+
+					// Construct a historical descriptor with expiration.
+					histDesc := historicalDescriptor{
+						desc:       descBuilder.BuildImmutable(),
+						expiration: subsequentModificationTime,
+					}
+					descriptorsRead = append(descriptorsRead, histDesc)
+
+					// Update the expiration time for next descriptor.
+					subsequentModificationTime = k.Timestamp
+				}
+			}(); err != nil {
+				return nil, err
+			}
+		}
+
+		// Check if the ExportRequest paginated with a resume span.
+		if exportResp.ResumeSpan == nil {
+			break
+		}
+		descriptorKey = exportResp.ResumeSpan.Key
 	}
+
 	return descriptorsRead, nil
 }
 
@@ -314,10 +364,10 @@ func getDescriptorsFromStoreForInterval(
 // descriptor version we are interested in, resulting at most 2 KV calls.
 //
 // TODO(vivek, james): Future work:
-// 1. Translate multiple simultaneous calls to this method into a single call
-//    as is done for acquireNodeLease().
-// 2. Figure out a sane policy on when these descriptors should be purged.
-//    They are currently purged in PurgeOldVersions.
+//  1. Translate multiple simultaneous calls to this method into a single call
+//     as is done for acquireNodeLease().
+//  2. Figure out a sane policy on when these descriptors should be purged.
+//     They are currently purged in PurgeOldVersions.
 func (m *Manager) readOlderVersionForTimestamp(
 	ctx context.Context, id descpb.ID, timestamp hlc.Timestamp,
 ) ([]historicalDescriptor, error) {
@@ -368,7 +418,9 @@ func (m *Manager) readOlderVersionForTimestamp(
 
 	// Retrieve descriptors in range [timestamp, endTimestamp) in decreasing
 	// modification time order.
-	descs, err := getDescriptorsFromStoreForInterval(ctx, m.DB(), m.Codec(), id, timestamp, endTimestamp)
+	descs, err := getDescriptorsFromStoreForInterval(
+		ctx, m.storage.db.KV(), m.Codec(), id, timestamp, endTimestamp,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +466,7 @@ func (m *Manager) insertDescriptorVersions(id descpb.ID, versions []historicalDe
 		existingVersion := t.mu.active.findVersion(versions[i].desc.GetVersion())
 		if existingVersion == nil {
 			t.mu.active.insert(
-				newDescriptorVersionState(t, versions[i].desc, versions[i].expiration, false))
+				newDescriptorVersionState(t, versions[i].desc, versions[i].expiration, nil, false))
 		}
 	}
 }
@@ -443,10 +495,7 @@ func (m *Manager) AcquireFreshestFromStore(ctx context.Context, id descpb.ID) er
 	attemptsMade := 0
 	for {
 		// Acquire a fresh lease.
-		didAcquire, err := acquireNodeLease(ctx, m, id)
-		if m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquireResultBlockEvent != nil {
-			m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquireResultBlockEvent(AcquireFreshestBlock, id)
-		}
+		didAcquire, err := acquireNodeLease(ctx, m, id, AcquireFreshestBlock)
 		if err != nil {
 			return err
 		}
@@ -469,59 +518,62 @@ func (m *Manager) AcquireFreshestFromStore(ctx context.Context, id descpb.ID) er
 // being dropped or offline, the error will be of type inactiveTableError.
 // The boolean returned is true if this call was actually responsible for the
 // lease acquisition.
-func acquireNodeLease(ctx context.Context, m *Manager, id descpb.ID) (bool, error) {
+func acquireNodeLease(
+	ctx context.Context, m *Manager, id descpb.ID, typ AcquireType,
+) (bool, error) {
+	start := timeutil.Now()
+	log.VEventf(ctx, 2, "acquiring lease for descriptor %d...", id)
 	var toRelease *storedLease
-	resultChan, didAcquire := m.storage.group.DoChan(fmt.Sprintf("acquire%d", id), func() (interface{}, error) {
-		// Note that we use a new `context` here to avoid a situation where a cancellation
-		// of the first context cancels other callers to the `acquireNodeLease()` method,
-		// because of its use of `singleflight.Group`. See issue #41780 for how this has
-		// happened.
-		lt := logtags.FromContext(ctx)
-		ctx, cancel := m.stopper.WithCancelOnQuiesce(logtags.AddTags(m.ambientCtx.AnnotateCtx(context.Background()), lt))
-		defer cancel()
-		if m.isDraining() {
-			return nil, errors.New("cannot acquire lease when draining")
-		}
-		newest := m.findNewest(id)
-		var minExpiration hlc.Timestamp
-		if newest != nil {
-			minExpiration = newest.getExpiration()
-		}
-		desc, expiration, err := m.storage.acquire(ctx, minExpiration, id)
-		if err != nil {
-			return nil, err
-		}
-		t := m.findDescriptorState(id, false /* create */)
-		t.mu.Lock()
-		t.mu.takenOffline = false
-		defer t.mu.Unlock()
-		var newDescVersionState *descriptorVersionState
-		newDescVersionState, toRelease, err = t.upsertLeaseLocked(ctx, desc, expiration)
-		if err != nil {
-			return nil, err
-		}
-		if newDescVersionState != nil {
-			m.names.insert(newDescVersionState)
-		}
-		if toRelease != nil {
-			releaseLease(ctx, toRelease, m)
-		}
-		return true, nil
-	})
-	select {
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case result := <-resultChan:
-		if result.Err != nil {
-			return false, result.Err
-		}
+	future, didAcquire := m.storage.group.DoChan(ctx,
+		strconv.Itoa(int(id)),
+		singleflight.DoOpts{
+			Stop:               m.stopper,
+			InheritCancelation: false,
+		},
+		func(ctx context.Context) (interface{}, error) {
+			if m.IsDraining() {
+				return nil, errors.New("cannot acquire lease when draining")
+			}
+			newest := m.findNewest(id)
+			var minExpiration hlc.Timestamp
+			if newest != nil {
+				minExpiration = newest.getExpiration()
+			}
+			desc, expiration, regionPrefix, err := m.storage.acquire(ctx, minExpiration, id)
+			if err != nil {
+				return nil, err
+			}
+			t := m.findDescriptorState(id, false /* create */)
+			t.mu.Lock()
+			t.mu.takenOffline = false
+			defer t.mu.Unlock()
+			var newDescVersionState *descriptorVersionState
+			newDescVersionState, toRelease, err = t.upsertLeaseLocked(ctx, desc, expiration, regionPrefix)
+			if err != nil {
+				return nil, err
+			}
+			if newDescVersionState != nil {
+				m.names.insert(newDescVersionState)
+			}
+			if toRelease != nil {
+				releaseLease(ctx, toRelease, m)
+			}
+			return true, nil
+		})
+	if m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquireResultBlockEvent != nil {
+		m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquireResultBlockEvent(typ, id)
 	}
+	result := future.WaitForResult(ctx)
+	if result.Err != nil {
+		return false, result.Err
+	}
+	log.VEventf(ctx, 2, "acquired lease for descriptor %d, took %v", id, timeutil.Since(start))
 	return didAcquire, nil
 }
 
 // releaseLease from store.
 func releaseLease(ctx context.Context, lease *storedLease, m *Manager) {
-	if m.isDraining() {
+	if m.IsDraining() {
 		// Release synchronously to guarantee release before exiting.
 		m.storage.release(ctx, m.stopper, lease)
 		return
@@ -560,12 +612,14 @@ func purgeOldVersions(
 	if t == nil {
 		return nil
 	}
-	t.mu.Lock()
-	if t.mu.maxVersionSeen < minVersion {
-		t.mu.maxVersionSeen = minVersion
-	}
-	empty := len(t.mu.active.data) == 0 && t.mu.acquisitionsInProgress == 0
-	t.mu.Unlock()
+	empty := func() bool {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.mu.maxVersionSeen < minVersion {
+			t.mu.maxVersionSeen = minVersion
+		}
+		return len(t.mu.active.data) == 0 && t.mu.acquisitionsInProgress == 0
+	}()
 	if empty && !dropped {
 		// We don't currently have a version on this descriptor, so no need to refresh
 		// anything.
@@ -573,10 +627,12 @@ func purgeOldVersions(
 	}
 
 	removeInactives := func(dropped bool) {
-		t.mu.Lock()
-		t.mu.takenOffline = dropped
-		leases := t.removeInactiveVersions()
-		t.mu.Unlock()
+		leases := func() []*storedLease {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.mu.takenOffline = dropped
+			return t.removeInactiveVersions()
+		}()
 		for _, l := range leases {
 			releaseLease(ctx, l, m)
 		}
@@ -606,17 +662,19 @@ func purgeOldVersions(
 	return err
 }
 
-// AcquireBlockType is the type of blocking result event when
+// AcquireType is the type of blocking result event when
 // calling LeaseAcquireResultBlockEvent.
-type AcquireBlockType int
+type AcquireType int
 
 const (
 	// AcquireBlock denotes the LeaseAcquireResultBlockEvent is
 	// coming from descriptorState.acquire().
-	AcquireBlock AcquireBlockType = iota
+	AcquireBlock AcquireType = iota
 	// AcquireFreshestBlock denotes the LeaseAcquireResultBlockEvent is
 	// from descriptorState.acquireFreshestFromStore().
 	AcquireFreshestBlock
+	// AcquireBackground happens due to periodic background refreshes.
+	AcquireBackground
 )
 
 // Manager manages acquiring and releasing per-descriptor leases. It also
@@ -634,6 +692,7 @@ const (
 type Manager struct {
 	rangeFeedFactory *rangefeed.Factory
 	storage          storage
+	settings         *cluster.Settings
 	mu               struct {
 		syncutil.Mutex
 		// TODO(james): Track size of leased descriptors in memory.
@@ -668,10 +727,10 @@ const leaseConcurrencyLimit = 5
 func NewLeaseManager(
 	ambientCtx log.AmbientContext,
 	nodeIDContainer *base.SQLIDContainer,
-	db *kv.DB,
+	db isql.DB,
 	clock *hlc.Clock,
-	internalExecutor sqlutil.InternalExecutor,
 	settings *cluster.Settings,
+	settingsWatcher *settingswatcher.SettingsWatcher,
 	codec keys.SQLCodec,
 	testingKnobs ManagerTestingKnobs,
 	stopper *stop.Stopper,
@@ -679,14 +738,15 @@ func NewLeaseManager(
 ) *Manager {
 	lm := &Manager{
 		storage: storage{
-			nodeIDContainer:  nodeIDContainer,
-			db:               db,
-			clock:            clock,
-			internalExecutor: internalExecutor,
-			settings:         settings,
-			codec:            codec,
-			group:            &singleflight.Group{},
-			testingKnobs:     testingKnobs.LeaseStoreTestingKnobs,
+			nodeIDContainer: nodeIDContainer,
+			writer:          newKVWriter(codec, db.KV(), keys.LeaseTableID, settingsWatcher),
+			db:              db,
+			clock:           clock,
+			settings:        settings,
+			codec:           codec,
+			sysDBCache:      catkv.NewSystemDatabaseCache(codec, settings),
+			group:           singleflight.NewGroup("acquire-lease", "descriptor ID"),
+			testingKnobs:    testingKnobs.LeaseStoreTestingKnobs,
 			outstandingLeases: metric.NewGauge(metric.Metadata{
 				Name:        "sql.leases.active",
 				Help:        "The number of outstanding SQL schema leases.",
@@ -694,6 +754,7 @@ func NewLeaseManager(
 				Unit:        metric.Unit_COUNT,
 			}),
 		},
+		settings:         settings,
 		rangeFeedFactory: rangeFeedFactory,
 		testingKnobs:     testingKnobs,
 		names:            makeNameCache(),
@@ -701,9 +762,11 @@ func NewLeaseManager(
 		stopper:          stopper,
 		sem:              quotapool.NewIntPool("lease manager", leaseConcurrencyLimit),
 	}
+	lm.storage.regionPrefix = &atomic.Value{}
+	lm.storage.regionPrefix.Store(enum.One)
 	lm.stopper.AddCloser(lm.sem.Closer("stopper"))
 	lm.mu.descriptors = make(map[descpb.ID]*descriptorState)
-	lm.mu.updatesResolvedTimestamp = db.Clock().Now()
+	lm.mu.updatesResolvedTimestamp = clock.Now()
 
 	lm.draining.Store(false)
 	return lm
@@ -728,6 +791,22 @@ func (m *Manager) findNewest(id descpb.ID) *descriptorVersionState {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.mu.active.findNewest()
+}
+
+// SetRegionPrefix sets the prefix this Manager uses to write leases. If val
+// is empty, this call is a no-op. Note that the default value is enum.One.
+// This means that leases acquired before initial startup may write their
+// entry to a remote region.
+//
+// TODO(ajwerner): We ought to reject attempts to lease descriptors before
+// we've set the prefix if the table is partitioned. In principle, this should
+// just mean returning ErrDescriptorNotFound. The challenge will be to sort
+// out all the conditions in which we expect, or don't expect to get a prefix
+// in a timely manner.
+func (m *Manager) SetRegionPrefix(val []byte) {
+	if len(val) > 0 {
+		m.storage.regionPrefix.Store(val)
+	}
 }
 
 // AcquireByName returns a version for the specified descriptor valid for
@@ -762,13 +841,9 @@ func (m *Manager) AcquireByName(
 	// This logic will release the lease (the lease manager will still
 	// cache it), and generate the offline descriptor error.
 	validateDescriptorForReturn := func(desc LeasedDescriptor) (LeasedDescriptor, error) {
-		if desc.Underlying().Offline() {
-			if err := catalog.FilterDescriptorState(
-				desc.Underlying(), tree.CommonLookupFlags{},
-			); err != nil {
-				desc.Release(ctx)
-				return nil, err
-			}
+		if err := catalog.FilterOfflineDescriptor(desc.Underlying()); err != nil {
+			desc.Release(ctx)
+			return nil, err
 		}
 		return desc, nil
 	}
@@ -875,7 +950,8 @@ func (m *Manager) resolveName(
 	parentSchemaID descpb.ID,
 	name string,
 ) (id descpb.ID, _ error) {
-	if err := m.storage.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	req := []descpb.NameInfo{{ParentID: parentID, ParentSchemaID: parentSchemaID, Name: name}}
+	if err := m.storage.db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Run the name lookup as high-priority, thereby pushing any intents out of
 		// its way. We don't want schema changes to prevent name resolution/lease
 		// acquisitions; we'd rather force them to refresh. Also this prevents
@@ -887,9 +963,14 @@ func (m *Manager) resolveName(
 		if err := txn.SetFixedTimestamp(ctx, timestamp); err != nil {
 			return err
 		}
-		var err error
-		id, err = catkv.LookupID(ctx, txn, m.storage.codec, parentID, parentSchemaID, name)
-		return err
+		c, err := m.storage.newCatalogReader(ctx).GetByNames(ctx, txn, req)
+		if err != nil {
+			return err
+		}
+		if e := c.LookupNamespaceEntry(&req[0]); e != nil {
+			id = e.GetID()
+		}
+		return nil
 	}); err != nil {
 		return id, err
 	}
@@ -953,14 +1034,10 @@ func (m *Manager) Acquire(
 				t.markAcquisitionStart(ctx)
 				defer t.markAcquisitionDone(ctx)
 				// Renew lease and retry. This will block until the lease is acquired.
-				_, errLease := acquireNodeLease(ctx, m, id)
+				_, errLease := acquireNodeLease(ctx, m, id, AcquireBlock)
 				return errLease
 			}(); err != nil {
 				return nil, err
-			}
-
-			if m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquireResultBlockEvent != nil {
-				m.testingKnobs.LeaseStoreTestingKnobs.LeaseAcquireResultBlockEvent(AcquireBlock, id)
 			}
 
 		case errors.Is(err, errReadOlderVersion):
@@ -982,10 +1059,11 @@ func (m *Manager) Acquire(
 func (m *Manager) removeOnceDereferenced() bool {
 	return m.storage.testingKnobs.RemoveOnceDereferenced ||
 		// Release from the store if the Manager is draining.
-		m.isDraining()
+		m.IsDraining()
 }
 
-func (m *Manager) isDraining() bool {
+// IsDraining returns true if this node's lease manager is draining.
+func (m *Manager) IsDraining() bool {
 	return m.draining.Load().(bool)
 }
 
@@ -1007,9 +1085,11 @@ func (m *Manager) SetDraining(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, t := range m.mu.descriptors {
-		t.mu.Lock()
-		leases := t.removeInactiveVersions()
-		t.mu.Unlock()
+		leases := func() []*storedLease {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			return t.removeInactiveVersions()
+		}()
 		for _, l := range leases {
 			releaseLease(ctx, l, m)
 		}
@@ -1037,7 +1117,7 @@ func (m *Manager) findDescriptorState(id descpb.ID, create bool) *descriptorStat
 // rangefeeds. This function must be passed a non-nil gossip if
 // RangefeedLeases is not active.
 func (m *Manager) RefreshLeases(ctx context.Context, s *stop.Stopper, db *kv.DB) {
-	descUpdateCh := make(chan *descpb.Descriptor)
+	descUpdateCh := make(chan catalog.Descriptor)
 	m.watchForUpdates(ctx, descUpdateCh)
 	_ = s.RunAsyncTask(ctx, "refresh-leases", func(ctx context.Context) {
 		for {
@@ -1050,28 +1130,49 @@ func (m *Manager) RefreshLeases(ctx context.Context, s *stop.Stopper, db *kv.DB)
 				}
 
 				if evFunc := m.testingKnobs.TestingDescriptorUpdateEvent; evFunc != nil {
-					if err := evFunc(desc); err != nil {
+					if err := evFunc(desc.DescriptorProto()); err != nil {
 						log.Infof(ctx, "skipping update of %v due to knob: %v",
 							desc, err)
 						continue
 					}
 				}
 
-				id, version, name, state, _, err := descpb.GetDescriptorMetadata(desc)
-				if err != nil {
-					log.Fatalf(ctx, "invalid descriptor %v: %v", desc, err)
-				}
-				dropped := state == descpb.DescriptorState_DROP
+				dropped := desc.Dropped()
 				// Try to refresh the lease to one >= this version.
 				log.VEventf(ctx, 2, "purging old version of descriptor %d@%d (dropped %v)",
-					id, version, dropped)
-				if err := purgeOldVersions(ctx, db, id, dropped, version, m); err != nil {
-					log.Warningf(ctx, "error purging leases for descriptor %d(%s): %s",
-						id, name, err)
+					desc.GetID(), desc.GetVersion(), dropped)
+				purge := func(ctx context.Context) {
+					if err := purgeOldVersions(ctx, db, desc.GetID(), dropped, desc.GetVersion(), m); err != nil {
+						log.Warningf(ctx, "error purging leases for descriptor %d(%s): %s",
+							desc.GetID(), desc.GetName(), err)
+					}
+				}
+				// New descriptors may appear in the future if the descriptor table is
+				// global or if the transaction which performed the schema change wrote
+				// to a global table. Attempts to acquire a lease after that new
+				// version has appeared won't acquire the latest version, they'll
+				// acquire the previous version because they'll occur at "now".
+				//
+				// That, in and of itself, is not a problem. The problem is that we
+				// may release the lease on the current version before we can start
+				// acquiring the lease on the new version. This could lead to periods
+				// of increased latency right as the descriptor has been committed.
+				if now := db.Clock().Now(); now.Less(desc.GetModificationTime()) {
+					_ = s.RunAsyncTask(ctx, "wait to purge", func(ctx context.Context) {
+						toWait := time.Duration(desc.GetModificationTime().WallTime - now.WallTime)
+						select {
+						case <-time.After(toWait):
+							purge(ctx)
+						case <-ctx.Done():
+						case <-s.ShouldQuiesce():
+						}
+					})
+				} else {
+					purge(ctx)
 				}
 
 				if evFunc := m.testingKnobs.TestingDescriptorRefreshedEvent; evFunc != nil {
-					evFunc(desc)
+					evFunc(desc.DescriptorProto())
 				}
 
 			case <-s.ShouldQuiesce():
@@ -1083,7 +1184,7 @@ func (m *Manager) RefreshLeases(ctx context.Context, s *stop.Stopper, db *kv.DB)
 
 // watchForUpdates will watch a rangefeed on the system.descriptor table for
 // updates.
-func (m *Manager) watchForUpdates(ctx context.Context, descUpdateCh chan<- *descpb.Descriptor) {
+func (m *Manager) watchForUpdates(ctx context.Context, descUpdateCh chan<- catalog.Descriptor) {
 	if log.V(1) {
 		log.Infof(ctx, "using rangefeeds for lease manager updates")
 	}
@@ -1093,32 +1194,27 @@ func (m *Manager) watchForUpdates(ctx context.Context, descUpdateCh chan<- *desc
 		EndKey: descriptorTableStart.PrefixEnd(),
 	}
 	handleEvent := func(
-		ctx context.Context, ev *roachpb.RangeFeedValue,
+		ctx context.Context, ev *kvpb.RangeFeedValue,
 	) {
 		if len(ev.Value.RawBytes) == 0 {
 			return
 		}
-		var descriptor descpb.Descriptor
-		if err := ev.Value.GetProto(&descriptor); err != nil {
+		b, err := descbuilder.FromSerializedValue(&ev.Value)
+		if err != nil {
 			logcrash.ReportOrPanic(ctx, &m.storage.settings.SV,
 				"%s: unable to unmarshal descriptor %v", ev.Key, ev.Value)
+		}
+		if b == nil {
 			return
 		}
-		if descriptor.Union == nil {
-			return
-		}
-		descpb.MaybeSetDescriptorModificationTimeFromMVCCTimestamp(&descriptor, ev.Value.Timestamp)
-		id, version, name, _, _, err := descpb.GetDescriptorMetadata(&descriptor)
-		if err != nil {
-			panic(err)
-		}
+		mut := b.BuildCreatedMutable()
 		if log.V(2) {
 			log.Infof(ctx, "%s: refreshing lease on descriptor: %d (%s), version: %d",
-				ev.Key, id, name, version)
+				ev.Key, mut.GetID(), mut.GetName(), mut.GetVersion())
 		}
 		select {
 		case <-ctx.Done():
-		case descUpdateCh <- &descriptor:
+		case descUpdateCh <- mut:
 		}
 	}
 	// Ignore errors here because they indicate that the server is shutting down.
@@ -1126,6 +1222,7 @@ func (m *Manager) watchForUpdates(ctx context.Context, descUpdateCh chan<- *desc
 	// shuts down, so we don't need to call Close() ourselves.
 	_, _ = m.rangeFeedFactory.RangeFeed(
 		ctx, "lease", []roachpb.Span{descriptorTableSpan}, hlc.Timestamp{}, handleEvent,
+		rangefeed.WithSystemTablePriority(),
 	)
 }
 
@@ -1172,21 +1269,27 @@ func (m *Manager) refreshSomeLeases(ctx context.Context) {
 		return
 	}
 	// Construct a list of descriptors needing their leases to be reacquired.
-	m.mu.Lock()
-	ids := make([]descpb.ID, 0, len(m.mu.descriptors))
-	var i int64
-	for k, desc := range m.mu.descriptors {
-		if i++; i > limit {
-			break
+	ids := func() []descpb.ID {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		ids := make([]descpb.ID, 0, len(m.mu.descriptors))
+		var i int64
+		for k, desc := range m.mu.descriptors {
+			if i++; i > limit {
+				break
+			}
+			takenOffline := func() bool {
+				desc.mu.Lock()
+				defer desc.mu.Unlock()
+				return desc.mu.takenOffline
+			}()
+			if !takenOffline {
+				ids = append(ids, k)
+			}
 		}
-		desc.mu.Lock()
-		takenOffline := desc.mu.takenOffline
-		desc.mu.Unlock()
-		if !takenOffline {
-			ids = append(ids, k)
-		}
-	}
-	m.mu.Unlock()
+		return ids
+	}()
 	// Limit the number of concurrent lease refreshes.
 	var wg sync.WaitGroup
 	for i := range ids {
@@ -1209,18 +1312,22 @@ func (m *Manager) refreshSomeLeases(ctx context.Context) {
 					}
 				}
 
-				if _, err := acquireNodeLease(ctx, m, id); err != nil {
+				if _, err := acquireNodeLease(ctx, m, id, AcquireBackground); err != nil {
 					log.Infof(ctx, "refreshing descriptor: %d lease failed: %s", id, err)
 
 					if errors.Is(err, catalog.ErrDescriptorNotFound) {
 						// Lease renewal failed due to removed descriptor; Remove this descriptor from cache.
-						if err := purgeOldVersions(ctx, m.DB(), id, true /* dropped */, 0 /* minVersion */, m); err != nil {
+						if err := purgeOldVersions(
+							ctx, m.storage.db.KV(), id, true /* dropped */, 0 /* minVersion */, m,
+						); err != nil {
 							log.Warningf(ctx, "error purging leases for descriptor %d: %s",
 								id, err)
 						}
-						m.mu.Lock()
-						delete(m.mu.descriptors, id)
-						m.mu.Unlock()
+						func() {
+							m.mu.Lock()
+							defer m.mu.Unlock()
+							delete(m.mu.descriptors, id)
+						}()
 					}
 				}
 			}); err != nil {
@@ -1238,11 +1345,9 @@ func (m *Manager) DeleteOrphanedLeases(ctx context.Context, timeThreshold int64)
 	if m.testingKnobs.DisableDeleteOrphanedLeases {
 		return
 	}
-	// TODO(asubiotto): clear up the nodeID naming here and in the table below,
-	// tracked as https://github.com/cockroachdb/cockroach/issues/48271.
-	nodeID := m.storage.nodeIDContainer.SQLInstanceID()
-	if nodeID == 0 {
-		panic("zero nodeID")
+	instanceID := m.storage.nodeIDContainer.SQLInstanceID()
+	if instanceID == 0 {
+		panic("SQL instance ID not set")
 	}
 
 	// Run as async worker to prevent blocking the main server Start method.
@@ -1256,16 +1361,26 @@ func (m *Manager) DeleteOrphanedLeases(ctx context.Context, timeThreshold int64)
 		// doesn't implement AS OF SYSTEM TIME.
 
 		// Read orphaned leases.
-		sqlQuery := fmt.Sprintf(`
+		const (
+			queryWithRegion = `
+SELECT "descID", version, expiration, crdb_region FROM system.public.lease AS OF SYSTEM TIME %d WHERE "nodeID" = %d
+`
+			queryWithoutRegion = `
 SELECT "descID", version, expiration FROM system.public.lease AS OF SYSTEM TIME %d WHERE "nodeID" = %d
-`, timeThreshold, nodeID)
+`
+		)
+		query := queryWithRegion
+		if !m.settings.Version.IsActive(ctx, clusterversion.V23_1_SystemRbrReadNew) {
+			query = queryWithoutRegion
+		}
+		sqlQuery := fmt.Sprintf(query, timeThreshold, instanceID)
 		var rows []tree.Datums
 		retryOptions := base.DefaultRetryOptions()
 		retryOptions.Closer = m.stopper.ShouldQuiesce()
 		// The retry is required because of errors caused by node restarts. Retry 30 times.
 		if err := retry.WithMaxAttempts(ctx, retryOptions, 30, func() error {
 			var err error
-			rows, err = m.storage.internalExecutor.QueryBuffered(
+			rows, err = m.storage.db.Executor().QueryBuffered(
 				ctx, "read orphaned leases", nil /*txn*/, sqlQuery,
 			)
 			return err
@@ -1285,6 +1400,13 @@ SELECT "descID", version, expiration FROM system.public.lease AS OF SYSTEM TIME 
 				version:    int(tree.MustBeDInt(row[1])),
 				expiration: tree.MustBeDTimestamp(row[2]),
 			}
+			if len(row) == 4 {
+				if ed, ok := row[3].(*tree.DEnum); ok {
+					lease.prefix = ed.PhysicalRep
+				} else if bd, ok := row[3].(*tree.DBytes); ok {
+					lease.prefix = []byte((*bd))
+				}
+			}
 			if err := m.stopper.RunAsyncTaskEx(
 				ctx,
 				stop.TaskOpts{
@@ -1303,14 +1425,14 @@ SELECT "descID", version, expiration FROM system.public.lease AS OF SYSTEM TIME 
 	})
 }
 
-// DB returns the Manager's handle to a kv.DB.
-func (m *Manager) DB() *kv.DB {
-	return m.storage.db
-}
-
-// Codec return the Manager's SQLCodec.
+// Codec returns the Manager's SQLCodec.
 func (m *Manager) Codec() keys.SQLCodec {
 	return m.storage.codec
+}
+
+// SystemDatabaseCache returns the Manager's catkv.SystemDatabaseCache.
+func (m *Manager) SystemDatabaseCache() *catkv.SystemDatabaseCache {
+	return m.storage.sysDBCache
 }
 
 // Metrics contains a pointer to all relevant lease.Manager metrics, for
@@ -1343,10 +1465,11 @@ func (m *Manager) VisitLeases(
 			takenOffline := ts.mu.takenOffline
 
 			for _, state := range ts.mu.active.data {
-				state.mu.Lock()
-				lease := state.mu.lease
-				refCount := state.mu.refcount
-				state.mu.Unlock()
+				lease, refCount := func() (*storedLease, int) {
+					state.mu.Lock()
+					defer state.mu.Unlock()
+					return state.mu.lease, state.mu.refcount
+				}()
 
 				if lease == nil {
 					continue

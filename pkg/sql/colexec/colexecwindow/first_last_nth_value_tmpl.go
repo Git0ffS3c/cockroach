@@ -56,7 +56,7 @@ func New_UPPERCASE_NAMEOperator(
 	frame *execinfrapb.WindowerSpec_Frame,
 	ordering *execinfrapb.Ordering,
 	argIdxs []int,
-) (colexecop.Operator, error) {
+) (colexecop.ClosableOperator, error) {
 	framer := newWindowFramer(args.EvalCtx, frame, ordering, args.InputTypes, args.PeersColIdx)
 	colsToStore := framer.getColsToStore([]int{argIdxs[0]})
 
@@ -68,8 +68,9 @@ func New_UPPERCASE_NAMEOperator(
 	bufferMemLimit := int64(float64(args.MemoryLimit) * 0.10)
 	mainMemLimit := args.MemoryLimit - bufferMemLimit
 	buffer := colexecutils.NewSpillingBuffer(
-		args.BufferAllocator, bufferMemLimit, args.QueueCfg,
-		args.FdSemaphore, args.InputTypes, args.DiskAcc, colsToStore...)
+		args.BufferAllocator, bufferMemLimit, args.QueueCfg, args.FdSemaphore,
+		args.InputTypes, args.DiskAcc, args.ConverterMemAcc, colsToStore...,
+	)
 	base := _OP_NAMEBase{
 		partitionSeekerBase: partitionSeekerBase{
 			buffer:          buffer,

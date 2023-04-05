@@ -22,8 +22,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptutil"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -31,7 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -47,6 +47,7 @@ import (
 func TestProtectedTimestamps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.WithIssue(t, 93497, "flaky test")
 	ctx := context.Background()
 
 	// This test is too slow to run with race.
@@ -95,11 +96,7 @@ func TestProtectedTimestamps(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			count := 0
 			if err := conn.QueryRow(
-				"SELECT count(*) "+
-					"FROM crdb_internal.ranges_no_leases "+
-					"WHERE table_name = $1 "+
-					"AND database_name = current_database()",
-				"foo").Scan(&count); err != nil {
+				"SELECT count(*) FROM [SHOW RANGES FROM TABLE foo]").Scan(&count); err != nil {
 				return err
 			}
 			if count == 0 {
@@ -110,14 +107,10 @@ func TestProtectedTimestamps(t *testing.T) {
 	}
 
 	getTableStartKey := func() roachpb.Key {
-		row := conn.QueryRow(
-			"SELECT start_key "+
-				"FROM crdb_internal.ranges_no_leases "+
-				"WHERE table_name = $1 "+
-				"AND database_name = current_database() "+
-				"ORDER BY start_key ASC "+
-				"LIMIT 1",
-			"foo")
+		row := conn.QueryRow(`
+SELECT raw_start_key
+FROM [SHOW RANGES FROM TABLE foo WITH KEYS]
+ORDER BY raw_start_key ASC LIMIT 1`)
 
 		var startKey roachpb.Key
 		require.NoError(t, row.Scan(&startKey))
@@ -156,7 +149,7 @@ func TestProtectedTimestamps(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			upsertUntilBackpressure()
 			s, repl := getStoreAndReplica()
-			trace, _, err := s.ManuallyEnqueue(ctx, "mvccGC", repl, false)
+			trace, _, err := s.Enqueue(ctx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
 			require.NoError(t, err)
 			if !processedRegexp.MatchString(trace.String()) {
 				return errors.Errorf("%q does not match %q", trace.String(), processedRegexp)
@@ -166,7 +159,7 @@ func TestProtectedTimestamps(t *testing.T) {
 	}
 
 	thresholdRE := regexp.MustCompile(`(?s).*Threshold:(?P<threshold>[^\s]*)`)
-	thresholdFromTrace := func(trace tracing.Recording) hlc.Timestamp {
+	thresholdFromTrace := func(trace tracingpb.Recording) hlc.Timestamp {
 		threshStr := string(thresholdRE.ExpandString(nil, "$threshold",
 			trace.String(), thresholdRE.FindStringSubmatchIndex(trace.String())))
 		thresh, err := hlc.ParseTimestamp(threshStr)
@@ -180,16 +173,15 @@ func TestProtectedTimestamps(t *testing.T) {
 	beforeWrites := s0.Clock().Now()
 	gcSoon()
 
-	pts := ptstorage.New(s0.ClusterSettings(), s0.InternalExecutor().(*sql.InternalExecutor),
-		nil /* knobs */)
-	ptsWithDB := ptstorage.WithDatabase(pts, s0.DB())
+	pts := ptstorage.New(s0.ClusterSettings(), nil)
+	ptsWithDB := ptstorage.WithDatabase(pts, s0.InternalDB().(isql.DB))
 	ptsRec := ptpb.Record{
 		ID:        uuid.MakeV4().GetBytes(),
 		Timestamp: s0.Clock().Now(),
 		Mode:      ptpb.PROTECT_AFTER,
 		Target:    ptpb.MakeSchemaObjectsTarget([]descpb.ID{getTableID()}),
 	}
-	require.NoError(t, ptsWithDB.Protect(ctx, nil /* txn */, &ptsRec))
+	require.NoError(t, ptsWithDB.Protect(ctx, &ptsRec))
 	upsertUntilBackpressure()
 	// We need to be careful choosing a time. We're a little limited because the
 	// ttl is defined in seconds and we need to wait for the threshold to be
@@ -200,13 +192,13 @@ func TestProtectedTimestamps(t *testing.T) {
 	s, repl := getStoreAndReplica()
 	// The protectedts record will prevent us from aging the MVCC garbage bytes
 	// past the oldest record so shouldQueue should be false. Verify that.
-	trace, _, err := s.ManuallyEnqueue(ctx, "mvccGC", repl, false /* skipShouldQueue */)
+	trace, _, err := s.Enqueue(ctx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
 	require.NoError(t, err)
 	require.Regexp(t, "(?s)shouldQueue=false", trace.String())
 
 	// If we skipShouldQueue then gc will run but it should only run up to the
 	// timestamp of our record at the latest.
-	trace, _, err = s.ManuallyEnqueue(ctx, "mvccGC", repl, true /* skipShouldQueue */)
+	trace, _, err = s.Enqueue(ctx, "mvccGC", repl, true /* skipShouldQueue */, false /* async */)
 	require.NoError(t, err)
 	require.Regexp(t, "(?s)done with GC evaluation for 0 keys", trace.String())
 	thresh := thresholdFromTrace(trace)
@@ -227,8 +219,8 @@ func TestProtectedTimestamps(t *testing.T) {
 	failedRec.ID = uuid.MakeV4().GetBytes()
 	failedRec.Timestamp = beforeWrites
 	failedRec.Timestamp.Logical = 0
-	require.NoError(t, ptsWithDB.Protect(ctx, nil /* txn */, &failedRec))
-	_, err = ptsWithDB.GetRecord(ctx, nil /* txn */, failedRec.ID.GetUUID())
+	require.NoError(t, ptsWithDB.Protect(ctx, &failedRec))
+	_, err = ptsWithDB.GetRecord(ctx, failedRec.ID.GetUUID())
 	require.NoError(t, err)
 
 	// Verify that the record did indeed make its way down into KV where the
@@ -246,7 +238,7 @@ func TestProtectedTimestamps(t *testing.T) {
 	laterRec.ID = uuid.MakeV4().GetBytes()
 	laterRec.Timestamp = afterWrites
 	laterRec.Timestamp.Logical = 0
-	require.NoError(t, ptsWithDB.Protect(ctx, nil /* txn */, &laterRec))
+	require.NoError(t, ptsWithDB.Protect(ctx, &laterRec))
 	require.NoError(
 		t,
 		ptutil.TestingVerifyProtectionTimestampExistsOnSpans(
@@ -256,9 +248,9 @@ func TestProtectedTimestamps(t *testing.T) {
 
 	// Release the record that had succeeded and ensure that GC eventually
 	// happens up to the protected timestamp of the new record.
-	require.NoError(t, ptsWithDB.Release(ctx, nil, ptsRec.ID.GetUUID()))
+	require.NoError(t, ptsWithDB.Release(ctx, ptsRec.ID.GetUUID()))
 	testutils.SucceedsSoon(t, func() error {
-		trace, _, err = s.ManuallyEnqueue(ctx, "mvccGC", repl, false)
+		trace, _, err = s.Enqueue(ctx, "mvccGC", repl, false /* skipShouldQueue */, false /* async */)
 		require.NoError(t, err)
 		if !processedRegexp.MatchString(trace.String()) {
 			return errors.Errorf("%q does not match %q", trace.String(), processedRegexp)
@@ -272,9 +264,9 @@ func TestProtectedTimestamps(t *testing.T) {
 	})
 
 	// Release the failed record.
-	require.NoError(t, ptsWithDB.Release(ctx, nil, failedRec.ID.GetUUID()))
-	require.NoError(t, ptsWithDB.Release(ctx, nil, laterRec.ID.GetUUID()))
-	state, err := ptsWithDB.GetState(ctx, nil)
+	require.NoError(t, ptsWithDB.Release(ctx, failedRec.ID.GetUUID()))
+	require.NoError(t, ptsWithDB.Release(ctx, laterRec.ID.GetUUID()))
+	state, err := ptsWithDB.GetState(ctx)
 	require.NoError(t, err)
 	require.Len(t, state.Records, 0)
 	require.Equal(t, int(state.NumRecords), len(state.Records))

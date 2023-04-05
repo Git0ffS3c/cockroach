@@ -13,9 +13,16 @@ package tabledesc
 import (
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/errors"
 	"github.com/robfig/cron/v3"
 )
 
@@ -24,10 +31,10 @@ func ValidateRowLevelTTL(ttl *catpb.RowLevelTTL) error {
 	if ttl == nil {
 		return nil
 	}
-	if ttl.DurationExpr == "" {
+	if !ttl.HasDurationExpr() && !ttl.HasExpirationExpr() {
 		return pgerror.Newf(
 			pgcode.InvalidParameterValue,
-			`"ttl_expire_after" must be set`,
+			`"ttl_expire_after" and/or "ttl_expiration_expression" must be set`,
 		)
 	}
 	if ttl.DeleteBatchSize != 0 {
@@ -45,11 +52,6 @@ func ValidateRowLevelTTL(ttl *catpb.RowLevelTTL) error {
 			return err
 		}
 	}
-	if ttl.RangeConcurrency != 0 {
-		if err := ValidateTTLRangeConcurrency("ttl_range_concurrency", ttl.RangeConcurrency); err != nil {
-			return err
-		}
-	}
 	if ttl.DeleteRateLimit != 0 {
 		if err := ValidateTTLRateLimit("ttl_delete_rate_limit", ttl.DeleteRateLimit); err != nil {
 			return err
@@ -63,20 +65,82 @@ func ValidateRowLevelTTL(ttl *catpb.RowLevelTTL) error {
 	return nil
 }
 
-// ValidateTTLBatchSize validates the batch size of a TTL.
-func ValidateTTLBatchSize(key string, val int64) error {
-	if val <= 0 {
-		return pgerror.Newf(
-			pgcode.InvalidParameterValue,
-			`"%s" must be at least 1`,
-			key,
-		)
+// ValidateTTLExpirationExpr validates that the ttl_expiration_expression, if
+// any, only references existing columns.
+func ValidateTTLExpirationExpr(desc catalog.TableDescriptor) error {
+	if !desc.HasRowLevelTTL() {
+		return nil
+	}
+	expirationExpr := desc.GetRowLevelTTL().ExpirationExpr
+	if expirationExpr == "" {
+		return nil
+	}
+	expr, err := parser.ParseExpr(string(expirationExpr))
+	if err != nil {
+		return errors.Wrapf(err, "ttl_expiration_expression %q must be a valid expression", expirationExpr)
+	}
+	// Ideally, we would also call schemaexpr.ValidateTTLExpirationExpression
+	// here, but that requires a SemaCtx which we don't have here.
+	valid, err := schemaexpr.HasValidColumnReferences(desc, expr)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return errors.Newf("row-level TTL expiration expression %q refers to unknown columns", expirationExpr)
 	}
 	return nil
 }
 
-// ValidateTTLRangeConcurrency validates the batch size of a TTL.
-func ValidateTTLRangeConcurrency(key string, val int64) error {
+// ValidateTTLExpirationColumn validates that the ttl_expire_after setting, if
+// any, is in a valid state. It requires that the TTLDefaultExpirationColumn
+// exists and has DEFAULT/ON UPDATE clauses.
+func ValidateTTLExpirationColumn(desc catalog.TableDescriptor) error {
+	if !desc.HasRowLevelTTL() {
+		return nil
+	}
+	if !desc.GetRowLevelTTL().HasDurationExpr() {
+		return nil
+	}
+	intervalExpr := desc.GetRowLevelTTL().DurationExpr
+	col, err := catalog.MustFindColumnByTreeName(desc, colinfo.TTLDefaultExpirationColumnName)
+	if err != nil {
+		return errors.Wrapf(err, "expected column %s", colinfo.TTLDefaultExpirationColumnName)
+	}
+	expectedStr := `current_timestamp():::TIMESTAMPTZ + ` + string(intervalExpr)
+	if col.GetDefaultExpr() != expectedStr {
+		return pgerror.Newf(
+			pgcode.InvalidTableDefinition,
+			"expected DEFAULT expression of %s to be %s",
+			colinfo.TTLDefaultExpirationColumnName,
+			expectedStr,
+		)
+	}
+	if col.GetOnUpdateExpr() != expectedStr {
+		return pgerror.Newf(
+			pgcode.InvalidTableDefinition,
+			"expected ON UPDATE expression of %s to be %s",
+			colinfo.TTLDefaultExpirationColumnName,
+			expectedStr,
+		)
+	}
+
+	// For row-level TTL, only ascending PKs are permitted.
+	pk := desc.GetPrimaryIndex()
+	for i := 0; i < pk.NumKeyColumns(); i++ {
+		dir := pk.GetKeyColumnDirection(i)
+		if dir != catenumpb.IndexColumn_ASC {
+			return unimplemented.NewWithIssuef(
+				76912,
+				`non-ascending ordering on PRIMARY KEYs are not supported with row-level TTL`,
+			)
+		}
+	}
+
+	return nil
+}
+
+// ValidateTTLBatchSize validates the batch size of a TTL.
+func ValidateTTLBatchSize(key string, val int64) error {
 	if val <= 0 {
 		return pgerror.Newf(
 			pgcode.InvalidParameterValue,

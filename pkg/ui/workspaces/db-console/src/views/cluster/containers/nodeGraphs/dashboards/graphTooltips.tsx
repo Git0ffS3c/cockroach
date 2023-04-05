@@ -161,7 +161,18 @@ export const CircuitBreakerTrippedReplicasTooltip: React.FC = () => (
 
 export const CircuitBreakerTrippedEventsTooltip: React.FC = () => (
   <div>
-    Number of times the per-Replica circuit breakers tripped since process
-    start.
+    The number of circuit breaker events occurred per aggregated interval of
+    time across all nodes since the process started.
+  </div>
+);
+
+export const PausedFollowersTooltip: React.FC = () => (
+  <div>The number of nonessential followers that have replication paused.</div>
+);
+
+export const ReceiverSnapshotsQueuedTooltip: React.FC = () => (
+  <div>
+    The number of snapshots queued to be applied on a receiver which can only{" "}
+    accept 1 at a time per store.
   </div>
 );

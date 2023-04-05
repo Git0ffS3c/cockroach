@@ -21,13 +21,12 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				minPhase(scop.PreCommitPhase),
-				emit(func(this *scpb.ColumnOnUpdateExpression) scop.Op {
+				emit(func(this *scpb.ColumnOnUpdateExpression) *scop.AddColumnOnUpdateExpression {
 					return &scop.AddColumnOnUpdateExpression{
 						OnUpdate: *protoutil.Clone(this).(*scpb.ColumnOnUpdateExpression),
 					}
 				}),
-				emit(func(this *scpb.ColumnOnUpdateExpression) scop.Op {
+				emit(func(this *scpb.ColumnOnUpdateExpression) *scop.UpdateTableBackReferencesInTypes {
 					if len(this.UsesTypeIDs) == 0 {
 						return nil
 					}
@@ -36,11 +35,11 @@ func init() {
 						BackReferencedTableID: this.TableID,
 					}
 				}),
-				emit(func(this *scpb.ColumnOnUpdateExpression) scop.Op {
+				emit(func(this *scpb.ColumnOnUpdateExpression) *scop.UpdateTableBackReferencesInSequences {
 					if len(this.UsesSequenceIDs) == 0 {
 						return nil
 					}
-					return &scop.UpdateBackReferencesInSequences{
+					return &scop.UpdateTableBackReferencesInSequences{
 						SequenceIDs:            this.UsesSequenceIDs,
 						BackReferencedTableID:  this.TableID,
 						BackReferencedColumnID: this.ColumnID,
@@ -51,14 +50,13 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
-				emit(func(this *scpb.ColumnOnUpdateExpression) scop.Op {
+				emit(func(this *scpb.ColumnOnUpdateExpression) *scop.RemoveColumnOnUpdateExpression {
 					return &scop.RemoveColumnOnUpdateExpression{
 						TableID:  this.TableID,
 						ColumnID: this.ColumnID,
 					}
 				}),
-				emit(func(this *scpb.ColumnOnUpdateExpression) scop.Op {
+				emit(func(this *scpb.ColumnOnUpdateExpression) *scop.UpdateTableBackReferencesInTypes {
 					if len(this.UsesTypeIDs) == 0 {
 						return nil
 					}
@@ -67,11 +65,11 @@ func init() {
 						BackReferencedTableID: this.TableID,
 					}
 				}),
-				emit(func(this *scpb.ColumnOnUpdateExpression) scop.Op {
+				emit(func(this *scpb.ColumnOnUpdateExpression) *scop.UpdateTableBackReferencesInSequences {
 					if len(this.UsesSequenceIDs) == 0 {
 						return nil
 					}
-					return &scop.UpdateBackReferencesInSequences{
+					return &scop.UpdateTableBackReferencesInSequences{
 						SequenceIDs:            this.UsesSequenceIDs,
 						BackReferencedTableID:  this.TableID,
 						BackReferencedColumnID: this.ColumnID,

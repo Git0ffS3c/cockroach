@@ -133,7 +133,7 @@ func (s *Store) MergeRange(
 	// we'll drop atomically with extending the right-hand side down below.
 	ph, err := s.removeInitializedReplicaRaftMuLocked(ctx, rightRepl, rightDesc.NextReplicaID, RemoveOptions{
 		// The replica was destroyed by the tombstones added to the batch in
-		// runPreApplyTriggersAfterStagingWriteBatch.
+		// runPostAddTriggers.
 		DestroyData:       false,
 		InsertPlaceholder: true,
 	})
@@ -145,26 +145,21 @@ func (s *Store) MergeRange(
 		return err
 	}
 
-	if leftRepl.leaseholderStats != nil {
-		leftRepl.leaseholderStats.ResetRequestCounts()
-	}
-	if leftRepl.writeStats != nil {
-		// Note: this could be drastically improved by adding a replicaStats method
-		// that merges stats. Resetting stats is typically bad for the rebalancing
-		// logic that depends on them.
-		leftRepl.writeStats.ResetRequestCounts()
-	}
-
-	leftRepl.loadStats.merge(rightRepl.loadStats)
+	leftRepl.loadStats.Merge(rightRepl.loadStats)
 
 	// Clear the concurrency manager's lock and txn wait-queues to redirect the
 	// queued transactions to the left-hand replica, if necessary.
 	rightRepl.concMgr.OnRangeMerge()
 
+	// Track Whether the leaseholders were aligned for later updating the
+	// minValidObservedTimestamp.
 	leftLease, _ := leftRepl.GetLease()
 	rightLease, _ := rightRepl.GetLease()
-	if leftLease.OwnedBy(s.Ident.StoreID) {
-		if !rightLease.OwnedBy(s.Ident.StoreID) {
+
+	leftLeaseholder := leftLease.OwnedBy(s.Ident.StoreID)
+	rightLeaseholder := rightLease.OwnedBy(s.Ident.StoreID)
+	if leftLeaseholder {
+		if !rightLeaseholder {
 			// We hold the lease for the LHS, but do not hold the lease for the RHS.
 			// That means we don't have up-to-date timestamp cache entries for the
 			// keyspace previously owned by the RHS. Update the timestamp cache for
@@ -217,6 +212,19 @@ func (s *Store) MergeRange(
 	// leftRepl.Desc().
 	leftRepl.mu.Lock()
 	defer leftRepl.mu.Unlock()
+
+	// As a result of the merge, update the minimum valid observed timestamp so
+	// that times before the merge freeze time are no longer respected. If the
+	// leaseholders were previously aligned, then we simply keep the larger
+	// timestamp. Otherwise, use the more pessimistic RHS freeze timestamp.
+	if leftLeaseholder {
+		if rightLeaseholder {
+			leftRepl.mu.minValidObservedTimestamp.Forward(rightRepl.mu.minValidObservedTimestamp)
+		} else {
+			leftRepl.mu.minValidObservedTimestamp.Forward(freezeStart)
+		}
+	}
+
 	leftRepl.setDescLockedRaftMuLocked(ctx, &newLeftDesc)
 	return nil
 }

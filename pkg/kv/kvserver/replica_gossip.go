@@ -13,15 +13,14 @@ package kvserver
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
-	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
@@ -65,91 +64,6 @@ func (r *Replica) shouldGossip(ctx context.Context) bool {
 	return r.OwnsValidLease(ctx, r.store.Clock().NowAsClockTimestamp())
 }
 
-// MaybeGossipSystemConfigRaftMuLocked scans the entire SystemConfig span and
-// gossips it. Further calls come from the trigger on EndTxn or range lease
-// acquisition.
-//
-// Note that MaybeGossipSystemConfigRaftMuLocked gossips information only when
-// the lease is actually held. The method does not request a range lease here
-// since RequestLease and applyRaftCommand call the method and we need to avoid
-// deadlocking in redirectOnOrAcquireLease.
-//
-// MaybeGossipSystemConfigRaftMuLocked must only be called from Raft commands
-// while holding the raftMu (which provide the necessary serialization to avoid
-// data races).
-//
-// TODO(nvanbenschoten,bdarnell): even though this is best effort, we should log
-// louder when we continually fail to gossip system config.
-//
-// TODO(ajwerner): Remove this in 22.2.
-func (r *Replica) MaybeGossipSystemConfigRaftMuLocked(ctx context.Context) error {
-	if r.ClusterSettings().Version.IsActive(
-		ctx, clusterversion.DisableSystemConfigGossipTrigger,
-	) {
-		return nil
-	}
-	r.raftMu.AssertHeld()
-	if r.store.Gossip() == nil {
-		log.VEventf(ctx, 2, "not gossiping system config because gossip isn't initialized")
-		return nil
-	}
-	if !r.IsInitialized() {
-		log.VEventf(ctx, 2, "not gossiping system config because the replica isn't initialized")
-		return nil
-	}
-	if !r.ContainsKey(keys.SystemConfigSpan.Key) {
-		log.VEventf(ctx, 3,
-			"not gossiping system config because the replica doesn't contain the system config's start key")
-		return nil
-	}
-	if !r.shouldGossip(ctx) {
-		log.VEventf(ctx, 2, "not gossiping system config because the replica doesn't hold the lease")
-		return nil
-	}
-
-	// TODO(marc): check for bad split in the middle of the SystemConfig span.
-	loadedCfg, err := r.loadSystemConfig(ctx)
-	if err != nil {
-		if errors.Is(err, errSystemConfigIntent) {
-			log.VEventf(ctx, 2, "not gossiping system config because intents were found on SystemConfigSpan")
-			r.markSystemConfigGossipFailed()
-			return nil
-		}
-		return errors.Wrap(err, "could not load SystemConfig span")
-	}
-
-	if gossipedCfg := r.store.Gossip().DeprecatedGetSystemConfig(); gossipedCfg != nil &&
-		gossipedCfg.Equal(loadedCfg) &&
-		r.store.Gossip().InfoOriginatedHere(gossip.KeyDeprecatedSystemConfig) {
-		log.VEventf(ctx, 2, "not gossiping unchanged system config")
-		// Clear the failure bit if all intents have been resolved but there's
-		// nothing new to gossip.
-		r.markSystemConfigGossipSuccess()
-		return nil
-	}
-
-	log.VEventf(ctx, 2, "gossiping system config")
-	if err := r.store.Gossip().AddInfoProto(gossip.KeyDeprecatedSystemConfig, loadedCfg, 0); err != nil {
-		return errors.Wrap(err, "failed to gossip system config")
-	}
-	r.markSystemConfigGossipSuccess()
-	return nil
-}
-
-// MaybeGossipSystemConfigIfHaveFailureRaftMuLocked is a trigger to gossip the
-// system config due to an abort of a transaction keyed in the system config
-// span. It will call MaybeGossipSystemConfigRaftMuLocked if
-// failureToGossipSystemConfig is true.
-func (r *Replica) MaybeGossipSystemConfigIfHaveFailureRaftMuLocked(ctx context.Context) error {
-	r.mu.RLock()
-	failed := r.mu.failureToGossipSystemConfig
-	r.mu.RUnlock()
-	if !failed {
-		return nil
-	}
-	return r.MaybeGossipSystemConfigRaftMuLocked(ctx)
-}
-
 // MaybeGossipNodeLivenessRaftMuLocked gossips information for all node liveness
 // records stored on this range. To scan and gossip, this replica must hold the
 // lease to a range which contains some or all of the node liveness records.
@@ -170,26 +84,31 @@ func (r *Replica) MaybeGossipNodeLivenessRaftMuLocked(
 		return nil
 	}
 
-	ba := roachpb.BatchRequest{}
-	ba.Timestamp = r.store.Clock().Now()
-	ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeaderFromSpan(span)})
+	ba := kvpb.BatchRequest{}
+	// Read at the maximum timestamp to ensure that we see the most recent
+	// liveness record, regardless of what timestamp it is written at.
+	ba.Timestamp = hlc.MaxTimestamp
+	ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeaderFromSpan(span)})
 	// Call evaluateBatch instead of Send to avoid reacquiring latches.
 	rec := NewReplicaEvalContext(
 		ctx, r, todoSpanSet, false, /* requiresClosedTSOlderThanStorageSnap */
 	)
 	defer rec.Release()
-	rw := r.Engine().NewReadOnly(storage.StandardDurability)
+	rw := r.store.TODOEngine().NewReadOnly(storage.StandardDurability)
 	defer rw.Close()
 
 	br, result, pErr :=
-		evaluateBatch(ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, uncertainty.Interval{}, true /* readOnly */)
+		evaluateBatch(
+			ctx, kvserverbase.CmdIDKey(""), rw, rec, nil /* ms */, &ba,
+			nil /* g */, nil /* st */, uncertainty.Interval{}, readOnlyDefault,
+		)
 	if pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "couldn't scan node liveness records in span %s", span)
 	}
 	if len(result.Local.EncounteredIntents) > 0 {
 		return errors.Errorf("unexpected intents on node liveness span %s: %+v", span, result.Local.EncounteredIntents)
 	}
-	kvs := br.Responses[0].GetInner().(*roachpb.ScanResponse).Rows
+	kvs := br.Responses[0].GetInner().(*kvpb.ScanResponse).Rows
 	log.VEventf(ctx, 2, "gossiping %d node liveness record(s) from span %s", len(kvs), span)
 	for _, kv := range kvs {
 		var kvLiveness, gossipLiveness livenesspb.Liveness
@@ -210,56 +129,15 @@ func (r *Replica) MaybeGossipNodeLivenessRaftMuLocked(
 	return nil
 }
 
-var errSystemConfigIntent = errors.New("must retry later due to intent on SystemConfigSpan")
-
-// loadSystemConfig scans the system config span and returns the system
-// config.
-func (r *Replica) loadSystemConfig(ctx context.Context) (*config.SystemConfigEntries, error) {
-	ba := roachpb.BatchRequest{}
-	ba.ReadConsistency = roachpb.INCONSISTENT
-	ba.Timestamp = r.store.Clock().Now()
-	ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeaderFromSpan(keys.SystemConfigSpan)})
-	// Call evaluateBatch instead of Send to avoid reacquiring latches.
-	rec := NewReplicaEvalContext(
-		ctx, r, todoSpanSet, false, /* requiresClosedTSOlderThanStorageSnap */
-	)
-	defer rec.Release()
-	rw := r.Engine().NewReadOnly(storage.StandardDurability)
-	defer rw.Close()
-
-	br, result, pErr := evaluateBatch(
-		ctx, kvserverbase.CmdIDKey(""), rw, rec, nil, &ba, uncertainty.Interval{}, true, /* readOnly */
-	)
-	if pErr != nil {
-		return nil, pErr.GoError()
-	}
-	if intents := result.Local.DetachEncounteredIntents(); len(intents) > 0 {
-		// There were intents, so what we read may not be consistent. Attempt
-		// to nudge the intents in case they're expired; next time around we'll
-		// hopefully have more luck.
-		// This is called from handleReadWriteLocalEvalResult (with raftMu
-		// locked), so disallow synchronous processing (which blocks that mutex
-		// for too long and is a potential deadlock).
-		if err := r.store.intentResolver.CleanupIntentsAsync(ctx, intents, false /* allowSync */); err != nil {
-			log.Warningf(ctx, "%v", err)
-		}
-		return nil, errSystemConfigIntent
-	}
-	kvs := br.Responses[0].GetInner().(*roachpb.ScanResponse).Rows
-	sysCfg := &config.SystemConfigEntries{}
-	sysCfg.Values = kvs
-	return sysCfg, nil
-}
-
 // getLeaseForGossip tries to obtain a range lease. Only one of the replicas
 // should gossip; the bool returned indicates whether it's us.
-func (r *Replica) getLeaseForGossip(ctx context.Context) (bool, *roachpb.Error) {
+func (r *Replica) getLeaseForGossip(ctx context.Context) (bool, *kvpb.Error) {
 	// If no Gossip available (some tests) or range too fresh, noop.
 	if r.store.Gossip() == nil || !r.IsInitialized() {
-		return false, roachpb.NewErrorf("no gossip or range not initialized")
+		return false, kvpb.NewErrorf("no gossip or range not initialized")
 	}
 	var hasLease bool
-	var pErr *roachpb.Error
+	var pErr *kvpb.Error
 	if err := r.store.Stopper().RunTask(
 		ctx, "storage.Replica: acquiring lease to gossip",
 		func(ctx context.Context) {
@@ -268,10 +146,10 @@ func (r *Replica) getLeaseForGossip(ctx context.Context) (bool, *roachpb.Error) 
 			hasLease = pErr == nil
 			if pErr != nil {
 				switch e := pErr.GetDetail().(type) {
-				case *roachpb.NotLeaseHolderError:
+				case *kvpb.NotLeaseHolderError:
 					// NotLeaseHolderError means there is an active lease, but only if
-					// the lease holder is set; otherwise, it's likely a timeout.
-					if e.LeaseHolder != nil {
+					// the lease is non-empty; otherwise, it's likely a timeout.
+					if !e.Lease.Empty() {
 						pErr = nil
 					}
 				default:
@@ -280,7 +158,7 @@ func (r *Replica) getLeaseForGossip(ctx context.Context) (bool, *roachpb.Error) 
 				}
 			}
 		}); err != nil {
-		pErr = roachpb.NewError(err)
+		pErr = kvpb.NewError(err)
 	}
 	return hasLease, pErr
 }
@@ -288,7 +166,7 @@ func (r *Replica) getLeaseForGossip(ctx context.Context) (bool, *roachpb.Error) 
 // maybeGossipFirstRange adds the sentinel and first range metadata to gossip
 // if this is the first range and a range lease can be obtained. The Store
 // calls this periodically on first range replicas.
-func (r *Replica) maybeGossipFirstRange(ctx context.Context) *roachpb.Error {
+func (r *Replica) maybeGossipFirstRange(ctx context.Context) *kvpb.Error {
 	if !r.IsFirstRange() {
 		return nil
 	}

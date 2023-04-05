@@ -20,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -101,8 +101,8 @@ func TestCriticalLocalitiesReport(t *testing.T) {
 					// All the learners are dead, but learners don't matter. So only reg1
 					// is critical for this range.
 					{key: "/Table/t5", stores: "1 2 3 4l 5l 6l 7l"},
-					// Joint-consensus case. Here 1,2,3 are part of the outgoing quorum and
-					// 1,4,8 are part of the incoming quorum. 4 and 5 are dead, which
+					// Joint-consensus case. Here 1,2,4 are part of the outgoing quorum and
+					// 1,5,8 are part of the incoming quorum. 4 and 5 are dead, which
 					// makes all the other nodes critical. So localities "reg1",
 					// "reg1,az1", "reg1,az=2" and "reg8" are critical for this range.
 					{key: "/Table/t6", stores: "1 2o 4o 5i 8i"},
@@ -181,7 +181,7 @@ func TestCriticalLocalitiesSaving(t *testing.T) {
 	// doesn't interfere with the test.
 	ReporterInterval.Override(ctx, &st.SV, 0)
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{Settings: st})
-	con := s.InternalExecutor().(sqlutil.InternalExecutor)
+	con := s.InternalExecutor().(isql.Executor)
 	defer s.Stopper().Stop(ctx)
 
 	// Verify that tables are empty.
@@ -206,7 +206,7 @@ func TestCriticalLocalitiesSaving(t *testing.T) {
 		{"7", "8", "'dc=B'", "2", "2"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"2", "'2001-01-01 10:00:00+00:00'"},
+		{"2", "'2001-01-01 10:00:00+00'"},
 	})
 	require.Equal(t, 3, saver.LastUpdatedRowCount())
 
@@ -227,7 +227,7 @@ func TestCriticalLocalitiesSaving(t *testing.T) {
 		{"15", "6", "'dc=A'", "2", "1"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"2", "'2001-01-01 11:00:00+00:00'"},
+		{"2", "'2001-01-01 11:00:00+00'"},
 	})
 	require.Equal(t, 3, saver.LastUpdatedRowCount())
 
@@ -267,7 +267,7 @@ func TestCriticalLocalitiesSaving(t *testing.T) {
 		{"15", "6", "'dc=A'", "2", "1"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"2", "'2001-01-01 12:00:00+00:00'"},
+		{"2", "'2001-01-01 12:00:00+00'"},
 	})
 	require.Equal(t, 2, saver.LastUpdatedRowCount())
 
@@ -282,15 +282,13 @@ func TestCriticalLocalitiesSaving(t *testing.T) {
 		{"5", "6", "'dc=A'", "2", "1"},
 	})
 	require.ElementsMatch(t, TableData(ctx, "system.reports_meta", con), [][]string{
-		{"2", "'2001-01-01 12:30:00+00:00'"},
+		{"2", "'2001-01-01 12:30:00+00'"},
 	})
 	require.Equal(t, 3, saver.LastUpdatedRowCount())
 }
 
 // TableData reads a table and returns the rows as strings.
-func TableData(
-	ctx context.Context, tableName string, executor sqlutil.InternalExecutor,
-) [][]string {
+func TableData(ctx context.Context, tableName string, executor isql.Executor) [][]string {
 	if it, err := executor.QueryIterator(
 		ctx, "test-select-"+tableName, nil /* txn */, "select * from "+tableName,
 	); err == nil {

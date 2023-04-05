@@ -9,24 +9,24 @@
 // licenses/APL.txt.
 
 import React from "react";
-import { assert } from "chai";
 import { shallow } from "enzyme";
-import * as sinon from "sinon";
 import moment from "moment";
 import _ from "lodash";
 
-import "src/enzymeInit";
 import { MetricsTimeManagerUnconnected as MetricsTimeManager } from "./";
 import * as timewindow from "src/redux/timeScale";
 
-describe("<MetricsTimeManager>", function() {
-  let spy: sinon.SinonSpy;
+describe("<MetricsTimeManager>", function () {
+  const spy = jest.fn();
   let state: timewindow.TimeScaleState;
   const now = () => moment("11-12-1955 10:04PM -0800", "MM-DD-YYYY hh:mma Z");
 
-  beforeEach(function() {
-    spy = sinon.spy();
+  beforeEach(function () {
     state = new timewindow.TimeScaleState();
+  });
+
+  afterEach(() => {
+    spy.mockReset();
   });
 
   const getManager = () =>
@@ -38,32 +38,30 @@ describe("<MetricsTimeManager>", function() {
       />,
     );
 
-  it("resets time window immediately it is empty", function() {
+  it("resets time window immediately it is empty", function () {
     getManager();
-    assert.isTrue(spy.calledOnce);
-    assert.deepEqual(spy.firstCall.args[0], {
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.calls[0][0]).toEqual({
       start: now().subtract(state.scale.windowSize),
       end: now(),
     });
   });
 
-  it("resets time window immediately if expired", function() {
+  it("resets time window immediately if expired", function () {
     state.metricsTime.currentWindow = {
       start: now().subtract(state.scale.windowSize),
-      end: now()
-        .subtract(state.scale.windowValid)
-        .subtract(1),
+      end: now().subtract(state.scale.windowValid).subtract(1),
     };
 
     getManager();
-    assert.isTrue(spy.calledOnce);
-    assert.deepEqual(spy.firstCall.args[0], {
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.calls[0][0]).toEqual({
       start: now().subtract(state.scale.windowSize),
       end: now(),
     });
   });
 
-  it("resets time window immediately if scale has changed", function() {
+  it("resets time window immediately if scale has changed", function () {
     // valid window.
     state.metricsTime.currentWindow = {
       start: now().subtract(state.scale.windowSize),
@@ -72,14 +70,14 @@ describe("<MetricsTimeManager>", function() {
     state.metricsTime.shouldUpdateMetricsWindowFromScale = true;
 
     getManager();
-    assert.isTrue(spy.calledOnce);
-    assert.deepEqual(spy.firstCall.args[0], {
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.calls[0][0]).toEqual({
       start: now().subtract(state.scale.windowSize),
       end: now(),
     });
   });
 
-  it("resets time window later if current window is valid", function() {
+  it("resets time window later if current window is valid", function () {
     state.metricsTime.currentWindow = {
       start: now().subtract(state.scale.windowSize),
       // 5 milliseconds until expiration.
@@ -87,13 +85,13 @@ describe("<MetricsTimeManager>", function() {
     };
 
     getManager();
-    assert.isTrue(spy.notCalled);
+    expect(spy).not.toHaveBeenCalled();
 
     // Wait 11 milliseconds, then verify that window was updated.
     return new Promise<void>((resolve, _reject) => {
       setTimeout(() => {
-        assert.isTrue(spy.calledOnce);
-        assert.deepEqual(spy.firstCall.args[0], {
+        expect(spy).toHaveBeenCalled();
+        expect(spy.mock.calls[0][0]).toEqual({
           start: now().subtract(state.scale.windowSize),
           end: now(),
         });
@@ -104,7 +102,7 @@ describe("<MetricsTimeManager>", function() {
 
   // TODO (maxlang): Fix this test to actually change the state to catch the
   // issue that caused #7590. Tracked in #8595.
-  it("has only a single timeout at a time.", function() {
+  it("has only a single timeout at a time.", function () {
     state.metricsTime.currentWindow = {
       start: now().subtract(state.scale.windowSize),
       // 5 milliseconds until expiration.
@@ -112,7 +110,7 @@ describe("<MetricsTimeManager>", function() {
     };
 
     const manager = getManager();
-    assert.isTrue(spy.notCalled);
+    expect(spy).not.toHaveBeenCalled();
 
     // Set new props on currentWindow. The previous timeout should be abandoned.
     state.metricsTime.currentWindow = {
@@ -123,13 +121,13 @@ describe("<MetricsTimeManager>", function() {
     manager.setProps({
       timeWindow: state,
     });
-    assert.isTrue(spy.notCalled);
+    expect(spy).not.toHaveBeenCalled();
 
     // Wait 11 milliseconds, then verify that window was updated a single time.
     return new Promise<void>((resolve, _reject) => {
       setTimeout(() => {
-        assert.isTrue(spy.calledOnce);
-        assert.deepEqual(spy.firstCall.args[0], {
+        expect(spy).toHaveBeenCalled();
+        expect(spy.mock.calls[0][0]).toEqual({
           start: now().subtract(state.scale.windowSize),
           end: now(),
         });

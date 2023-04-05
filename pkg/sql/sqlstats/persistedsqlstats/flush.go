@@ -12,15 +12,17 @@ package persistedsqlstats
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -70,15 +72,81 @@ func (s *PersistedSQLStats) Flush(ctx context.Context) {
 
 	aggregatedTs := s.ComputeAggregatedTs()
 
-	s.flushStmtStats(ctx, aggregatedTs)
-	s.flushTxnStats(ctx, aggregatedTs)
+	if s.stmtsLimitSizeReached(ctx) || s.txnsLimitSizeReached(ctx) {
+		log.Infof(ctx, "unable to flush fingerprints because table limit was reached.")
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			s.flushStmtStats(ctx, aggregatedTs)
+		}()
+
+		go func() {
+			defer wg.Done()
+			s.flushTxnStats(ctx, aggregatedTs)
+		}()
+
+		wg.Wait()
+	}
+}
+
+func (s *PersistedSQLStats) stmtsLimitSizeReached(ctx context.Context) bool {
+	maxPersistedRows := float64(SQLStatsMaxPersistedRows.Get(&s.SQLStats.GetClusterSettings().SV))
+
+	readStmt := `
+SELECT
+    count(*)
+FROM
+    system.statement_statistics
+`
+
+	row, err := s.cfg.DB.Executor().QueryRowEx(
+		ctx,
+		"fetch-stmt-count",
+		nil,
+		sessiondata.NodeUserSessionDataOverride,
+		readStmt,
+	)
+
+	if err != nil {
+		return false
+	}
+	actualSize := float64(tree.MustBeDInt(row[0]))
+	return actualSize > (maxPersistedRows * 1.5)
+}
+
+func (s *PersistedSQLStats) txnsLimitSizeReached(ctx context.Context) bool {
+	maxPersistedRows := float64(SQLStatsMaxPersistedRows.Get(&s.SQLStats.GetClusterSettings().SV))
+
+	readStmt := `
+SELECT
+    count(*)
+FROM
+    system.transaction_statistics
+`
+
+	row, err := s.cfg.DB.Executor().QueryRowEx(
+		ctx,
+		"fetch-txn-count",
+		nil,
+		sessiondata.NodeUserSessionDataOverride,
+		readStmt,
+	)
+
+	if err != nil {
+		return false
+	}
+	actualSize := float64(tree.MustBeDInt(row[0]))
+	return actualSize > (maxPersistedRows * 1.5)
 }
 
 func (s *PersistedSQLStats) flushStmtStats(ctx context.Context, aggregatedTs time.Time) {
 	// s.doFlush directly logs errors if they are encountered. Therefore,
 	// no error is returned here.
 	_ = s.SQLStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{},
-		func(ctx context.Context, statistics *roachpb.CollectedStatementStatistics) error {
+		func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 			s.doFlush(ctx, func() error {
 				return s.doFlushSingleStmtStats(ctx, statistics, aggregatedTs)
 			}, "failed to flush statement statistics" /* errMsg */)
@@ -93,7 +161,7 @@ func (s *PersistedSQLStats) flushStmtStats(ctx context.Context, aggregatedTs tim
 
 func (s *PersistedSQLStats) flushTxnStats(ctx context.Context, aggregatedTs time.Time) {
 	_ = s.SQLStats.IterateTransactionStats(ctx, &sqlstats.IteratorOptions{},
-		func(ctx context.Context, statistics *roachpb.CollectedTransactionStatistics) error {
+		func(ctx context.Context, statistics *appstatspb.CollectedTransactionStatistics) error {
 			s.doFlush(ctx, func() error {
 				return s.doFlushSingleTxnStats(ctx, statistics, aggregatedTs)
 			}, "failed to flush transaction statistics" /* errMsg */)
@@ -124,15 +192,15 @@ func (s *PersistedSQLStats) doFlush(ctx context.Context, workFn func() error, er
 }
 
 func (s *PersistedSQLStats) doFlushSingleTxnStats(
-	ctx context.Context, stats *roachpb.CollectedTransactionStatistics, aggregatedTs time.Time,
+	ctx context.Context, stats *appstatspb.CollectedTransactionStatistics, aggregatedTs time.Time,
 ) error {
-	return s.cfg.KvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	return s.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// Explicitly copy the stats variable so the txn closure is retryable.
 		scopedStats := *stats
 
 		serializedFingerprintID := sqlstatsutil.EncodeUint64ToBytes(uint64(stats.TransactionFingerprintID))
 
-		insertFn := func(ctx context.Context, txn *kv.Txn) (alreadyExists bool, err error) {
+		insertFn := func(ctx context.Context, txn isql.Txn) (alreadyExists bool, err error) {
 			rowsAffected, err := s.insertTransactionStats(ctx, txn, aggregatedTs, serializedFingerprintID, &scopedStats)
 
 			if err != nil {
@@ -146,8 +214,8 @@ func (s *PersistedSQLStats) doFlushSingleTxnStats(
 			return false /* alreadyExists */, nil /* err */
 		}
 
-		readFn := func(ctx context.Context, txn *kv.Txn) error {
-			persistedData := roachpb.TransactionStatistics{}
+		readFn := func(ctx context.Context, txn isql.Txn) error {
+			persistedData := appstatspb.TransactionStatistics{}
 			err := s.fetchPersistedTransactionStats(ctx, txn, aggregatedTs, serializedFingerprintID, scopedStats.App, &persistedData)
 			if err != nil {
 				return err
@@ -157,7 +225,7 @@ func (s *PersistedSQLStats) doFlushSingleTxnStats(
 			return nil
 		}
 
-		updateFn := func(ctx context.Context, txn *kv.Txn) error {
+		updateFn := func(ctx context.Context, txn isql.Txn) error {
 			return s.updateTransactionStats(ctx, txn, aggregatedTs, serializedFingerprintID, &scopedStats)
 		}
 
@@ -170,9 +238,9 @@ func (s *PersistedSQLStats) doFlushSingleTxnStats(
 }
 
 func (s *PersistedSQLStats) doFlushSingleStmtStats(
-	ctx context.Context, stats *roachpb.CollectedStatementStatistics, aggregatedTs time.Time,
+	ctx context.Context, stats *appstatspb.CollectedStatementStatistics, aggregatedTs time.Time,
 ) error {
-	return s.cfg.KvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	return s.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// Explicitly copy the stats so that this closure is retryable.
 		scopedStats := *stats
 
@@ -180,7 +248,7 @@ func (s *PersistedSQLStats) doFlushSingleStmtStats(
 		serializedTransactionFingerprintID := sqlstatsutil.EncodeUint64ToBytes(uint64(scopedStats.Key.TransactionFingerprintID))
 		serializedPlanHash := sqlstatsutil.EncodeUint64ToBytes(scopedStats.Key.PlanHash)
 
-		insertFn := func(ctx context.Context, txn *kv.Txn) (alreadyExists bool, err error) {
+		insertFn := func(ctx context.Context, txn isql.Txn) (alreadyExists bool, err error) {
 			rowsAffected, err := s.insertStatementStats(
 				ctx,
 				txn,
@@ -202,8 +270,8 @@ func (s *PersistedSQLStats) doFlushSingleStmtStats(
 			return false /* alreadyExists */, nil /* err */
 		}
 
-		readFn := func(ctx context.Context, txn *kv.Txn) error {
-			persistedData := roachpb.StatementStatistics{}
+		readFn := func(ctx context.Context, txn isql.Txn) error {
+			persistedData := appstatspb.StatementStatistics{}
 			err := s.fetchPersistedStatementStats(
 				ctx,
 				txn,
@@ -222,7 +290,7 @@ func (s *PersistedSQLStats) doFlushSingleStmtStats(
 			return nil
 		}
 
-		updateFn := func(ctx context.Context, txn *kv.Txn) error {
+		updateFn := func(ctx context.Context, txn isql.Txn) error {
 			return s.updateStatementStats(
 				ctx,
 				txn,
@@ -244,10 +312,10 @@ func (s *PersistedSQLStats) doFlushSingleStmtStats(
 
 func (s *PersistedSQLStats) doInsertElseDoUpdate(
 	ctx context.Context,
-	txn *kv.Txn,
-	insertFn func(context.Context, *kv.Txn) (alreadyExists bool, err error),
-	readFn func(context.Context, *kv.Txn) error,
-	updateFn func(context.Context, *kv.Txn) error,
+	txn isql.Txn,
+	insertFn func(context.Context, isql.Txn) (alreadyExists bool, err error),
+	readFn func(context.Context, isql.Txn) error,
+	updateFn func(context.Context, isql.Txn) error,
 ) error {
 	alreadyExists, err := insertFn(ctx, txn)
 	if err != nil {
@@ -296,10 +364,10 @@ func (s *PersistedSQLStats) getTimeNow() time.Time {
 
 func (s *PersistedSQLStats) insertTransactionStats(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	aggregatedTs time.Time,
 	serializedFingerprintID []byte,
-	stats *roachpb.CollectedTransactionStatistics,
+	stats *appstatspb.CollectedTransactionStatistics,
 ) (rowsAffected int, err error) {
 	insertStmt := `
 INSERT INTO system.transaction_statistics
@@ -323,31 +391,30 @@ DO NOTHING
 	}
 	statistics := tree.NewDJSON(statisticsJSON)
 
-	rowsAffected, err = s.cfg.InternalExecutor.ExecEx(
+	nodeID := s.GetEnabledSQLInstanceID()
+	rowsAffected, err = txn.ExecEx(
 		ctx,
 		"insert-txn-stats",
-		txn, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		},
+		txn.KV(),
+		sessiondata.NodeUserSessionDataOverride,
 		insertStmt,
-		aggregatedTs,                         // aggregated_ts
-		serializedFingerprintID,              // fingerprint_id
-		stats.App,                            // app_name
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
-		aggInterval,                          // agg_interval
-		metadata,                             // metadata
-		statistics,                           // statistics
+		aggregatedTs,            // aggregated_ts
+		serializedFingerprintID, // fingerprint_id
+		stats.App,               // app_name
+		nodeID,                  // node_id
+		aggInterval,             // agg_interval
+		metadata,                // metadata
+		statistics,              // statistics
 	)
 
 	return rowsAffected, err
 }
 func (s *PersistedSQLStats) updateTransactionStats(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	aggregatedTs time.Time,
 	serializedFingerprintID []byte,
-	stats *roachpb.CollectedTransactionStatistics,
+	stats *appstatspb.CollectedTransactionStatistics,
 ) error {
 	updateStmt := `
 UPDATE system.transaction_statistics
@@ -364,19 +431,18 @@ WHERE fingerprint_id = $2
 	}
 	statistics := tree.NewDJSON(statisticsJSON)
 
-	rowsAffected, err := s.cfg.InternalExecutor.ExecEx(
+	nodeID := s.GetEnabledSQLInstanceID()
+	rowsAffected, err := txn.ExecEx(
 		ctx,
 		"update-stmt-stats",
-		txn, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		},
+		txn.KV(), /* txn */
+		sessiondata.NodeUserSessionDataOverride,
 		updateStmt,
-		statistics,                           // statistics
-		serializedFingerprintID,              // fingerprint_id
-		aggregatedTs,                         // aggregated_ts
-		stats.App,                            // app_name
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		statistics,              // statistics
+		serializedFingerprintID, // fingerprint_id
+		aggregatedTs,            // aggregated_ts
+		stats.App,               // app_name
+		nodeID,                  // node_id
 	)
 
 	if err != nil {
@@ -385,8 +451,7 @@ WHERE fingerprint_id = $2
 
 	if rowsAffected == 0 {
 		return errors.AssertionFailedf("failed to update transaction statistics for  fingerprint_id: %s, app: %s, aggregated_ts: %s, node_id: %d",
-			serializedFingerprintID, stats.App, aggregatedTs,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			serializedFingerprintID, stats.App, aggregatedTs, nodeID)
 	}
 
 	return nil
@@ -394,45 +459,51 @@ WHERE fingerprint_id = $2
 
 func (s *PersistedSQLStats) updateStatementStats(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	aggregatedTs time.Time,
 	serializedFingerprintID []byte,
 	serializedTransactionFingerprintID []byte,
 	serializedPlanHash []byte,
-	stats *roachpb.CollectedStatementStatistics,
+	stats *appstatspb.CollectedStatementStatistics,
 ) error {
 	updateStmt := `
 UPDATE system.statement_statistics
-SET statistics = $1
-WHERE fingerprint_id = $2
-  AND transaction_fingerprint_id = $3
-	AND aggregated_ts = $4
-  AND app_name = $5
-  AND plan_hash = $6
-  AND node_id = $7
+SET statistics = $1,
+index_recommendations = $2
+WHERE fingerprint_id = $3
+  AND transaction_fingerprint_id = $4
+	AND aggregated_ts = $5
+  AND app_name = $6
+  AND plan_hash = $7
+  AND node_id = $8
 `
-
 	statisticsJSON, err := sqlstatsutil.BuildStmtStatisticsJSON(&stats.Stats)
 	if err != nil {
 		return err
 	}
 	statistics := tree.NewDJSON(statisticsJSON)
+	indexRecommendations := tree.NewDArray(types.String)
+	for _, recommendation := range stats.Stats.IndexRecommendations {
+		if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
+			return err
+		}
+	}
 
-	rowsAffected, err := s.cfg.InternalExecutor.ExecEx(
+	nodeID := s.GetEnabledSQLInstanceID()
+	rowsAffected, err := txn.ExecEx(
 		ctx,
 		"update-stmt-stats",
-		txn, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		},
+		txn.KV(), /* txn */
+		sessiondata.NodeUserSessionDataOverride,
 		updateStmt,
-		statistics,                           // statistics
-		serializedFingerprintID,              // fingerprint_id
-		serializedTransactionFingerprintID,   // transaction_fingerprint_id
-		aggregatedTs,                         // aggregated_ts
-		stats.Key.App,                        // app_name
-		serializedPlanHash,                   // plan_hash
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		statistics,                         // statistics
+		indexRecommendations,               // index_recommendations
+		serializedFingerprintID,            // fingerprint_id
+		serializedTransactionFingerprintID, // transaction_fingerprint_id
+		aggregatedTs,                       // aggregated_ts
+		stats.Key.App,                      // app_name
+		serializedPlanHash,                 // plan_hash
+		nodeID,                             // node_id
 	)
 
 	if err != nil {
@@ -448,7 +519,7 @@ WHERE fingerprint_id = $2
 			"plan_hash: %d, "+
 			"node_id: %d",
 			serializedFingerprintID, serializedTransactionFingerprintID, stats.Key.App,
-			aggregatedTs, serializedPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
+			aggregatedTs, serializedPlanHash, nodeID)
 	}
 
 	return nil
@@ -456,20 +527,14 @@ WHERE fingerprint_id = $2
 
 func (s *PersistedSQLStats) insertStatementStats(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	aggregatedTs time.Time,
 	serializedFingerprintID []byte,
 	serializedTransactionFingerprintID []byte,
 	serializedPlanHash []byte,
-	stats *roachpb.CollectedStatementStatistics,
+	stats *appstatspb.CollectedStatementStatistics,
 ) (rowsAffected int, err error) {
-	insertStmt := `
-INSERT INTO system.statement_statistics
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-ON CONFLICT (crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8,
-             aggregated_ts, fingerprint_id, transaction_fingerprint_id, app_name, plan_hash, node_id)
-DO NOTHING
-`
+
 	aggInterval := s.GetAggregationInterval()
 
 	// Prepare data for insertion.
@@ -486,25 +551,44 @@ DO NOTHING
 	statistics := tree.NewDJSON(statisticsJSON)
 
 	plan := tree.NewDJSON(sqlstatsutil.ExplainTreePlanNodeToJSON(&stats.Stats.SensitiveInfo.MostRecentPlanDescription))
+	nodeID := s.GetEnabledSQLInstanceID()
 
-	rowsAffected, err = s.cfg.InternalExecutor.ExecEx(
+	indexRecommendations := tree.NewDArray(types.String)
+	for _, recommendation := range stats.Stats.IndexRecommendations {
+		if err := indexRecommendations.Append(tree.NewDString(recommendation)); err != nil {
+			return 0, err
+		}
+	}
+
+	values := "$1 ,$2, $3, $4, $5, $6, $7, $8, $9, $10, $11"
+	args := append(make([]interface{}, 0, 11),
+		aggregatedTs,                       // aggregated_ts
+		serializedFingerprintID,            // fingerprint_id
+		serializedTransactionFingerprintID, // transaction_fingerprint_id
+		serializedPlanHash,                 // plan_hash
+		stats.Key.App,                      // app_name
+		nodeID,                             // node_id
+		aggInterval,                        // agg_interval
+		metadata,                           // metadata
+		statistics,                         // statistics
+		plan,                               // plan
+		indexRecommendations,               // index_recommendations
+	)
+
+	insertStmt := fmt.Sprintf(`
+INSERT INTO system.statement_statistics
+VALUES (%s)
+ON CONFLICT (crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8,
+             aggregated_ts, fingerprint_id, transaction_fingerprint_id, app_name, plan_hash, node_id)
+DO NOTHING
+`, values)
+	rowsAffected, err = txn.ExecEx(
 		ctx,
 		"insert-stmt-stats",
-		txn, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		},
+		txn.KV(), /* txn */
+		sessiondata.NodeUserSessionDataOverride,
 		insertStmt,
-		aggregatedTs,                         // aggregated_ts
-		serializedFingerprintID,              // fingerprint_id
-		serializedTransactionFingerprintID,   // transaction_fingerprint_id
-		serializedPlanHash,                   // plan_hash
-		stats.Key.App,                        // app_name
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
-		aggInterval,                          // agg_interval
-		metadata,                             // metadata
-		statistics,                           // statistics
-		plan,                                 // plan
+		args...,
 	)
 
 	return rowsAffected, err
@@ -512,11 +596,11 @@ DO NOTHING
 
 func (s *PersistedSQLStats) fetchPersistedTransactionStats(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	aggregatedTs time.Time,
 	serializedFingerprintID []byte,
 	appName string,
-	result *roachpb.TransactionStatistics,
+	result *appstatspb.TransactionStatistics,
 ) error {
 	// We use `SELECT ... FOR UPDATE` statement because we are going to perform
 	// and `UPDATE` on the stats for the given fingerprint later.
@@ -532,18 +616,17 @@ WHERE fingerprint_id = $1
 FOR UPDATE
 `
 
-	row, err := s.cfg.InternalExecutor.QueryRowEx(
+	nodeID := s.GetEnabledSQLInstanceID()
+	row, err := txn.QueryRowEx(
 		ctx,
 		"fetch-txn-stats",
-		txn, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		},
-		readStmt,                             // stmt
-		serializedFingerprintID,              // fingerprint_id
-		appName,                              // app_name
-		aggregatedTs,                         // aggregated_ts
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		txn.KV(), /* txn */
+		sessiondata.NodeUserSessionDataOverride,
+		readStmt,                // stmt
+		serializedFingerprintID, // fingerprint_id
+		appName,                 // app_name
+		aggregatedTs,            // aggregated_ts
+		nodeID,                  // node_id
 	)
 
 	if err != nil {
@@ -553,13 +636,13 @@ FOR UPDATE
 	if row == nil {
 		return errors.AssertionFailedf("transaction statistics not found for fingerprint_id: %s, app: %s, aggregated_ts: %s, node_id: %d",
 			serializedFingerprintID, appName, aggregatedTs,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			nodeID)
 	}
 
 	if len(row) != 1 {
 		return errors.AssertionFailedf("unexpectedly found %d returning columns for fingerprint_id: %s, app: %s, aggregated_ts: %s, node_id: %d",
 			len(row), serializedFingerprintID, appName, aggregatedTs,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			nodeID)
 	}
 
 	statistics := tree.MustBeDJSON(row[0])
@@ -568,13 +651,13 @@ FOR UPDATE
 
 func (s *PersistedSQLStats) fetchPersistedStatementStats(
 	ctx context.Context,
-	txn *kv.Txn,
+	txn isql.Txn,
 	aggregatedTs time.Time,
 	serializedFingerprintID []byte,
 	serializedTransactionFingerprintID []byte,
 	serializedPlanHash []byte,
-	key *roachpb.StatementStatisticsKey,
-	result *roachpb.StatementStatistics,
+	key *appstatspb.StatementStatisticsKey,
+	result *appstatspb.StatementStatistics,
 ) error {
 	readStmt := `
 SELECT
@@ -589,20 +672,19 @@ WHERE fingerprint_id = $1
     AND node_id = $6
 FOR UPDATE
 `
-	row, err := s.cfg.InternalExecutor.QueryRowEx(
+	nodeID := s.GetEnabledSQLInstanceID()
+	row, err := txn.QueryRowEx(
 		ctx,
 		"fetch-stmt-stats",
-		txn, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: username.NodeUserName(),
-		},
-		readStmt,                             // stmt
-		serializedFingerprintID,              // fingerprint_id
-		serializedTransactionFingerprintID,   // transaction_fingerprint_id
-		key.App,                              // app_name
-		aggregatedTs,                         // aggregated_ts
-		serializedPlanHash,                   // plan_hash
-		s.cfg.SQLIDContainer.SQLInstanceID(), // node_id
+		txn.KV(), /* txn */
+		sessiondata.NodeUserSessionDataOverride,
+		readStmt,                           // stmt
+		serializedFingerprintID,            // fingerprint_id
+		serializedTransactionFingerprintID, // transaction_fingerprint_id
+		key.App,                            // app_name
+		aggregatedTs,                       // aggregated_ts
+		serializedPlanHash,                 // plan_hash
+		nodeID,                             // node_id
 	)
 
 	if err != nil {
@@ -612,13 +694,12 @@ FOR UPDATE
 	if row == nil {
 		return errors.AssertionFailedf(
 			"statement statistics not found fingerprint_id: %s, app: %s, aggregated_ts: %s, plan_hash: %d, node_id: %d",
-			serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash, s.cfg.SQLIDContainer.SQLInstanceID())
+			serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash, nodeID)
 	}
 
 	if len(row) != 1 {
 		return errors.AssertionFailedf("unexpectedly found %d returning columns for fingerprint_id: %s, app: %s, aggregated_ts: %s, plan_hash %d, node_id: %d",
-			len(row), serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash,
-			s.cfg.SQLIDContainer.SQLInstanceID())
+			len(row), serializedFingerprintID, key.App, aggregatedTs, serializedPlanHash, nodeID)
 	}
 
 	statistics := tree.MustBeDJSON(row[0])
